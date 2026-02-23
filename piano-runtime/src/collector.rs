@@ -8,16 +8,16 @@
 //! `collect()` aggregates raw records into per-function summaries sorted by
 //! self-time descending. `reset()` clears all state for the current thread.
 //!
-//! Flush strategy: `RECORDS` is wrapped in `AutoFlushRecords`, which implements
-//! `Drop`. When thread-local storage is destroyed (normal process exit, thread
-//! join), the `Drop` impl flushes records to disk. This avoids the classic
-//! atexit-vs-TLS ordering problem where atexit fires after TLS is destroyed.
+//! Flush strategy: each thread's records live in an `Arc<Mutex<Vec<RawRecord>>>`
+//! registered in a global `THREAD_RECORDS` Vec. `shutdown()` (injected at the
+//! end of main by the AST rewriter) iterates all Arcs to collect data from every
+//! thread, including thread-pool workers whose TLS destructors may never fire.
 //!
-//! Thread-locality: all state (stack, records) is thread-local. Each thread
-//! produces an independent call tree by default. For cross-thread attribution
-//! (e.g. rayon scopes, spawned threads), use `fork()` / `adopt()` / `finalize()`
-//! to propagate timing context so that child thread elapsed time is correctly
-//! subtracted from the parent's self-time.
+//! Thread-locality: stack and records are thread-local. Each thread produces an
+//! independent call tree by default. For cross-thread attribution (e.g. rayon
+//! scopes, spawned threads), use `fork()` / `adopt()` to propagate timing context
+//! so that child thread elapsed time is correctly subtracted from the parent's
+//! self-time. `SpanContext` auto-finalizes on Drop.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -85,77 +85,34 @@ pub(crate) struct StackEntry {
 }
 
 /// Raw measurement produced when a Guard drops.
+#[derive(Clone)]
 struct RawRecord {
     name: &'static str,
     elapsed_ms: f64,
     children_ms: f64,
 }
 
-/// Container for all flush-critical data, auto-flushes to disk on Drop.
-///
-/// When thread-local storage is destroyed (process exit, thread join), Drop
-/// fires while the data is still alive — no TLS lookup needed.
-/// All data needed for flush is consolidated here to avoid TLS destruction
-/// order issues.
-struct AutoFlushRecords {
-    records: Vec<RawRecord>,
-    frames: Vec<Vec<FrameFnSummary>>,
-    registered: Vec<&'static str>,
-}
+type ThreadRecordArc = Arc<Mutex<Vec<RawRecord>>>;
 
-impl AutoFlushRecords {
-    const fn new() -> Self {
-        Self {
-            records: Vec::new(),
-            frames: Vec::new(),
-            registered: Vec::new(),
-        }
-    }
-}
-
-impl Drop for AutoFlushRecords {
-    fn drop(&mut self) {
-        if cfg!(test) {
-            return;
-        }
-
-        let Some(dir) = runs_dir() else { return };
-
-        if !self.frames.is_empty() {
-            let mut seen = HashSet::new();
-            let mut fn_names: Vec<&str> = Vec::new();
-            for frame in &self.frames {
-                for s in frame {
-                    if seen.insert(s.name) {
-                        fn_names.push(s.name);
-                    }
-                }
-            }
-            let path = dir.join(format!("{}.ndjson", timestamp_ms()));
-            let _ = write_ndjson(&self.frames, &fn_names, &path);
-            return;
-        }
-
-        // Fall back to JSON for non-frame workloads.
-        if self.records.is_empty() && self.registered.is_empty() {
-            return;
-        }
-        let aggregated = aggregate(&self.records, &self.registered);
-        if aggregated.is_empty() {
-            return;
-        }
-        let path = dir.join(format!("{}.json", timestamp_ms()));
-        let _ = write_json(&aggregated, &path);
-    }
-}
+/// Global registry of per-thread record storage.
+/// Each thread registers its Arc on first access. collect_all() iterates all Arcs.
+static THREAD_RECORDS: LazyLock<Mutex<Vec<ThreadRecordArc>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 thread_local! {
     pub(crate) static STACK: RefCell<Vec<StackEntry>> = const { RefCell::new(Vec::new()) };
-    static RECORDS: RefCell<AutoFlushRecords> = const { RefCell::new(AutoFlushRecords::new()) };
+    static RECORDS: Arc<Mutex<Vec<RawRecord>>> = {
+        let arc = Arc::new(Mutex::new(Vec::new()));
+        THREAD_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&arc));
+        arc
+    };
+    static REGISTERED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     #[cfg(test)]
     static INVOCATIONS: RefCell<Vec<InvocationRecord>> = const { RefCell::new(Vec::new()) };
     /// Invocations accumulated within the current frame (cleared on frame boundary).
     static FRAME_BUFFER: RefCell<Vec<InvocationRecord>> = const { RefCell::new(Vec::new()) };
+    /// Completed per-frame summaries.
+    static FRAMES: RefCell<Vec<Vec<FrameFnSummary>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// RAII timing guard. Records elapsed time on drop.
@@ -188,11 +145,14 @@ impl Drop for Guard {
             }
 
             RECORDS.with(|records| {
-                records.borrow_mut().records.push(RawRecord {
-                    name: entry.name,
-                    elapsed_ms,
-                    children_ms,
-                });
+                records
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(RawRecord {
+                        name: entry.name,
+                        elapsed_ms,
+                        children_ms,
+                    });
             });
 
             let invocation = InvocationRecord {
@@ -220,8 +180,8 @@ impl Drop for Guard {
                 FRAME_BUFFER.with(|buf| {
                     let buffer = buf.borrow_mut().drain(..).collect::<Vec<_>>();
                     let summary = aggregate_frame(&buffer);
-                    RECORDS.with(|records| {
-                        records.borrow_mut().frames.push(summary);
+                    FRAMES.with(|frames| {
+                        frames.borrow_mut().push(summary);
                     });
                 });
             }
@@ -251,11 +211,18 @@ pub fn enter(name: &'static str) -> Guard {
 }
 
 /// Register a function name so it appears in output even if never called.
+///
+/// Must be called from the same thread that will later call `collect_all()`
+/// or `shutdown()`. In practice this means `main()` -- the AST rewriter
+/// injects `register()` calls at the top of `main()` and `shutdown()` at
+/// the end. Calling `register()` from worker threads will cause those
+/// function names to be missing from aggregated output because `REGISTERED`
+/// is thread-local.
 pub fn register(name: &'static str) {
-    RECORDS.with(|records| {
-        let mut r = records.borrow_mut();
-        if !r.registered.contains(&name) {
-            r.registered.push(name);
+    REGISTERED.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        if !reg.contains(&name) {
+            reg.push(name);
         }
     });
 }
@@ -294,10 +261,11 @@ fn aggregate(raw: &[RawRecord], registered: &[&str]) -> Vec<FunctionRecord> {
 }
 
 /// Aggregate raw records into per-function summaries, sorted by self_ms descending.
+/// Reads only from the current thread's record storage.
 pub fn collect() -> Vec<FunctionRecord> {
     RECORDS.with(|records| {
-        let r = records.borrow();
-        aggregate(&r.records, &r.registered)
+        let recs = records.lock().unwrap_or_else(|e| e.into_inner());
+        REGISTERED.with(|reg| aggregate(&recs, &reg.borrow()))
     })
 }
 
@@ -309,7 +277,7 @@ pub fn collect_invocations() -> Vec<InvocationRecord> {
 
 /// Return completed per-frame summaries.
 pub fn collect_frames() -> Vec<Vec<FrameFnSummary>> {
-    RECORDS.with(|records| records.borrow().frames.clone())
+    FRAMES.with(|frames| frames.borrow().clone())
 }
 
 /// Aggregate invocation records within a single frame into per-function summaries.
@@ -335,18 +303,67 @@ fn aggregate_frame(records: &[InvocationRecord]) -> Vec<FrameFnSummary> {
     map.into_values().collect()
 }
 
-/// Clear all collected timing data.
+/// Collect records from ALL threads via the global registry.
+/// This is the primary collection method for cross-thread profiling — it
+/// captures data from thread-pool workers whose TLS destructors may never fire.
+///
+/// Clones the Arc handles under the global lock, then drops the lock before
+/// iterating per-thread records. This avoids blocking new thread registrations
+/// while aggregation is in progress.
+///
+/// Note: `REGISTERED` (the set of known function names) is read from the
+/// calling thread's TLS only. Function names registered on other threads
+/// will not appear in the output unless they were also recorded via `enter()`.
+/// In the normal flow the AST rewriter injects all `register()` calls into
+/// `main()`, so calling `collect_all()` from `main()` (via `shutdown()`)
+/// sees every registered name.
+pub fn collect_all() -> Vec<FunctionRecord> {
+    let arcs: Vec<ThreadRecordArc> = {
+        let registry = THREAD_RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+        registry.clone()
+    };
+    let mut all_raw: Vec<RawRecord> = Vec::new();
+    for arc in &arcs {
+        let records = arc.lock().unwrap_or_else(|e| e.into_inner());
+        all_raw.extend(records.iter().cloned());
+    }
+    let registered: Vec<&str> = REGISTERED
+        .try_with(|reg| reg.borrow().clone())
+        .unwrap_or_default();
+    aggregate(&all_raw, &registered)
+}
+
+/// Clear all collected timing data for the current thread.
 pub fn reset() {
     STACK.with(|stack| stack.borrow_mut().clear());
     RECORDS.with(|records| {
-        let mut r = records.borrow_mut();
-        r.records.clear();
-        r.frames.clear();
-        r.registered.clear();
+        records.lock().unwrap_or_else(|e| e.into_inner()).clear();
     });
+    REGISTERED.with(|reg| reg.borrow_mut().clear());
     #[cfg(test)]
     INVOCATIONS.with(|inv| inv.borrow_mut().clear());
     FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
+    FRAMES.with(|frames| frames.borrow_mut().clear());
+}
+
+/// Clear collected timing data across ALL threads, plus the calling thread's
+/// local state (stack, registrations, frame buffers).
+///
+/// Unlike `reset()` which only clears the calling thread's records,
+/// `reset_all()` iterates every Arc in the global `THREAD_RECORDS` registry
+/// so that a subsequent `collect_all()` sees no stale data from other threads.
+#[cfg(test)]
+pub fn reset_all() {
+    // Clear every thread's record Arc.
+    let arcs: Vec<ThreadRecordArc> = {
+        let registry = THREAD_RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+        registry.clone()
+    };
+    for arc in &arcs {
+        arc.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    // Clear the calling thread's local state.
+    reset();
 }
 
 /// Return the current time as milliseconds since the Unix epoch.
@@ -460,70 +477,113 @@ fn write_ndjson(
 /// If frame data is present, writes NDJSON format. Otherwise falls back
 /// to JSON for non-frame workloads.
 ///
-/// Normally you don't need to call this — `AutoFlushRecords::drop` flushes
-/// automatically when thread-local storage is destroyed (process exit). This
-/// function exists for explicit mid-program flushes.
+/// Normally you don't need to call this — `shutdown()` flushes all threads
+/// at the end of main. This function exists for explicit mid-program flushes
+/// of the current thread's data.
 pub fn flush() {
     let Some(dir) = runs_dir() else {
         return;
     };
 
-    RECORDS.with(|records| {
-        let r = records.borrow();
-        if !r.frames.is_empty() {
-            let mut seen = HashSet::new();
-            let mut fn_names: Vec<&str> = Vec::new();
-            for frame in &r.frames {
-                for s in frame {
-                    if seen.insert(s.name) {
-                        fn_names.push(s.name);
-                    }
+    let frames = collect_frames();
+    if !frames.is_empty() {
+        let mut seen = HashSet::new();
+        let mut fn_names: Vec<&str> = Vec::new();
+        for frame in &frames {
+            for s in frame {
+                if seen.insert(s.name) {
+                    fn_names.push(s.name);
                 }
             }
-            let path = dir.join(format!("{}.ndjson", timestamp_ms()));
-            let _ = write_ndjson(&r.frames, &fn_names, &path);
-        } else {
-            let aggregated = aggregate(&r.records, &r.registered);
-            if aggregated.is_empty() {
-                return;
-            }
-            let path = dir.join(format!("{}.json", timestamp_ms()));
-            let _ = write_json(&aggregated, &path);
         }
-    });
+        let path = dir.join(format!("{}.ndjson", timestamp_ms()));
+        let _ = write_ndjson(&frames, &fn_names, &path);
+    } else {
+        let records = collect();
+        if records.is_empty() {
+            return;
+        }
+        let path = dir.join(format!("{}.json", timestamp_ms()));
+        let _ = write_json(&records, &path);
+    }
     reset();
 }
 
 /// No-op retained for API compatibility.
 ///
-/// Auto-flush now happens via `AutoFlushRecords::drop` when TLS is destroyed.
+/// Flushing now happens via `shutdown()` at the end of main.
 /// Instrumented code may still call `init()` — it's harmless.
 pub fn init() {}
+
+/// Flush all collected timing data from ALL threads and write to disk.
+///
+/// Collects from the global per-thread registry, so data from thread-pool
+/// workers is included. Injected at the end of main() by the AST rewriter.
+///
+/// Writes NDJSON if frame data is present (from the calling thread), and
+/// always writes JSON with cross-thread aggregation from all registered Arcs.
+pub fn shutdown() {
+    let Some(dir) = runs_dir() else { return };
+    let ts = timestamp_ms();
+
+    // Write frame-level data if present (NDJSON format).
+    let frames = collect_frames();
+    if !frames.is_empty() {
+        let mut seen = HashSet::new();
+        let mut fn_names: Vec<&str> = Vec::new();
+        for frame in &frames {
+            for s in frame {
+                if seen.insert(s.name) {
+                    fn_names.push(s.name);
+                }
+            }
+        }
+        let path = dir.join(format!("{ts}.ndjson"));
+        let _ = write_ndjson(&frames, &fn_names, &path);
+    }
+
+    // Always write aggregated cross-thread data (JSON format).
+    let records = collect_all();
+    if !records.is_empty() {
+        let path = dir.join(format!("{ts}.json"));
+        let _ = write_json(&records, &path);
+    }
+}
 
 /// Context for propagating parent-child timing across thread boundaries.
 ///
 /// Created by `fork()` on the parent thread, passed to child threads via
 /// `adopt()`. When the child completes, its elapsed time is accumulated
-/// in `children_ms` which the parent reads back via `finalize()`.
-#[must_use = "dropping SpanContext without calling finalize() loses child attribution"]
+/// in `children_ms` which the parent reads back via Drop (or explicit `finalize()`).
 pub struct SpanContext {
     parent_name: &'static str,
     children_ms: Arc<Mutex<f64>>,
+    finalized: bool,
 }
 
 impl SpanContext {
-    /// Finalize cross-thread attribution after all child threads complete.
-    ///
-    /// Adds the accumulated children time to the current thread's top-of-stack
-    /// entry (which should be the parent function). Call this after joining
-    /// worker threads / awaiting rayon scope.
-    pub fn finalize(self) {
+    /// Explicitly finalize cross-thread attribution.
+    /// Equivalent to dropping the SpanContext, but makes intent clear.
+    pub fn finalize(mut self) {
+        self.apply_children();
+        self.finalized = true;
+    }
+
+    fn apply_children(&self) {
         let children = *self.children_ms.lock().unwrap_or_else(|e| e.into_inner());
         STACK.with(|stack| {
             if let Some(top) = stack.borrow_mut().last_mut() {
                 top.children_ms += children;
             }
         });
+    }
+}
+
+impl Drop for SpanContext {
+    fn drop(&mut self) {
+        if !self.finalized {
+            self.apply_children();
+        }
     }
 }
 
@@ -562,6 +622,7 @@ pub fn fork() -> Option<SpanContext> {
         Some(SpanContext {
             parent_name: top.name,
             children_ms: Arc::new(Mutex::new(0.0)),
+            finalized: false,
         })
     })
 }
@@ -1359,5 +1420,203 @@ mod tests {
         // Aggregate collect() should still work
         let records = collect();
         assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn records_from_other_threads_are_captured_via_shutdown() {
+        reset();
+        // Spawn a thread that does work, then joins.
+        // With TLS-only storage, the thread's records would be lost
+        // if TLS destructors don't fire (as with rayon workers).
+        // With per-thread Arc storage, collect_all() can collect them.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _g = enter("thread_work");
+                burn_cpu(10_000);
+            });
+        });
+
+        let records = collect_all();
+        let thread_work = records.iter().find(|r| r.name == "thread_work");
+        assert!(
+            thread_work.is_some(),
+            "thread_work should be captured via global registry. Got: {:?}",
+            records.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        // Use >= instead of == because collect_all() reads all threads and
+        // may include stale records from concurrent tests.
+        assert!(thread_work.unwrap().calls >= 1);
+    }
+
+    #[test]
+    fn span_context_auto_finalizes_on_drop() {
+        reset();
+        {
+            let _parent = enter("auto_parent");
+            burn_cpu(5_000);
+
+            // fork + adopt, but do NOT call finalize() — rely on Drop.
+            {
+                let ctx = fork().expect("should have parent on stack");
+                {
+                    let _adopt = adopt(&ctx);
+                    {
+                        let _child = enter("auto_child");
+                        burn_cpu(20_000);
+                    }
+                }
+                // ctx drops here — should auto-finalize
+            }
+        }
+
+        let records = collect();
+        let parent = records.iter().find(|r| r.name == "auto_parent").unwrap();
+        let child = records.iter().find(|r| r.name == "auto_child").unwrap();
+
+        // Parent's self_ms should be less than total_ms because child time was attributed.
+        assert!(
+            parent.self_ms < parent.total_ms * 0.9,
+            "auto-finalize should subtract child time: self={:.1}ms, total={:.1}ms",
+            parent.self_ms,
+            parent.total_ms
+        );
+        // Conservation check.
+        let sum_self = parent.self_ms + child.self_ms;
+        let error_pct = ((sum_self - parent.total_ms) / parent.total_ms).abs() * 100.0;
+        assert!(
+            error_pct < 10.0,
+            "conservation: sum_self={sum_self:.1}ms, total={:.1}ms, error={error_pct:.1}%",
+            parent.total_ms
+        );
+    }
+
+    #[test]
+    fn shutdown_writes_json_with_all_thread_data() {
+        reset();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _g = enter("shutdown_thread_work");
+                burn_cpu(10_000);
+            });
+        });
+        {
+            let _g = enter("shutdown_main_work");
+            burn_cpu(5_000);
+        }
+
+        let tmp = std::env::temp_dir().join(format!("piano_shutdown_{}", timestamp_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { std::env::set_var("PIANO_RUNS_DIR", &tmp) };
+        shutdown();
+        unsafe { std::env::remove_var("PIANO_RUNS_DIR") };
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert!(!files.is_empty(), "shutdown should write JSON");
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        assert!(
+            content.contains("\"shutdown_thread_work\""),
+            "should contain thread work: {content}"
+        );
+        assert!(
+            content.contains("\"shutdown_main_work\""),
+            "should contain main work: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn fork_adopt_does_not_inflate_reported_times() {
+        // Verify that fork/adopt overhead is NOT attributed to any function.
+        // Only instrumented functions (via enter()) should appear in output.
+        reset();
+        {
+            let _parent = enter("timed_parent");
+            burn_cpu(5_000);
+
+            let ctx = fork().unwrap();
+
+            // Simulate rayon: 4 children each doing work
+            for _ in 0..4 {
+                let _adopt = adopt(&ctx);
+                {
+                    let _child = enter("timed_child");
+                    burn_cpu(10_000);
+                }
+            }
+            // ctx auto-finalizes on drop
+        }
+
+        // No cross-thread spawning here, so thread-local collect() is sufficient
+        // and avoids picking up stale records from other threads in parallel tests.
+        let records = collect();
+
+        // Only "timed_parent" and "timed_child" should appear. No adopt/fork entries.
+        let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("adopt") || n.contains("fork") || n.contains("piano")),
+            "fork/adopt should not appear in output. Got: {:?}",
+            names
+        );
+
+        let parent = records.iter().find(|r| r.name == "timed_parent").unwrap();
+        let child = records.iter().find(|r| r.name == "timed_child").unwrap();
+
+        // Parent should appear once, child 4 times
+        assert_eq!(parent.calls, 1);
+        assert_eq!(child.calls, 4);
+
+        // Conservation: sum of self-times should approximate parent total
+        let sum_self = parent.self_ms + child.self_ms;
+        let error_pct = ((sum_self - parent.total_ms) / parent.total_ms).abs() * 100.0;
+        assert!(
+            error_pct < 10.0,
+            "conservation violated: sum_self={sum_self:.1}ms, total={:.1}ms, error={error_pct:.1}%",
+            parent.total_ms
+        );
+
+        // Parent self_ms should be much less than total (children subtracted)
+        assert!(
+            parent.self_ms < parent.total_ms * 0.5,
+            "parent self ({:.1}) should be << total ({:.1}) since 4 children ran",
+            parent.self_ms,
+            parent.total_ms
+        );
+    }
+
+    #[test]
+    #[ignore] // reset_all() clears ALL threads' records; must run in isolation
+    fn reset_all_clears_cross_thread_records() {
+        reset();
+        // Produce records on a spawned thread.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _g = enter("reset_all_thread");
+                burn_cpu(5_000);
+            });
+        });
+        // Verify the spawned-thread record is visible via collect_all().
+        let before = collect_all();
+        assert!(
+            before.iter().any(|r| r.name == "reset_all_thread"),
+            "should see cross-thread record before reset_all"
+        );
+
+        // reset_all() should clear all threads' records.
+        reset_all();
+
+        let after = collect_all();
+        assert!(
+            !after.iter().any(|r| r.name == "reset_all_thread"),
+            "reset_all should have cleared cross-thread records. Got: {:?}",
+            after.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
     }
 }
