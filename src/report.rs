@@ -219,7 +219,7 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
 ///
 /// Columns: Function | Calls | Self | p50 | p99 | Allocs | Bytes
 /// Footer: frame count summary.
-pub fn format_table_v2(frame_data: &FrameData) -> String {
+pub fn format_table_with_frames(frame_data: &FrameData) -> String {
     struct FnStats {
         name: String,
         total_calls: u64,
@@ -867,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn format_table_v2_shows_percentiles_and_allocs() {
+    fn format_table_with_frames_shows_percentiles_and_allocs() {
         let frame_data = FrameData {
             fn_names: vec!["update".into(), "physics".into()],
             frames: vec![
@@ -881,7 +881,7 @@ mod tests {
                 ],
             ],
         };
-        let table = format_table_v2(&frame_data);
+        let table = format_table_with_frames(&frame_data);
         assert!(table.contains("p50"), "should have p50 column");
         assert!(table.contains("p99"), "should have p99 column");
         assert!(table.contains("Allocs"), "should have allocs column");
