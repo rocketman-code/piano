@@ -1370,7 +1370,8 @@ mod tests {
             let _parent = enter("baseline");
             burn_cpu(5_000);
             // Sleep to simulate child wall-clock time without fork/adopt.
-            thread::sleep(Duration::from_millis(50));
+            // Use 200ms (not 50ms) so the delta reliably exceeds burn_cpu variance on CI.
+            thread::sleep(Duration::from_millis(200));
         }
         let baseline_records = collect();
         let baseline = baseline_records
@@ -1395,7 +1396,8 @@ mod tests {
                     {
                         let _child = enter("thread_child");
                         // Sleep long enough to create a measurable difference.
-                        thread::sleep(Duration::from_millis(50));
+                        // Must match baseline sleep so the delta is clear.
+                        thread::sleep(Duration::from_millis(200));
                     }
                 });
             });
