@@ -9,10 +9,11 @@ use piano::build::{
 };
 use piano::error::Error;
 use piano::report::{
-    diff_runs, format_table, load_latest_run, load_run, load_tagged_run, save_tag,
+    diff_runs, find_latest_run_file, format_frames_table, format_table, format_table_with_frames,
+    load_latest_run, load_ndjson, load_run, load_tagged_run, save_tag,
 };
 use piano::resolve::{TargetSpec, resolve_targets};
-use piano::rewrite::{inject_registrations, instrument_source};
+use piano::rewrite::{inject_global_allocator, inject_registrations, instrument_source};
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +58,10 @@ enum Commands {
         /// Show all functions, including those with zero calls.
         #[arg(long)]
         all: bool,
+
+        /// Show per-frame breakdown with spike detection.
+        #[arg(long)]
+        frames: bool,
     },
     /// Compare two profiling runs.
     Diff {
@@ -95,7 +100,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             project,
             runtime_path,
         ),
-        Commands::Report { run, all } => cmd_report(run, all),
+        Commands::Report { run, all, frames } => cmd_report(run, all, frames),
         Commands::Diff { a, b } => cmd_diff(a, b),
         Commands::Tag { name } => cmd_tag(name),
     }
@@ -199,6 +204,19 @@ fn cmd_build(
                 source,
             }
         })?;
+
+        // Inject global allocator for allocation tracking.
+        let existing = if rewritten.contains("#[global_allocator]") {
+            Some("existing")
+        } else {
+            None
+        };
+        let rewritten =
+            inject_global_allocator(&rewritten, existing).map_err(|source| Error::ParseError {
+                path: main_file.clone(),
+                source,
+            })?;
+
         std::fs::write(&main_file, rewritten)?;
     }
 
@@ -212,15 +230,42 @@ fn cmd_build(
     Ok(())
 }
 
-fn cmd_report(run_path: Option<PathBuf>, show_all: bool) -> Result<(), Error> {
-    let run = match run_path {
-        Some(p) if p.exists() => load_run(&p)?,
+fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result<(), Error> {
+    // Resolve the run file path.
+    let resolved_path = match &run_path {
+        Some(p) if p.exists() => Some(p.clone()),
         Some(p) => {
+            // Tag lookup — no direct file path, so no frame data available.
             let tag = p.to_string_lossy();
             let tags_dir = default_tags_dir()?;
             let runs_dir = default_runs_dir()?;
-            load_tagged_run(&tags_dir, &runs_dir, &tag)?
+            let run = load_tagged_run(&tags_dir, &runs_dir, &tag)?;
+            print!("{}", format_table(&run, show_all));
+            return Ok(());
         }
+        None => {
+            // Find the latest run file.
+            let dir = default_runs_dir()?;
+            find_latest_run_file(&dir)?
+        }
+    };
+
+    // If we have a .ndjson file, load frame data for richer output.
+    if let Some(path) = &resolved_path
+        && path.extension().and_then(|e| e.to_str()) == Some("ndjson")
+    {
+        let (_run, frame_data) = load_ndjson(path)?;
+        if frames {
+            print!("{}", format_frames_table(&frame_data));
+        } else {
+            print!("{}", format_table_with_frames(&frame_data));
+        }
+        return Ok(());
+    }
+
+    // Fall back to JSON table.
+    let run = match resolved_path {
+        Some(p) => load_run(&p)?,
         None => {
             let dir = default_runs_dir()?;
             load_latest_run(&dir)?
