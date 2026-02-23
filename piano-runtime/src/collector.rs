@@ -431,23 +431,24 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
     }
 }
 
+/// CPU-bound workload for testing: hash a buffer `iterations` times.
+/// Uses wrapping arithmetic to prevent optimization while staying deterministic.
+#[cfg(test)]
+pub(crate) fn burn_cpu(iterations: u64) {
+    let mut buf = [0x42u8; 4096];
+    for i in 0..iterations {
+        for b in &mut buf {
+            *b = b.wrapping_add(i as u8).wrapping_mul(31);
+        }
+    }
+    std::hint::black_box(&buf);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
-
-    /// CPU-bound workload: hash a buffer `iterations` times.
-    /// Uses wrapping arithmetic to prevent optimization while staying deterministic.
-    fn burn_cpu(iterations: u64) {
-        let mut buf = [0x42u8; 4096];
-        for i in 0..iterations {
-            for b in &mut buf {
-                *b = b.wrapping_add(i as u8).wrapping_mul(31);
-            }
-        }
-        std::hint::black_box(&buf);
-    }
 
     #[test]
     fn burn_cpu_takes_measurable_time() {

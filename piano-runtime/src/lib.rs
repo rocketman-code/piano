@@ -1,6 +1,8 @@
+mod alloc;
 mod collector;
 
+pub use alloc::PianoAllocator;
 pub use collector::{
-    AdoptGuard, FunctionRecord, Guard, SpanContext, adopt, collect, enter, flush, fork, init,
-    register, reset,
+    AdoptGuard, FunctionRecord, Guard, InvocationRecord, SpanContext, adopt, collect,
+    collect_invocations, enter, flush, fork, init, register, reset,
 };
