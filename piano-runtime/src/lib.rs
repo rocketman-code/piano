@@ -1,3 +1,3 @@
 mod collector;
 
-pub use collector::{FunctionRecord, Guard, collect, enter, flush, init, reset};
+pub use collector::{FunctionRecord, Guard, collect, enter, flush, init, register, reset};
