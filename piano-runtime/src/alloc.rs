@@ -36,11 +36,14 @@ impl AllocSnapshot {
 /// for thread-local bookkeeping, which is safe on all Rust versions
 /// (including < 1.93.1 where TLS with destructors is forbidden for
 /// global allocators).
-pub struct PianoAllocator<A: GlobalAlloc> {
+/// The struct bound is on `GlobalAlloc` impls only (not the struct itself)
+/// so that `const fn new` compiles on Rust < 1.61 where trait bounds on
+/// const fn parameters are unstable.
+pub struct PianoAllocator<A> {
     inner: A,
 }
 
-impl<A: GlobalAlloc> PianoAllocator<A> {
+impl<A> PianoAllocator<A> {
     pub const fn new(inner: A) -> Self {
         Self { inner }
     }

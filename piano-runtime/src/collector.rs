@@ -19,25 +19,59 @@
 //! so that child thread elapsed time is correctly subtracted from the parent's
 //! self-time. `SpanContext` auto-finalizes on Drop.
 
-use std::cell::RefCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Thread-safe, initialize-once cell using `Once` + `UnsafeCell`.
+///
+/// Equivalent to `OnceLock` (stabilized in 1.70) but works on Rust 1.56+.
+/// The `Once` primitive guarantees single-writer semantics; after initialization
+/// the value is read-only, so there are no data races.
+struct SyncOnceCell<T> {
+    once: Once,
+    value: UnsafeCell<Option<T>>,
+}
+
+// SAFETY: `Once` synchronizes initialization. After `call_once` completes,
+// the inner value is only read, never mutated, so `Sync` is sound.
+unsafe impl<T: Send + Sync> Sync for SyncOnceCell<T> {}
+
+impl<T> SyncOnceCell<T> {
+    const fn new() -> Self {
+        Self {
+            once: Once::new(),
+            value: UnsafeCell::new(None),
+        }
+    }
+
+    fn get_or_init(&self, f: impl FnOnce() -> T) -> &T {
+        self.once.call_once(|| {
+            // SAFETY: `call_once` guarantees this runs exactly once, with
+            // all subsequent callers blocking until it completes.
+            unsafe { *self.value.get() = Some(f()) };
+        });
+        // SAFETY: After `call_once` returns (on any thread), `value` is
+        // `Some` and never mutated again.
+        unsafe { (*self.value.get()).as_ref().unwrap() }
+    }
+}
 
 /// Process-wide run identifier.
 ///
 /// All threads within a single process share this ID, so that JSON files
 /// written by different threads can be correlated during report consolidation.
-static RUN_ID: OnceLock<String> = OnceLock::new();
+static RUN_ID: SyncOnceCell<String> = SyncOnceCell::new();
 
 fn run_id() -> &'static str {
     RUN_ID.get_or_init(|| format!("{}_{}", std::process::id(), timestamp_ms()))
 }
 
 /// Process-start epoch for relative timestamps.
-static EPOCH: OnceLock<Instant> = OnceLock::new();
+static EPOCH: SyncOnceCell<Instant> = SyncOnceCell::new();
 
 fn epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)
@@ -100,7 +134,7 @@ type ThreadRecordArc = Arc<Mutex<Vec<RawRecord>>>;
 
 /// Global registry of per-thread record storage.
 /// Each thread registers its Arc on first access. collect_all() iterates all Arcs.
-static THREAD_RECORDS: OnceLock<Mutex<Vec<ThreadRecordArc>>> = OnceLock::new();
+static THREAD_RECORDS: SyncOnceCell<Mutex<Vec<ThreadRecordArc>>> = SyncOnceCell::new();
 
 fn thread_records() -> &'static Mutex<Vec<ThreadRecordArc>> {
     THREAD_RECORDS.get_or_init(|| Mutex::new(Vec::new()))
@@ -137,10 +171,12 @@ impl Drop for Guard {
             .unwrap_or_default();
 
         STACK.with(|stack| {
-            let entry = stack.borrow_mut().pop();
-            let Some(entry) = entry else {
-                eprintln!("piano-runtime: guard dropped without matching stack entry (bug)");
-                return;
+            let entry = match stack.borrow_mut().pop() {
+                Some(e) => e,
+                None => {
+                    eprintln!("piano-runtime: guard dropped without matching stack entry (bug)");
+                    return;
+                }
             };
 
             // Restore parent's saved alloc counters.
@@ -322,7 +358,9 @@ fn aggregate_frame(records: &[InvocationRecord]) -> Vec<FrameFnSummary> {
         entry.free_count += rec.free_count;
         entry.free_bytes += rec.free_bytes;
     }
-    map.into_values().collect()
+    #[allow(clippy::iter_kv_map)]
+    // into_values() requires Rust 1.54; we support 1.56 but keep the pattern uniform
+    map.into_iter().map(|(_, v)| v).collect()
 }
 
 /// Collect records from ALL threads via the global registry.
@@ -423,7 +461,8 @@ fn write_json(records: &[FunctionRecord], path: &std::path::Path) -> std::io::Re
     let run_id = run_id();
     write!(
         f,
-        "{{\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts},\"functions\":["
+        "{{\"run_id\":\"{}\",\"timestamp_ms\":{},\"functions\":[",
+        run_id, ts
     )?;
     for (i, rec) in records.iter().enumerate() {
         if i > 0 {
@@ -433,8 +472,8 @@ fn write_json(records: &[FunctionRecord], path: &std::path::Path) -> std::io::Re
         let name = rec.name.replace('\\', "\\\\").replace('"', "\\\"");
         write!(
             f,
-            "{{\"name\":\"{name}\",\"calls\":{},\"total_ms\":{:.3},\"self_ms\":{:.3}}}",
-            rec.calls, rec.total_ms, rec.self_ms
+            "{{\"name\":\"{}\",\"calls\":{},\"total_ms\":{:.3},\"self_ms\":{:.3}}}",
+            name, rec.calls, rec.total_ms, rec.self_ms
         )?;
     }
     writeln!(f, "]}}")?;
@@ -460,14 +499,15 @@ fn write_ndjson(
     // Header line: metadata + function name table
     write!(
         f,
-        "{{\"format_version\":2,\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts},\"functions\":["
+        "{{\"format_version\":2,\"run_id\":\"{}\",\"timestamp_ms\":{},\"functions\":[",
+        run_id, ts
     )?;
     for (i, name) in fn_names.iter().enumerate() {
         if i > 0 {
             write!(f, ",")?;
         }
         let name = name.replace('\\', "\\\\").replace('"', "\\\"");
-        write!(f, "\"{name}\"")?;
+        write!(f, "\"{}\"", name)?;
     }
     writeln!(f, "]}}")?;
 
@@ -477,7 +517,7 @@ fn write_ndjson(
 
     // One line per frame
     for (frame_idx, frame) in frames.iter().enumerate() {
-        write!(f, "{{\"frame\":{frame_idx},\"fns\":[")?;
+        write!(f, "{{\"frame\":{},\"fns\":[", frame_idx)?;
         for (i, s) in frame.iter().enumerate() {
             if i > 0 {
                 write!(f, ",")?;
@@ -485,8 +525,8 @@ fn write_ndjson(
             let fn_id = fn_id_map.get(s.name).copied().unwrap_or(0);
             write!(
                 f,
-                "{{\"id\":{fn_id},\"calls\":{},\"self_ns\":{},\"ac\":{},\"ab\":{},\"fc\":{},\"fb\":{}}}",
-                s.calls, s.self_ns, s.alloc_count, s.alloc_bytes, s.free_count, s.free_bytes
+                "{{\"id\":{},\"calls\":{},\"self_ns\":{},\"ac\":{},\"ab\":{},\"fc\":{},\"fb\":{}}}",
+                fn_id, s.calls, s.self_ns, s.alloc_count, s.alloc_bytes, s.free_count, s.free_bytes
             )?;
         }
         writeln!(f, "]}}")?;
@@ -503,8 +543,9 @@ fn write_ndjson(
 /// at the end of main. This function exists for explicit mid-program flushes
 /// of the current thread's data.
 pub fn flush() {
-    let Some(dir) = runs_dir() else {
-        return;
+    let dir = match runs_dir() {
+        Some(d) => d,
+        None => return,
     };
 
     let frames = collect_frames();
@@ -545,7 +586,10 @@ pub fn init() {}
 /// Writes NDJSON if frame data is present (from the calling thread), and
 /// always writes JSON with cross-thread aggregation from all registered Arcs.
 pub fn shutdown() {
-    let Some(dir) = runs_dir() else { return };
+    let dir = match runs_dir() {
+        Some(d) => d,
+        None => return,
+    };
     let ts = timestamp_ms();
 
     // Write frame-level data if present (NDJSON format).
@@ -560,14 +604,14 @@ pub fn shutdown() {
                 }
             }
         }
-        let path = dir.join(format!("{ts}.ndjson"));
+        let path = dir.join(format!("{}.ndjson", ts));
         let _ = write_ndjson(&frames, &fn_names, &path);
     }
 
     // Always write aggregated cross-thread data (JSON format).
     let records = collect_all();
     if !records.is_empty() {
-        let path = dir.join(format!("{ts}.json"));
+        let path = dir.join(format!("{}.json", ts));
         let _ = write_json(&records, &path);
     }
 }
@@ -622,8 +666,10 @@ impl Drop for AdoptGuard {
         // The adopted scope's alloc data isn't recorded into an InvocationRecord,
         // but the restore is necessary for correct nesting.
         STACK.with(|stack| {
-            let entry = stack.borrow_mut().pop();
-            let Some(entry) = entry else { return };
+            let entry = match stack.borrow_mut().pop() {
+                Some(e) => e,
+                None => return,
+            };
 
             let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
                 cell.set(entry.saved_alloc);
