@@ -34,8 +34,13 @@ pub fn load_run(path: &Path) -> Result<Run, Error> {
 }
 
 /// Format a run as a text table sorted by self_ms descending.
-pub fn format_table(run: &Run) -> String {
+///
+/// When `show_all` is false, entries with zero calls are hidden.
+pub fn format_table(run: &Run, show_all: bool) -> String {
     let mut entries = run.functions.clone();
+    if !show_all {
+        entries.retain(|e| e.calls > 0);
+    }
     entries.sort_by(|a, b| {
         b.self_ms
             .partial_cmp(&a.self_ms)
@@ -293,7 +298,7 @@ mod tests {
                 },
             ],
         };
-        let table = format_table(&run);
+        let table = format_table(&run, true);
         let slow_pos = table.find("slow").expect("slow not in table");
         let fast_pos = table.find("fast").expect("fast not in table");
         assert!(
@@ -480,5 +485,39 @@ mod tests {
         let run = load_latest_run(dir.path()).unwrap();
         assert_eq!(run.functions.len(), 1);
         assert_eq!(run.functions[0].name, "new_fn");
+    }
+
+    #[test]
+    fn format_table_hides_zero_call_entries_by_default() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            functions: vec![
+                FnEntry {
+                    name: "called".into(),
+                    calls: 5,
+                    total_ms: 10.0,
+                    self_ms: 8.0,
+                },
+                FnEntry {
+                    name: "uncalled".into(),
+                    calls: 0,
+                    total_ms: 0.0,
+                    self_ms: 0.0,
+                },
+            ],
+        };
+        let table = format_table(&run, false);
+        assert!(table.contains("called"), "should show called function");
+        assert!(
+            !table.contains("uncalled"),
+            "should hide zero-call function"
+        );
+
+        let table_all = format_table(&run, true);
+        assert!(
+            table_all.contains("uncalled"),
+            "should show zero-call function with show_all"
+        );
     }
 }
