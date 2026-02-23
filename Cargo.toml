@@ -3,7 +3,7 @@ members = ["piano-runtime"]
 
 [package]
 name = "piano"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 description = "Automated instrumentation-based profiling for Rust"
 license = "MIT"
