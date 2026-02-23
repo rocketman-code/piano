@@ -52,6 +52,10 @@ enum Commands {
     Report {
         /// Path to a specific run file. If omitted, shows the latest.
         run: Option<PathBuf>,
+
+        /// Show all functions, including those with zero calls.
+        #[arg(long)]
+        all: bool,
     },
     /// Compare two profiling runs.
     Diff {
@@ -90,7 +94,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             project,
             runtime_path,
         ),
-        Commands::Report { run } => cmd_report(run),
+        Commands::Report { run, all } => cmd_report(run, all),
         Commands::Diff { a, b } => cmd_diff(a, b),
         Commands::Tag { name } => cmd_tag(name),
     }
@@ -200,7 +204,7 @@ fn cmd_build(
     Ok(())
 }
 
-fn cmd_report(run_path: Option<PathBuf>) -> Result<(), Error> {
+fn cmd_report(run_path: Option<PathBuf>, show_all: bool) -> Result<(), Error> {
     let run = match run_path {
         Some(p) if p.exists() => load_run(&p)?,
         Some(p) => {
@@ -214,7 +218,7 @@ fn cmd_report(run_path: Option<PathBuf>) -> Result<(), Error> {
             load_latest_run(&dir)?
         }
     };
-    print!("{}", format_table(&run));
+    print!("{}", format_table(&run, show_all));
     Ok(())
 }
 
