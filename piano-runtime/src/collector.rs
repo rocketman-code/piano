@@ -33,6 +33,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 static RUN_ID: LazyLock<String> =
     LazyLock::new(|| format!("{}_{}", std::process::id(), timestamp_ms()));
 
+/// Process-start epoch for relative timestamps.
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
 /// Aggregated timing data for a single function.
 #[derive(Debug, Clone)]
 pub struct FunctionRecord {
@@ -42,11 +45,31 @@ pub struct FunctionRecord {
     pub self_ms: f64,
 }
 
+/// Per-invocation measurement record with nanosecond precision.
+#[derive(Debug, Clone)]
+pub struct InvocationRecord {
+    pub name: &'static str,
+    pub start_ns: u64,
+    pub elapsed_ns: u64,
+    pub self_ns: u64,
+    pub alloc_count: u32,
+    pub alloc_bytes: u64,
+    pub free_count: u32,
+    pub free_bytes: u64,
+    pub depth: u16,
+}
+
 /// Entry on the thread-local timing stack.
-struct StackEntry {
-    name: &'static str,
-    start: Instant,
-    children_ms: f64,
+pub(crate) struct StackEntry {
+    pub(crate) name: &'static str,
+    pub(crate) start: Instant,
+    pub(crate) children_ms: f64,
+    pub(crate) overhead_ns: u128,
+    pub(crate) alloc_count: u32,
+    pub(crate) alloc_bytes: u64,
+    pub(crate) free_count: u32,
+    pub(crate) free_bytes: u64,
+    pub(crate) depth: u16,
 }
 
 /// Raw measurement produced when a Guard drops.
@@ -94,9 +117,10 @@ impl Drop for AutoFlushRecords {
 }
 
 thread_local! {
-    static STACK: RefCell<Vec<StackEntry>> = const { RefCell::new(Vec::new()) };
+    pub(crate) static STACK: RefCell<Vec<StackEntry>> = const { RefCell::new(Vec::new()) };
     static RECORDS: RefCell<AutoFlushRecords> = const { RefCell::new(AutoFlushRecords::new()) };
     static REGISTERED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    static INVOCATIONS: RefCell<Vec<InvocationRecord>> = const { RefCell::new(Vec::new()) };
 }
 
 /// RAII timing guard. Records elapsed time on drop.
@@ -114,7 +138,13 @@ impl Drop for Guard {
                 eprintln!("piano-runtime: guard dropped without matching stack entry (bug)");
                 return;
             };
-            let elapsed_ms = entry.start.elapsed().as_secs_f64() * 1000.0;
+            let elapsed_ns = entry.start.elapsed().as_nanos() as u64;
+            let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
+            let children_ns = (entry.children_ms * 1_000_000.0) as u64;
+            let self_ns = elapsed_ns
+                .saturating_sub(children_ns)
+                .saturating_sub(entry.overhead_ns as u64);
+            let start_ns = entry.start.duration_since(*EPOCH).as_nanos() as u64;
             let children_ms = entry.children_ms;
 
             // Safe to re-borrow: the RefMut from pop() was dropped above.
@@ -129,17 +159,40 @@ impl Drop for Guard {
                     children_ms,
                 });
             });
+
+            INVOCATIONS.with(|inv| {
+                inv.borrow_mut().push(InvocationRecord {
+                    name: entry.name,
+                    start_ns,
+                    elapsed_ns,
+                    self_ns,
+                    alloc_count: entry.alloc_count,
+                    alloc_bytes: entry.alloc_bytes,
+                    free_count: entry.free_count,
+                    free_bytes: entry.free_bytes,
+                    depth: entry.depth,
+                });
+            });
         });
     }
 }
 
 /// Start timing a function. Returns a Guard that records the measurement on drop.
 pub fn enter(name: &'static str) -> Guard {
+    // Touch EPOCH so relative timestamps are anchored to process start.
+    let _ = *EPOCH;
     STACK.with(|stack| {
+        let depth = stack.borrow().len() as u16;
         stack.borrow_mut().push(StackEntry {
             name,
             start: Instant::now(),
             children_ms: 0.0,
+            overhead_ns: 0,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
+            depth,
         });
     });
     Guard { _private: () }
@@ -194,11 +247,17 @@ pub fn collect() -> Vec<FunctionRecord> {
         .with(|records| REGISTERED.with(|reg| aggregate(&records.borrow().records, &reg.borrow())))
 }
 
+/// Return all raw per-invocation records (not aggregated).
+pub fn collect_invocations() -> Vec<InvocationRecord> {
+    INVOCATIONS.with(|inv| inv.borrow().clone())
+}
+
 /// Clear all collected timing data.
 pub fn reset() {
     STACK.with(|stack| stack.borrow_mut().clear());
     RECORDS.with(|records| records.borrow_mut().records.clear());
     REGISTERED.with(|reg| reg.borrow_mut().clear());
+    INVOCATIONS.with(|inv| inv.borrow_mut().clear());
 }
 
 /// Return the current time as milliseconds since the Unix epoch.
@@ -354,10 +413,17 @@ pub fn fork() -> Option<SpanContext> {
 /// propagates elapsed time back to the parent on drop.
 pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
     STACK.with(|stack| {
+        let depth = stack.borrow().len() as u16;
         stack.borrow_mut().push(StackEntry {
             name: ctx.parent_name,
             start: Instant::now(),
             children_ms: 0.0,
+            overhead_ns: 0,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
+            depth,
         });
     });
     AdoptGuard {
@@ -965,6 +1031,24 @@ mod tests {
             parent.total_ms,
             worker.total_ms
         );
+    }
+
+    #[test]
+    fn invocation_records_capture_depth() {
+        reset();
+        {
+            let _outer = enter("outer");
+            burn_cpu(5_000);
+            {
+                let _inner = enter("inner");
+                burn_cpu(5_000);
+            }
+        }
+        let invocations = collect_invocations();
+        let outer_inv = invocations.iter().find(|r| r.name == "outer").unwrap();
+        let inner_inv = invocations.iter().find(|r| r.name == "inner").unwrap();
+        assert_eq!(outer_inv.depth, 0);
+        assert_eq!(inner_inv.depth, 1);
     }
 
     #[test]
