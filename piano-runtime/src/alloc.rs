@@ -1,0 +1,160 @@
+use std::alloc::{GlobalAlloc, Layout};
+use std::time::Instant;
+
+use crate::collector::STACK;
+
+// Re-entrancy guard: when tracking code itself allocates, we skip tracking.
+thread_local! {
+    static IN_ALLOC_TRACKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A global allocator wrapper that tracks allocation counts and bytes
+/// per instrumented function scope, with zero timing distortion.
+///
+/// Wraps any inner `GlobalAlloc`. Measures its own bookkeeping overhead
+/// and subtracts it from the current function's timing via `overhead_ns`.
+pub struct PianoAllocator<A: GlobalAlloc> {
+    inner: A,
+}
+
+impl<A: GlobalAlloc> PianoAllocator<A> {
+    pub const fn new(inner: A) -> Self {
+        Self { inner }
+    }
+}
+
+unsafe impl<A: GlobalAlloc> GlobalAlloc for PianoAllocator<A> {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { self.inner.alloc(layout) };
+        track_alloc(layout.size() as u64);
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { self.inner.dealloc(ptr, layout) };
+        track_dealloc(layout.size() as u64);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let old_size = layout.size() as u64;
+        let result = unsafe { self.inner.realloc(ptr, layout, new_size) };
+        if !result.is_null() {
+            track_dealloc(old_size);
+            track_alloc(new_size as u64);
+        }
+        result
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { self.inner.alloc_zeroed(layout) };
+        track_alloc(layout.size() as u64);
+        ptr
+    }
+}
+
+fn track_alloc(bytes: u64) {
+    let ok = IN_ALLOC_TRACKING.try_with(|flag| {
+        if flag.get() {
+            return false;
+        }
+        flag.set(true);
+        true
+    });
+    if ok != Ok(true) {
+        return;
+    }
+
+    let t0 = Instant::now();
+    let _ = STACK.try_with(|stack| {
+        if let Ok(mut s) = stack.try_borrow_mut()
+            && let Some(top) = s.last_mut()
+        {
+            top.alloc_count += 1;
+            top.alloc_bytes += bytes;
+            top.overhead_ns += t0.elapsed().as_nanos();
+        }
+    });
+
+    let _ = IN_ALLOC_TRACKING.try_with(|flag| flag.set(false));
+}
+
+fn track_dealloc(bytes: u64) {
+    let ok = IN_ALLOC_TRACKING.try_with(|flag| {
+        if flag.get() {
+            return false;
+        }
+        flag.set(true);
+        true
+    });
+    if ok != Ok(true) {
+        return;
+    }
+
+    let t0 = Instant::now();
+    let _ = STACK.try_with(|stack| {
+        if let Ok(mut s) = stack.try_borrow_mut()
+            && let Some(top) = s.last_mut()
+        {
+            top.free_count += 1;
+            top.free_bytes += bytes;
+            top.overhead_ns += t0.elapsed().as_nanos();
+        }
+    });
+
+    let _ = IN_ALLOC_TRACKING.try_with(|flag| flag.set(false));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{collect_invocations, enter, reset};
+
+    #[test]
+    fn track_alloc_updates_stack_entry() {
+        reset();
+        {
+            let _g = enter("alloc_test");
+            track_alloc(1024);
+            track_alloc(512);
+            track_dealloc(256);
+        }
+        let invocations = collect_invocations();
+        let rec = invocations.iter().find(|r| r.name == "alloc_test").unwrap();
+        assert_eq!(rec.alloc_count, 2);
+        assert_eq!(rec.alloc_bytes, 1536);
+        assert_eq!(rec.free_count, 1);
+        assert_eq!(rec.free_bytes, 256);
+    }
+
+    #[test]
+    fn alloc_tracking_does_not_distort_timing() {
+        reset();
+        // Measure CPU work WITHOUT any alloc tracking
+        let baseline_start = std::time::Instant::now();
+        crate::collector::burn_cpu(50_000);
+        let baseline_ns = baseline_start.elapsed().as_nanos() as u64;
+
+        // Now measure WITH alloc tracking overhead injected
+        {
+            let _g = enter("timed_fn");
+            crate::collector::burn_cpu(50_000);
+            // Simulate 10K allocations worth of tracking overhead
+            for _ in 0..10_000 {
+                track_alloc(64);
+            }
+        }
+        let invocations = collect_invocations();
+        let rec = invocations.iter().find(|r| r.name == "timed_fn").unwrap();
+
+        // self_ns should be close to baseline (overhead subtracted)
+        // Allow 30% tolerance for measurement noise
+        let ratio = rec.self_ns as f64 / baseline_ns as f64;
+        assert!(
+            (0.7..1.3).contains(&ratio),
+            "self_ns ({}) should be close to baseline ({}) but ratio was {:.2}",
+            rec.self_ns,
+            baseline_ns,
+            ratio
+        );
+    }
+}
