@@ -1,0 +1,38 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/),
+and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
+
+## [0.4.0] - 2026-02-23
+
+### Added
+
+- Per-frame allocation tracking with zero-distortion timing
+- NDJSON output format with per-frame views and allocation diffs
+- PianoAllocator AST injection for automatic allocation tracking
+- Cross-thread instrumentation: per-thread Arc registry, fork/adopt/shutdown
+- AST rewriter detects concurrency patterns (rayon par_iter, thread::spawn, rayon::scope) and injects fork/adopt/shutdown
+- Workspace member support with inherited Cargo.toml fields
+- Custom `[[bin]]` entry point resolution from Cargo.toml
+- MSRV integration test verifying piano-runtime compiles on Rust 1.70
+- GitHub Actions CI workflow (fmt, clippy, test, doc, msrv)
+- Release checklist and versioning policy
+
+### Fixed
+
+- piano-runtime MSRV lowered from 1.88 to 1.70 (edition 2024 to 2021)
+- TLS destructor crash in PianoAllocator on Rust 1.88
+- Tail expression preserved in `fn main() -> T` (no longer drops return value)
+- Projects with `-Dunsafe_code` in RUSTFLAGS no longer fail to build
+- Binary entry point correctly resolved for non-standard `[[bin]]` paths
+
+### Changed
+
+- MSRV for piano-runtime: 1.70 (was 1.88)
+- MSRV for piano CLI: 1.88 (pinned via rust-toolchain.toml)
+
+## [0.3.0] - 2025-12-01
+
+Initial tagged release.

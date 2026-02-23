@@ -37,7 +37,7 @@ Batch related changes, release when there's a meaningful set of user-facing chan
 4. `cargo doc --workspace --no-deps` builds without warnings
 5. Update `CHANGELOG.md`
 6. Bump version in both `Cargo.toml` and `piano-runtime/Cargo.toml`
-7. Run `cargo generate-lockfile`
+7. Run `cargo generate-lockfile --ignore-rust-version` (without this flag, cargo constrains all workspace deps to the lowest member MSRV, downgrading shared dependencies like clap)
 8. Commit: `chore(cargo): bump version to 0.x.y`
 9. Tag: `git tag v0.x.y`
 10. Push: `git push && git push --tags`

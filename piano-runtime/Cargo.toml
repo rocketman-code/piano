@@ -1,6 +1,6 @@
 [package]
 name = "piano-runtime"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.70"
 description = "Zero-dependency timing and allocation tracking runtime for piano profiler"
