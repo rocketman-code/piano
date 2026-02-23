@@ -74,6 +74,9 @@ impl AutoFlushRecords {
 
 impl Drop for AutoFlushRecords {
     fn drop(&mut self) {
+        if cfg!(test) {
+            return;
+        }
         let registered: Vec<&str> = REGISTERED
             .try_with(|reg| reg.borrow().clone())
             .unwrap_or_default();
