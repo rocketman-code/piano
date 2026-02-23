@@ -161,17 +161,17 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         }
     }
 
-    let functions: Vec<FnEntry> = fn_agg
-        .into_iter()
-        .map(|(fn_id, (calls, self_ns, alloc_count, alloc_bytes))| {
-            let name = header
-                .functions
-                .get(fn_id)
-                .cloned()
-                .unwrap_or_else(|| format!("<unknown_{fn_id}>"));
+    // Build FnEntry for every registered function, including zero-call ones.
+    let functions: Vec<FnEntry> = header
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(fn_id, name)| {
+            let (calls, self_ns, alloc_count, alloc_bytes) =
+                fn_agg.get(&fn_id).copied().unwrap_or((0, 0, 0, 0));
             let self_ms = self_ns as f64 / 1_000_000.0;
             FnEntry {
-                name,
+                name: name.clone(),
                 calls,
                 total_ms: self_ms, // NDJSON format has no total_ms; approximate with self_ms
                 self_ms,
@@ -230,7 +230,7 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
 ///
 /// Columns: Function | Calls | Self | p50 | p99 | Allocs | Bytes
 /// Footer: frame count summary.
-pub fn format_table_with_frames(frame_data: &FrameData) -> String {
+pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> String {
     struct FnStats {
         name: String,
         total_calls: u64,
@@ -274,7 +274,24 @@ pub fn format_table_with_frames(frame_data: &FrameData) -> String {
         }
     }
 
+    // Include zero-call functions from fn_names when show_all is set.
+    if show_all {
+        for (fn_id, name) in frame_data.fn_names.iter().enumerate() {
+            stats_map.entry(fn_id).or_insert_with(|| FnStats {
+                name: name.clone(),
+                total_calls: 0,
+                total_self_ns: 0,
+                total_allocs: 0,
+                total_alloc_bytes: 0,
+                per_frame_self_ns: Vec::new(),
+            });
+        }
+    }
+
     let mut entries: Vec<FnStats> = stats_map.into_values().collect();
+    if !show_all {
+        entries.retain(|e| e.total_calls > 0);
+    }
     entries.sort_by(|a, b| b.total_self_ns.cmp(&a.total_self_ns));
 
     // Pad per-frame vectors so late-appearing functions have zeros for earlier frames.
@@ -1055,7 +1072,7 @@ mod tests {
                 ],
             ],
         };
-        let table = format_table_with_frames(&frame_data);
+        let table = format_table_with_frames(&frame_data, true);
         assert!(table.contains("p50"), "should have p50 column");
         assert!(table.contains("p99"), "should have p99 column");
         assert!(table.contains("Allocs"), "should have allocs column");
@@ -1179,6 +1196,61 @@ mod tests {
         assert!(
             table.contains("<<"),
             "should flag the spike frame. Got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn load_ndjson_includes_zero_call_functions() {
+        let dir = TempDir::new().unwrap();
+        // "render" is registered but never appears in any frame
+        let content = r#"{"format_version":2,"run_id":"test_1","timestamp_ms":1000,"functions":["update","physics","render"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":2000000,"ac":10,"ab":4096,"fc":8,"fb":3072},{"id":1,"calls":1,"self_ns":1000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        let path = dir.path().join("1000.ndjson");
+        fs::write(&path, content).unwrap();
+
+        let (run, _frame_data) = load_ndjson(&path).unwrap();
+
+        // All 3 functions should be present, including zero-call "render"
+        assert_eq!(
+            run.functions.len(),
+            3,
+            "expected 3 functions (including zero-call), got {}: {:?}",
+            run.functions.len(),
+            run.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        let render = run.functions.iter().find(|f| f.name == "render").unwrap();
+        assert_eq!(render.calls, 0);
+        assert_eq!(render.alloc_count, 0);
+    }
+
+    #[test]
+    fn format_table_with_frames_hides_zero_call_by_default() {
+        let frame_data = FrameData {
+            fn_names: vec!["update".into(), "unused".into()],
+            frames: vec![vec![FrameFnEntry {
+                fn_id: 0,
+                calls: 1,
+                self_ns: 1_000_000,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            }]],
+        };
+        // Default (show_all=false) should hide "unused"
+        let table = format_table_with_frames(&frame_data, false);
+        assert!(table.contains("update"), "should show called function");
+        assert!(
+            !table.contains("unused"),
+            "should hide zero-call function by default. Got:\n{table}"
+        );
+
+        // show_all=true should include "unused"
+        let table_all = format_table_with_frames(&frame_data, true);
+        assert!(
+            table_all.contains("unused"),
+            "should show zero-call function with show_all. Got:\n{table_all}"
         );
     }
 }

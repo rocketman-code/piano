@@ -297,7 +297,7 @@ fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result
         if frames {
             print!("{}", format_frames_table(&frame_data));
         } else {
-            print!("{}", format_table_with_frames(&frame_data));
+            print!("{}", format_table_with_frames(&frame_data, show_all));
         }
         return Ok(());
     }
