@@ -145,7 +145,7 @@ fn cmd_build(
             inject_runtime_path_dependency(staging.path(), &abs_path)?;
         }
         None => {
-            inject_runtime_dependency(staging.path(), "0.1.0")?;
+            inject_runtime_dependency(staging.path(), env!("CARGO_PKG_VERSION"))?;
         }
     }
 
