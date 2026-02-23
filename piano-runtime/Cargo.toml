@@ -1,8 +1,8 @@
 [package]
 name = "piano-runtime"
 version = "0.3.0"
-edition = "2024"
-rust-version = "1.88"
+edition = "2021"
+rust-version = "1.70"
 description = "Zero-dependency timing and allocation tracking runtime for piano profiler"
 license = "MIT"
 repository = "https://github.com/rocketman-code/piano"

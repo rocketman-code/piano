@@ -15,7 +15,7 @@ pub(crate) struct AllocSnapshot {
 thread_local! {
     /// Destructor-free counters that the allocator hot path increments.
     /// `enter()` saves and zeroes this; `Guard::drop()` reads and restores.
-    pub(crate) static ALLOC_COUNTERS: Cell<AllocSnapshot> = const { Cell::new(AllocSnapshot::new()) };
+    pub(crate) static ALLOC_COUNTERS: Cell<AllocSnapshot> = Cell::new(AllocSnapshot::new());
 }
 
 impl AllocSnapshot {

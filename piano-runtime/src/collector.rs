@@ -23,18 +23,25 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Process-wide run identifier.
 ///
 /// All threads within a single process share this ID, so that JSON files
 /// written by different threads can be correlated during report consolidation.
-static RUN_ID: LazyLock<String> =
-    LazyLock::new(|| format!("{}_{}", std::process::id(), timestamp_ms()));
+static RUN_ID: OnceLock<String> = OnceLock::new();
+
+fn run_id() -> &'static str {
+    RUN_ID.get_or_init(|| format!("{}_{}", std::process::id(), timestamp_ms()))
+}
 
 /// Process-start epoch for relative timestamps.
-static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+fn epoch() -> Instant {
+    *EPOCH.get_or_init(Instant::now)
+}
 
 /// Aggregated timing data for a single function.
 #[derive(Debug, Clone)]
@@ -93,23 +100,26 @@ type ThreadRecordArc = Arc<Mutex<Vec<RawRecord>>>;
 
 /// Global registry of per-thread record storage.
 /// Each thread registers its Arc on first access. collect_all() iterates all Arcs.
-static THREAD_RECORDS: LazyLock<Mutex<Vec<ThreadRecordArc>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+static THREAD_RECORDS: OnceLock<Mutex<Vec<ThreadRecordArc>>> = OnceLock::new();
+
+fn thread_records() -> &'static Mutex<Vec<ThreadRecordArc>> {
+    THREAD_RECORDS.get_or_init(|| Mutex::new(Vec::new()))
+}
 
 thread_local! {
-    pub(crate) static STACK: RefCell<Vec<StackEntry>> = const { RefCell::new(Vec::new()) };
+    pub(crate) static STACK: RefCell<Vec<StackEntry>> = RefCell::new(Vec::new());
     static RECORDS: Arc<Mutex<Vec<RawRecord>>> = {
         let arc = Arc::new(Mutex::new(Vec::new()));
-        THREAD_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&arc));
+        thread_records().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&arc));
         arc
     };
-    static REGISTERED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    static REGISTERED: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
     #[cfg(test)]
-    static INVOCATIONS: RefCell<Vec<InvocationRecord>> = const { RefCell::new(Vec::new()) };
+    static INVOCATIONS: RefCell<Vec<InvocationRecord>> = RefCell::new(Vec::new());
     /// Invocations accumulated within the current frame (cleared on frame boundary).
-    static FRAME_BUFFER: RefCell<Vec<InvocationRecord>> = const { RefCell::new(Vec::new()) };
+    static FRAME_BUFFER: RefCell<Vec<InvocationRecord>> = RefCell::new(Vec::new());
     /// Completed per-frame summaries.
-    static FRAMES: RefCell<Vec<Vec<FrameFnSummary>>> = const { RefCell::new(Vec::new()) };
+    static FRAMES: RefCell<Vec<Vec<FrameFnSummary>>> = RefCell::new(Vec::new());
 }
 
 /// RAII timing guard. Records elapsed time on drop.
@@ -142,7 +152,7 @@ impl Drop for Guard {
             let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
             let children_ns = (entry.children_ms * 1_000_000.0) as u64;
             let self_ns = elapsed_ns.saturating_sub(children_ns);
-            let start_ns = entry.start.duration_since(*EPOCH).as_nanos() as u64;
+            let start_ns = entry.start.duration_since(epoch()).as_nanos() as u64;
             let children_ms = entry.children_ms;
 
             // Safe to re-borrow: the RefMut from pop() was dropped above.
@@ -198,7 +208,7 @@ impl Drop for Guard {
 /// Start timing a function. Returns a Guard that records the measurement on drop.
 pub fn enter(name: &'static str) -> Guard {
     // Touch EPOCH so relative timestamps are anchored to process start.
-    let _ = *EPOCH;
+    let _ = epoch();
 
     // Save current alloc counters and zero them for this scope.
     let saved_alloc = crate::alloc::ALLOC_COUNTERS
@@ -331,7 +341,7 @@ fn aggregate_frame(records: &[InvocationRecord]) -> Vec<FrameFnSummary> {
 /// sees every registered name.
 pub fn collect_all() -> Vec<FunctionRecord> {
     let arcs: Vec<ThreadRecordArc> = {
-        let registry = THREAD_RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+        let registry = thread_records().lock().unwrap_or_else(|e| e.into_inner());
         registry.clone()
     };
     let mut all_raw: Vec<RawRecord> = Vec::new();
@@ -368,7 +378,7 @@ pub fn reset() {
 pub fn reset_all() {
     // Clear every thread's record Arc.
     let arcs: Vec<ThreadRecordArc> = {
-        let registry = THREAD_RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+        let registry = thread_records().lock().unwrap_or_else(|e| e.into_inner());
         registry.clone()
     };
     for arc in &arcs {
@@ -410,7 +420,7 @@ fn write_json(records: &[FunctionRecord], path: &std::path::Path) -> std::io::Re
     }
     let mut f = std::fs::File::create(path)?;
     let ts = timestamp_ms();
-    let run_id = &*RUN_ID;
+    let run_id = run_id();
     write!(
         f,
         "{{\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts},\"functions\":["
@@ -445,7 +455,7 @@ fn write_ndjson(
     }
     let mut f = std::fs::File::create(path)?;
     let ts = timestamp_ms();
-    let run_id = &*RUN_ID;
+    let run_id = run_id();
 
     // Header line: metadata + function name table
     write!(
