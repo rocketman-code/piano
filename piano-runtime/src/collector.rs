@@ -76,11 +76,8 @@ pub(crate) struct StackEntry {
     pub(crate) name: &'static str,
     pub(crate) start: Instant,
     pub(crate) children_ms: f64,
-    pub(crate) overhead_ns: u128,
-    pub(crate) alloc_count: u32,
-    pub(crate) alloc_bytes: u64,
-    pub(crate) free_count: u32,
-    pub(crate) free_bytes: u64,
+    /// Saved ALLOC_COUNTERS from before this scope, restored on Guard::drop.
+    pub(crate) saved_alloc: crate::alloc::AllocSnapshot,
     pub(crate) depth: u16,
 }
 
@@ -124,18 +121,27 @@ pub struct Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        // Read this scope's alloc counters and restore the parent's saved state.
+        let scope_alloc = crate::alloc::ALLOC_COUNTERS
+            .try_with(|cell| cell.get())
+            .unwrap_or_default();
+
         STACK.with(|stack| {
             let entry = stack.borrow_mut().pop();
             let Some(entry) = entry else {
                 eprintln!("piano-runtime: guard dropped without matching stack entry (bug)");
                 return;
             };
+
+            // Restore parent's saved alloc counters.
+            let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
+                cell.set(entry.saved_alloc);
+            });
+
             let elapsed_ns = entry.start.elapsed().as_nanos() as u64;
             let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
             let children_ns = (entry.children_ms * 1_000_000.0) as u64;
-            let self_ns = elapsed_ns
-                .saturating_sub(children_ns)
-                .saturating_sub(entry.overhead_ns as u64);
+            let self_ns = elapsed_ns.saturating_sub(children_ns);
             let start_ns = entry.start.duration_since(*EPOCH).as_nanos() as u64;
             let children_ms = entry.children_ms;
 
@@ -160,10 +166,10 @@ impl Drop for Guard {
                 start_ns,
                 elapsed_ns,
                 self_ns,
-                alloc_count: entry.alloc_count,
-                alloc_bytes: entry.alloc_bytes,
-                free_count: entry.free_count,
-                free_bytes: entry.free_bytes,
+                alloc_count: scope_alloc.alloc_count,
+                alloc_bytes: scope_alloc.alloc_bytes,
+                free_count: scope_alloc.free_count,
+                free_bytes: scope_alloc.free_bytes,
                 depth: entry.depth,
             };
 
@@ -193,21 +199,23 @@ impl Drop for Guard {
 pub fn enter(name: &'static str) -> Guard {
     // Touch EPOCH so relative timestamps are anchored to process start.
     let _ = *EPOCH;
-    // Signal the allocator that STACK is initialized on this thread, so
-    // alloc tracking can safely access it via `try_with` without triggering
-    // TLS destructor registration from within the global allocator.
-    crate::alloc::mark_thread_active();
+
+    // Save current alloc counters and zero them for this scope.
+    let saved_alloc = crate::alloc::ALLOC_COUNTERS
+        .try_with(|cell| {
+            let snap = cell.get();
+            cell.set(crate::alloc::AllocSnapshot::new());
+            snap
+        })
+        .unwrap_or_default();
+
     STACK.with(|stack| {
         let depth = stack.borrow().len() as u16;
         stack.borrow_mut().push(StackEntry {
             name,
             start: Instant::now(),
             children_ms: 0.0,
-            overhead_ns: 0,
-            alloc_count: 0,
-            alloc_bytes: 0,
-            free_count: 0,
-            free_bytes: 0,
+            saved_alloc,
             depth,
         });
     });
@@ -600,9 +608,17 @@ pub struct AdoptGuard {
 
 impl Drop for AdoptGuard {
     fn drop(&mut self) {
+        // Restore the parent's saved alloc counters (same pattern as Guard::drop).
+        // The adopted scope's alloc data isn't recorded into an InvocationRecord,
+        // but the restore is necessary for correct nesting.
         STACK.with(|stack| {
             let entry = stack.borrow_mut().pop();
             let Some(entry) = entry else { return };
+
+            let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
+                cell.set(entry.saved_alloc);
+            });
+
             let elapsed_ms = entry.start.elapsed().as_secs_f64() * 1000.0;
 
             // Propagate this thread's total time back to the parent context.
@@ -637,18 +653,22 @@ pub fn fork() -> Option<SpanContext> {
 /// thread correctly attributes children time. Returns an `AdoptGuard` that
 /// propagates elapsed time back to the parent on drop.
 pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
-    crate::alloc::mark_thread_active();
+    // Save current alloc counters and zero them, same as enter().
+    let saved_alloc = crate::alloc::ALLOC_COUNTERS
+        .try_with(|cell| {
+            let snap = cell.get();
+            cell.set(crate::alloc::AllocSnapshot::new());
+            snap
+        })
+        .unwrap_or_default();
+
     STACK.with(|stack| {
         let depth = stack.borrow().len() as u16;
         stack.borrow_mut().push(StackEntry {
             name: ctx.parent_name,
             start: Instant::now(),
             children_ms: 0.0,
-            overhead_ns: 0,
-            alloc_count: 0,
-            alloc_bytes: 0,
-            free_count: 0,
-            free_bytes: 0,
+            saved_alloc,
             depth,
         });
     });
