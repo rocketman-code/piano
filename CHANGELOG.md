@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-02-23
+
+### Fixed
+
+- Zero-call registered functions now appear in NDJSON output (previously silently dropped)
+- Dynamic column width in `--frames` table prevents long function names from being truncated
+- piano-runtime MSRV lowered from 1.70 to 1.56 (supports older Rust projects)
+- Flaky cross-thread timing test stabilized for CI (sleep margin increased from 50ms to 200ms)
+
+### Changed
+
+- MSRV for piano-runtime: 1.56 (was 1.70)
+
 ## [0.4.0] - 2026-02-23
 
 ### Added
