@@ -1,0 +1,12 @@
+[package]
+name = "piano-runtime"
+version = "0.0.1"
+edition = "2024"
+description = "Zero-dependency timing runtime for piano profiler"
+license = "MIT"
+repository = "https://github.com/rocketman-code/piano"
+keywords = ["profiling", "instrumentation"]
+categories = ["development-tools::profiling"]
+
+[dev-dependencies]
+tempfile = "3"
