@@ -84,6 +84,37 @@ impl VisitMut for Instrumenter {
     }
 }
 
+/// Inject `piano_runtime::register(name)` calls at the top of `fn main`.
+///
+/// This ensures every instrumented function appears in the output, even if it
+/// was never called during the run.
+pub fn inject_registrations(source: &str, names: &[String]) -> Result<String, syn::Error> {
+    let mut file: syn::File = syn::parse_str(source)?;
+    let mut injector = RegistrationInjector {
+        names: names.to_vec(),
+    };
+    injector.visit_file_mut(&mut file);
+    Ok(prettyplease::unparse(&file))
+}
+
+struct RegistrationInjector {
+    names: Vec<String>,
+}
+
+impl VisitMut for RegistrationInjector {
+    fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
+        if node.sig.ident == "main" {
+            for name in self.names.iter().rev() {
+                let stmt: syn::Stmt = syn::parse_quote! {
+                    piano_runtime::register(#name);
+                };
+                node.block.stmts.insert(0, stmt);
+            }
+        }
+        syn::visit_mut::visit_item_fn_mut(self, node);
+    }
+}
+
 /// Extract the type name from a `syn::Type` for qualified method names.
 fn type_ident(ty: &syn::Type) -> String {
     match ty {
@@ -187,6 +218,25 @@ fn c() {}
         assert!(
             result.contains("piano_runtime::enter(\"c\")"),
             "c should be instrumented"
+        );
+    }
+
+    #[test]
+    fn injects_register_calls_in_main() {
+        let source = r#"
+fn main() {
+    do_stuff();
+}
+"#;
+        let names = vec!["walk".to_string(), "parse".to_string()];
+        let result = inject_registrations(source, &names).unwrap();
+        assert!(
+            result.contains("piano_runtime::register(\"walk\")"),
+            "Got:\n{result}"
+        );
+        assert!(
+            result.contains("piano_runtime::register(\"parse\")"),
+            "Got:\n{result}"
         );
     }
 

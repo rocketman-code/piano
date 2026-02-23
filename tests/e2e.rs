@@ -130,16 +130,22 @@ fn full_pipeline_instrument_build_run_verify() {
         "JSON should contain calls"
     );
 
-    // Verify `piano report` can read the output.
+    // Verify run_id is present.
+    assert!(
+        json_content.contains("\"run_id\":\""),
+        "JSON should contain run_id"
+    );
+
+    // Verify `piano report` with latest-run consolidation.
     let report_output = Command::new(piano_bin)
         .args(["report"])
-        .arg(json_files[0].path())
+        .env("PIANO_RUNS_DIR", &runs_dir)
         .output()
-        .expect("failed to run piano report");
+        .expect("failed to run piano report (latest)");
 
     assert!(
         report_output.status.success(),
-        "piano report failed:\n{}",
+        "piano report (latest) failed:\n{}",
         String::from_utf8_lossy(&report_output.stderr)
     );
 
@@ -147,5 +153,18 @@ fn full_pipeline_instrument_build_run_verify() {
     assert!(
         report_stdout.contains("work"),
         "report should show the 'work' function"
+    );
+
+    // Verify `piano report` can also read a specific file.
+    let specific_report = Command::new(piano_bin)
+        .args(["report"])
+        .arg(json_files[0].path())
+        .output()
+        .expect("failed to run piano report (specific)");
+
+    assert!(
+        specific_report.status.success(),
+        "piano report (specific) failed:\n{}",
+        String::from_utf8_lossy(&specific_report.stderr)
     );
 }
