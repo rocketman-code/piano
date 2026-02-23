@@ -12,6 +12,12 @@
 //! `Drop`. When thread-local storage is destroyed (normal process exit, thread
 //! join), the `Drop` impl flushes records to disk. This avoids the classic
 //! atexit-vs-TLS ordering problem where atexit fires after TLS is destroyed.
+//!
+//! Thread-locality: all state (stack, records) is thread-local. Each thread
+//! produces an independent call tree. Spawned threads or async tasks that
+//! cross thread boundaries appear as separate, unrelated profiles. This is
+//! the correct model for CPU profiling — wall-clock time on one thread is
+//! independent of work on another.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -158,7 +164,7 @@ fn aggregate(raw: &[RawRecord], registered: &[&str]) -> Vec<FunctionRecord> {
         let entry = map.entry(rec.name).or_insert((0, 0.0, 0.0));
         entry.0 += 1;
         entry.1 += rec.elapsed_ms;
-        entry.2 += rec.elapsed_ms - rec.children_ms;
+        entry.2 += (rec.elapsed_ms - rec.children_ms).max(0.0);
     }
 
     let mut result: Vec<FunctionRecord> = map
@@ -277,6 +283,30 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
+
+    /// CPU-bound workload: hash a buffer `iterations` times.
+    /// Uses wrapping arithmetic to prevent optimization while staying deterministic.
+    fn burn_cpu(iterations: u64) {
+        let mut buf = [0x42u8; 4096];
+        for i in 0..iterations {
+            for b in &mut buf {
+                *b = b.wrapping_add(i as u8).wrapping_mul(31);
+            }
+        }
+        std::hint::black_box(&buf);
+    }
+
+    #[test]
+    fn burn_cpu_takes_measurable_time() {
+        let start = std::time::Instant::now();
+        burn_cpu(50_000);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() >= 1,
+            "burn_cpu(50_000) should take at least 1ms, took {:?}",
+            elapsed
+        );
+    }
 
     #[test]
     fn flush_writes_valid_json_to_env_dir() {
@@ -524,5 +554,222 @@ mod tests {
             "should contain run_id field: {content}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn conservation_sequential_calls() {
+        reset();
+        {
+            let _main = enter("main_seq");
+            burn_cpu(10_000);
+            {
+                let _a = enter("a");
+                burn_cpu(30_000);
+            }
+            {
+                let _b = enter("b");
+                burn_cpu(20_000);
+            }
+        }
+        let records = collect();
+        let main_r = records.iter().find(|r| r.name == "main_seq").unwrap();
+        let a_r = records.iter().find(|r| r.name == "a").unwrap();
+        let b_r = records.iter().find(|r| r.name == "b").unwrap();
+
+        let sum_self = main_r.self_ms + a_r.self_ms + b_r.self_ms;
+        let root_total = main_r.total_ms;
+        let error_pct = ((sum_self - root_total) / root_total).abs() * 100.0;
+        assert!(
+            error_pct < 5.0,
+            "conservation violated: sum_self={sum_self:.3}ms, root_total={root_total:.3}ms, error={error_pct:.1}%"
+        );
+    }
+
+    #[test]
+    fn conservation_nested_calls() {
+        reset();
+        {
+            let _main = enter("main_nest");
+            burn_cpu(5_000);
+            {
+                let _a = enter("a_nest");
+                burn_cpu(5_000);
+                {
+                    let _b = enter("b_nest");
+                    burn_cpu(30_000);
+                }
+            }
+        }
+        let records = collect();
+        let main_r = records.iter().find(|r| r.name == "main_nest").unwrap();
+        let a_r = records.iter().find(|r| r.name == "a_nest").unwrap();
+        let b_r = records.iter().find(|r| r.name == "b_nest").unwrap();
+
+        let sum_self = main_r.self_ms + a_r.self_ms + b_r.self_ms;
+        let root_total = main_r.total_ms;
+        let error_pct = ((sum_self - root_total) / root_total).abs() * 100.0;
+        assert!(
+            error_pct < 5.0,
+            "conservation violated: sum_self={sum_self:.3}ms, root_total={root_total:.3}ms, error={error_pct:.1}%"
+        );
+
+        // b has no children, so self_ms should equal total_ms
+        let b_diff = (b_r.self_ms - b_r.total_ms).abs();
+        assert!(
+            b_diff < 0.1,
+            "leaf self_ms should equal total_ms: self={:.3}, total={:.3}",
+            b_r.self_ms,
+            b_r.total_ms
+        );
+    }
+
+    #[test]
+    fn conservation_mixed_topology() {
+        reset();
+        {
+            let _main = enter("main_mix");
+            burn_cpu(5_000);
+            {
+                let _a = enter("a_mix");
+                burn_cpu(10_000);
+                {
+                    let _b = enter("b_mix");
+                    burn_cpu(20_000);
+                }
+            }
+            {
+                let _c = enter("c_mix");
+                burn_cpu(15_000);
+            }
+        }
+        let records = collect();
+        let main_r = records.iter().find(|r| r.name == "main_mix").unwrap();
+
+        let sum_self: f64 = records.iter().map(|r| r.self_ms).sum();
+        let root_total = main_r.total_ms;
+        let error_pct = ((sum_self - root_total) / root_total).abs() * 100.0;
+        assert!(
+            error_pct < 5.0,
+            "conservation violated: sum_self={sum_self:.3}ms, root_total={root_total:.3}ms, error={error_pct:.1}%"
+        );
+    }
+
+    #[test]
+    fn conservation_repeated_calls() {
+        reset();
+        {
+            let _main = enter("main_rep");
+            burn_cpu(5_000);
+            for _ in 0..10 {
+                let _a = enter("a_rep");
+                burn_cpu(5_000);
+            }
+        }
+        let records = collect();
+        let main_r = records.iter().find(|r| r.name == "main_rep").unwrap();
+        let a_r = records.iter().find(|r| r.name == "a_rep").unwrap();
+
+        assert_eq!(a_r.calls, 10);
+
+        let sum_self = main_r.self_ms + a_r.self_ms;
+        let root_total = main_r.total_ms;
+        let error_pct = ((sum_self - root_total) / root_total).abs() * 100.0;
+        assert!(
+            error_pct < 5.0,
+            "conservation violated: sum_self={sum_self:.3}ms, root_total={root_total:.3}ms, error={error_pct:.1}%"
+        );
+    }
+
+    #[test]
+    fn negative_self_time_clamped_to_zero() {
+        // Regression test for the f64 drift clamp in aggregate().
+        // Construct a synthetic RawRecord where children_ms slightly exceeds elapsed_ms
+        // (simulating floating-point accumulation drift).
+        let raw = vec![RawRecord {
+            name: "drifted",
+            elapsed_ms: 10.0,
+            children_ms: 10.001,
+        }];
+        let result = aggregate(&raw, &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].self_ms, 0.0,
+            "negative self-time should be clamped to zero"
+        );
+    }
+
+    #[test]
+    fn guard_overhead_under_1us() {
+        reset();
+        let iterations = 1_000_000u64;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _g = enter("overhead");
+        }
+        let elapsed = start.elapsed();
+        let per_call_ns = elapsed.as_nanos() as f64 / iterations as f64;
+        eprintln!("guard overhead: {per_call_ns:.1}ns per call ({iterations} iterations)");
+        assert!(
+            per_call_ns < 1000.0,
+            "per-call overhead {per_call_ns:.1}ns exceeds 1us limit"
+        );
+        reset();
+    }
+
+    #[test]
+    fn deep_nesting_100_levels() {
+        reset();
+
+        // Pre-generate static names for each level.
+        let names: Vec<&'static str> = (0..100)
+            .map(|i| -> &'static str { Box::leak(format!("level_{i}").into_boxed_str()) })
+            .collect();
+
+        // Build nested call tree iteratively using a vec of guards.
+        let mut guards = Vec::with_capacity(100);
+        for name in &names {
+            guards.push(enter(name));
+            burn_cpu(1_000);
+        }
+        // Drop guards in reverse order (innermost first).
+        while let Some(g) = guards.pop() {
+            drop(g);
+        }
+
+        let records = collect();
+        assert_eq!(records.len(), 100, "expected 100 functions");
+
+        let root = records.iter().find(|r| r.name == "level_0").unwrap();
+
+        // Conservation: sum of self-times should equal root total.
+        let sum_self: f64 = records.iter().map(|r| r.self_ms).sum();
+        let error_pct = ((sum_self - root.total_ms) / root.total_ms).abs() * 100.0;
+        assert!(
+            error_pct < 5.0,
+            "conservation violated at 100 levels: sum_self={sum_self:.3}ms, root_total={:.3}ms, error={error_pct:.1}%",
+            root.total_ms
+        );
+
+        // No negative self-times.
+        for rec in &records {
+            assert!(
+                rec.self_ms >= 0.0,
+                "{} has negative self_ms: {}",
+                rec.name,
+                rec.self_ms
+            );
+        }
+
+        // Each non-leaf should have self_ms < total_ms (except the innermost).
+        let innermost = records.iter().find(|r| r.name == "level_99").unwrap();
+        let diff = (innermost.self_ms - innermost.total_ms).abs();
+        assert!(
+            diff < 0.5,
+            "innermost level should have self ≈ total: self={:.3}, total={:.3}",
+            innermost.self_ms,
+            innermost.total_ms
+        );
+
+        reset();
     }
 }
