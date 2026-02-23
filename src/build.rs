@@ -110,9 +110,10 @@ fn extract_rendered_errors(json_output: &str) -> Vec<String> {
 
 /// Find the workspace root for a project directory.
 ///
-/// Walks up from `project_dir` looking for a parent `Cargo.toml` containing
-/// a `[workspace]` table whose `members` pattern matches this project.
-/// Returns `None` if the project is standalone (not a workspace member).
+/// Walks up from `project_dir` looking for the nearest parent `Cargo.toml`
+/// containing a `[workspace]` table. Does not validate that this project
+/// is an actual member of the workspace -- Cargo will catch mismatches at
+/// build time. Returns `None` if no workspace root is found.
 pub fn find_workspace_root(project_dir: &Path) -> Option<PathBuf> {
     let project_dir = project_dir.canonicalize().ok()?;
     let mut dir = project_dir.parent()?;
