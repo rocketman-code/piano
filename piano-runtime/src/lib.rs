@@ -6,5 +6,5 @@ pub use alloc::PianoAllocator;
 pub use collector::collect_invocations;
 pub use collector::{
     AdoptGuard, FrameFnSummary, FunctionRecord, Guard, InvocationRecord, SpanContext, adopt,
-    collect, collect_frames, enter, flush, fork, init, register, reset,
+    collect, collect_all, collect_frames, enter, flush, fork, init, register, reset, shutdown,
 };
