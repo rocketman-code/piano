@@ -215,6 +215,117 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
     out
 }
 
+/// Format frame-level data as a table with percentile and allocation columns.
+///
+/// Columns: Function | Calls | Self | p50 | p99 | Allocs | Bytes
+/// Footer: frame count summary.
+pub fn format_table_v2(frame_data: &FrameData) -> String {
+    struct FnStats {
+        name: String,
+        total_calls: u64,
+        total_self_ns: u64,
+        total_allocs: u64,
+        total_alloc_bytes: u64,
+        per_frame_self_ns: Vec<u64>,
+    }
+
+    let mut stats_map: HashMap<usize, FnStats> = HashMap::new();
+    for frame in &frame_data.frames {
+        // Track which fn_ids appear in this frame (to fill zeros for missing ones).
+        let mut seen: HashMap<usize, bool> = stats_map.keys().map(|&k| (k, false)).collect();
+
+        for entry in frame {
+            seen.insert(entry.fn_id, true);
+            let stats = stats_map.entry(entry.fn_id).or_insert_with(|| FnStats {
+                name: frame_data
+                    .fn_names
+                    .get(entry.fn_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("<fn_{}>", entry.fn_id)),
+                total_calls: 0,
+                total_self_ns: 0,
+                total_allocs: 0,
+                total_alloc_bytes: 0,
+                per_frame_self_ns: Vec::new(),
+            });
+            stats.total_calls += entry.calls;
+            stats.total_self_ns += entry.self_ns;
+            stats.total_allocs += entry.alloc_count as u64;
+            stats.total_alloc_bytes += entry.alloc_bytes;
+            stats.per_frame_self_ns.push(entry.self_ns);
+        }
+
+        // Functions not present in this frame get a zero entry.
+        for (fn_id, present) in &seen {
+            if !present {
+                if let Some(stats) = stats_map.get_mut(fn_id) {
+                    stats.per_frame_self_ns.push(0);
+                }
+            }
+        }
+    }
+
+    let mut entries: Vec<FnStats> = stats_map.into_values().collect();
+    entries.sort_by(|a, b| b.total_self_ns.cmp(&a.total_self_ns));
+
+    // Sort per-frame vectors for percentile calculation.
+    for e in &mut entries {
+        e.per_frame_self_ns.sort_unstable();
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<40} {:>8} {:>10} {:>10} {:>10} {:>8} {:>10}\n",
+        "Function", "Calls", "Self", "p50", "p99", "Allocs", "Bytes"
+    ));
+    out.push_str(&format!("{}\n", "-".repeat(100)));
+
+    for e in &entries {
+        let self_str = format_ns(e.total_self_ns);
+        let p50 = percentile(&e.per_frame_self_ns, 50.0);
+        let p99 = percentile(&e.per_frame_self_ns, 99.0);
+        let p50_str = format_ns(p50);
+        let p99_str = format_ns(p99);
+        let bytes_str = format_bytes(e.total_alloc_bytes);
+        out.push_str(&format!(
+            "{:<40} {:>8} {:>10} {:>10} {:>10} {:>8} {:>10}\n",
+            e.name, e.total_calls, self_str, p50_str, p99_str, e.total_allocs, bytes_str
+        ));
+    }
+
+    let n_frames = frame_data.frames.len();
+    out.push_str(&format!("\n{n_frames} frames"));
+
+    out
+}
+
+fn percentile(sorted: &[u64], p: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((p / 100.0) * (sorted.len() - 1) as f64).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn format_ns(ns: u64) -> String {
+    let us = ns as f64 / 1_000.0;
+    if us < 1000.0 {
+        format!("{us:.1}us")
+    } else {
+        format!("{:.2}ms", us / 1_000.0)
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 /// Show the delta between two runs, comparing functions by name.
 pub fn diff_runs(a: &Run, b: &Run) -> String {
     let a_map: HashMap<&str, &FnEntry> = a.functions.iter().map(|f| (f.name.as_str(), f)).collect();
@@ -753,5 +864,29 @@ mod tests {
         fs::write(dir.path().join("200.json"), "also garbage").unwrap();
         let result = load_latest_run(dir.path());
         assert!(result.is_err(), "expected Err when all files are corrupt");
+    }
+
+    #[test]
+    fn format_table_v2_shows_percentiles_and_allocs() {
+        let frame_data = FrameData {
+            fn_names: vec!["update".into(), "physics".into()],
+            frames: vec![
+                vec![
+                    FrameFnEntry { fn_id: 0, calls: 1, self_ns: 2_000_000, alloc_count: 10, alloc_bytes: 4096, free_count: 8, free_bytes: 3072 },
+                    FrameFnEntry { fn_id: 1, calls: 1, self_ns: 1_000_000, alloc_count: 0, alloc_bytes: 0, free_count: 0, free_bytes: 0 },
+                ],
+                vec![
+                    FrameFnEntry { fn_id: 0, calls: 1, self_ns: 8_000_000, alloc_count: 50, alloc_bytes: 16384, free_count: 40, free_bytes: 12288 },
+                    FrameFnEntry { fn_id: 1, calls: 1, self_ns: 1_100_000, alloc_count: 0, alloc_bytes: 0, free_count: 0, free_bytes: 0 },
+                ],
+            ],
+        };
+        let table = format_table_v2(&frame_data);
+        assert!(table.contains("p50"), "should have p50 column");
+        assert!(table.contains("p99"), "should have p99 column");
+        assert!(table.contains("Allocs"), "should have allocs column");
+        assert!(table.contains("update"), "should list update");
+        assert!(table.contains("physics"), "should list physics");
+        assert!(table.contains("frames"), "should have frame count in footer");
     }
 }
