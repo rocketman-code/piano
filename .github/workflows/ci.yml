@@ -45,6 +45,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88.0"
+      - name: Install Rust 1.70 for runtime MSRV test
+        run: rustup toolchain install 1.70.0 --profile minimal
       - run: cargo test --workspace
 
   doc:
