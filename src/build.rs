@@ -1,0 +1,207 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use ignore::WalkBuilder;
+use toml_edit::DocumentMut;
+
+use crate::error::Error;
+
+/// Copy the user's project into a staging directory, respecting .gitignore
+/// and skipping the `target/` directory.
+pub fn prepare_staging(project_root: &Path, staging_dir: &Path) -> Result<(), Error> {
+    let walker = WalkBuilder::new(project_root)
+        .hidden(false)
+        .filter_entry(|entry| {
+            // Skip target/ only at the project root level (depth 1).
+            entry.depth() != 1 || entry.file_name().to_string_lossy() != "target"
+        })
+        .build();
+
+    for entry in walker {
+        let entry = entry.map_err(|e| std::io::Error::other(e.to_string()))?;
+        let source = entry.path();
+        let relative = source
+            .strip_prefix(project_root)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        let dest = staging_dir.join(relative);
+
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            std::fs::create_dir_all(&dest)?;
+        } else if entry.file_type().is_some_and(|ft| ft.is_file()) {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(source, &dest)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// How to reference piano-runtime in the staged Cargo.toml.
+pub(crate) enum RuntimeSource<'a> {
+    /// Published crate version (e.g. "0.1.0").
+    Version(&'a str),
+    /// Local path (for development before publishing).
+    Path(&'a Path),
+}
+
+/// Add `piano-runtime` as a dependency in the staged project's Cargo.toml.
+/// Uses `toml_edit` for structured manipulation (never string replacement).
+pub fn inject_runtime_dependency(staging_dir: &Path, runtime_version: &str) -> Result<(), Error> {
+    inject_runtime(staging_dir, RuntimeSource::Version(runtime_version))
+}
+
+/// Add `piano-runtime` as a path dependency in the staged project's Cargo.toml.
+pub fn inject_runtime_path_dependency(
+    staging_dir: &Path,
+    runtime_path: &Path,
+) -> Result<(), Error> {
+    inject_runtime(staging_dir, RuntimeSource::Path(runtime_path))
+}
+
+fn inject_runtime(staging_dir: &Path, source: RuntimeSource<'_>) -> Result<(), Error> {
+    let cargo_toml_path = staging_dir.join("Cargo.toml");
+    let content = std::fs::read_to_string(&cargo_toml_path)?;
+
+    let mut doc: DocumentMut = content
+        .parse::<DocumentMut>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+    // Ensure [dependencies] table exists.
+    if !doc.contains_table("dependencies") {
+        doc["dependencies"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+
+    match source {
+        RuntimeSource::Version(v) => {
+            doc["dependencies"]["piano-runtime"] = toml_edit::value(v);
+        }
+        RuntimeSource::Path(p) => {
+            let mut table = toml_edit::InlineTable::new();
+            table.insert("path", p.to_string_lossy().as_ref().into());
+            doc["dependencies"]["piano-runtime"] =
+                toml_edit::Item::Value(toml_edit::Value::InlineTable(table));
+        }
+    }
+
+    std::fs::write(&cargo_toml_path, doc.to_string())?;
+
+    Ok(())
+}
+
+/// Build the instrumented binary using `cargo build --message-format=json`.
+/// Returns the path to the compiled executable.
+pub fn build_instrumented(staging_dir: &Path, target_dir: &Path) -> Result<PathBuf, Error> {
+    let output = Command::new("cargo")
+        .arg("build")
+        .arg("--message-format=json")
+        .env("CARGO_TARGET_DIR", target_dir)
+        .current_dir(staging_dir)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::BuildFailed(stderr.into_owned()));
+    }
+
+    // Parse JSON lines to find the last compiler-artifact with an executable.
+    // Cargo emits dependencies first; the project's own binary comes last.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut binary_path = None;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if msg.get("reason").and_then(|r| r.as_str()) == Some("compiler-artifact")
+            && let Some(exe) = msg.get("executable").and_then(|e| e.as_str())
+        {
+            binary_path = Some(PathBuf::from(exe));
+        }
+    }
+
+    binary_path
+        .ok_or_else(|| Error::BuildFailed("no executable found in cargo build output".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Helper: create a file within a directory, creating parents as needed.
+    fn create_file(base: &Path, relative: &str, content: &str) {
+        let path = base.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn staging_copies_project_structure() {
+        let project = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        create_file(project.path(), "Cargo.toml", "[package]\nname = \"demo\"");
+        create_file(project.path(), "src/main.rs", "fn main() {}");
+        create_file(project.path(), "src/lib.rs", "pub fn lib() {}");
+        create_file(project.path(), "src/util/helper.rs", "pub fn help() {}");
+
+        // Also create a target/ dir that should be skipped
+        create_file(project.path(), "target/debug/demo", "binary-content");
+
+        prepare_staging(project.path(), staging.path()).unwrap();
+
+        assert!(staging.path().join("Cargo.toml").exists());
+        assert!(staging.path().join("src/main.rs").exists());
+        assert!(staging.path().join("src/lib.rs").exists());
+        assert!(staging.path().join("src/util/helper.rs").exists());
+        assert!(!staging.path().join("target").exists());
+
+        // Verify content was copied correctly
+        let content = std::fs::read_to_string(staging.path().join("Cargo.toml")).unwrap();
+        assert_eq!(content, "[package]\nname = \"demo\"");
+    }
+
+    #[test]
+    fn inject_dependency_adds_piano_runtime() {
+        let staging = TempDir::new().unwrap();
+        let toml_content = r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[dependencies]
+serde = "1"
+"#;
+        create_file(staging.path(), "Cargo.toml", toml_content);
+
+        inject_runtime_dependency(staging.path(), "0.1.0").unwrap();
+
+        let result = std::fs::read_to_string(staging.path().join("Cargo.toml")).unwrap();
+        let doc: DocumentMut = result.parse().unwrap();
+
+        // piano-runtime was added
+        assert_eq!(doc["dependencies"]["piano-runtime"].as_str(), Some("0.1.0"),);
+        // serde is preserved
+        assert_eq!(doc["dependencies"]["serde"].as_str(), Some("1"),);
+    }
+
+    #[test]
+    fn inject_dependency_creates_section_if_missing() {
+        let staging = TempDir::new().unwrap();
+        let toml_content = r#"[package]
+name = "demo"
+version = "0.1.0"
+"#;
+        create_file(staging.path(), "Cargo.toml", toml_content);
+
+        inject_runtime_dependency(staging.path(), "0.2.0").unwrap();
+
+        let result = std::fs::read_to_string(staging.path().join("Cargo.toml")).unwrap();
+        let doc: DocumentMut = result.parse().unwrap();
+
+        assert_eq!(doc["dependencies"]["piano-runtime"].as_str(), Some("0.2.0"),);
+    }
+}
