@@ -20,6 +20,20 @@ pub fn instrument_source(source: &str, targets: &HashSet<String>) -> Result<Stri
     Ok(prettyplease::unparse(&file))
 }
 
+/// Method names that indicate parallel iterator chains.
+const PARALLEL_ITER_METHODS: &[&str] = &[
+    "par_iter",
+    "par_iter_mut",
+    "into_par_iter",
+    "par_bridge",
+    "par_chunks",
+    "par_chunks_mut",
+    "par_windows",
+];
+
+/// Function/method path segments that indicate spawn/scope boundaries.
+const SPAWN_FUNCTIONS: &[&str] = &["spawn", "scope", "scope_fifo", "join"];
+
 struct Instrumenter {
     targets: HashSet<String>,
     current_impl: Option<String>,
@@ -35,6 +49,176 @@ impl Instrumenter {
             let _piano_guard = piano_runtime::enter(#name);
         };
         block.stmts.insert(0, guard_stmt);
+
+        // If the function body contains concurrency calls, inject fork
+        // and adopt in the relevant closures.
+        if block_contains_concurrency(block) {
+            let fork_stmt: syn::Stmt = syn::parse_quote! {
+                let _piano_ctx = piano_runtime::fork();
+            };
+            // Insert after the guard (position 1)
+            block.stmts.insert(1, fork_stmt);
+
+            // Walk the remaining statements and inject adopt into closures
+            for stmt in block.stmts.iter_mut().skip(2) {
+                match stmt {
+                    syn::Stmt::Expr(expr, _) => {
+                        inject_adopt_in_concurrency_closures(expr, false);
+                    }
+                    syn::Stmt::Local(local) => {
+                        if let Some(init) = &mut local.init {
+                            inject_adopt_in_concurrency_closures(&mut init.expr, false);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Check if a block contains a known concurrency method call.
+fn block_contains_concurrency(block: &syn::Block) -> bool {
+    block.stmts.iter().any(stmt_contains_concurrency)
+}
+
+fn stmt_contains_concurrency(stmt: &syn::Stmt) -> bool {
+    match stmt {
+        syn::Stmt::Expr(e, _) => contains_concurrency_call(e),
+        syn::Stmt::Local(local) => local
+            .init
+            .as_ref()
+            .is_some_and(|init| contains_concurrency_call(&init.expr)),
+        _ => false,
+    }
+}
+
+fn contains_concurrency_call(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::MethodCall(mc) => {
+            let method = mc.method.to_string();
+            if PARALLEL_ITER_METHODS.contains(&method.as_str())
+                || SPAWN_FUNCTIONS.contains(&method.as_str())
+            {
+                return true;
+            }
+            if contains_concurrency_call(&mc.receiver) {
+                return true;
+            }
+            mc.args.iter().any(contains_concurrency_call)
+        }
+        syn::Expr::Call(call) => {
+            if let syn::Expr::Path(path) = &*call.func {
+                let last_seg = path.path.segments.last().map(|s| s.ident.to_string());
+                if let Some(name) = last_seg
+                    && SPAWN_FUNCTIONS.contains(&name.as_str())
+                {
+                    return true;
+                }
+            }
+            call.args.iter().any(contains_concurrency_call)
+        }
+        syn::Expr::Block(b) => b.block.stmts.iter().any(stmt_contains_concurrency),
+        syn::Expr::Closure(c) => contains_concurrency_call(&c.body),
+        _ => false,
+    }
+}
+
+/// Walk an expression and inject adopt() at the start of closures that
+/// are arguments to concurrency calls or methods chained after par_iter.
+fn inject_adopt_in_concurrency_closures(expr: &mut syn::Expr, in_parallel_chain: bool) {
+    match expr {
+        syn::Expr::MethodCall(mc) => {
+            let method = mc.method.to_string();
+            let is_par = PARALLEL_ITER_METHODS.contains(&method.as_str());
+            let is_spawn = SPAWN_FUNCTIONS.contains(&method.as_str());
+
+            // Recurse into receiver first
+            inject_adopt_in_concurrency_closures(&mut mc.receiver, in_parallel_chain);
+
+            // Determine if we're in a parallel chain
+            let chain_active =
+                in_parallel_chain || is_par || receiver_has_parallel_method(&mc.receiver);
+
+            // If in a parallel chain or this is a spawn call, inject adopt into closure args
+            if (chain_active && !is_par) || is_spawn {
+                for arg in &mut mc.args {
+                    if let syn::Expr::Closure(closure) = arg {
+                        inject_adopt_at_closure_start(closure);
+                    } else {
+                        inject_adopt_in_concurrency_closures(arg, false);
+                    }
+                }
+            } else {
+                // Recurse into args anyway for nested concurrency
+                for arg in &mut mc.args {
+                    inject_adopt_in_concurrency_closures(arg, chain_active);
+                }
+            }
+        }
+        syn::Expr::Call(call) => {
+            let is_spawn = if let syn::Expr::Path(path) = &*call.func {
+                path.path
+                    .segments
+                    .last()
+                    .map(|s| SPAWN_FUNCTIONS.contains(&s.ident.to_string().as_str()))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if is_spawn {
+                for arg in &mut call.args {
+                    if let syn::Expr::Closure(closure) = arg {
+                        inject_adopt_at_closure_start(closure);
+                    } else {
+                        inject_adopt_in_concurrency_closures(arg, false);
+                    }
+                }
+            } else {
+                for arg in &mut call.args {
+                    inject_adopt_in_concurrency_closures(arg, false);
+                }
+            }
+        }
+        syn::Expr::Block(b) => {
+            for stmt in &mut b.block.stmts {
+                if let syn::Stmt::Expr(e, _) = stmt {
+                    inject_adopt_in_concurrency_closures(e, false);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn receiver_has_parallel_method(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::MethodCall(mc) => {
+            let method = mc.method.to_string();
+            PARALLEL_ITER_METHODS.contains(&method.as_str())
+                || receiver_has_parallel_method(&mc.receiver)
+        }
+        _ => false,
+    }
+}
+
+fn inject_adopt_at_closure_start(closure: &mut syn::ExprClosure) {
+    let adopt_stmt: syn::Stmt = syn::parse_quote! {
+        let _piano_adopt = _piano_ctx.as_ref().map(|c| piano_runtime::adopt(c));
+    };
+    match &mut *closure.body {
+        syn::Expr::Block(block) => {
+            block.block.stmts.insert(0, adopt_stmt);
+        }
+        other => {
+            let existing = other.clone();
+            *other = syn::parse_quote! {
+                {
+                    #adopt_stmt
+                    #existing
+                }
+            };
+        }
     }
 }
 
@@ -158,6 +342,36 @@ pub fn inject_global_allocator(
     }
 
     Ok(prettyplease::unparse(&file))
+}
+
+/// Inject `piano_runtime::shutdown()` as the last statement in `fn main`.
+pub fn inject_shutdown(source: &str) -> Result<String, syn::Error> {
+    let mut file: syn::File = syn::parse_str(source)?;
+    let mut injector = ShutdownInjector;
+    injector.visit_file_mut(&mut file);
+    Ok(prettyplease::unparse(&file))
+}
+
+struct ShutdownInjector;
+
+impl VisitMut for ShutdownInjector {
+    fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
+        if node.sig.ident == "main" {
+            // Wrap existing body in a block so all guards drop before shutdown.
+            // This ensures main's own timing guard records before shutdown collects.
+            let existing_stmts = std::mem::take(&mut node.block.stmts);
+            let inner_block: syn::Stmt = syn::parse_quote! {
+                {
+                    #(#existing_stmts)*
+                }
+            };
+            let shutdown_stmt: syn::Stmt = syn::parse_quote! {
+                piano_runtime::shutdown();
+            };
+            node.block.stmts = vec![inner_block, shutdown_stmt];
+        }
+        syn::visit_mut::visit_item_fn_mut(self, node);
+    }
 }
 
 /// Extract the type name from a `syn::Type` for qualified method names.
@@ -337,6 +551,113 @@ fn main() {
         assert!(
             !result.contains("piano_runtime::init()"),
             "should NOT inject init (init is a no-op)"
+        );
+    }
+
+    #[test]
+    fn injects_shutdown_at_end_of_main() {
+        let source = r#"
+fn main() {
+    do_stuff();
+}
+"#;
+        let result = inject_shutdown(source).unwrap();
+        assert!(
+            result.contains("piano_runtime::shutdown()"),
+            "should inject shutdown. Got:\n{result}"
+        );
+        let shutdown_pos = result.find("piano_runtime::shutdown()").unwrap();
+        let do_stuff_pos = result.find("do_stuff()").unwrap();
+        assert!(
+            shutdown_pos > do_stuff_pos,
+            "shutdown should come after existing code"
+        );
+    }
+
+    #[test]
+    fn injects_fork_and_adopt_for_par_iter() {
+        let source = r#"
+fn process_all(items: &[Item]) -> Vec<Result> {
+    items.par_iter()
+         .map(|item| transform(item))
+         .collect()
+}
+"#;
+        let targets: HashSet<String> = ["process_all".to_string()].into();
+        let result = instrument_source(source, &targets).unwrap();
+
+        assert!(
+            result.contains("piano_runtime::enter(\"process_all\")"),
+            "should have guard. Got:\n{result}"
+        );
+        assert!(
+            result.contains("piano_runtime::fork()"),
+            "should inject fork. Got:\n{result}"
+        );
+        assert!(
+            result.contains("piano_runtime::adopt"),
+            "should inject adopt in closure. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn injects_fork_and_adopt_for_thread_spawn() {
+        let source = r#"
+fn do_work() {
+    std::thread::spawn(|| {
+        heavy_computation();
+    });
+}
+"#;
+        let targets: HashSet<String> = ["do_work".to_string()].into();
+        let result = instrument_source(source, &targets).unwrap();
+
+        assert!(
+            result.contains("piano_runtime::fork()"),
+            "should inject fork. Got:\n{result}"
+        );
+        assert!(
+            result.contains("piano_runtime::adopt"),
+            "should inject adopt in spawn closure. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn injects_adopt_in_rayon_scope_spawn() {
+        let source = r#"
+fn parallel_work() {
+    rayon::scope(|s| {
+        s.spawn(|_| { work_a(); });
+        s.spawn(|_| { work_b(); });
+    });
+}
+"#;
+        let targets: HashSet<String> = ["parallel_work".to_string()].into();
+        let result = instrument_source(source, &targets).unwrap();
+
+        assert!(
+            result.contains("piano_runtime::fork()"),
+            "should inject fork. Got:\n{result}"
+        );
+        assert!(
+            result.contains("piano_runtime::adopt"),
+            "should inject adopt. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn no_fork_inject_in_non_target_function() {
+        let source = r#"
+fn not_targeted() {
+    items.par_iter().map(|x| x).collect()
+}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets).unwrap();
+
+        assert!(
+            !result.contains("piano_runtime::fork()"),
+            "should NOT inject fork in non-target function. Got:\n{result}"
         );
     }
 }

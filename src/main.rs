@@ -13,7 +13,9 @@ use piano::report::{
     load_latest_run, load_ndjson, load_run, load_tagged_run, save_tag,
 };
 use piano::resolve::{TargetSpec, resolve_targets};
-use piano::rewrite::{inject_global_allocator, inject_registrations, instrument_source};
+use piano::rewrite::{
+    inject_global_allocator, inject_registrations, inject_shutdown, instrument_source,
+};
 
 #[derive(Parser)]
 #[command(
@@ -217,6 +219,10 @@ fn cmd_build(
                 source,
             })?;
 
+        let rewritten = inject_shutdown(&rewritten).map_err(|source| Error::ParseError {
+            path: main_file.clone(),
+            source,
+        })?;
         std::fs::write(&main_file, rewritten)?;
     }
 
