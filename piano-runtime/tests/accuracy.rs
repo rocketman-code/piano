@@ -1,6 +1,7 @@
 //! Accuracy validation: compute-bound workload with known ratios.
 //!
 //! Run with: cargo test -p piano-runtime --test accuracy -- --ignored --nocapture
+#![allow(clippy::incompatible_msrv)] // tests run on dev toolchain, not published MSRV
 
 /// CPU-bound workload: wrapping arithmetic over a buffer.
 fn burn_cpu(iterations: u64) {
