@@ -91,6 +91,23 @@ fn inject_runtime(staging_dir: &Path, source: RuntimeSource<'_>) -> Result<(), E
     Ok(())
 }
 
+/// Extract human-readable compiler errors from cargo's JSON output.
+fn extract_rendered_errors(json_output: &str) -> Vec<String> {
+    json_output
+        .lines()
+        .filter_map(|line| {
+            let msg: serde_json::Value = serde_json::from_str(line).ok()?;
+            if msg.get("reason")?.as_str()? != "compiler-message" {
+                return None;
+            }
+            msg.get("message")?
+                .get("rendered")?
+                .as_str()
+                .map(String::from)
+        })
+        .collect()
+}
+
 /// Build the instrumented binary using `cargo build --message-format=json`.
 /// Returns the path to the compiled executable.
 pub fn build_instrumented(staging_dir: &Path, target_dir: &Path) -> Result<PathBuf, Error> {
@@ -102,8 +119,13 @@ pub fn build_instrumented(staging_dir: &Path, target_dir: &Path) -> Result<PathB
         .output()?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::BuildFailed(stderr.into_owned()));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let rendered = extract_rendered_errors(&stdout);
+        if rendered.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::BuildFailed(stderr.into_owned()));
+        }
+        return Err(Error::BuildFailed(rendered.join("")));
     }
 
     // Parse JSON lines to find the last compiler-artifact with an executable.
@@ -186,6 +208,20 @@ serde = "1"
         assert_eq!(doc["dependencies"]["piano-runtime"].as_str(), Some("0.1.0"),);
         // serde is preserved
         assert_eq!(doc["dependencies"]["serde"].as_str(), Some("1"),);
+    }
+
+    #[test]
+    fn extract_compiler_errors_from_json() {
+        let json_lines = concat!(
+            r#"{"reason":"compiler-message","message":{"rendered":"error[E0308]: mismatched types\n --> src/main.rs:2:5\n"}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"rendered":"error: aborting due to previous error\n"}}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":false}"#,
+        );
+        let errors = extract_rendered_errors(json_lines);
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].contains("mismatched types"));
     }
 
     #[test]
