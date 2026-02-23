@@ -5,7 +5,8 @@ use std::process;
 use clap::{Parser, Subcommand};
 
 use piano::build::{
-    build_instrumented, inject_runtime_dependency, inject_runtime_path_dependency, prepare_staging,
+    build_instrumented, find_workspace_root, inject_runtime_dependency,
+    inject_runtime_path_dependency, prepare_staging,
 };
 use piano::error::Error;
 use piano::report::{
@@ -153,18 +154,49 @@ fn cmd_build(
         }
     }
 
+    // Detect workspace membership. If the project is a workspace member,
+    // stage from the workspace root so inherited fields and cross-member
+    // path dependencies resolve correctly.
+    let workspace_root = find_workspace_root(&project);
+    let (staging_root, member_subdir, package_name) = if let Some(ref ws_root) = workspace_root {
+        let relative = project
+            .strip_prefix(ws_root)
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .to_path_buf();
+        // Read package name from the member's Cargo.toml.
+        let member_toml = std::fs::read_to_string(project.join("Cargo.toml"))?;
+        let doc: toml_edit::DocumentMut = member_toml
+            .parse()
+            .map_err(|e| Error::BuildFailed(format!("failed to parse member Cargo.toml: {e}")))?;
+        let pkg_name = doc
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| Error::BuildFailed("member Cargo.toml missing package.name".into()))?
+            .to_string();
+        (ws_root.clone(), Some(relative), Some(pkg_name))
+    } else {
+        (project.clone(), None, None)
+    };
+
     // Prepare staging directory.
     let staging = tempfile::tempdir()?;
-    prepare_staging(&project, staging.path())?;
+    prepare_staging(&staging_root, staging.path())?;
+
+    // Determine the member directory within staging (workspace root for standalone).
+    let member_staging = match &member_subdir {
+        Some(sub) => staging.path().join(sub),
+        None => staging.path().to_path_buf(),
+    };
 
     // Inject piano-runtime dependency.
     match runtime_path {
         Some(ref path) => {
             let abs_path = std::fs::canonicalize(path)?;
-            inject_runtime_path_dependency(staging.path(), &abs_path)?;
+            inject_runtime_path_dependency(&member_staging, &abs_path)?;
         }
         None => {
-            inject_runtime_dependency(staging.path(), env!("PIANO_RUNTIME_VERSION"))?;
+            inject_runtime_dependency(&member_staging, env!("PIANO_RUNTIME_VERSION"))?;
         }
     }
 
@@ -172,7 +204,7 @@ fn cmd_build(
     for target in &targets {
         let target_set: HashSet<String> = target.functions.iter().cloned().collect();
         let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
-        let staged_file = staging.path().join("src").join(relative);
+        let staged_file = member_staging.join("src").join(relative);
         let source =
             std::fs::read_to_string(&staged_file).map_err(|source| Error::RunReadError {
                 path: staged_file.clone(),
@@ -189,7 +221,7 @@ fn cmd_build(
     }
 
     // Inject register calls into main.rs for all instrumented functions.
-    let main_file = staging.path().join("src").join("main.rs");
+    let main_file = member_staging.join("src").join("main.rs");
     if main_file.exists() {
         let all_fn_names: Vec<String> = targets
             .iter()
@@ -228,7 +260,7 @@ fn cmd_build(
 
     // Build the instrumented binary.
     let target_dir = project.join("target").join("piano");
-    let binary = build_instrumented(staging.path(), &target_dir)?;
+    let binary = build_instrumented(staging.path(), &target_dir, package_name.as_deref())?;
 
     eprintln!("built: {}", binary.display());
     println!("{}", binary.display());
