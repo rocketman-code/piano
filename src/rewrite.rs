@@ -115,6 +115,51 @@ impl VisitMut for RegistrationInjector {
     }
 }
 
+/// Inject a `#[global_allocator]` static using `PianoAllocator` wrapping System.
+///
+/// If `existing_allocator_type` is provided, the source already has a
+/// `#[global_allocator]` that should be wrapped rather than replaced.
+pub fn inject_global_allocator(
+    source: &str,
+    existing_allocator_type: Option<&str>,
+) -> Result<String, syn::Error> {
+    let mut file: syn::File = syn::parse_str(source)?;
+
+    match existing_allocator_type {
+        None => {
+            let item: syn::Item = syn::parse_quote! {
+                #[global_allocator]
+                static _PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>
+                    = piano_runtime::PianoAllocator::new(std::alloc::System);
+            };
+            file.items.insert(0, item);
+        }
+        Some(_) => {
+            for item in &mut file.items {
+                if let syn::Item::Static(static_item) = item {
+                    let has_global_alloc = static_item
+                        .attrs
+                        .iter()
+                        .any(|a| a.path().is_ident("global_allocator"));
+                    if has_global_alloc {
+                        let orig_ty = &static_item.ty;
+                        let orig_expr = &static_item.expr;
+                        static_item.ty = Box::new(syn::parse_quote! {
+                            piano_runtime::PianoAllocator<#orig_ty>
+                        });
+                        static_item.expr = Box::new(syn::parse_quote! {
+                            piano_runtime::PianoAllocator::new(#orig_expr)
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(prettyplease::unparse(&file))
+}
+
 /// Extract the type name from a `syn::Type` for qualified method names.
 fn type_ident(ty: &syn::Type) -> String {
     match ty {
@@ -237,6 +282,45 @@ fn main() {
         assert!(
             result.contains("piano_runtime::register(\"parse\")"),
             "Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn injects_global_allocator() {
+        let source = r#"
+fn main() {
+    println!("hello");
+}
+"#;
+        let result = inject_global_allocator(source, None).unwrap();
+        assert!(
+            result.contains("#[global_allocator]"),
+            "should inject global_allocator attribute. Got:\n{result}"
+        );
+        assert!(
+            result.contains("PianoAllocator"),
+            "should use PianoAllocator. Got:\n{result}"
+        );
+        assert!(
+            result.contains("std::alloc::System"),
+            "should wrap System allocator. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn wraps_existing_global_allocator() {
+        let source = r#"
+use std::alloc::System;
+
+#[global_allocator]
+static ALLOC: System = System;
+
+fn main() {}
+"#;
+        let result = inject_global_allocator(source, Some("System")).unwrap();
+        assert!(
+            result.contains("PianoAllocator"),
+            "should wrap existing allocator. Got:\n{result}"
         );
     }
 

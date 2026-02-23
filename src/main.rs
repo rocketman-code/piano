@@ -12,7 +12,7 @@ use piano::report::{
     diff_runs, format_table, load_latest_run, load_run, load_tagged_run, save_tag,
 };
 use piano::resolve::{TargetSpec, resolve_targets};
-use piano::rewrite::{inject_registrations, instrument_source};
+use piano::rewrite::{inject_global_allocator, inject_registrations, instrument_source};
 
 #[derive(Parser)]
 #[command(
@@ -199,6 +199,19 @@ fn cmd_build(
                 source,
             }
         })?;
+
+        // Inject global allocator for allocation tracking.
+        let existing = if rewritten.contains("#[global_allocator]") {
+            Some("existing")
+        } else {
+            None
+        };
+        let rewritten =
+            inject_global_allocator(&rewritten, existing).map_err(|source| Error::ParseError {
+                path: main_file.clone(),
+                source,
+            })?;
+
         std::fs::write(&main_file, rewritten)?;
     }
 
