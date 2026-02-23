@@ -39,13 +39,15 @@ pub struct FrameFnEntry {
     pub self_ns: u64,
     pub alloc_count: u32,
     pub alloc_bytes: u64,
+    pub free_count: u32,
+    pub free_bytes: u64,
 }
 
 /// v2 NDJSON header line.
 #[derive(serde::Deserialize)]
 struct NdjsonHeader {
-    #[allow(dead_code)]
-    format_version: u32,
+    #[serde(rename = "format_version")]
+    _format_version: u32,
     run_id: Option<String>,
     timestamp_ms: u128,
     functions: Vec<String>,
@@ -54,14 +56,13 @@ struct NdjsonHeader {
 /// v2 NDJSON frame line.
 #[derive(serde::Deserialize)]
 struct NdjsonFrame {
-    #[allow(dead_code)]
-    frame: usize,
+    #[serde(rename = "frame")]
+    _frame: usize,
     fns: Vec<NdjsonFnEntry>,
 }
 
 /// Per-function entry within an NDJSON frame line.
 #[derive(serde::Deserialize)]
-#[allow(dead_code)]
 struct NdjsonFnEntry {
     id: usize,
     calls: u64,
@@ -131,6 +132,8 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
                 self_ns: f.self_ns,
                 alloc_count: f.ac,
                 alloc_bytes: f.ab,
+                free_count: f.fc,
+                free_bytes: f.fb,
             })
             .collect();
         frames.push(entries);
