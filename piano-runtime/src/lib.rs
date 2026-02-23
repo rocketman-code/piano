@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 mod alloc;
 mod collector;
 
