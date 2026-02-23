@@ -28,7 +28,7 @@ Piano rewrites your source at the AST level to inject RAII timing guards and an 
 cargo install piano
 ```
 
-Requires Rust 2024 edition (1.85+).
+Requires Rust 1.88+.
 
 ## Usage
 

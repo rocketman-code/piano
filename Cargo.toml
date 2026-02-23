@@ -5,6 +5,7 @@ members = ["piano-runtime"]
 name = "piano"
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Automated instrumentation-based profiling for Rust"
 license = "MIT"
 repository = "https://github.com/rocketman-code/piano"
