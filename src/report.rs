@@ -8,6 +8,7 @@ use crate::error::Error;
 pub struct Run {
     #[serde(default)]
     pub run_id: Option<String>,
+    #[serde(alias = "timestamp")]
     pub timestamp_ms: u128,
     pub functions: Vec<FnEntry>,
 }
@@ -196,7 +197,7 @@ pub fn load_run_by_id(runs_dir: &Path, run_id: &str) -> Result<Run, Error> {
     let all_files = collect_run_files(runs_dir)?;
     let mut matching: Vec<Run> = Vec::new();
     for path in &all_files {
-        let run = load_run(path)?;
+        let Ok(run) = load_run(path) else { continue };
         if run.run_id.as_deref() == Some(run_id) {
             matching.push(run);
         }
@@ -222,7 +223,14 @@ pub fn load_latest_run(runs_dir: &Path) -> Result<Run, Error> {
 
     let mut runs: Vec<Run> = Vec::new();
     for path in &all_files {
-        runs.push(load_run(path)?);
+        match load_run(path) {
+            Ok(run) => runs.push(run),
+            Err(_) => continue,
+        }
+    }
+
+    if runs.is_empty() {
+        return Err(Error::NoRuns(runs_dir.to_path_buf()));
     }
 
     // Find the latest run_id by max timestamp.
@@ -519,5 +527,50 @@ mod tests {
             table_all.contains("uncalled"),
             "should show zero-call function with show_all"
         );
+    }
+
+    #[test]
+    fn load_run_accepts_legacy_timestamp_field() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{"timestamp":500,"functions":[
+            {"name":"old_fn","calls":1,"total_ms":5.0,"self_ms":5.0}
+        ]}"#;
+        let path = dir.path().join("500.json");
+        fs::write(&path, json).unwrap();
+        let run = load_run(&path).unwrap();
+        assert_eq!(run.timestamp_ms, 500);
+    }
+
+    #[test]
+    fn load_latest_run_skips_corrupt_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("100.json"), "not valid json").unwrap();
+        let valid = r#"{"run_id":"ok_200","timestamp_ms":200,"functions":[
+            {"name":"good","calls":1,"total_ms":1.0,"self_ms":1.0}
+        ]}"#;
+        fs::write(dir.path().join("200.json"), valid).unwrap();
+        let run = load_latest_run(dir.path()).unwrap();
+        assert_eq!(run.functions[0].name, "good");
+    }
+
+    #[test]
+    fn load_run_by_id_skips_corrupt_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("100.json"), "garbage").unwrap();
+        let valid = r#"{"run_id":"target_200","timestamp_ms":200,"functions":[
+            {"name":"found","calls":1,"total_ms":2.0,"self_ms":2.0}
+        ]}"#;
+        fs::write(dir.path().join("200.json"), valid).unwrap();
+        let run = load_run_by_id(dir.path(), "target_200").unwrap();
+        assert_eq!(run.functions[0].name, "found");
+    }
+
+    #[test]
+    fn load_latest_run_errors_when_all_files_corrupt() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("100.json"), "garbage").unwrap();
+        fs::write(dir.path().join("200.json"), "also garbage").unwrap();
+        let result = load_latest_run(dir.path());
+        assert!(result.is_err(), "expected Err when all files are corrupt");
     }
 }
