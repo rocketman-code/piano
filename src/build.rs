@@ -108,19 +108,51 @@ fn extract_rendered_errors(json_output: &str) -> Vec<String> {
         .collect()
 }
 
+/// Find the workspace root for a project directory.
+///
+/// Walks up from `project_dir` looking for the nearest parent `Cargo.toml`
+/// containing a `[workspace]` table. Does not validate that this project
+/// is an actual member of the workspace -- Cargo will catch mismatches at
+/// build time. Returns `None` if no workspace root is found.
+pub fn find_workspace_root(project_dir: &Path) -> Option<PathBuf> {
+    let project_dir = project_dir.canonicalize().ok()?;
+    let mut dir = project_dir.parent()?;
+    loop {
+        let cargo_toml = dir.join("Cargo.toml");
+        if cargo_toml.exists() {
+            let content = std::fs::read_to_string(&cargo_toml).ok()?;
+            let doc: DocumentMut = content.parse().ok()?;
+            if doc.get("workspace").is_some() {
+                return Some(dir.to_path_buf());
+            }
+        }
+        dir = dir.parent()?;
+    }
+}
+
 /// Build the instrumented binary using `cargo build --message-format=json`.
 /// Returns the path to the compiled executable.
-pub fn build_instrumented(staging_dir: &Path, target_dir: &Path) -> Result<PathBuf, Error> {
+///
+/// When `package` is `Some`, passes `-p <name>` to cargo to build a specific
+/// workspace member (used when staging an entire workspace).
+pub fn build_instrumented(
+    staging_dir: &Path,
+    target_dir: &Path,
+    package: Option<&str>,
+) -> Result<PathBuf, Error> {
     // Remove RUSTUP_TOOLCHAIN so the target project's rust-toolchain.toml
     // is respected. Without this, nested cargo invocations inherit the
     // parent's toolchain, ignoring the project's pinned version.
-    let output = Command::new("cargo")
-        .arg("build")
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build")
         .arg("--message-format=json")
         .env("CARGO_TARGET_DIR", target_dir)
         .env_remove("RUSTUP_TOOLCHAIN")
-        .current_dir(staging_dir)
-        .output()?;
+        .current_dir(staging_dir);
+    if let Some(pkg) = package {
+        cmd.arg("-p").arg(pkg);
+    }
+    let output = cmd.output()?;
 
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -243,5 +275,43 @@ version = "0.1.0"
         let doc: DocumentMut = result.parse().unwrap();
 
         assert_eq!(doc["dependencies"]["piano-runtime"].as_str(), Some("0.2.0"),);
+    }
+
+    #[test]
+    fn find_workspace_root_detects_parent_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+
+        // Create workspace root with [workspace] table.
+        create_file(&ws, "Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        // Create a member project.
+        create_file(
+            &ws,
+            "crates/member/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
+        );
+        create_file(&ws, "crates/member/src/main.rs", "fn main() {}");
+
+        let member_dir = ws.join("crates").join("member");
+        let result = find_workspace_root(&member_dir);
+        assert!(result.is_some(), "should find workspace root");
+        assert_eq!(result.unwrap(), ws.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn find_workspace_root_returns_none_for_standalone() {
+        let tmp = TempDir::new().unwrap();
+        create_file(
+            tmp.path(),
+            "Cargo.toml",
+            "[package]\nname = \"standalone\"\nversion = \"0.1.0\"\n",
+        );
+        create_file(tmp.path(), "src/main.rs", "fn main() {}");
+
+        let result = find_workspace_root(tmp.path());
+        assert!(
+            result.is_none(),
+            "standalone project should not find workspace root"
+        );
     }
 }
