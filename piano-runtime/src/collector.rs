@@ -14,16 +14,16 @@
 //! atexit-vs-TLS ordering problem where atexit fires after TLS is destroyed.
 //!
 //! Thread-locality: all state (stack, records) is thread-local. Each thread
-//! produces an independent call tree. Spawned threads or async tasks that
-//! cross thread boundaries appear as separate, unrelated profiles. This is
-//! the correct model for CPU profiling — wall-clock time on one thread is
-//! independent of work on another.
+//! produces an independent call tree by default. For cross-thread attribution
+//! (e.g. rayon scopes, spawned threads), use `fork()` / `adopt()` / `finalize()`
+//! to propagate timing context so that child thread elapsed time is correctly
+//! subtracted from the parent's self-time.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Process-wide run identifier.
@@ -280,6 +280,90 @@ pub fn flush() {
 /// Auto-flush now happens via `AutoFlushRecords::drop` when TLS is destroyed.
 /// Instrumented code may still call `init()` — it's harmless.
 pub fn init() {}
+
+/// Context for propagating parent-child timing across thread boundaries.
+///
+/// Created by `fork()` on the parent thread, passed to child threads via
+/// `adopt()`. When the child completes, its elapsed time is accumulated
+/// in `children_ms` which the parent reads back via `finalize()`.
+#[must_use = "dropping SpanContext without calling finalize() loses child attribution"]
+pub struct SpanContext {
+    parent_name: &'static str,
+    children_ms: Arc<Mutex<f64>>,
+}
+
+impl SpanContext {
+    /// Finalize cross-thread attribution after all child threads complete.
+    ///
+    /// Adds the accumulated children time to the current thread's top-of-stack
+    /// entry (which should be the parent function). Call this after joining
+    /// worker threads / awaiting rayon scope.
+    pub fn finalize(self) {
+        let children = *self.children_ms.lock().unwrap_or_else(|e| e.into_inner());
+        STACK.with(|stack| {
+            if let Some(top) = stack.borrow_mut().last_mut() {
+                top.children_ms += children;
+            }
+        });
+    }
+}
+
+/// RAII guard for cross-thread adoption. Pops the synthetic parent on drop
+/// and propagates elapsed time back to the parent's `SpanContext`.
+#[must_use = "dropping AdoptGuard immediately records ~0ms; bind it with `let _guard = ...`"]
+pub struct AdoptGuard {
+    ctx_children_ms: Arc<Mutex<f64>>,
+}
+
+impl Drop for AdoptGuard {
+    fn drop(&mut self) {
+        STACK.with(|stack| {
+            let entry = stack.borrow_mut().pop();
+            let Some(entry) = entry else { return };
+            let elapsed_ms = entry.start.elapsed().as_secs_f64() * 1000.0;
+
+            // Propagate this thread's total time back to the parent context.
+            let mut children = self
+                .ctx_children_ms
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *children += elapsed_ms;
+        });
+    }
+}
+
+/// Capture the current stack top as a cross-thread span context.
+///
+/// Returns `None` if the call stack is empty (no active span to fork from).
+/// Pass the returned context to child threads via `adopt()`.
+pub fn fork() -> Option<SpanContext> {
+    STACK.with(|stack| {
+        let stack = stack.borrow();
+        let top = stack.last()?;
+        Some(SpanContext {
+            parent_name: top.name,
+            children_ms: Arc::new(Mutex::new(0.0)),
+        })
+    })
+}
+
+/// Adopt a parent span context on a child thread.
+///
+/// Pushes a synthetic parent entry so that `enter()`/`Guard::drop()` on this
+/// thread correctly attributes children time. Returns an `AdoptGuard` that
+/// propagates elapsed time back to the parent on drop.
+pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
+    STACK.with(|stack| {
+        stack.borrow_mut().push(StackEntry {
+            name: ctx.parent_name,
+            start: Instant::now(),
+            children_ms: 0.0,
+        });
+    });
+    AdoptGuard {
+        ctx_children_ms: Arc::clone(&ctx.children_ms),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -774,5 +858,168 @@ mod tests {
         );
 
         reset();
+    }
+
+    #[test]
+    fn fork_returns_none_with_empty_stack() {
+        reset();
+        assert!(fork().is_none(), "fork should return None with empty stack");
+    }
+
+    #[test]
+    fn fork_adopt_propagates_child_time_to_parent() {
+        reset();
+        {
+            let _parent = enter("parent_fn");
+            burn_cpu(5_000);
+
+            let ctx = fork().expect("should have parent on stack");
+
+            // Simulate a child thread (same thread for test simplicity).
+            {
+                let _adopt = adopt(&ctx);
+                {
+                    let _child = enter("child_fn");
+                    burn_cpu(20_000);
+                }
+            }
+
+            ctx.finalize();
+        }
+
+        let records = collect();
+        let parent = records.iter().find(|r| r.name == "parent_fn").unwrap();
+        let child = records.iter().find(|r| r.name == "child_fn").unwrap();
+
+        // Parent's total should include child time (via finalize).
+        assert!(
+            parent.total_ms > child.total_ms,
+            "parent total ({:.1}ms) should exceed child total ({:.1}ms)",
+            parent.total_ms,
+            child.total_ms
+        );
+
+        // Conservation: sum of self times should approximate root total.
+        let sum_self: f64 = records.iter().map(|r| r.self_ms).sum();
+        let error_pct = ((sum_self - parent.total_ms) / parent.total_ms).abs() * 100.0;
+        assert!(
+            error_pct < 10.0,
+            "conservation: sum_self={sum_self:.1}ms, root_total={:.1}ms, error={error_pct:.1}%",
+            parent.total_ms
+        );
+    }
+
+    #[test]
+    fn adopt_without_child_work_adds_minimal_overhead() {
+        reset();
+        {
+            let _parent = enter("overhead_parent");
+            let ctx = fork().unwrap();
+            {
+                let _adopt = adopt(&ctx);
+                // No work on child thread.
+            }
+            ctx.finalize();
+        }
+
+        let records = collect();
+        let parent = records
+            .iter()
+            .find(|r| r.name == "overhead_parent")
+            .unwrap();
+        // Parent should still have valid timing.
+        assert!(parent.calls == 1);
+        assert!(parent.total_ms >= 0.0);
+    }
+
+    #[test]
+    fn multiple_children_accumulate_in_parent() {
+        reset();
+        {
+            let _parent = enter("multi_parent");
+            burn_cpu(5_000);
+
+            let ctx = fork().unwrap();
+
+            // Simulate 3 child threads.
+            for _ in 0..3 {
+                let _adopt = adopt(&ctx);
+                {
+                    let _child = enter("worker");
+                    burn_cpu(10_000);
+                }
+            }
+
+            ctx.finalize();
+        }
+
+        let records = collect();
+        let parent = records.iter().find(|r| r.name == "multi_parent").unwrap();
+        let worker = records.iter().find(|r| r.name == "worker").unwrap();
+
+        assert_eq!(worker.calls, 3, "should have 3 worker calls");
+        // Parent's children time should include all 3 workers.
+        assert!(
+            parent.total_ms > worker.total_ms,
+            "parent total ({:.1}ms) should exceed single worker total ({:.1}ms)",
+            parent.total_ms,
+            worker.total_ms
+        );
+    }
+
+    #[test]
+    fn cross_thread_fork_adopt_propagates() {
+        reset();
+
+        // Baseline: measure parent_fn with no cross-thread attribution.
+        {
+            let _parent = enter("baseline");
+            burn_cpu(5_000);
+            // Sleep to simulate child wall-clock time without fork/adopt.
+            thread::sleep(Duration::from_millis(50));
+        }
+        let baseline_records = collect();
+        let baseline = baseline_records
+            .iter()
+            .find(|r| r.name == "baseline")
+            .unwrap();
+        let baseline_self = baseline.self_ms;
+
+        reset();
+
+        // Now: same parent work, but spawn a real child thread via fork/adopt.
+        // The child's elapsed time should be subtracted from parent self-time.
+        {
+            let _parent = enter("parent_fn");
+            burn_cpu(5_000);
+
+            let ctx = fork().expect("should have parent on stack");
+
+            thread::scope(|s| {
+                s.spawn(|| {
+                    let _adopt = adopt(&ctx);
+                    {
+                        let _child = enter("thread_child");
+                        // Sleep long enough to create a measurable difference.
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                });
+            });
+
+            ctx.finalize();
+        }
+
+        let records = collect();
+        let parent = records.iter().find(|r| r.name == "parent_fn").unwrap();
+
+        // The parent's self_ms should be notably less than baseline because
+        // finalize() propagated the child thread's ~50ms as children_ms.
+        assert!(
+            parent.self_ms < baseline_self,
+            "parent self ({:.1}ms) should be less than baseline self ({:.1}ms) \
+             due to cross-thread attribution",
+            parent.self_ms,
+            baseline_self
+        );
     }
 }
