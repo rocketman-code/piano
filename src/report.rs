@@ -353,15 +353,20 @@ pub fn format_frames_table(frame_data: &FrameData) -> String {
     let median = percentile(&sorted_totals, 50.0);
     let spike_threshold = median.saturating_mul(2);
 
+    // Compute per-function column width: at least 12, or the longest name.
+    let fn_col_width = fn_names.iter().map(|n| n.len()).max().unwrap_or(12).max(12);
+
     // Header.
     let mut out = String::new();
     out.push_str(&format!("{:>6} {:>10}", "Frame", "Total"));
     for name in fn_names {
-        let truncated: String = name.chars().take(12).collect();
-        out.push_str(&format!(" {truncated:>12}"));
+        out.push_str(&format!(" {name:>fn_col_width$}"));
     }
     out.push_str(&format!(" {:>8} {:>10} {}\n", "Allocs", "Bytes", ""));
-    out.push_str(&format!("{}\n", "-".repeat(32 + n_fns * 13)));
+    out.push_str(&format!(
+        "{}\n",
+        "-".repeat(32 + n_fns * (fn_col_width + 1))
+    ));
 
     // Rows.
     for (i, frame) in frame_data.frames.iter().enumerate() {
@@ -374,7 +379,7 @@ pub fn format_frames_table(frame_data: &FrameData) -> String {
         for fn_id in 0..n_fns {
             let entry = frame.iter().find(|e| e.fn_id == fn_id);
             let ns = entry.map_or(0, |e| e.self_ns);
-            out.push_str(&format!(" {:>12}", format_ns(ns)));
+            out.push_str(&format!(" {:>width$}", format_ns(ns), width = fn_col_width));
         }
 
         let allocs: u64 = frame.iter().map(|e| e.alloc_count as u64).sum();
@@ -1251,6 +1256,28 @@ mod tests {
         assert!(
             table_all.contains("unused"),
             "should show zero-call function with show_all. Got:\n{table_all}"
+        );
+    }
+
+    #[test]
+    fn format_table_with_frames_does_not_truncate_long_names() {
+        let long_name = "print_session_status";
+        let frame_data = FrameData {
+            fn_names: vec![long_name.into()],
+            frames: vec![vec![FrameFnEntry {
+                fn_id: 0,
+                calls: 1,
+                self_ns: 1_000_000,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            }]],
+        };
+        let table = format_table_with_frames(&frame_data, false);
+        assert!(
+            table.contains(long_name),
+            "should show full function name '{long_name}', not truncated. Got:\n{table}"
         );
     }
 }
