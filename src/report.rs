@@ -394,6 +394,8 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 /// Show the delta between two runs, comparing functions by name.
+///
+/// Includes timing deltas and allocation deltas when alloc data is present.
 pub fn diff_runs(a: &Run, b: &Run) -> String {
     let a_map: HashMap<&str, &FnEntry> = a.functions.iter().map(|f| (f.name.as_str(), f)).collect();
     let b_map: HashMap<&str, &FnEntry> = b.functions.iter().map(|f| (f.name.as_str(), f)).collect();
@@ -403,21 +405,44 @@ pub fn diff_runs(a: &Run, b: &Run) -> String {
     names.sort_unstable();
     names.dedup();
 
+    // Check if either run has alloc data.
+    let has_allocs = a.functions.iter().any(|f| f.alloc_count > 0)
+        || b.functions.iter().any(|f| f.alloc_count > 0);
+
     let mut out = String::new();
-    out.push_str(&format!(
-        "{:<40} {:>10} {:>10} {:>10}\n",
-        "Function", "Before", "After", "Delta"
-    ));
-    out.push_str(&format!("{}\n", "-".repeat(74)));
+    if has_allocs {
+        out.push_str(&format!(
+            "{:<40} {:>10} {:>10} {:>10} {:>10} {:>10}\n",
+            "Function", "Before", "After", "Delta", "Allocs", "A.Delta"
+        ));
+        out.push_str(&format!("{}\n", "-".repeat(94)));
+    } else {
+        out.push_str(&format!(
+            "{:<40} {:>10} {:>10} {:>10}\n",
+            "Function", "Before", "After", "Delta"
+        ));
+        out.push_str(&format!("{}\n", "-".repeat(74)));
+    }
 
     for name in &names {
         let before = a_map.get(name).map_or(0.0, |e| e.self_ms);
         let after = b_map.get(name).map_or(0.0, |e| e.self_ms);
         let delta = after - before;
-        out.push_str(&format!(
-            "{:<40} {:>9.2}ms {:>9.2}ms {:>+9.2}ms\n",
-            name, before, after, delta
-        ));
+
+        if has_allocs {
+            let allocs_before = a_map.get(name).map_or(0i64, |e| e.alloc_count as i64);
+            let allocs_after = b_map.get(name).map_or(0i64, |e| e.alloc_count as i64);
+            let allocs_delta = allocs_after - allocs_before;
+            out.push_str(&format!(
+                "{:<40} {:>9.2}ms {:>9.2}ms {:>+9.2}ms {:>10} {:>+10}\n",
+                name, before, after, delta, allocs_after, allocs_delta
+            ));
+        } else {
+            out.push_str(&format!(
+                "{:<40} {:>9.2}ms {:>9.2}ms {:>+9.2}ms\n",
+                name, before, after, delta
+            ));
+        }
     }
     out
 }
@@ -965,6 +990,37 @@ mod tests {
         assert!(table.contains("update"), "should list update");
         assert!(table.contains("physics"), "should list physics");
         assert!(table.contains("frames"), "should have frame count in footer");
+    }
+
+    #[test]
+    fn diff_shows_alloc_deltas() {
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            functions: vec![FnEntry {
+                name: "walk".into(),
+                calls: 3,
+                total_ms: 12.0,
+                self_ms: 10.0,
+                alloc_count: 100,
+                alloc_bytes: 8192,
+            }],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            functions: vec![FnEntry {
+                name: "walk".into(),
+                calls: 3,
+                total_ms: 9.0,
+                self_ms: 8.0,
+                alloc_count: 50,
+                alloc_bytes: 4096,
+            }],
+        };
+        let diff = diff_runs(&a, &b);
+        assert!(diff.contains("Allocs"), "should have Allocs column header");
+        assert!(diff.contains("-50"), "should show alloc count delta: {diff}");
     }
 
     #[test]
