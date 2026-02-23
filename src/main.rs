@@ -17,7 +17,8 @@ use piano::rewrite::{inject_registrations, instrument_source};
 #[derive(Parser)]
 #[command(
     name = "piano",
-    about = "Automated instrumentation-based profiling for Rust"
+    about = "Automated instrumentation-based profiling for Rust",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -156,7 +157,7 @@ fn cmd_build(
             inject_runtime_path_dependency(staging.path(), &abs_path)?;
         }
         None => {
-            inject_runtime_dependency(staging.path(), env!("CARGO_PKG_VERSION"))?;
+            inject_runtime_dependency(staging.path(), env!("PIANO_RUNTIME_VERSION"))?;
         }
     }
 

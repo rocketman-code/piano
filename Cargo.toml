@@ -30,3 +30,6 @@ path = "src/main.rs"
 [lib]
 name = "piano"
 path = "src/lib.rs"
+
+[build-dependencies]
+toml_edit = "0.22"
