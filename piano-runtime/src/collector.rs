@@ -45,6 +45,18 @@ pub struct FunctionRecord {
     pub self_ms: f64,
 }
 
+/// Per-function summary within a single frame.
+#[derive(Debug, Clone)]
+pub struct FrameFnSummary {
+    pub name: &'static str,
+    pub calls: u32,
+    pub self_ns: u64,
+    pub alloc_count: u32,
+    pub alloc_bytes: u64,
+    pub free_count: u32,
+    pub free_bytes: u64,
+}
+
 /// Per-invocation measurement record with nanosecond precision.
 #[derive(Debug, Clone)]
 pub struct InvocationRecord {
@@ -121,6 +133,10 @@ thread_local! {
     static RECORDS: RefCell<AutoFlushRecords> = const { RefCell::new(AutoFlushRecords::new()) };
     static REGISTERED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     static INVOCATIONS: RefCell<Vec<InvocationRecord>> = const { RefCell::new(Vec::new()) };
+    /// Invocations accumulated within the current frame (cleared on frame boundary).
+    static FRAME_BUFFER: RefCell<Vec<InvocationRecord>> = const { RefCell::new(Vec::new()) };
+    /// Completed frame summaries.
+    static FRAMES: RefCell<Vec<Vec<FrameFnSummary>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// RAII timing guard. Records elapsed time on drop.
@@ -160,19 +176,35 @@ impl Drop for Guard {
                 });
             });
 
+            let invocation = InvocationRecord {
+                name: entry.name,
+                start_ns,
+                elapsed_ns,
+                self_ns,
+                alloc_count: entry.alloc_count,
+                alloc_bytes: entry.alloc_bytes,
+                free_count: entry.free_count,
+                free_bytes: entry.free_bytes,
+                depth: entry.depth,
+            };
+
             INVOCATIONS.with(|inv| {
-                inv.borrow_mut().push(InvocationRecord {
-                    name: entry.name,
-                    start_ns,
-                    elapsed_ns,
-                    self_ns,
-                    alloc_count: entry.alloc_count,
-                    alloc_bytes: entry.alloc_bytes,
-                    free_count: entry.free_count,
-                    free_bytes: entry.free_bytes,
-                    depth: entry.depth,
-                });
+                inv.borrow_mut().push(invocation.clone());
             });
+
+            // Frame boundary detection: push to buffer, aggregate on depth-0 return.
+            FRAME_BUFFER.with(|buf| {
+                buf.borrow_mut().push(invocation);
+            });
+            if entry.depth == 0 {
+                FRAME_BUFFER.with(|buf| {
+                    let records = buf.borrow_mut().drain(..).collect::<Vec<_>>();
+                    let summary = aggregate_frame(&records);
+                    FRAMES.with(|frames| {
+                        frames.borrow_mut().push(summary);
+                    });
+                });
+            }
         });
     }
 }
@@ -252,12 +284,42 @@ pub fn collect_invocations() -> Vec<InvocationRecord> {
     INVOCATIONS.with(|inv| inv.borrow().clone())
 }
 
+/// Return completed per-frame summaries.
+pub fn collect_frames() -> Vec<Vec<FrameFnSummary>> {
+    FRAMES.with(|f| f.borrow().clone())
+}
+
+/// Aggregate invocation records within a single frame into per-function summaries.
+fn aggregate_frame(records: &[InvocationRecord]) -> Vec<FrameFnSummary> {
+    let mut map: HashMap<&'static str, FrameFnSummary> = HashMap::new();
+    for rec in records {
+        let entry = map.entry(rec.name).or_insert(FrameFnSummary {
+            name: rec.name,
+            calls: 0,
+            self_ns: 0,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
+        });
+        entry.calls += 1;
+        entry.self_ns += rec.self_ns;
+        entry.alloc_count += rec.alloc_count;
+        entry.alloc_bytes += rec.alloc_bytes;
+        entry.free_count += rec.free_count;
+        entry.free_bytes += rec.free_bytes;
+    }
+    map.into_values().collect()
+}
+
 /// Clear all collected timing data.
 pub fn reset() {
     STACK.with(|stack| stack.borrow_mut().clear());
     RECORDS.with(|records| records.borrow_mut().records.clear());
     REGISTERED.with(|reg| reg.borrow_mut().clear());
     INVOCATIONS.with(|inv| inv.borrow_mut().clear());
+    FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
+    FRAMES.with(|frames| frames.borrow_mut().clear());
 }
 
 /// Return the current time as milliseconds since the Unix epoch.
@@ -1106,5 +1168,49 @@ mod tests {
             parent.self_ms,
             baseline_self
         );
+    }
+
+    #[test]
+    fn frame_boundary_aggregation() {
+        reset();
+        // Simulate 3 frames: depth-0 function called 3 times
+        for _frame in 0..3u32 {
+            let _outer = enter("update");
+            burn_cpu(5_000);
+            {
+                let _inner = enter("physics");
+                burn_cpu(5_000);
+            }
+        }
+        let frames = collect_frames();
+        assert_eq!(frames.len(), 3, "should have 3 frames");
+        for frame in &frames {
+            let update = frame.iter().find(|s| s.name == "update").unwrap();
+            assert_eq!(update.calls, 1);
+            assert!(update.self_ns > 0);
+            let physics = frame.iter().find(|s| s.name == "physics").unwrap();
+            assert_eq!(physics.calls, 1);
+        }
+    }
+
+    #[test]
+    fn non_frame_workload_still_collects() {
+        reset();
+        // All calls at depth 0 but no "frame" structure
+        {
+            let _a = enter("parse");
+            burn_cpu(5_000);
+        }
+        {
+            let _b = enter("resolve");
+            burn_cpu(5_000);
+        }
+        // Each depth-0 return is a frame boundary, so we get 2 single-function frames
+        let frames = collect_frames();
+        assert_eq!(frames.len(), 2, "each depth-0 return creates a frame");
+
+        // Aggregate collect() should still work
+        let records = collect();
+        assert_eq!(records.len(), 2);
     }
 }
