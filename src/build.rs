@@ -111,10 +111,14 @@ fn extract_rendered_errors(json_output: &str) -> Vec<String> {
 /// Build the instrumented binary using `cargo build --message-format=json`.
 /// Returns the path to the compiled executable.
 pub fn build_instrumented(staging_dir: &Path, target_dir: &Path) -> Result<PathBuf, Error> {
+    // Remove RUSTUP_TOOLCHAIN so the target project's rust-toolchain.toml
+    // is respected. Without this, nested cargo invocations inherit the
+    // parent's toolchain, ignoring the project's pinned version.
     let output = Command::new("cargo")
         .arg("build")
         .arg("--message-format=json")
         .env("CARGO_TARGET_DIR", target_dir)
+        .env_remove("RUSTUP_TOOLCHAIN")
         .current_dir(staging_dir)
         .output()?;
 
