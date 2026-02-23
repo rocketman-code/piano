@@ -14,16 +14,75 @@ pub struct Run {
 }
 
 /// Timing data for one function within a profiling run.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct FnEntry {
     pub name: String,
     pub calls: u64,
     pub total_ms: f64,
     pub self_ms: f64,
+    #[serde(default)]
+    pub alloc_count: u64,
+    #[serde(default)]
+    pub alloc_bytes: u64,
 }
 
-/// Read a profiling run from a JSON file on disk.
+/// Per-frame data loaded from a v2 NDJSON file.
+pub struct FrameData {
+    pub fn_names: Vec<String>,
+    pub frames: Vec<Vec<FrameFnEntry>>,
+}
+
+/// Per-function entry within a single frame.
+pub struct FrameFnEntry {
+    pub fn_id: usize,
+    pub calls: u64,
+    pub self_ns: u64,
+    pub alloc_count: u32,
+    pub alloc_bytes: u64,
+}
+
+/// v2 NDJSON header line.
+#[derive(serde::Deserialize)]
+struct NdjsonHeader {
+    #[allow(dead_code)]
+    format_version: u32,
+    run_id: Option<String>,
+    timestamp_ms: u128,
+    functions: Vec<String>,
+}
+
+/// v2 NDJSON frame line.
+#[derive(serde::Deserialize)]
+struct NdjsonFrame {
+    #[allow(dead_code)]
+    frame: usize,
+    fns: Vec<NdjsonFnEntry>,
+}
+
+/// Per-function entry within an NDJSON frame line.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct NdjsonFnEntry {
+    id: usize,
+    calls: u64,
+    self_ns: u64,
+    #[serde(default)]
+    ac: u32,
+    #[serde(default)]
+    ab: u64,
+    #[serde(default)]
+    fc: u32,
+    #[serde(default)]
+    fb: u64,
+}
+
+/// Read a profiling run from a JSON or NDJSON file on disk.
 pub fn load_run(path: &Path) -> Result<Run, Error> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext == "ndjson" {
+        let (run, _frame_data) = load_ndjson(path)?;
+        return Ok(run);
+    }
     let contents = std::fs::read_to_string(path).map_err(|source| Error::RunReadError {
         path: path.to_path_buf(),
         source,
@@ -32,6 +91,95 @@ pub fn load_run(path: &Path) -> Result<Run, Error> {
         path: path.to_path_buf(),
         reason: e.to_string(),
     })
+}
+
+/// Load a v2 NDJSON file, returning both the aggregated Run and frame-level data.
+pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
+    let contents = std::fs::read_to_string(path).map_err(|source| Error::RunReadError {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut lines = contents.lines();
+
+    let header_line = lines.next().ok_or_else(|| Error::InvalidRunData {
+        path: path.to_path_buf(),
+        reason: "empty NDJSON file".into(),
+    })?;
+    let header: NdjsonHeader =
+        serde_json::from_str(header_line).map_err(|e| Error::InvalidRunData {
+            path: path.to_path_buf(),
+            reason: format!("invalid NDJSON header: {e}"),
+        })?;
+
+    let mut frames: Vec<Vec<FrameFnEntry>> = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let frame: NdjsonFrame =
+            serde_json::from_str(line).map_err(|e| Error::InvalidRunData {
+                path: path.to_path_buf(),
+                reason: format!("invalid NDJSON frame: {e}"),
+            })?;
+        let entries: Vec<FrameFnEntry> = frame
+            .fns
+            .into_iter()
+            .map(|f| FrameFnEntry {
+                fn_id: f.id,
+                calls: f.calls,
+                self_ns: f.self_ns,
+                alloc_count: f.ac,
+                alloc_bytes: f.ab,
+            })
+            .collect();
+        frames.push(entries);
+    }
+
+    // Aggregate into Run for backward compatibility.
+    let mut fn_agg: HashMap<usize, (u64, u64, u64, u64)> = HashMap::new();
+    for frame in &frames {
+        for entry in frame {
+            let agg = fn_agg.entry(entry.fn_id).or_insert((0, 0, 0, 0));
+            agg.0 += entry.calls;
+            agg.1 += entry.self_ns;
+            agg.2 += entry.alloc_count as u64;
+            agg.3 += entry.alloc_bytes;
+        }
+    }
+
+    let functions: Vec<FnEntry> = fn_agg
+        .into_iter()
+        .map(|(fn_id, (calls, self_ns, alloc_count, alloc_bytes))| {
+            let name = header
+                .functions
+                .get(fn_id)
+                .cloned()
+                .unwrap_or_else(|| format!("<unknown_{fn_id}>"));
+            let self_ms = self_ns as f64 / 1_000_000.0;
+            FnEntry {
+                name,
+                calls,
+                total_ms: self_ms, // no total_ms in v2; approximate with self_ms
+                self_ms,
+                alloc_count,
+                alloc_bytes,
+            }
+        })
+        .collect();
+
+    let run = Run {
+        run_id: header.run_id,
+        timestamp_ms: header.timestamp_ms,
+        functions,
+    };
+
+    let frame_data = FrameData {
+        fn_names: header.functions,
+        frames,
+    };
+
+    Ok((run, frame_data))
 }
 
 /// Format a run as a text table sorted by self_ms descending.
@@ -93,7 +241,7 @@ pub fn diff_runs(a: &Run, b: &Run) -> String {
     out
 }
 
-/// Collect all JSON run files in the given directory, sorted by filename.
+/// Collect all run files (.json and .ndjson) in the given directory, sorted by filename.
 fn collect_run_files(runs_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let entries = std::fs::read_dir(runs_dir).map_err(|source| Error::RunReadError {
         path: runs_dir.to_path_buf(),
@@ -103,7 +251,8 @@ fn collect_run_files(runs_dir: &Path) -> Result<Vec<PathBuf>, Error> {
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            let ext = path.extension().and_then(|e| e.to_str())?;
+            if ext != "json" && ext != "ndjson" {
                 return None;
             }
             let _ts: u128 = path.file_stem()?.to_str()?.parse().ok()?;
@@ -131,10 +280,14 @@ fn merge_runs(runs: &[&Run]) -> Run {
                 calls: 0,
                 total_ms: 0.0,
                 self_ms: 0.0,
+                alloc_count: 0,
+                alloc_bytes: 0,
             });
             entry.calls += f.calls;
             entry.total_ms += f.total_ms;
             entry.self_ms += f.self_ms;
+            entry.alloc_count += f.alloc_count;
+            entry.alloc_bytes += f.alloc_bytes;
         }
     }
 
@@ -297,12 +450,14 @@ mod tests {
                     calls: 1,
                     total_ms: 2.0,
                     self_ms: 1.0,
+                    ..Default::default()
                 },
                 FnEntry {
                     name: "slow".into(),
                     calls: 1,
                     total_ms: 20.0,
                     self_ms: 15.0,
+                    ..Default::default()
                 },
             ],
         };
@@ -325,6 +480,7 @@ mod tests {
                 calls: 3,
                 total_ms: 12.0,
                 self_ms: 10.0,
+                ..Default::default()
             }],
         };
         let b = Run {
@@ -335,6 +491,7 @@ mod tests {
                 calls: 3,
                 total_ms: 9.0,
                 self_ms: 8.0,
+                ..Default::default()
             }],
         };
         let diff = diff_runs(&a, &b);
@@ -506,12 +663,11 @@ mod tests {
                     calls: 5,
                     total_ms: 10.0,
                     self_ms: 8.0,
+                    ..Default::default()
                 },
                 FnEntry {
                     name: "uncalled".into(),
-                    calls: 0,
-                    total_ms: 0.0,
-                    self_ms: 0.0,
+                    ..Default::default()
                 },
             ],
         };
@@ -563,6 +719,28 @@ mod tests {
         fs::write(dir.path().join("200.json"), valid).unwrap();
         let run = load_run_by_id(dir.path(), "target_200").unwrap();
         assert_eq!(run.functions[0].name, "found");
+    }
+
+    #[test]
+    fn load_v2_ndjson_run() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"format_version":2,"run_id":"test_1","timestamp_ms":1000,"functions":["update","physics"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":2000000,"ac":10,"ab":4096,"fc":8,"fb":3072},{"id":1,"calls":1,"self_ns":1000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+{"frame":1,"fns":[{"id":0,"calls":1,"self_ns":2100000,"ac":12,"ab":5000,"fc":10,"fb":4000},{"id":1,"calls":1,"self_ns":950000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        fs::write(dir.path().join("1000.ndjson"), content).unwrap();
+
+        let run = load_latest_run(dir.path()).unwrap();
+        assert_eq!(run.functions.len(), 2);
+
+        let update = run.functions.iter().find(|f| f.name == "update").unwrap();
+        assert_eq!(update.calls, 2);
+        // total self_ms should be (2000000 + 2100000) / 1_000_000 = 4.1ms
+        assert!(
+            (update.self_ms - 4.1).abs() < 0.01,
+            "expected ~4.1ms, got {}",
+            update.self_ms
+        );
     }
 
     #[test]
