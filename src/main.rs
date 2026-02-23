@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -8,9 +8,11 @@ use piano::build::{
     build_instrumented, inject_runtime_dependency, inject_runtime_path_dependency, prepare_staging,
 };
 use piano::error::Error;
-use piano::report::{diff_runs, format_table, latest_run, load_run};
+use piano::report::{
+    diff_runs, format_table, load_latest_run, load_run, load_tagged_run, save_tag,
+};
 use piano::resolve::{TargetSpec, resolve_targets};
-use piano::rewrite::instrument_source;
+use piano::rewrite::{inject_registrations, instrument_source};
 
 #[derive(Parser)]
 #[command(
@@ -58,6 +60,11 @@ enum Commands {
         /// Second run file.
         b: PathBuf,
     },
+    /// Tag the latest run for easy reference.
+    Tag {
+        /// Tag name.
+        name: String,
+    },
 }
 
 fn main() {
@@ -85,6 +92,7 @@ fn run(cli: Cli) -> Result<(), Error> {
         ),
         Commands::Report { run } => cmd_report(run),
         Commands::Diff { a, b } => cmd_diff(a, b),
+        Commands::Tag { name } => cmd_tag(name),
     }
 }
 
@@ -161,6 +169,27 @@ fn cmd_build(
         std::fs::write(&staged_file, rewritten)?;
     }
 
+    // Inject register calls into main.rs for all instrumented functions.
+    let main_file = staging.path().join("src").join("main.rs");
+    if main_file.exists() {
+        let all_fn_names: Vec<String> = targets
+            .iter()
+            .flat_map(|t| t.functions.iter().cloned())
+            .collect();
+        let main_source =
+            std::fs::read_to_string(&main_file).map_err(|source| Error::RunReadError {
+                path: main_file.clone(),
+                source,
+            })?;
+        let rewritten = inject_registrations(&main_source, &all_fn_names).map_err(|source| {
+            Error::ParseError {
+                path: main_file.clone(),
+                source,
+            }
+        })?;
+        std::fs::write(&main_file, rewritten)?;
+    }
+
     // Build the instrumented binary.
     let target_dir = project.join("target").join("piano");
     let binary = build_instrumented(staging.path(), &target_dir)?;
@@ -172,30 +201,64 @@ fn cmd_build(
 }
 
 fn cmd_report(run_path: Option<PathBuf>) -> Result<(), Error> {
-    let path = match run_path {
-        Some(p) => p,
+    let run = match run_path {
+        Some(p) if p.exists() => load_run(&p)?,
+        Some(p) => {
+            let tag = p.to_string_lossy();
+            let tags_dir = default_tags_dir()?;
+            let runs_dir = default_runs_dir()?;
+            load_tagged_run(&tags_dir, &runs_dir, &tag)?
+        }
         None => {
             let dir = default_runs_dir()?;
-            latest_run(&dir)?
+            load_latest_run(&dir)?
         }
     };
-    let run = load_run(&path)?;
     print!("{}", format_table(&run));
     Ok(())
 }
 
 fn cmd_diff(a: PathBuf, b: PathBuf) -> Result<(), Error> {
-    let run_a = load_run(&a)?;
-    let run_b = load_run(&b)?;
+    let run_a = resolve_run_arg(&a)?;
+    let run_b = resolve_run_arg(&b)?;
     print!("{}", diff_runs(&run_a, &run_b));
     Ok(())
+}
+
+fn cmd_tag(name: String) -> Result<(), Error> {
+    let runs_dir = default_runs_dir()?;
+    let tags_dir = default_tags_dir()?;
+    let latest = load_latest_run(&runs_dir)?;
+    let run_id = latest
+        .run_id
+        .ok_or_else(|| Error::NoRuns(runs_dir.clone()))?;
+    save_tag(&tags_dir, &name, &run_id)?;
+    eprintln!("tagged '{}' -> {}", name, run_id);
+    Ok(())
+}
+
+fn resolve_run_arg(arg: &Path) -> Result<piano::report::Run, Error> {
+    if arg.exists() {
+        return load_run(arg);
+    }
+    let tag = arg.to_string_lossy();
+    let tags_dir = default_tags_dir()?;
+    let runs_dir = default_runs_dir()?;
+    load_tagged_run(&tags_dir, &runs_dir, &tag)
 }
 
 fn default_runs_dir() -> Result<PathBuf, Error> {
     if let Ok(dir) = std::env::var("PIANO_RUNS_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    let home =
-        std::env::var_os("HOME").ok_or_else(|| Error::NoRuns(PathBuf::from("~/.piano/runs")))?;
+    let home = std::env::var_os("HOME").ok_or(Error::HomeNotFound)?;
     Ok(PathBuf::from(home).join(".piano").join("runs"))
+}
+
+fn default_tags_dir() -> Result<PathBuf, Error> {
+    if let Ok(dir) = std::env::var("PIANO_TAGS_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("HOME").ok_or(Error::HomeNotFound)?;
+    Ok(PathBuf::from(home).join(".piano").join("tags"))
 }

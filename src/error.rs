@@ -18,6 +18,9 @@ pub enum Error {
     #[error("no runs found in {}", .0.display())]
     NoRuns(PathBuf),
 
+    #[error("HOME environment variable not set")]
+    HomeNotFound,
+
     #[error("failed to read run file {}: {source}", path.display())]
     RunReadError {
         path: PathBuf,
@@ -27,6 +30,9 @@ pub enum Error {
 
     #[error("invalid run data in {}: {reason}", path.display())]
     InvalidRunData { path: PathBuf, reason: String },
+
+    #[error("invalid tag name: {0}")]
+    InvalidTagName(String),
 
     #[error("{0}")]
     Io(#[from] std::io::Error),
