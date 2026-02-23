@@ -130,6 +130,39 @@ pub fn find_workspace_root(project_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Find the binary entry point for a Cargo project.
+///
+/// Reads `Cargo.toml` and looks for `[[bin]]` entries with a `path` field.
+/// Falls back to `src/main.rs` if no explicit path is specified.
+/// Returns an error if no entry point can be found.
+pub fn find_bin_entry_point(project_dir: &Path) -> Result<PathBuf, Error> {
+    let cargo_toml_path = project_dir.join("Cargo.toml");
+    let content = std::fs::read_to_string(&cargo_toml_path)?;
+    let doc: DocumentMut = content
+        .parse::<DocumentMut>()
+        .map_err(|e| Error::BuildFailed(format!("failed to parse Cargo.toml: {e}")))?;
+
+    // Check [[bin]] entries for an explicit path.
+    if let Some(bins) = doc.get("bin").and_then(|b| b.as_array_of_tables()) {
+        for bin in bins {
+            if let Some(path) = bin.get("path").and_then(|p| p.as_str()) {
+                return Ok(PathBuf::from(path));
+            }
+        }
+    }
+
+    // Cargo default: src/main.rs
+    let default = PathBuf::from("src").join("main.rs");
+    if project_dir.join(&default).exists() {
+        return Ok(default);
+    }
+
+    Err(Error::BuildFailed(format!(
+        "could not find binary entry point: no [[bin]] path in Cargo.toml and {} does not exist",
+        project_dir.join(&default).display()
+    )))
+}
+
 /// Build the instrumented binary using `cargo build --message-format=json`.
 /// Returns the path to the compiled executable.
 ///

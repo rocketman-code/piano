@@ -5,7 +5,7 @@ use std::process;
 use clap::{Parser, Subcommand};
 
 use piano::build::{
-    build_instrumented, find_workspace_root, inject_runtime_dependency,
+    build_instrumented, find_bin_entry_point, find_workspace_root, inject_runtime_dependency,
     inject_runtime_path_dependency, prepare_staging,
 };
 use piano::error::Error;
@@ -221,9 +221,10 @@ fn cmd_build(
         std::fs::write(&staged_file, rewritten)?;
     }
 
-    // Inject register calls into main.rs for all instrumented functions.
-    let main_file = member_staging.join("src").join("main.rs");
-    if main_file.exists() {
+    // Inject register calls into the binary entry point for all instrumented functions.
+    let bin_entry = find_bin_entry_point(&member_staging)?;
+    let main_file = member_staging.join(&bin_entry);
+    {
         let all_fn_names: Vec<String> = targets
             .iter()
             .flat_map(|t| t.functions.iter().cloned())
