@@ -299,6 +299,73 @@ pub fn format_table_with_frames(frame_data: &FrameData) -> String {
     out
 }
 
+/// Format per-frame breakdown table.
+///
+/// Each row is one frame. Columns: Frame | Total | [one column per function] | Allocs | Bytes
+/// Frames where total exceeds 2x median are flagged as spikes.
+pub fn format_frames_table(frame_data: &FrameData) -> String {
+    let fn_names = &frame_data.fn_names;
+    let n_fns = fn_names.len();
+
+    // Compute per-frame totals for spike detection.
+    let frame_totals: Vec<u64> = frame_data
+        .frames
+        .iter()
+        .map(|f| f.iter().map(|e| e.self_ns).sum())
+        .collect();
+
+    let mut sorted_totals = frame_totals.clone();
+    sorted_totals.sort_unstable();
+    let median = percentile(&sorted_totals, 50.0);
+    let spike_threshold = median.saturating_mul(2);
+
+    // Header.
+    let mut out = String::new();
+    out.push_str(&format!("{:>6} {:>10}", "Frame", "Total"));
+    for name in fn_names {
+        let truncated: String = name.chars().take(12).collect();
+        out.push_str(&format!(" {:>12}", truncated));
+    }
+    out.push_str(&format!(" {:>8} {:>10} {}\n", "Allocs", "Bytes", ""));
+    out.push_str(&format!("{}\n", "-".repeat(32 + n_fns * 13)));
+
+    // Rows.
+    for (i, frame) in frame_data.frames.iter().enumerate() {
+        let total = frame_totals[i];
+        let is_spike = total > spike_threshold && median > 0;
+
+        out.push_str(&format!("{:>6} {:>10}", i + 1, format_ns(total)));
+
+        // One column per function.
+        for fn_id in 0..n_fns {
+            let entry = frame.iter().find(|e| e.fn_id == fn_id);
+            let ns = entry.map_or(0, |e| e.self_ns);
+            out.push_str(&format!(" {:>12}", format_ns(ns)));
+        }
+
+        let allocs: u64 = frame.iter().map(|e| e.alloc_count as u64).sum();
+        let bytes: u64 = frame.iter().map(|e| e.alloc_bytes).sum();
+        out.push_str(&format!(" {:>8} {:>10}", allocs, format_bytes(bytes)));
+
+        if is_spike {
+            out.push_str(" <<");
+        }
+        out.push('\n');
+    }
+
+    let n_spikes = frame_totals
+        .iter()
+        .filter(|&&t| t > spike_threshold && median > 0)
+        .count();
+    out.push_str(&format!(
+        "\n{} frames | {} spikes (>2x median)\n",
+        frame_data.frames.len(),
+        n_spikes
+    ));
+
+    out
+}
+
 fn percentile(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
@@ -520,6 +587,16 @@ pub fn load_latest_run(runs_dir: &Path) -> Result<Run, Error> {
     };
 
     Ok(merge_runs(&to_merge))
+}
+
+/// Find the path to the latest run file without loading it.
+///
+/// Returns `Some(path)` to the latest file (preferring .ndjson over .json
+/// at the same timestamp), or `None` if the directory is empty.
+pub fn find_latest_run_file(runs_dir: &Path) -> Result<Option<PathBuf>, Error> {
+    let all_files = collect_run_files(runs_dir)?;
+    // Files are sorted by name (timestamp ascending); last is latest.
+    Ok(all_files.into_iter().next_back())
 }
 
 #[cfg(test)]
@@ -888,5 +965,33 @@ mod tests {
         assert!(table.contains("update"), "should list update");
         assert!(table.contains("physics"), "should list physics");
         assert!(table.contains("frames"), "should have frame count in footer");
+    }
+
+    #[test]
+    fn format_frames_table_shows_per_frame_breakdown() {
+        let frame_data = FrameData {
+            fn_names: vec!["update".into(), "physics".into()],
+            frames: vec![
+                vec![
+                    FrameFnEntry { fn_id: 0, calls: 1, self_ns: 2_000_000, alloc_count: 10, alloc_bytes: 4096, free_count: 8, free_bytes: 3072 },
+                    FrameFnEntry { fn_id: 1, calls: 1, self_ns: 1_000_000, alloc_count: 0, alloc_bytes: 0, free_count: 0, free_bytes: 0 },
+                ],
+                vec![
+                    FrameFnEntry { fn_id: 0, calls: 1, self_ns: 2_100_000, alloc_count: 10, alloc_bytes: 4096, free_count: 8, free_bytes: 3072 },
+                    FrameFnEntry { fn_id: 1, calls: 1, self_ns: 1_000_000, alloc_count: 0, alloc_bytes: 0, free_count: 0, free_bytes: 0 },
+                ],
+                // Spike frame: 4x the typical total
+                vec![
+                    FrameFnEntry { fn_id: 0, calls: 1, self_ns: 12_000_000, alloc_count: 50, alloc_bytes: 16384, free_count: 40, free_bytes: 12288 },
+                    FrameFnEntry { fn_id: 1, calls: 1, self_ns: 1_100_000, alloc_count: 0, alloc_bytes: 0, free_count: 0, free_bytes: 0 },
+                ],
+            ],
+        };
+        let table = format_frames_table(&frame_data);
+        assert!(table.contains("Frame"), "should have Frame column header");
+        assert!(table.contains("update"), "should have function column");
+        assert!(table.contains("physics"), "should have function column");
+        // Spike detection: frame 2 has 8ms update vs 2ms, should be flagged
+        assert!(table.contains("<<"), "should flag the spike frame. Got:\n{table}");
     }
 }
