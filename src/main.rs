@@ -165,8 +165,7 @@ fn cmd_build(
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .to_path_buf();
         // Read package name from the member's Cargo.toml.
-        let member_toml =
-            std::fs::read_to_string(project.join("Cargo.toml"))?;
+        let member_toml = std::fs::read_to_string(project.join("Cargo.toml"))?;
         let doc: toml_edit::DocumentMut = member_toml
             .parse()
             .map_err(|e| Error::BuildFailed(format!("failed to parse member Cargo.toml: {e}")))?;
@@ -262,11 +261,7 @@ fn cmd_build(
 
     // Build the instrumented binary.
     let target_dir = project.join("target").join("piano");
-    let binary = build_instrumented(
-        staging.path(),
-        &target_dir,
-        package_name.as_deref(),
-    )?;
+    let binary = build_instrumented(staging.path(), &target_dir, package_name.as_deref())?;
 
     eprintln!("built: {}", binary.display());
     println!("{}", binary.display());

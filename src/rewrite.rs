@@ -357,8 +357,7 @@ struct ShutdownInjector;
 impl VisitMut for ShutdownInjector {
     fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
         if node.sig.ident == "main" {
-            let has_return_type =
-                !matches!(&node.sig.output, syn::ReturnType::Default);
+            let has_return_type = !matches!(&node.sig.output, syn::ReturnType::Default);
 
             // Wrap existing body in a block so all guards drop before shutdown.
             // This ensures main's own timing guard records before shutdown collects.
@@ -377,10 +376,8 @@ impl VisitMut for ShutdownInjector {
                 let shutdown_stmt: syn::Stmt = syn::parse_quote! {
                     piano_runtime::shutdown();
                 };
-                let return_expr: syn::Stmt = syn::Stmt::Expr(
-                    syn::parse_quote! { __piano_result },
-                    None,
-                );
+                let return_expr: syn::Stmt =
+                    syn::Stmt::Expr(syn::parse_quote! { __piano_result }, None);
                 node.block.stmts = vec![combined, shutdown_stmt, return_expr];
             } else {
                 // fn main(): original behavior — run body then shutdown.
@@ -633,7 +630,11 @@ fn main() -> ExitCode {
             .expect("should have main fn");
         // The last statement in main should be an expression (the return value),
         // not a semicolon-terminated statement
-        let last = main_fn.block.stmts.last().expect("main should have statements");
+        let last = main_fn
+            .block
+            .stmts
+            .last()
+            .expect("main should have statements");
         assert!(
             matches!(last, syn::Stmt::Expr(_, None)),
             "last statement should be a tail expression (no semicolon) for the return value. Got:\n{result}"

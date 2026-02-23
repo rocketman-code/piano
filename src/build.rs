@@ -282,11 +282,7 @@ version = "0.1.0"
         let ws = tmp.path().join("ws");
 
         // Create workspace root with [workspace] table.
-        create_file(
-            &ws,
-            "Cargo.toml",
-            "[workspace]\nmembers = [\"crates/*\"]\n",
-        );
+        create_file(&ws, "Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
         // Create a member project.
         create_file(
             &ws,
@@ -312,6 +308,9 @@ version = "0.1.0"
         create_file(tmp.path(), "src/main.rs", "fn main() {}");
 
         let result = find_workspace_root(tmp.path());
-        assert!(result.is_none(), "standalone project should not find workspace root");
+        assert!(
+            result.is_none(),
+            "standalone project should not find workspace root"
+        );
     }
 }
