@@ -38,6 +38,15 @@ jobs:
           toolchain: stable
       - run: cargo test --workspace
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+      - run: cargo test --workspace
+
   doc:
     runs-on: ubuntu-latest
     steps:
