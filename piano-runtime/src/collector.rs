@@ -193,6 +193,10 @@ impl Drop for Guard {
 pub fn enter(name: &'static str) -> Guard {
     // Touch EPOCH so relative timestamps are anchored to process start.
     let _ = *EPOCH;
+    // Signal the allocator that STACK is initialized on this thread, so
+    // alloc tracking can safely access it via `try_with` without triggering
+    // TLS destructor registration from within the global allocator.
+    crate::alloc::mark_thread_active();
     STACK.with(|stack| {
         let depth = stack.borrow().len() as u16;
         stack.borrow_mut().push(StackEntry {
@@ -633,6 +637,7 @@ pub fn fork() -> Option<SpanContext> {
 /// thread correctly attributes children time. Returns an `AdoptGuard` that
 /// propagates elapsed time back to the parent on drop.
 pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
+    crate::alloc::mark_thread_active();
     STACK.with(|stack| {
         let depth = stack.borrow().len() as u16;
         stack.borrow_mut().push(StackEntry {
@@ -678,8 +683,7 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(
             elapsed.as_millis() >= 1,
-            "burn_cpu(50_000) should take at least 1ms, took {:?}",
-            elapsed
+            "burn_cpu(50_000) should take at least 1ms, took {elapsed:?}",
         );
     }
 
@@ -1562,8 +1566,7 @@ mod tests {
             !names
                 .iter()
                 .any(|n| n.contains("adopt") || n.contains("fork") || n.contains("piano")),
-            "fork/adopt should not appear in output. Got: {:?}",
-            names
+            "fork/adopt should not appear in output. Got: {names:?}",
         );
 
         let parent = records.iter().find(|r| r.name == "timed_parent").unwrap();

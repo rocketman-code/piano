@@ -3,10 +3,128 @@ use std::time::Instant;
 
 use crate::collector::STACK;
 
-// Re-entrancy guard: when tracking code itself allocates, we skip tracking.
-thread_local! {
-    static IN_ALLOC_TRACKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+// ---------------------------------------------------------------------------
+// Destructor-free thread-local state for the global allocator.
+//
+// Rust 1.88 forbids global allocators from using `thread_local!` because the
+// macro registers TLS destructors. We use raw POSIX TLS (`pthread_key_create`
+// with a NULL destructor) to store a per-thread tracking state that is safe to
+// access from within `GlobalAlloc::alloc` / `dealloc`.
+//
+// State values (stored as `*mut u8` cast from usize):
+//   0  thread has not called `enter()` yet, or TLS key not ready — skip tracking
+//   1  thread is active (STACK initialized), not currently inside tracking code
+//   2  currently inside tracking code — re-entrancy guard
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+mod raw_tls {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // `pthread_key_t` is `unsigned long` on macOS, `unsigned int` on Linux/glibc.
+    // Use a type alias so the extern declarations match the platform ABI.
+    #[cfg(target_os = "macos")]
+    type PthreadKey = std::ffi::c_ulong;
+    #[cfg(not(target_os = "macos"))]
+    type PthreadKey = std::ffi::c_uint;
+
+    unsafe extern "C" {
+        fn pthread_key_create(
+            key: *mut PthreadKey,
+            destructor: Option<unsafe extern "C" fn(*mut u8)>,
+        ) -> std::ffi::c_int;
+        fn pthread_getspecific(key: PthreadKey) -> *mut u8;
+        fn pthread_setspecific(key: PthreadKey, value: *mut u8) -> std::ffi::c_int;
+    }
+
+    /// Sentinel value: no key has been created yet.
+    const KEY_UNINITIALIZED: usize = usize::MAX;
+    /// Sentinel value: a thread is currently creating the key.
+    const KEY_CREATING: usize = usize::MAX - 1;
+
+    /// Stores the pthread key as a `usize`. `PthreadKey` is `c_ulong` (8 bytes)
+    /// on macOS and `c_uint` (4 bytes) on Linux, so `usize` can hold either.
+    /// `KEY_UNINITIALIZED` means no key yet; `KEY_CREATING` means init in progress.
+    static KEY: AtomicUsize = AtomicUsize::new(KEY_UNINITIALIZED);
+    static KEY_CREATING_FLAG: AtomicBool = AtomicBool::new(false);
+
+    const STATE_INACTIVE: usize = 0;
+    const STATE_READY: usize = 1;
+    const STATE_TRACKING: usize = 2;
+
+    fn ensure_key() -> Option<PthreadKey> {
+        let k = KEY.load(Ordering::Acquire);
+        if k != KEY_UNINITIALIZED && k != KEY_CREATING {
+            return Some(k as PthreadKey);
+        }
+        // One-time initialization via compare-and-swap spinlock.
+        if KEY_CREATING_FLAG
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let mut raw_key: PthreadKey = 0;
+            // SAFETY: passing NULL destructor — no TLS destructor registered.
+            let rc = unsafe { pthread_key_create(&mut raw_key, None) };
+            if rc != 0 {
+                KEY_CREATING_FLAG.store(false, Ordering::Release);
+                return None;
+            }
+            KEY.store(raw_key as usize, Ordering::Release);
+        } else {
+            // Another thread is creating the key; spin until ready.
+            loop {
+                let v = KEY.load(Ordering::Acquire);
+                if v != KEY_UNINITIALIZED && v != KEY_CREATING {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+        }
+        let stored = KEY.load(Ordering::Acquire);
+        Some(stored as PthreadKey)
+    }
+
+    /// Mark the current thread as active (STACK is initialized).
+    /// Called from `enter()` in the collector module.
+    pub(crate) fn mark_thread_active() {
+        let Some(key) = ensure_key() else { return };
+        let current = unsafe { pthread_getspecific(key) } as usize;
+        if current == STATE_INACTIVE {
+            unsafe { pthread_setspecific(key, STATE_READY as *mut u8) };
+        }
+    }
+
+    /// Try to acquire the tracking re-entrancy guard.
+    /// Returns `true` if the caller should proceed with tracking.
+    pub(crate) fn acquire_tracking() -> bool {
+        let Some(key) = ensure_key() else {
+            return false;
+        };
+        let current = unsafe { pthread_getspecific(key) } as usize;
+        if current != STATE_READY {
+            return false;
+        }
+        unsafe { pthread_setspecific(key, STATE_TRACKING as *mut u8) };
+        true
+    }
+
+    /// Release the tracking re-entrancy guard.
+    pub(crate) fn release_tracking() {
+        let Some(key) = ensure_key() else { return };
+        unsafe { pthread_setspecific(key, STATE_READY as *mut u8) };
+    }
 }
+
+// Fallback for non-unix platforms: tracking is disabled (graceful degradation).
+#[cfg(not(unix))]
+mod raw_tls {
+    pub(crate) fn mark_thread_active() {}
+    pub(crate) fn acquire_tracking() -> bool {
+        false
+    }
+    pub(crate) fn release_tracking() {}
+}
+
+pub(crate) use raw_tls::mark_thread_active;
 
 /// A global allocator wrapper that tracks allocation counts and bytes
 /// per instrumented function scope, with zero timing distortion.
@@ -53,14 +171,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for PianoAllocator<A> {
 }
 
 fn track_alloc(bytes: u64) {
-    let ok = IN_ALLOC_TRACKING.try_with(|flag| {
-        if flag.get() {
-            return false;
-        }
-        flag.set(true);
-        true
-    });
-    if ok != Ok(true) {
+    if !raw_tls::acquire_tracking() {
         return;
     }
 
@@ -75,18 +186,11 @@ fn track_alloc(bytes: u64) {
         }
     });
 
-    let _ = IN_ALLOC_TRACKING.try_with(|flag| flag.set(false));
+    raw_tls::release_tracking();
 }
 
 fn track_dealloc(bytes: u64) {
-    let ok = IN_ALLOC_TRACKING.try_with(|flag| {
-        if flag.get() {
-            return false;
-        }
-        flag.set(true);
-        true
-    });
-    if ok != Ok(true) {
+    if !raw_tls::acquire_tracking() {
         return;
     }
 
@@ -101,7 +205,7 @@ fn track_dealloc(bytes: u64) {
         }
     });
 
-    let _ = IN_ALLOC_TRACKING.try_with(|flag| flag.set(false));
+    raw_tls::release_tracking();
 }
 
 #[cfg(test)]
