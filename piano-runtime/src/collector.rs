@@ -17,7 +17,15 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Process-wide run identifier.
+///
+/// All threads within a single process share this ID, so that JSON files
+/// written by different threads can be correlated during report consolidation.
+static RUN_ID: LazyLock<String> =
+    LazyLock::new(|| format!("{}_{}", std::process::id(), timestamp_ms()));
 
 /// Aggregated timing data for a single function.
 #[derive(Debug, Clone)]
@@ -60,10 +68,13 @@ impl AutoFlushRecords {
 
 impl Drop for AutoFlushRecords {
     fn drop(&mut self) {
-        if self.records.is_empty() {
+        let registered: Vec<&str> = REGISTERED
+            .try_with(|reg| reg.borrow().clone())
+            .unwrap_or_default();
+        if self.records.is_empty() && registered.is_empty() {
             return;
         }
-        let aggregated = aggregate(&self.records);
+        let aggregated = aggregate(&self.records, &registered);
         if aggregated.is_empty() {
             return;
         }
@@ -76,6 +87,7 @@ impl Drop for AutoFlushRecords {
 thread_local! {
     static STACK: RefCell<Vec<StackEntry>> = const { RefCell::new(Vec::new()) };
     static RECORDS: RefCell<AutoFlushRecords> = const { RefCell::new(AutoFlushRecords::new()) };
+    static REGISTERED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
 }
 
 /// RAII timing guard. Records elapsed time on drop.
@@ -124,9 +136,23 @@ pub fn enter(name: &'static str) -> Guard {
     Guard { _private: () }
 }
 
+/// Register a function name so it appears in output even if never called.
+pub fn register(name: &'static str) {
+    REGISTERED.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        if !reg.contains(&name) {
+            reg.push(name);
+        }
+    });
+}
+
 /// Aggregate raw records into per-function summaries, sorted by self_ms descending.
-fn aggregate(raw: &[RawRecord]) -> Vec<FunctionRecord> {
+fn aggregate(raw: &[RawRecord], registered: &[&str]) -> Vec<FunctionRecord> {
     let mut map: HashMap<&str, (u64, f64, f64)> = HashMap::new();
+
+    for name in registered {
+        map.entry(name).or_insert((0, 0.0, 0.0));
+    }
 
     for rec in raw {
         let entry = map.entry(rec.name).or_insert((0, 0.0, 0.0));
@@ -155,13 +181,15 @@ fn aggregate(raw: &[RawRecord]) -> Vec<FunctionRecord> {
 
 /// Aggregate raw records into per-function summaries, sorted by self_ms descending.
 pub fn collect() -> Vec<FunctionRecord> {
-    RECORDS.with(|records| aggregate(&records.borrow().records))
+    RECORDS
+        .with(|records| REGISTERED.with(|reg| aggregate(&records.borrow().records, &reg.borrow())))
 }
 
 /// Clear all collected timing data.
 pub fn reset() {
     STACK.with(|stack| stack.borrow_mut().clear());
     RECORDS.with(|records| records.borrow_mut().records.clear());
+    REGISTERED.with(|reg| reg.borrow_mut().clear());
 }
 
 /// Return the current time as milliseconds since the Unix epoch.
@@ -196,7 +224,11 @@ fn write_json(records: &[FunctionRecord], path: &std::path::Path) -> std::io::Re
     }
     let mut f = std::fs::File::create(path)?;
     let ts = timestamp_ms();
-    write!(f, "{{\"timestamp_ms\":{ts},\"functions\":[")?;
+    let run_id = &*RUN_ID;
+    write!(
+        f,
+        "{{\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts},\"functions\":["
+    )?;
     for (i, rec) in records.iter().enumerate() {
         if i > 0 {
             write!(f, ",")?;
@@ -309,8 +341,12 @@ mod tests {
 
         // Verify structure.
         assert!(
-            content.starts_with("{\"timestamp_ms\":"),
-            "should start with timestamp_ms"
+            content.starts_with("{\"run_id\":\""),
+            "should start with run_id"
+        );
+        assert!(
+            content.contains("\"timestamp_ms\":"),
+            "should contain timestamp_ms"
         );
         assert!(
             content.contains("\"functions\":["),
@@ -438,5 +474,55 @@ mod tests {
             "expected fast second, got {:?}",
             records[1].name
         );
+    }
+
+    #[test]
+    fn registered_but_uncalled_functions_appear_with_zero_calls() {
+        reset();
+        register("never_called");
+        {
+            let _g = enter("called_once");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let records = collect();
+        assert_eq!(records.len(), 2, "should have both functions");
+        let never = records
+            .iter()
+            .find(|r| r.name == "never_called")
+            .expect("never_called");
+        assert_eq!(never.calls, 0);
+        assert!((never.total_ms).abs() < f64::EPSILON);
+        assert!((never.self_ms).abs() < f64::EPSILON);
+        let called = records
+            .iter()
+            .find(|r| r.name == "called_once")
+            .expect("called_once");
+        assert_eq!(called.calls, 1);
+    }
+
+    #[test]
+    fn json_output_contains_run_id() {
+        reset();
+        {
+            let _g = enter("rid_test");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let tmp = std::env::temp_dir().join(format!("piano_rid_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { std::env::set_var("PIANO_RUNS_DIR", &tmp) };
+        flush();
+        unsafe { std::env::remove_var("PIANO_RUNS_DIR") };
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert!(!files.is_empty());
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        assert!(
+            content.contains("\"run_id\":\""),
+            "should contain run_id field: {content}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
