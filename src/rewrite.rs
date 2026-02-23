@@ -357,18 +357,40 @@ struct ShutdownInjector;
 impl VisitMut for ShutdownInjector {
     fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
         if node.sig.ident == "main" {
+            let has_return_type = !matches!(&node.sig.output, syn::ReturnType::Default);
+
             // Wrap existing body in a block so all guards drop before shutdown.
             // This ensures main's own timing guard records before shutdown collects.
             let existing_stmts = std::mem::take(&mut node.block.stmts);
-            let inner_block: syn::Stmt = syn::parse_quote! {
-                {
-                    #(#existing_stmts)*
-                }
-            };
-            let shutdown_stmt: syn::Stmt = syn::parse_quote! {
-                piano_runtime::shutdown();
-            };
-            node.block.stmts = vec![inner_block, shutdown_stmt];
+
+            if has_return_type {
+                // fn main() -> T: capture the body's result, shutdown, return it.
+                let inner_block: syn::Expr = syn::parse_quote! {
+                    {
+                        #(#existing_stmts)*
+                    }
+                };
+                let combined: syn::Stmt = syn::parse_quote! {
+                    let __piano_result = #inner_block;
+                };
+                let shutdown_stmt: syn::Stmt = syn::parse_quote! {
+                    piano_runtime::shutdown();
+                };
+                let return_expr: syn::Stmt =
+                    syn::Stmt::Expr(syn::parse_quote! { __piano_result }, None);
+                node.block.stmts = vec![combined, shutdown_stmt, return_expr];
+            } else {
+                // fn main(): original behavior — run body then shutdown.
+                let inner_block: syn::Stmt = syn::parse_quote! {
+                    {
+                        #(#existing_stmts)*
+                    }
+                };
+                let shutdown_stmt: syn::Stmt = syn::parse_quote! {
+                    piano_runtime::shutdown();
+                };
+                node.block.stmts = vec![inner_block, shutdown_stmt];
+            }
         }
         syn::visit_mut::visit_item_fn_mut(self, node);
     }
@@ -571,6 +593,51 @@ fn main() {
         assert!(
             shutdown_pos > do_stuff_pos,
             "shutdown should come after existing code"
+        );
+    }
+
+    #[test]
+    fn injects_shutdown_preserves_main_return_type() {
+        let source = r#"
+use std::process::ExitCode;
+fn main() -> ExitCode {
+    do_stuff();
+    ExitCode::SUCCESS
+}
+"#;
+        let result = inject_shutdown(source).unwrap();
+        // Must contain shutdown
+        assert!(
+            result.contains("piano_runtime::shutdown()"),
+            "should inject shutdown. Got:\n{result}"
+        );
+        // Must preserve ExitCode as the tail expression (not discard it)
+        // The rewritten code should compile — ExitCode must be returned after shutdown.
+        let parsed: syn::File = syn::parse_str(&result)
+            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
+        // Find main function and verify it still has a return type
+        let main_fn = parsed
+            .items
+            .iter()
+            .find_map(|item| {
+                if let syn::Item::Fn(f) = item {
+                    if f.sig.ident == "main" {
+                        return Some(f);
+                    }
+                }
+                None
+            })
+            .expect("should have main fn");
+        // The last statement in main should be an expression (the return value),
+        // not a semicolon-terminated statement
+        let last = main_fn
+            .block
+            .stmts
+            .last()
+            .expect("main should have statements");
+        assert!(
+            matches!(last, syn::Stmt::Expr(_, None)),
+            "last statement should be a tail expression (no semicolon) for the return value. Got:\n{result}"
         );
     }
 
