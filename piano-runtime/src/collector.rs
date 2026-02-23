@@ -112,6 +112,29 @@ impl Drop for AutoFlushRecords {
         if cfg!(test) {
             return;
         }
+
+        let Some(dir) = runs_dir() else { return };
+
+        // Try frame-level v2 format first.
+        let frames: Vec<Vec<FrameFnSummary>> = FRAMES
+            .try_with(|f| f.borrow().clone())
+            .unwrap_or_default();
+
+        if !frames.is_empty() {
+            let mut fn_names: Vec<&str> = Vec::new();
+            for frame in &frames {
+                for s in frame {
+                    if !fn_names.contains(&s.name) {
+                        fn_names.push(s.name);
+                    }
+                }
+            }
+            let path = dir.join(format!("{}.ndjson", timestamp_ms()));
+            let _ = write_ndjson(&frames, &fn_names, &path);
+            return;
+        }
+
+        // Fall back to v1 JSON for non-frame workloads.
         let registered: Vec<&str> = REGISTERED
             .try_with(|reg| reg.borrow().clone())
             .unwrap_or_default();
@@ -122,7 +145,6 @@ impl Drop for AutoFlushRecords {
         if aggregated.is_empty() {
             return;
         }
-        let Some(dir) = runs_dir() else { return };
         let path = dir.join(format!("{}.json", timestamp_ms()));
         let _ = write_json(&aggregated, &path);
     }
@@ -375,24 +397,89 @@ fn write_json(records: &[FunctionRecord], path: &std::path::Path) -> std::io::Re
     Ok(())
 }
 
-/// Flush collected timing data to a JSON file on disk.
+/// Write a v2 NDJSON file with frame-level data.
 ///
-/// Writes to `PIANO_RUNS_DIR/<timestamp>.json` or `~/.piano/runs/<timestamp>.json`.
-/// No-op if no records were collected or the output directory cannot be determined.
+/// Line 1: header with metadata and function name table.
+/// Lines 2+: one line per frame with per-function summaries.
+fn write_ndjson(
+    frames: &[Vec<FrameFnSummary>],
+    fn_names: &[&str],
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::File::create(path)?;
+    let ts = timestamp_ms();
+    let run_id = &*RUN_ID;
+
+    // Header line: metadata + function name table
+    write!(
+        f,
+        "{{\"format_version\":2,\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts},\"functions\":["
+    )?;
+    for (i, name) in fn_names.iter().enumerate() {
+        if i > 0 {
+            write!(f, ",")?;
+        }
+        let name = name.replace('\\', "\\\\").replace('"', "\\\"");
+        write!(f, "\"{name}\"")?;
+    }
+    writeln!(f, "]}}")?;
+
+    // One line per frame
+    for (frame_idx, frame) in frames.iter().enumerate() {
+        write!(f, "{{\"frame\":{frame_idx},\"fns\":[")?;
+        for (i, s) in frame.iter().enumerate() {
+            if i > 0 {
+                write!(f, ",")?;
+            }
+            let fn_id = fn_names.iter().position(|&n| n == s.name).unwrap_or(0);
+            write!(
+                f,
+                "{{\"id\":{fn_id},\"calls\":{},\"self_ns\":{},\"ac\":{},\"ab\":{},\"fc\":{},\"fb\":{}}}",
+                s.calls, s.self_ns, s.alloc_count, s.alloc_bytes, s.free_count, s.free_bytes
+            )?;
+        }
+        writeln!(f, "]}}")?;
+    }
+    Ok(())
+}
+
+/// Flush collected timing data to disk.
+///
+/// If frame data is present, writes v2 NDJSON format. Otherwise falls back
+/// to v1 JSON for non-frame workloads.
 ///
 /// Normally you don't need to call this — `AutoFlushRecords::drop` flushes
 /// automatically when thread-local storage is destroyed (process exit). This
 /// function exists for explicit mid-program flushes.
 pub fn flush() {
-    let records = collect();
-    if records.is_empty() {
-        return;
-    }
+    let frames = collect_frames();
     let Some(dir) = runs_dir() else {
         return;
     };
-    let path = dir.join(format!("{}.json", timestamp_ms()));
-    let _ = write_json(&records, &path);
+
+    if !frames.is_empty() {
+        // Collect unique function names across all frames.
+        let mut fn_names: Vec<&str> = Vec::new();
+        for frame in &frames {
+            for s in frame {
+                if !fn_names.contains(&s.name) {
+                    fn_names.push(s.name);
+                }
+            }
+        }
+        let path = dir.join(format!("{}.ndjson", timestamp_ms()));
+        let _ = write_ndjson(&frames, &fn_names, &path);
+    } else {
+        let records = collect();
+        if records.is_empty() {
+            return;
+        }
+        let path = dir.join(format!("{}.json", timestamp_ms()));
+        let _ = write_json(&records, &path);
+    }
     reset();
 }
 
@@ -525,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_writes_valid_json_to_env_dir() {
+    fn flush_writes_valid_output_to_env_dir() {
         reset();
         {
             let _g = enter("flush_test");
@@ -541,24 +628,27 @@ mod tests {
         flush();
         unsafe { std::env::remove_var("PIANO_RUNS_DIR") };
 
-        // Find the written file.
+        // Find written file (v2 NDJSON for frame workloads).
         let files: Vec<_> = std::fs::read_dir(&tmp)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .filter(|e| {
+                let ext = e.path().extension().map(|e| e.to_owned());
+                ext.as_deref() == Some(std::ffi::OsStr::new("ndjson"))
+                    || ext.as_deref() == Some(std::ffi::OsStr::new("json"))
+            })
             .collect();
-        assert!(!files.is_empty(), "expected at least one JSON file");
+        assert!(!files.is_empty(), "expected at least one output file");
 
         let content = std::fs::read_to_string(files[0].path()).unwrap();
         assert!(
-            content.contains("\"flush_test\""),
+            content.contains("flush_test"),
             "should contain function name"
         );
         assert!(
-            content.contains("\"timestamp_ms\""),
+            content.contains("timestamp_ms"),
             "should contain timestamp_ms"
         );
-        assert!(content.contains("\"self_ms\""), "should contain self_ms");
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&tmp);
@@ -747,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn json_output_contains_run_id() {
+    fn output_contains_run_id() {
         reset();
         {
             let _g = enter("rid_test");
@@ -761,7 +851,11 @@ mod tests {
         let files: Vec<_> = std::fs::read_dir(&tmp)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .filter(|e| {
+                let ext = e.path().extension().map(|e| e.to_owned());
+                ext.as_deref() == Some(std::ffi::OsStr::new("ndjson"))
+                    || ext.as_deref() == Some(std::ffi::OsStr::new("json"))
+            })
             .collect();
         assert!(!files.is_empty());
         let content = std::fs::read_to_string(files[0].path()).unwrap();
@@ -1168,6 +1262,47 @@ mod tests {
             parent.self_ms,
             baseline_self
         );
+    }
+
+    #[test]
+    fn write_ndjson_v2_format() {
+        reset();
+        for _ in 0..2 {
+            let _outer = enter("update");
+            burn_cpu(5_000);
+            {
+                let _inner = enter("physics");
+                burn_cpu(5_000);
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!("piano_ndjson_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        unsafe { std::env::set_var("PIANO_RUNS_DIR", &tmp) };
+        flush();
+        unsafe { std::env::remove_var("PIANO_RUNS_DIR") };
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+        assert!(!files.is_empty(), "should write .ndjson file");
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+
+        // First line is header
+        assert!(lines[0].contains("\"format_version\":2"));
+        assert!(lines[0].contains("\"functions\""));
+
+        // Remaining lines are frames
+        assert!(lines.len() >= 3, "header + 2 frames, got {}", lines.len());
+        assert!(lines[1].contains("\"frame\":0"));
+        assert!(lines[2].contains("\"frame\":1"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
