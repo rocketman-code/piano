@@ -296,7 +296,7 @@ fn cmd_tag(name: String) -> Result<(), Error> {
         .run_id
         .ok_or_else(|| Error::NoRuns(runs_dir.clone()))?;
     save_tag(&tags_dir, &name, &run_id)?;
-    eprintln!("tagged '{}' -> {}", name, run_id);
+    eprintln!("tagged '{name}' -> {run_id}");
     Ok(())
 }
 

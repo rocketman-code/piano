@@ -341,7 +341,7 @@ pub fn format_frames_table(frame_data: &FrameData) -> String {
     out.push_str(&format!("{:>6} {:>10}", "Frame", "Total"));
     for name in fn_names {
         let truncated: String = name.chars().take(12).collect();
-        out.push_str(&format!(" {:>12}", truncated));
+        out.push_str(&format!(" {truncated:>12}"));
     }
     out.push_str(&format!(" {:>8} {:>10} {}\n", "Allocs", "Bytes", ""));
     out.push_str(&format!("{}\n", "-".repeat(32 + n_fns * 13)));
@@ -458,13 +458,11 @@ pub fn diff_runs(a: &Run, b: &Run) -> String {
             let allocs_after = b_map.get(name).map_or(0i64, |e| e.alloc_count as i64);
             let allocs_delta = allocs_after - allocs_before;
             out.push_str(&format!(
-                "{:<40} {:>9.2}ms {:>9.2}ms {:>+9.2}ms {:>10} {:>+10}\n",
-                name, before, after, delta, allocs_after, allocs_delta
+                "{name:<40} {before:>9.2}ms {after:>9.2}ms {delta:>+9.2}ms {allocs_after:>10} {allocs_delta:>+10}\n",
             ));
         } else {
             out.push_str(&format!(
-                "{:<40} {:>9.2}ms {:>9.2}ms {:>+9.2}ms\n",
-                name, before, after, delta
+                "{name:<40} {before:>9.2}ms {after:>9.2}ms {delta:>+9.2}ms\n",
             ));
         }
     }
