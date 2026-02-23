@@ -1,1 +1,5 @@
-// piano: automated instrumentation-based profiling for Rust
+pub mod build;
+pub mod error;
+pub mod report;
+pub mod resolve;
+pub mod rewrite;
