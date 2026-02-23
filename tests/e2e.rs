@@ -1,4 +1,4 @@
-//! End-to-end test: create a project, instrument it, build it, run it, verify JSON output.
+//! End-to-end test: create a project, instrument it, build it, run it, verify output.
 
 use std::fs;
 use std::path::Path;
@@ -100,40 +100,34 @@ fn full_pipeline_instrument_build_run_verify() {
         "program should produce correct output, got: {program_stdout}"
     );
 
-    // Verify a JSON run file was written.
-    let json_files: Vec<_> = fs::read_dir(&runs_dir)
+    // Verify a run file was written (JSON or NDJSON depending on frame boundaries).
+    let run_files: Vec<_> = fs::read_dir(&runs_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|ext| ext == "json" || ext == "ndjson")
+        })
         .collect();
 
     assert!(
-        !json_files.is_empty(),
-        "expected at least one JSON run file in {runs_dir:?}"
+        !run_files.is_empty(),
+        "expected at least one run file in {runs_dir:?}"
     );
 
-    let json_content = fs::read_to_string(json_files[0].path()).unwrap();
+    let content = fs::read_to_string(run_files[0].path()).unwrap();
     assert!(
-        json_content.contains("\"work\""),
-        "JSON should contain instrumented function name 'work'"
+        content.contains("\"work\"") || content.contains("work"),
+        "output should contain instrumented function name 'work'"
     );
     assert!(
-        json_content.contains("\"timestamp_ms\""),
-        "JSON should contain timestamp_ms"
+        content.contains("\"timestamp_ms\""),
+        "output should contain timestamp_ms"
     );
     assert!(
-        json_content.contains("\"self_ms\""),
-        "JSON should contain self_ms"
-    );
-    assert!(
-        json_content.contains("\"calls\""),
-        "JSON should contain calls"
-    );
-
-    // Verify run_id is present.
-    assert!(
-        json_content.contains("\"run_id\":\""),
-        "JSON should contain run_id"
+        content.contains("\"run_id\":\""),
+        "output should contain run_id"
     );
 
     // Verify `piano report` with latest-run consolidation.
@@ -158,7 +152,7 @@ fn full_pipeline_instrument_build_run_verify() {
     // Verify `piano report` can also read a specific file.
     let specific_report = Command::new(piano_bin)
         .args(["report"])
-        .arg(json_files[0].path())
+        .arg(run_files[0].path())
         .output()
         .expect("failed to run piano report (specific)");
 

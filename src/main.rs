@@ -263,7 +263,7 @@ fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result
         }
     }
 
-    // Fall back to v1 JSON table.
+    // Fall back to JSON table.
     let run = match resolved_path {
         Some(p) => load_run(&p)?,
         None => {

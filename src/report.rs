@@ -26,7 +26,7 @@ pub struct FnEntry {
     pub alloc_bytes: u64,
 }
 
-/// Per-frame data loaded from a v2 NDJSON file.
+/// Per-frame data loaded from an NDJSON file.
 pub struct FrameData {
     pub fn_names: Vec<String>,
     pub frames: Vec<Vec<FrameFnEntry>>,
@@ -43,7 +43,7 @@ pub struct FrameFnEntry {
     pub free_bytes: u64,
 }
 
-/// v2 NDJSON header line.
+/// NDJSON header line.
 #[derive(serde::Deserialize)]
 struct NdjsonHeader {
     #[serde(rename = "format_version")]
@@ -53,7 +53,7 @@ struct NdjsonHeader {
     functions: Vec<String>,
 }
 
-/// v2 NDJSON frame line.
+/// NDJSON frame line.
 #[derive(serde::Deserialize)]
 struct NdjsonFrame {
     #[serde(rename = "frame")]
@@ -94,7 +94,7 @@ pub fn load_run(path: &Path) -> Result<Run, Error> {
     })
 }
 
-/// Load a v2 NDJSON file, returning both the aggregated Run and frame-level data.
+/// Load an NDJSON file, returning both the aggregated Run and frame-level data.
 pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
     let contents = std::fs::read_to_string(path).map_err(|source| Error::RunReadError {
         path: path.to_path_buf(),
@@ -163,7 +163,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
             FnEntry {
                 name,
                 calls,
-                total_ms: self_ms, // no total_ms in v2; approximate with self_ms
+                total_ms: self_ms, // NDJSON format has no total_ms; approximate with self_ms
                 self_ms,
                 alloc_count,
                 alloc_bytes,
@@ -938,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn load_v2_ndjson_run() {
+    fn load_ndjson_run() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"format_version":2,"run_id":"test_1","timestamp_ms":1000,"functions":["update","physics"]}
 {"frame":0,"fns":[{"id":0,"calls":1,"self_ns":2000000,"ac":10,"ab":4096,"fc":8,"fb":3072},{"id":1,"calls":1,"self_ns":1000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
