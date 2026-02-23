@@ -3,8 +3,7 @@ use std::time::Instant;
 
 use crate::collector::STACK;
 
-/// Thread-local re-entrancy guard to prevent infinite recursion.
-/// When the tracking code itself allocates, we must not re-enter tracking.
+// Re-entrancy guard: when tracking code itself allocates, we skip tracking.
 thread_local! {
     static IN_ALLOC_TRACKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -50,18 +49,26 @@ fn track_alloc(bytes: u64) {
     }
 
     let t0 = Instant::now();
-    STACK.with(|stack| {
-        if let Some(top) = stack.borrow_mut().last_mut() {
-            top.alloc_count += 1;
-            top.alloc_bytes += bytes;
+    let updated = STACK.try_with(|stack| {
+        if let Ok(mut s) = stack.try_borrow_mut() {
+            if let Some(top) = s.last_mut() {
+                top.alloc_count += 1;
+                top.alloc_bytes += bytes;
+                return true;
+            }
         }
+        false
     });
-    let overhead = t0.elapsed().as_nanos();
-    STACK.with(|stack| {
-        if let Some(top) = stack.borrow_mut().last_mut() {
-            top.overhead_ns += overhead;
-        }
-    });
+    if updated == Ok(true) {
+        let overhead = t0.elapsed().as_nanos();
+        let _ = STACK.try_with(|stack| {
+            if let Ok(mut s) = stack.try_borrow_mut() {
+                if let Some(top) = s.last_mut() {
+                    top.overhead_ns += overhead;
+                }
+            }
+        });
+    }
 
     let _ = IN_ALLOC_TRACKING.try_with(|flag| flag.set(false));
 }
@@ -79,18 +86,26 @@ fn track_dealloc(bytes: u64) {
     }
 
     let t0 = Instant::now();
-    STACK.with(|stack| {
-        if let Some(top) = stack.borrow_mut().last_mut() {
-            top.free_count += 1;
-            top.free_bytes += bytes;
+    let updated = STACK.try_with(|stack| {
+        if let Ok(mut s) = stack.try_borrow_mut() {
+            if let Some(top) = s.last_mut() {
+                top.free_count += 1;
+                top.free_bytes += bytes;
+                return true;
+            }
         }
+        false
     });
-    let overhead = t0.elapsed().as_nanos();
-    STACK.with(|stack| {
-        if let Some(top) = stack.borrow_mut().last_mut() {
-            top.overhead_ns += overhead;
-        }
-    });
+    if updated == Ok(true) {
+        let overhead = t0.elapsed().as_nanos();
+        let _ = STACK.try_with(|stack| {
+            if let Ok(mut s) = stack.try_borrow_mut() {
+                if let Some(top) = s.last_mut() {
+                    top.overhead_ns += overhead;
+                }
+            }
+        });
+    }
 
     let _ = IN_ALLOC_TRACKING.try_with(|flag| flag.set(false));
 }
