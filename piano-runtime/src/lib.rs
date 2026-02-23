@@ -1,3 +1,6 @@
 mod collector;
 
-pub use collector::{FunctionRecord, Guard, collect, enter, flush, init, register, reset};
+pub use collector::{
+    AdoptGuard, FunctionRecord, Guard, SpanContext, adopt, collect, enter, flush, fork, init,
+    register, reset,
+};
