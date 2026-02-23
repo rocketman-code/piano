@@ -137,6 +137,13 @@ fn cmd_build(
         total_fns,
         targets.len()
     );
+    for target in &targets {
+        let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
+        eprintln!("  {}:", relative.display());
+        for f in &target.functions {
+            eprintln!("    {f}");
+        }
+    }
 
     // Prepare staging directory.
     let staging = tempfile::tempdir()?;

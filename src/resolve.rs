@@ -162,6 +162,9 @@ fn walk_rs_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> 
 /// Top-level functions are returned as bare names.
 /// Impl methods are returned as "Type::method".
 /// Default trait methods are returned as "Trait::method".
+///
+/// Functions annotated with `#[test]` and items inside `#[cfg(test)]` modules
+/// are excluded -- they are not useful instrumentation targets.
 fn extract_functions(source: &str, path: &Path) -> Result<Vec<String>, Error> {
     let syntax = syn::parse_file(source).map_err(|source| Error::ParseError {
         path: path.to_path_buf(),
@@ -171,6 +174,23 @@ fn extract_functions(source: &str, path: &Path) -> Result<Vec<String>, Error> {
     let mut collector = FnCollector::default();
     collector.visit_file(&syntax);
     Ok(collector.functions)
+}
+
+/// Check whether an attribute list contains a specific simple attribute (e.g. `#[test]`).
+fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
+    attrs.iter().any(|a| a.path().is_ident(name))
+}
+
+/// Check whether an attribute list contains `#[cfg(test)]`.
+fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        if !a.path().is_ident("cfg") {
+            return false;
+        }
+        a.parse_args::<syn::Ident>()
+            .map(|id| id == "test")
+            .unwrap_or(false)
+    })
 }
 
 /// AST visitor that collects function names from a parsed Rust file.
@@ -184,8 +204,17 @@ struct FnCollector {
 }
 
 impl<'ast> Visit<'ast> for FnCollector {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if has_cfg_test(&node.attrs) {
+            return; // skip entire #[cfg(test)] module
+        }
+        syn::visit::visit_item_mod(self, node);
+    }
+
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.functions.push(node.sig.ident.to_string());
+        if !has_attr(&node.attrs, "test") {
+            self.functions.push(node.sig.ident.to_string());
+        }
         // Continue visiting nested items (closures etc. are not collected).
         syn::visit::visit_item_fn(self, node);
     }
@@ -198,11 +227,13 @@ impl<'ast> Visit<'ast> for FnCollector {
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        let method_name = node.sig.ident.to_string();
-        if let Some(ref impl_name) = self.current_impl {
-            self.functions.push(format!("{impl_name}::{method_name}"));
-        } else {
-            self.functions.push(method_name);
+        if !has_attr(&node.attrs, "test") {
+            let method_name = node.sig.ident.to_string();
+            if let Some(ref impl_name) = self.current_impl {
+                self.functions.push(format!("{impl_name}::{method_name}"));
+            } else {
+                self.functions.push(method_name);
+            }
         }
         syn::visit::visit_impl_item_fn(self, node);
     }
@@ -272,6 +303,25 @@ fn helper() {}
         fs::write(
             src.join("walker").join("mod.rs"),
             "pub fn walk_dir() {}\nfn scan() {}\n",
+        )
+        .unwrap();
+
+        fs::write(
+            src.join("with_tests.rs"),
+            "\
+fn production_fn() {}
+
+#[test]
+fn test_something() {}
+
+#[cfg(test)]
+mod tests {
+    fn test_helper() {}
+
+    #[test]
+    fn it_works() {}
+}
+",
         )
         .unwrap();
     }
@@ -363,6 +413,55 @@ fn helper() {}
         assert!(
             err.contains("nonexistent_xyz"),
             "error should mention the pattern"
+        );
+    }
+
+    #[test]
+    fn resolve_skips_test_functions_and_cfg_test_modules() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        let specs = [TargetSpec::File("with_tests.rs".into())];
+        let results = resolve_targets(&tmp.path().join("src"), &specs).unwrap();
+
+        let all_fns: Vec<&str> = results
+            .iter()
+            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .collect();
+
+        assert!(
+            all_fns.contains(&"production_fn"),
+            "should include production function"
+        );
+        assert!(
+            !all_fns.contains(&"test_something"),
+            "should skip #[test] function"
+        );
+        assert!(
+            !all_fns.contains(&"test_helper"),
+            "should skip function inside #[cfg(test)] module"
+        );
+        assert!(
+            !all_fns.contains(&"it_works"),
+            "should skip #[test] inside #[cfg(test)] module"
+        );
+    }
+
+    #[test]
+    fn no_match_error_shows_clean_patterns() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        let specs = [TargetSpec::Fn("zzz_nonexistent".into())];
+        let result = resolve_targets(&tmp.path().join("src"), &specs);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.starts_with("no functions matched:"),
+            "error should start with 'no functions matched:': {err}"
+        );
+        assert!(
+            err.contains("--fn zzz_nonexistent"),
+            "error should include the spec: {err}"
         );
     }
 }
