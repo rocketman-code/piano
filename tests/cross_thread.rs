@@ -123,12 +123,13 @@ fn cross_thread_captures_all_calls() {
         "compute should be called 200 times (100 par_iter + 100 thread::scope), got {compute_calls}"
     );
 
-    // main should have self_ms < total_ms (children subtracted).
+    // After wall-time non-propagation: main self_ms ~ total_ms because
+    // cross-thread children wall time is NOT subtracted from parent.
     let main_self = extract_field_f64(&content, "main", "self_ms");
     let main_total = extract_field_f64(&content, "main", "total_ms");
     assert!(
-        main_self < main_total,
-        "main self_ms ({main_self}) should be less than total_ms ({main_total})"
+        main_self > main_total * 0.5,
+        "main self_ms ({main_self}) should be close to total_ms ({main_total}) — no cross-thread wall subtraction"
     );
 }
 
