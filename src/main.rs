@@ -312,9 +312,14 @@ fn cmd_build(
                 source,
             })?;
 
-        let rewritten = inject_shutdown(&rewritten).map_err(|source| Error::ParseError {
-            path: main_file.clone(),
-            source,
+        let target_dir = project.join("target").join("piano");
+        let runs_dir = target_dir.join("runs");
+        let runs_dir_str = runs_dir.to_string_lossy().to_string();
+        let rewritten = inject_shutdown(&rewritten, Some(&runs_dir_str)).map_err(|source| {
+            Error::ParseError {
+                path: main_file.clone(),
+                source,
+            }
         })?;
         std::fs::write(&main_file, rewritten)?;
     }
@@ -409,6 +414,12 @@ fn default_runs_dir() -> Result<PathBuf, Error> {
     if let Ok(dir) = std::env::var("PIANO_RUNS_DIR") {
         return Ok(PathBuf::from(dir));
     }
+    // Project-local first: ./target/piano/runs/
+    let local = PathBuf::from("target/piano/runs");
+    if local.is_dir() {
+        return Ok(std::fs::canonicalize(local)?);
+    }
+    // Fall back to global ~/.piano/runs/ for backward compat
     let home = std::env::var_os("HOME").ok_or(Error::HomeNotFound)?;
     Ok(PathBuf::from(home).join(".piano").join("runs"))
 }
@@ -417,6 +428,12 @@ fn default_tags_dir() -> Result<PathBuf, Error> {
     if let Ok(dir) = std::env::var("PIANO_TAGS_DIR") {
         return Ok(PathBuf::from(dir));
     }
+    // Project-local first: ./target/piano/tags/
+    let local = PathBuf::from("target/piano/tags");
+    if local.is_dir() {
+        return Ok(std::fs::canonicalize(local)?);
+    }
+    // Fall back to global ~/.piano/tags/ for backward compat
     let home = std::env::var_os("HOME").ok_or(Error::HomeNotFound)?;
     Ok(PathBuf::from(home).join(".piano").join("tags"))
 }

@@ -481,14 +481,35 @@ pub fn inject_global_allocator(
 }
 
 /// Wrap `fn main`'s body in `catch_unwind` and inject `piano_runtime::shutdown()`.
-pub fn inject_shutdown(source: &str) -> Result<String, syn::Error> {
+///
+/// When `runs_dir` is `Some`, emits `shutdown_to(dir)` to write run data to
+/// the given project-local directory. When `None`, falls back to `shutdown()`
+/// which uses the global `~/.piano/runs/`.
+pub fn inject_shutdown(source: &str, runs_dir: Option<&str>) -> Result<String, syn::Error> {
     let mut file: syn::File = syn::parse_str(source)?;
-    let mut injector = ShutdownInjector;
+    let mut injector = ShutdownInjector {
+        runs_dir: runs_dir.map(String::from),
+    };
     injector.visit_file_mut(&mut file);
     Ok(prettyplease::unparse(&file))
 }
 
-struct ShutdownInjector;
+struct ShutdownInjector {
+    runs_dir: Option<String>,
+}
+
+impl ShutdownInjector {
+    fn shutdown_stmt(&self) -> syn::Stmt {
+        match &self.runs_dir {
+            Some(dir) => syn::parse_quote! {
+                piano_runtime::shutdown_to(#dir);
+            },
+            None => syn::parse_quote! {
+                piano_runtime::shutdown();
+            },
+        }
+    }
+}
 
 impl VisitMut for ShutdownInjector {
     fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
@@ -498,16 +519,13 @@ impl VisitMut for ShutdownInjector {
             // Wrap existing body in catch_unwind so guards drop on panic
             // (recording timing data), then shutdown collects it, then re-panic.
             let existing_stmts = std::mem::take(&mut node.block.stmts);
+            let shutdown_stmt = self.shutdown_stmt();
 
             let catch_stmt: syn::Stmt = syn::parse_quote! {
                 let __piano_result = std::panic::catch_unwind(
                     std::panic::AssertUnwindSafe(|| { #(#existing_stmts)* })
                 );
             };
-            let shutdown_stmt: syn::Stmt = syn::parse_quote! {
-                piano_runtime::shutdown();
-            };
-
             if has_return_type {
                 // fn main() -> T: match on result, resume_unwind on panic.
                 let tail: syn::Stmt = syn::Stmt::Expr(
@@ -721,7 +739,7 @@ fn main() {
     do_stuff();
 }
 "#;
-        let result = inject_shutdown(source).unwrap();
+        let result = inject_shutdown(source, None).unwrap();
         assert!(
             result.contains("piano_runtime::shutdown()"),
             "should inject shutdown. Got:\n{result}"
@@ -743,6 +761,20 @@ fn main() {
     }
 
     #[test]
+    fn injects_shutdown_to_with_dir() {
+        let source = r#"
+fn main() {
+    do_stuff();
+}
+"#;
+        let result = inject_shutdown(source, Some("/tmp/my-project/target/piano/runs")).unwrap();
+        assert!(
+            result.contains("piano_runtime::shutdown_to(\"/tmp/my-project/target/piano/runs\")"),
+            "should inject shutdown_to with dir. Got:\n{result}"
+        );
+    }
+
+    #[test]
     fn injects_shutdown_preserves_main_return_type() {
         let source = r#"
 use std::process::ExitCode;
@@ -751,7 +783,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 "#;
-        let result = inject_shutdown(source).unwrap();
+        let result = inject_shutdown(source, None).unwrap();
         assert!(
             result.contains("piano_runtime::shutdown()"),
             "should inject shutdown. Got:\n{result}"

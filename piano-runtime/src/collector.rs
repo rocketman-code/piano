@@ -663,6 +663,23 @@ pub fn shutdown() {
         Some(d) => d,
         None => return,
     };
+    shutdown_impl(&dir);
+}
+
+/// Like `shutdown`, but writes run files to the specified directory.
+///
+/// Used by the CLI to write to project-local `target/piano/runs/` instead
+/// of the global `~/.piano/runs/`. `PIANO_RUNS_DIR` env var takes priority
+/// if set (for testing and user overrides).
+pub fn shutdown_to(dir: &str) {
+    if let Ok(override_dir) = std::env::var("PIANO_RUNS_DIR") {
+        shutdown_impl(std::path::Path::new(&override_dir));
+    } else {
+        shutdown_impl(std::path::Path::new(dir));
+    }
+}
+
+fn shutdown_impl(dir: &std::path::Path) {
     let ts = timestamp_ms();
 
     // Write frame-level data if present (NDJSON format).
