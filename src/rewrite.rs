@@ -484,7 +484,7 @@ pub fn inject_global_allocator(
 ///
 /// When `runs_dir` is `Some`, emits `shutdown_to(dir)` to write run data to
 /// the given project-local directory. When `None`, falls back to `shutdown()`
-/// which uses the global `~/.piano/runs/`.
+/// which uses the runtime's default directory resolution.
 pub fn inject_shutdown(source: &str, runs_dir: Option<&str>) -> Result<String, syn::Error> {
     let mut file: syn::File = syn::parse_str(source)?;
     let mut injector = ShutdownInjector {
