@@ -162,3 +162,76 @@ fn full_pipeline_instrument_build_run_verify() {
         String::from_utf8_lossy(&specific_report.stderr)
     );
 }
+
+#[test]
+fn build_with_no_targets_instruments_all_functions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("mini");
+    create_mini_project(&project_dir);
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // No --fn, --file, or --mod: should instrument everything.
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano build (no targets) failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    // Should have found both main and work (the two functions in mini project).
+    assert!(
+        stderr.contains("found 2 function(s)"),
+        "should instrument both functions, got: {stderr}"
+    );
+
+    // Run the instrumented binary and verify it produces output.
+    let binary_path = stdout.trim();
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let run_output = Command::new(binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run_output.status.success(),
+        "instrumented binary failed:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let program_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        program_stdout.contains("result: 499500"),
+        "program should produce correct output, got: {program_stdout}"
+    );
+
+    // Verify run file contains both functions.
+    let run_files: Vec<_> = fs::read_dir(&runs_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|ext| ext == "json" || ext == "ndjson")
+        })
+        .collect();
+
+    assert!(!run_files.is_empty(), "expected at least one run file");
+
+    let content = fs::read_to_string(run_files[0].path()).unwrap();
+    assert!(content.contains("\"main\""), "output should contain 'main'");
+    assert!(content.contains("\"work\""), "output should contain 'work'");
+}
