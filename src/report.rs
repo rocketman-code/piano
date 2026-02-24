@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
@@ -157,6 +157,50 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         frames.push(entries);
     }
 
+    // Merge cross-thread functions from companion JSON if present.
+    // NDJSON only has main-thread frame data (from collect_frames TLS).
+    // The companion JSON has all threads (from collect_all Arc registry).
+    let mut fn_names = header.functions;
+    let json_companion = path.with_extension("json");
+    if json_companion.exists() {
+        match std::fs::read_to_string(&json_companion)
+            .map_err(|e| e.to_string())
+            .and_then(|c| serde_json::from_str::<Run>(&c).map_err(|e| e.to_string()))
+        {
+            Ok(json_run) => {
+                let existing: HashSet<String> = fn_names.iter().cloned().collect();
+                for fn_entry in &json_run.functions {
+                    if !existing.contains(&fn_entry.name) {
+                        let new_id = fn_names.len();
+                        fn_names.push(fn_entry.name.clone());
+                        // Add aggregate data to first frame. Worker threads lack
+                        // frame boundaries, so we can't assign to specific frames.
+                        if let Some(first_frame) = frames.first_mut() {
+                            first_frame.push(FrameFnEntry {
+                                fn_id: new_id,
+                                calls: fn_entry.calls,
+                                self_ns: (fn_entry.self_ms * 1_000_000.0) as u64,
+                                cpu_self_ns: fn_entry
+                                    .cpu_self_ms
+                                    .map(|ms| (ms * 1_000_000.0) as u64),
+                                alloc_count: fn_entry.alloc_count as u32,
+                                alloc_bytes: fn_entry.alloc_bytes,
+                                free_count: 0,
+                                free_bytes: 0,
+                            });
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: companion {} unreadable: {e}",
+                    json_companion.display()
+                );
+            }
+        }
+    }
+
     // Aggregate into Run for backward compatibility.
     let has_cpu = header.has_cpu_time;
     let mut fn_agg: HashMap<usize, (u64, u64, u64, u64, u64)> = HashMap::new();
@@ -172,8 +216,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
     }
 
     // Build FnEntry for every registered function, including zero-call ones.
-    let functions: Vec<FnEntry> = header
-        .functions
+    let functions: Vec<FnEntry> = fn_names
         .iter()
         .enumerate()
         .map(|(fn_id, name)| {
@@ -203,10 +246,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         source_format: RunFormat::Ndjson,
     };
 
-    let frame_data = FrameData {
-        fn_names: header.functions,
-        frames,
-    };
+    let frame_data = FrameData { fn_names, frames };
 
     Ok((run, frame_data))
 }
@@ -608,6 +648,26 @@ fn collect_run_files(runs_dir: &Path) -> Result<Vec<PathBuf>, Error> {
             a_ndjson.cmp(&b_ndjson)
         })
     });
+
+    // Deduplicate by stem: when both <stem>.json and <stem>.ndjson exist,
+    // keep only the .ndjson file. load_ndjson already merges companion JSON
+    // data, so loading both would double-count every function.
+    let ndjson_stems: HashSet<String> = files
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "ndjson"))
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect();
+    if !ndjson_stems.is_empty() {
+        files.retain(|p| {
+            let is_json = p.extension().is_some_and(|e| e == "json");
+            if !is_json {
+                return true;
+            }
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            !ndjson_stems.contains(stem)
+        });
+    }
+
     Ok(files)
 }
 
@@ -1722,6 +1782,155 @@ mod tests {
             "should not show CPU column when no CPU data. Got:\n{table}"
         );
         assert!(table.contains("update"), "should still show function");
+    }
+
+    #[test]
+    fn load_ndjson_merges_cross_thread_functions_from_companion_json() {
+        // NDJSON has main-thread functions only (from collect_frames TLS).
+        // Companion JSON has ALL functions (from collect_all Arc registry).
+        // load_ndjson should merge worker-thread-only functions into FrameData.
+        let dir = TempDir::new().unwrap();
+
+        let ndjson = r#"{"format_version":2,"run_id":"test_1","timestamp_ms":5000,"functions":["main","orchestrate"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":10000000,"ac":100,"ab":50000,"fc":10,"fb":5000},{"id":1,"calls":1,"self_ns":5000000,"ac":50,"ab":25000,"fc":5,"fb":2500}]}
+"#;
+        fs::write(dir.path().join("5000.ndjson"), ndjson).unwrap();
+
+        let json = r#"{
+            "run_id": "test_1",
+            "timestamp_ms": 5000,
+            "functions": [
+                {"name": "main", "calls": 1, "total_ms": 15.0, "self_ms": 10.0, "cpu_self_ms": 8.0},
+                {"name": "orchestrate", "calls": 1, "total_ms": 5.0, "self_ms": 5.0, "cpu_self_ms": 0.0},
+                {"name": "busy_wait_ms", "calls": 200, "total_ms": 3.0, "self_ms": 3.0, "cpu_self_ms": 2.5},
+                {"name": "expensive_computation", "calls": 50, "total_ms": 1.5, "self_ms": 1.5, "cpu_self_ms": 1.2}
+            ]
+        }"#;
+        fs::write(dir.path().join("5000.json"), json).unwrap();
+
+        let ndjson_path = dir.path().join("5000.ndjson");
+        let (_run, frame_data) = load_ndjson(&ndjson_path).unwrap();
+
+        // Should have all 4 functions, not just the 2 from NDJSON.
+        assert_eq!(
+            frame_data.fn_names.len(),
+            4,
+            "should merge worker-thread functions from companion JSON. Got: {:?}",
+            frame_data.fn_names
+        );
+        assert!(frame_data.fn_names.contains(&"busy_wait_ms".to_string()));
+        assert!(
+            frame_data
+                .fn_names
+                .contains(&"expensive_computation".to_string())
+        );
+
+        // The merged functions should appear in the default table output.
+        let table = format_table_with_frames(&frame_data, false);
+        assert!(
+            table.contains("busy_wait_ms"),
+            "worker-thread function should appear in report. Got:\n{table}"
+        );
+        assert!(
+            table.contains("expensive_computation"),
+            "worker-thread function should appear in report. Got:\n{table}"
+        );
+        assert!(
+            table.contains("200"),
+            "busy_wait_ms should show 200 calls. Got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn collect_run_files_deduplicates_json_when_ndjson_exists() {
+        let dir = TempDir::new().unwrap();
+
+        // Create both .json and .ndjson with the same stem.
+        let json = r#"{"run_id":"dup_5000","timestamp_ms":5000,"functions":[
+            {"name":"work","calls":10,"total_ms":5.0,"self_ms":5.0}
+        ]}"#;
+        let ndjson = r#"{"format_version":2,"run_id":"dup_5000","timestamp_ms":5000,"functions":["work"]}
+{"frame":0,"fns":[{"id":0,"calls":10,"self_ns":5000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        fs::write(dir.path().join("5000.json"), json).unwrap();
+        fs::write(dir.path().join("5000.ndjson"), ndjson).unwrap();
+        // A standalone .json with a different stem should survive.
+        let other = r#"{"run_id":"other_6000","timestamp_ms":6000,"functions":[]}"#;
+        fs::write(dir.path().join("6000.json"), other).unwrap();
+
+        let files = collect_run_files(dir.path()).unwrap();
+        let stems_and_exts: Vec<_> = files
+            .iter()
+            .map(|p| {
+                (
+                    p.file_stem().unwrap().to_str().unwrap().to_string(),
+                    p.extension().unwrap().to_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+
+        // 5000.json should be removed; 5000.ndjson and 6000.json remain.
+        assert_eq!(
+            files.len(),
+            2,
+            "expected 2 files after dedup, got {files:?}"
+        );
+        assert!(
+            stems_and_exts.contains(&("5000".into(), "ndjson".into())),
+            "should keep .ndjson: {stems_and_exts:?}"
+        );
+        assert!(
+            !stems_and_exts.contains(&("5000".into(), "json".into())),
+            "should remove duplicate .json: {stems_and_exts:?}"
+        );
+        assert!(
+            stems_and_exts.contains(&("6000".into(), "json".into())),
+            "should keep standalone .json: {stems_and_exts:?}"
+        );
+    }
+
+    #[test]
+    fn load_run_by_id_no_double_count_with_json_and_ndjson() {
+        // When both 5000.json and 5000.ndjson exist with the same run_id,
+        // load_run_by_id must NOT double-count metrics.
+        let dir = TempDir::new().unwrap();
+
+        let ndjson = r#"{"format_version":2,"run_id":"dup_5000","timestamp_ms":5000,"functions":["main_fn"]}
+{"frame":0,"fns":[{"id":0,"calls":10,"self_ns":5000000,"ac":100,"ab":4096,"fc":0,"fb":0}]}
+"#;
+        // The companion JSON has the same function plus a worker-thread one.
+        let json = r#"{
+            "run_id": "dup_5000",
+            "timestamp_ms": 5000,
+            "functions": [
+                {"name": "main_fn", "calls": 10, "total_ms": 5.0, "self_ms": 5.0},
+                {"name": "worker_fn", "calls": 20, "total_ms": 3.0, "self_ms": 3.0}
+            ]
+        }"#;
+        fs::write(dir.path().join("5000.ndjson"), ndjson).unwrap();
+        fs::write(dir.path().join("5000.json"), json).unwrap();
+
+        let run = load_run_by_id(dir.path(), "dup_5000").unwrap();
+
+        // main_fn should have calls=10 (not 20 from double-counting).
+        let main_fn = run
+            .functions
+            .iter()
+            .find(|f| f.name == "main_fn")
+            .expect("main_fn should be present");
+        assert_eq!(
+            main_fn.calls, 10,
+            "main_fn calls should be 10, not doubled. Got {}",
+            main_fn.calls
+        );
+
+        // worker_fn should be merged from companion JSON via load_ndjson.
+        let worker_fn = run
+            .functions
+            .iter()
+            .find(|f| f.name == "worker_fn")
+            .expect("worker_fn should be merged from companion JSON");
+        assert_eq!(worker_fn.calls, 20);
     }
 
     #[test]
