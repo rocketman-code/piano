@@ -766,16 +766,48 @@ pub fn save_tag(tags_dir: &Path, tag: &str, run_id: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Load a run by resolving a tag name to a run_id, then consolidating.
-pub fn load_tagged_run(tags_dir: &Path, runs_dir: &Path, tag: &str) -> Result<Run, Error> {
+/// Resolve a tag name to a run_id string.
+pub fn resolve_tag(tags_dir: &Path, tag: &str) -> Result<String, Error> {
     validate_tag_name(tag)?;
     let tag_path = tags_dir.join(tag);
     let run_id = std::fs::read_to_string(&tag_path).map_err(|source| Error::RunReadError {
         path: tag_path,
         source,
     })?;
-    let run_id = run_id.trim();
-    load_run_by_id(runs_dir, run_id)
+    Ok(run_id.trim().to_owned())
+}
+
+/// Load a run by resolving a tag name to a run_id, then consolidating.
+pub fn load_tagged_run(tags_dir: &Path, runs_dir: &Path, tag: &str) -> Result<Run, Error> {
+    let run_id = resolve_tag(tags_dir, tag)?;
+    load_run_by_id(runs_dir, &run_id)
+}
+
+/// Find the NDJSON file for a given run_id, if one exists.
+pub fn find_ndjson_by_run_id(runs_dir: &Path, run_id: &str) -> Result<Option<PathBuf>, Error> {
+    use std::io::BufRead;
+
+    let all_files = collect_run_files(runs_dir)?;
+    for path in &all_files {
+        if path.extension().and_then(|e| e.to_str()) != Some("ndjson") {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let mut reader = std::io::BufReader::new(file);
+        let mut first_line = String::new();
+        if reader.read_line(&mut first_line).unwrap_or(0) == 0 {
+            continue;
+        }
+        // Parse just the header to check the run_id.
+        if let Ok(header) = serde_json::from_str::<serde_json::Value>(&first_line) {
+            if header.get("run_id").and_then(|v| v.as_str()) == Some(run_id) {
+                return Ok(Some(path.clone()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Load and merge all run files matching a specific run_id.
@@ -2038,5 +2070,72 @@ mod tests {
         assert_eq!(work.calls, 8);
         // CPU should be Some(10.0) — only accumulated from runs that have it.
         assert_eq!(work.cpu_self_ms, Some(10.0));
+    }
+
+    #[test]
+    fn resolve_tag_returns_run_id() {
+        let dir = TempDir::new().unwrap();
+        let tags_dir = dir.path().join("tags");
+        fs::create_dir_all(&tags_dir).unwrap();
+
+        save_tag(&tags_dir, "baseline", "abc_1000").unwrap();
+        let run_id = resolve_tag(&tags_dir, "baseline").unwrap();
+        assert_eq!(run_id, "abc_1000");
+    }
+
+    #[test]
+    fn resolve_tag_errors_on_missing_tag() {
+        let dir = TempDir::new().unwrap();
+        let tags_dir = dir.path().join("tags");
+        fs::create_dir_all(&tags_dir).unwrap();
+
+        let result = resolve_tag(&tags_dir, "nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn find_ndjson_by_run_id_finds_matching_file() {
+        let dir = TempDir::new().unwrap();
+        let runs_dir = dir.path().join("runs");
+        fs::create_dir_all(&runs_dir).unwrap();
+
+        let ndjson = r#"{"format_version":2,"run_id":"test_42","timestamp_ms":5000,"functions":["work"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":2000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        let ndjson_path = runs_dir.join("5000.ndjson");
+        fs::write(&ndjson_path, ndjson).unwrap();
+
+        let result = find_ndjson_by_run_id(&runs_dir, "test_42").unwrap();
+        assert_eq!(result, Some(ndjson_path));
+    }
+
+    #[test]
+    fn find_ndjson_by_run_id_returns_none_for_json_only() {
+        let dir = TempDir::new().unwrap();
+        let runs_dir = dir.path().join("runs");
+        fs::create_dir_all(&runs_dir).unwrap();
+
+        let json = r#"{"run_id":"test_42","timestamp_ms":5000,"functions":[
+            {"name":"work","calls":1,"total_ms":5.0,"self_ms":5.0}
+        ]}"#;
+        fs::write(runs_dir.join("5000.json"), json).unwrap();
+
+        let result = find_ndjson_by_run_id(&runs_dir, "test_42").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn find_ndjson_by_run_id_returns_none_for_mismatched_id() {
+        let dir = TempDir::new().unwrap();
+        let runs_dir = dir.path().join("runs");
+        fs::create_dir_all(&runs_dir).unwrap();
+
+        let ndjson = r#"{"format_version":2,"run_id":"other_id","timestamp_ms":5000,"functions":["work"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":2000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        fs::write(runs_dir.join("5000.ndjson"), ndjson).unwrap();
+
+        let result = find_ndjson_by_run_id(&runs_dir, "nonexistent").unwrap();
+        assert_eq!(result, None);
     }
 }
