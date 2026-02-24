@@ -11,6 +11,7 @@ use crate::error::Error;
 pub fn prepare_staging(project_root: &Path, staging_dir: &Path) -> Result<(), Error> {
     let walker = WalkBuilder::new(project_root)
         .hidden(false)
+        .follow_links(true)
         .filter_entry(|entry| {
             // Skip target/ only at the project root level (depth 1).
             entry.depth() != 1 || entry.file_name().to_string_lossy() != "target"
@@ -495,6 +496,63 @@ version = "0.1.0"
 
         let result = find_bin_entry_point(tmp.path()).unwrap();
         assert_eq!(result, PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn staging_follows_symlinked_directories() {
+        let project = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        // Create a real src directory outside the project.
+        let real_src = TempDir::new().unwrap();
+        create_file(real_src.path(), "main.rs", "fn main() {}");
+        create_file(real_src.path(), "lib.rs", "pub fn lib() {}");
+
+        create_file(project.path(), "Cargo.toml", "[package]\nname = \"demo\"");
+        // Symlink project/src -> real_src
+        std::os::unix::fs::symlink(real_src.path(), project.path().join("src")).unwrap();
+
+        prepare_staging(project.path(), staging.path()).unwrap();
+
+        assert!(staging.path().join("Cargo.toml").exists());
+        assert!(
+            staging.path().join("src/main.rs").exists(),
+            "symlinked src/main.rs should be copied to staging"
+        );
+        assert!(
+            staging.path().join("src/lib.rs").exists(),
+            "symlinked src/lib.rs should be copied to staging"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn staging_follows_symlinked_files() {
+        let project = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        // Create a real file outside the project.
+        let real_file = TempDir::new().unwrap();
+        create_file(real_file.path(), "shared.rs", "pub fn shared() {}");
+
+        create_file(project.path(), "Cargo.toml", "[package]\nname = \"demo\"");
+        create_file(project.path(), "src/main.rs", "fn main() {}");
+        // Symlink project/src/shared.rs -> real_file/shared.rs
+        std::os::unix::fs::symlink(
+            real_file.path().join("shared.rs"),
+            project.path().join("src/shared.rs"),
+        )
+        .unwrap();
+
+        prepare_staging(project.path(), staging.path()).unwrap();
+
+        assert!(
+            staging.path().join("src/shared.rs").exists(),
+            "symlinked file should be copied to staging"
+        );
+        let content = std::fs::read_to_string(staging.path().join("src/shared.rs")).unwrap();
+        assert_eq!(content, "pub fn shared() {}");
     }
 
     #[test]
