@@ -40,7 +40,7 @@ pub fn resolve_targets(src_dir: &Path, specs: &[TargetSpec]) -> Result<Vec<Resol
                             path: file.clone(),
                             source,
                         })?;
-                    let all_fns = extract_functions(&source, file)?;
+                    let all_fns = extract_functions(&source, file);
                     let matched: Vec<String> = all_fns
                         .into_iter()
                         .filter(|name| {
@@ -64,7 +64,7 @@ pub fn resolve_targets(src_dir: &Path, specs: &[TargetSpec]) -> Result<Vec<Resol
                             path: file.clone(),
                             source,
                         })?;
-                    let all_fns = extract_functions(&source, file)?;
+                    let all_fns = extract_functions(&source, file);
                     if !all_fns.is_empty() {
                         merge_into(&mut results, file, all_fns);
                     }
@@ -91,7 +91,7 @@ pub fn resolve_targets(src_dir: &Path, specs: &[TargetSpec]) -> Result<Vec<Resol
                             path: file.clone(),
                             source,
                         })?;
-                    let all_fns = extract_functions(&source, file)?;
+                    let all_fns = extract_functions(&source, file);
                     if !all_fns.is_empty() {
                         merge_into(&mut results, file, all_fns);
                     }
@@ -165,15 +165,18 @@ fn walk_rs_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> 
 ///
 /// Functions annotated with `#[test]` and items inside `#[cfg(test)]` modules
 /// are excluded -- they are not useful instrumentation targets.
-fn extract_functions(source: &str, path: &Path) -> Result<Vec<String>, Error> {
-    let syntax = syn::parse_file(source).map_err(|source| Error::ParseError {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn extract_functions(source: &str, path: &Path) -> Vec<String> {
+    let syntax = match syn::parse_file(source) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("warning: skipping {}: {e}", path.display());
+            return Vec::new();
+        }
+    };
 
     let mut collector = FnCollector::default();
     collector.visit_file(&syntax);
-    Ok(collector.functions)
+    collector.functions
 }
 
 /// Check whether an attribute list contains a specific simple attribute (e.g. `#[test]`).
@@ -444,6 +447,38 @@ mod tests {
         assert!(
             !all_fns.contains(&"it_works"),
             "should skip #[test] inside #[cfg(test)] module"
+        );
+    }
+
+    #[test]
+    fn resolve_skips_unparseable_files() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        // Add a file that looks like .rs but isn't valid Rust (e.g. a Tera template).
+        let src = tmp.path().join("src");
+        fs::write(
+            src.join("template.tera.rs"),
+            "{% for variant in variants %}\nfn {{ variant }}() {}\n{% endfor %}\n",
+        )
+        .unwrap();
+
+        // Should succeed despite the unparseable file.
+        let specs = [TargetSpec::Fn("walk".into())];
+        let results = resolve_targets(&src, &specs).unwrap();
+
+        let all_fns: Vec<&str> = results
+            .iter()
+            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .collect();
+
+        assert!(
+            all_fns.contains(&"walk"),
+            "should still find valid functions"
+        );
+        assert!(
+            all_fns.contains(&"walk_dir"),
+            "should still find valid functions"
         );
     }
 
