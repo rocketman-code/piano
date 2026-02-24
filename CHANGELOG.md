@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-02-24
+
+### Added
+
+- CPU time profiling via `--cpu-time` flag (Linux + macOS, 64-bit)
+- Instrument all functions by default when no `--fn`/`--file`/`--mod` specified
+- Hidden-function footer in summary and frames reports
+- Project-local run data: output written to `target/piano/runs/` instead of global `~/.piano/runs/`
+- `shutdown_to(dir)` runtime API for directing output to a specific directory
+- Panic-safe data capture: profiling data is collected even when the instrumented program panics
+- Workflow note in `piano --help` output
+
+### Fixed
+
+- Unparseable source files are skipped with a warning instead of aborting
+- Async functions are skipped with a warning (instrumentation not yet supported)
+- Cross-thread functions correctly merged into NDJSON report
+- Symlinks followed when staging project files for instrumentation
+- Bare stdout path suppressed in interactive terminals (no more duplicate path output)
+- `--fn` help text clarified with substring matching example including qualified names
+- Actionable error messages when project directory or `src/` is missing
+- `piano report` and `piano tag` check project-local `target/piano/runs/` before falling back to global
+
+### Changed
+
+- Default behavior: `piano build` instruments all functions when no targeting flags are given
+- Run data location: project-local `target/piano/runs/` by default (falls back to `~/.piano/runs/`)
+
 ## [0.4.1] - 2026-02-23
 
 ### Fixed
