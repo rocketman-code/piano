@@ -11,8 +11,9 @@ use piano::build::{
 };
 use piano::error::Error;
 use piano::report::{
-    diff_runs, find_latest_run_file, format_frames_table, format_table, format_table_with_frames,
-    load_latest_run, load_ndjson, load_run, load_tagged_run, save_tag,
+    diff_runs, find_latest_run_file, find_ndjson_by_run_id, format_frames_table, format_table,
+    format_table_with_frames, load_latest_run, load_ndjson, load_run, load_run_by_id,
+    load_tagged_run, resolve_tag, save_tag,
 };
 use piano::resolve::{TargetSpec, resolve_targets};
 use piano::rewrite::{
@@ -463,13 +464,20 @@ fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result
     let resolved_path = match &run_path {
         Some(p) if p.exists() => Some(p.clone()),
         Some(p) => {
-            // Tag lookup — no direct file path, so no frame data available.
+            // Tag lookup — resolve to NDJSON file if available.
             let tag = p.to_string_lossy();
             let tags_dir = default_tags_dir()?;
             let runs_dir = default_runs_dir()?;
-            let run = load_tagged_run(&tags_dir, &runs_dir, &tag)?;
-            print!("{}", format_table(&run, show_all));
-            return Ok(());
+            let run_id = resolve_tag(&tags_dir, &tag)?;
+            match find_ndjson_by_run_id(&runs_dir, &run_id)? {
+                Some(ndjson_path) => Some(ndjson_path),
+                None => {
+                    // No NDJSON — fall back to basic JSON table.
+                    let run = load_run_by_id(&runs_dir, &run_id)?;
+                    print!("{}", format_table(&run, show_all));
+                    return Ok(());
+                }
+            }
         }
         None => {
             // Find the latest run file.
