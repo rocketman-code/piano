@@ -127,6 +127,12 @@ fn cmd_build(
     runtime_path: Option<PathBuf>,
     cpu_time: bool,
 ) -> Result<(), Error> {
+    if !project.exists() {
+        return Err(Error::BuildFailed(format!(
+            "project directory does not exist: {}",
+            project.display()
+        )));
+    }
     let project = std::fs::canonicalize(&project)?;
 
     // Build target specs from CLI args.
@@ -143,6 +149,12 @@ fn cmd_build(
 
     // Resolve targets against the project source.
     let src_dir = project.join("src");
+    if !src_dir.is_dir() {
+        return Err(Error::BuildFailed(format!(
+            "no src/ directory found in {} — is this a Rust project?",
+            project.display()
+        )));
+    }
     let targets = resolve_targets(&src_dir, &specs)?;
 
     let total_fns: usize = targets.iter().map(|t| t.functions.len()).sum();
