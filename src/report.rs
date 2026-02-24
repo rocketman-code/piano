@@ -256,6 +256,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
 /// When `show_all` is false, entries with zero calls are hidden.
 pub fn format_table(run: &Run, show_all: bool) -> String {
     let mut entries = run.functions.clone();
+    let total_count = entries.len();
     if !show_all {
         entries.retain(|e| e.calls > 0);
     }
@@ -297,6 +298,13 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
                 "{:<40} {:>8} {:>9.2}ms {:>9.2}ms\n",
                 entry.name, entry.calls, entry.total_ms, entry.self_ms
             ));
+        }
+    }
+    if !show_all {
+        let hidden = total_count - entries.len();
+        if hidden > 0 {
+            let label = if hidden == 1 { "function" } else { "functions" };
+            out.push_str(&format!("\n{hidden} {label} hidden; use --all to show\n"));
         }
     }
     out
@@ -1109,10 +1117,42 @@ mod tests {
             "should hide zero-call function"
         );
 
+        // Footer should indicate hidden functions.
+        assert!(
+            table.contains("1 function hidden; use --all to show"),
+            "should show hidden footer. Got:\n{table}"
+        );
+
         let table_all = format_table(&run, true);
         assert!(
             table_all.contains("uncalled"),
             "should show zero-call function with show_all"
+        );
+        // No footer when show_all is true.
+        assert!(
+            !table_all.contains("hidden"),
+            "should not show footer with show_all. Got:\n{table_all}"
+        );
+    }
+
+    #[test]
+    fn format_table_no_footer_when_all_called() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "active".into(),
+                calls: 3,
+                total_ms: 5.0,
+                self_ms: 4.0,
+                ..Default::default()
+            }],
+        };
+        let table = format_table(&run, false);
+        assert!(
+            !table.contains("hidden"),
+            "no footer when nothing hidden. Got:\n{table}"
         );
     }
 
@@ -1721,6 +1761,10 @@ mod tests {
         let table = format_table(&run, false);
         assert!(table.contains("CPU"), "should have CPU column");
         assert!(!table.contains("unused"), "should hide zero-call fn");
+        assert!(
+            table.contains("1 function hidden; use --all to show"),
+            "should show hidden footer. Got:\n{table}"
+        );
 
         // With --all: shows unused with CPU column present.
         let table_all = format_table(&run, true);
@@ -1728,6 +1772,10 @@ mod tests {
         assert!(
             table_all.contains("unused"),
             "should show zero-call fn with --all. Got:\n{table_all}"
+        );
+        assert!(
+            !table_all.contains("hidden"),
+            "should not show footer with show_all. Got:\n{table_all}"
         );
     }
 
