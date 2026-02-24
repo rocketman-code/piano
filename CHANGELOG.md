@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `piano report` and `piano tag` no longer silently fall back to global `~/.piano/` storage; they error if no project-local runs exist
+
+### Removed
+
+- Global `~/.piano/runs/` and `~/.piano/tags/` fallback (all data is project-local under `target/piano/`)
+
 ## [0.5.0] - 2026-02-24
 
 ### Added
@@ -31,7 +41,7 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - Default behavior: `piano build` instruments all functions when no targeting flags are given
-- Run data location: project-local `target/piano/runs/` by default (falls back to `~/.piano/runs/`)
+- Run data location: project-local `target/piano/runs/`
 
 ## [0.4.1] - 2026-02-23
 

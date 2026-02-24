@@ -15,11 +15,8 @@ pub enum Error {
     #[error("build failed: {0}")]
     BuildFailed(String),
 
-    #[error("no runs found in {}", .0.display())]
+    #[error("no piano runs found in {} -- run `piano build` and execute the instrumented binary first", .0.display())]
     NoRuns(PathBuf),
-
-    #[error("HOME environment variable not set")]
-    HomeNotFound,
 
     #[error("failed to read run file {}: {source}", path.display())]
     RunReadError {

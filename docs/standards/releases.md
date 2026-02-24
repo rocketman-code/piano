@@ -22,7 +22,7 @@ Both `piano` and `piano-runtime` share the same version number. Bump them togeth
 
 - Human-readable report formatting -- column widths, spacing, wording
 - Internal lib API in the `piano` crate -- not intended for external use
-- Run file directory layout under `~/.piano/` -- implementation detail
+- Run file directory layout under `target/piano/` -- implementation detail
 - Performance -- faster is never breaking, slower is a regression but not a semver event
 
 ## Release Cadence

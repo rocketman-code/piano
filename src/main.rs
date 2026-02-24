@@ -414,26 +414,26 @@ fn default_runs_dir() -> Result<PathBuf, Error> {
     if let Ok(dir) = std::env::var("PIANO_RUNS_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    // Project-local first: ./target/piano/runs/
     let local = PathBuf::from("target/piano/runs");
     if local.is_dir() {
         return Ok(std::fs::canonicalize(local)?);
     }
-    // Fall back to global ~/.piano/runs/ for backward compat
-    let home = std::env::var_os("HOME").ok_or(Error::HomeNotFound)?;
-    Ok(PathBuf::from(home).join(".piano").join("runs"))
+    Err(Error::NoRuns(local))
 }
 
 fn default_tags_dir() -> Result<PathBuf, Error> {
     if let Ok(dir) = std::env::var("PIANO_TAGS_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    // Project-local first: ./target/piano/tags/
     let local = PathBuf::from("target/piano/tags");
     if local.is_dir() {
         return Ok(std::fs::canonicalize(local)?);
     }
-    // Fall back to global ~/.piano/tags/ for backward compat
-    let home = std::env::var_os("HOME").ok_or(Error::HomeNotFound)?;
-    Ok(PathBuf::from(home).join(".piano").join("tags"))
+    // Auto-create tags dir if runs exist (tags live alongside runs)
+    let runs_local = PathBuf::from("target/piano/runs");
+    if runs_local.is_dir() {
+        std::fs::create_dir_all(&local)?;
+        return Ok(std::fs::canonicalize(local)?);
+    }
+    Err(Error::NoRuns(runs_local))
 }
