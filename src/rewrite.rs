@@ -9,8 +9,6 @@ pub struct InstrumentResult {
     /// Functions that contain concurrency patterns, with the pattern name.
     /// e.g. [("concurrent_discover", "rayon::scope"), ("process_all", "par_iter")]
     pub concurrency: Vec<(String, String)>,
-    /// Async functions that were skipped (cannot be instrumented safely).
-    pub async_skipped: Vec<String>,
 }
 
 /// Rewrite `source` so that every function whose name (or qualified name) is in
@@ -29,13 +27,11 @@ pub fn instrument_source(
         current_impl: None,
         current_trait: None,
         concurrency: Vec::new(),
-        async_skipped: Vec::new(),
     };
     instrumenter.visit_file_mut(&mut file);
     Ok(InstrumentResult {
         source: prettyplease::unparse(&file),
         concurrency: instrumenter.concurrency,
-        async_skipped: instrumenter.async_skipped,
     })
 }
 
@@ -61,8 +57,6 @@ struct Instrumenter {
     current_trait: Option<String>,
     /// Collected concurrency info: (function_name, pattern_name).
     concurrency: Vec<(String, String)>,
-    /// Async functions that were skipped.
-    async_skipped: Vec<String>,
 }
 
 impl Instrumenter {
@@ -349,11 +343,7 @@ fn inject_adopt_in_stmts(stmts: &mut [syn::Stmt]) {
 impl VisitMut for Instrumenter {
     fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
         let name = node.sig.ident.to_string();
-        if node.sig.asyncness.is_some() && self.targets.contains(&name) {
-            self.async_skipped.push(name);
-        } else {
-            self.inject_guard(&mut node.block, &name);
-        }
+        self.inject_guard(&mut node.block, &name);
         syn::visit_mut::visit_item_fn_mut(self, node);
     }
 
@@ -371,11 +361,7 @@ impl VisitMut for Instrumenter {
             Some(ty) => format!("{ty}::{method}"),
             None => method,
         };
-        if node.sig.asyncness.is_some() && self.targets.contains(&qualified) {
-            self.async_skipped.push(qualified);
-        } else {
-            self.inject_guard(&mut node.block, &qualified);
-        }
+        self.inject_guard(&mut node.block, &qualified);
         syn::visit_mut::visit_impl_item_fn_mut(self, node);
     }
 
@@ -394,11 +380,7 @@ impl VisitMut for Instrumenter {
                 Some(trait_name) => format!("{trait_name}::{method}"),
                 None => method,
             };
-            if node.sig.asyncness.is_some() && self.targets.contains(&qualified) {
-                self.async_skipped.push(qualified);
-            } else {
-                self.inject_guard(block, &qualified);
-            }
+            self.inject_guard(block, &qualified);
         }
         syn::visit_mut::visit_trait_item_fn_mut(self, node);
     }
@@ -514,38 +496,53 @@ impl ShutdownInjector {
 impl VisitMut for ShutdownInjector {
     fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
         if node.sig.ident == "main" {
+            let is_async = node.sig.asyncness.is_some();
             let has_return_type = !matches!(&node.sig.output, syn::ReturnType::Default);
 
-            // Wrap existing body in catch_unwind so guards drop on panic
-            // (recording timing data), then shutdown collects it, then re-panic.
             let existing_stmts = std::mem::take(&mut node.block.stmts);
             let shutdown_stmt = self.shutdown_stmt();
 
-            let catch_stmt: syn::Stmt = syn::parse_quote! {
-                let __piano_result = std::panic::catch_unwind(
-                    std::panic::AssertUnwindSafe(|| { #(#existing_stmts)* })
-                );
-            };
-            if has_return_type {
-                // fn main() -> T: match on result, resume_unwind on panic.
-                let tail: syn::Stmt = syn::Stmt::Expr(
-                    syn::parse_quote! {
-                        match __piano_result {
-                            Ok(__piano_val) => __piano_val,
-                            Err(__piano_panic) => std::panic::resume_unwind(__piano_panic),
-                        }
-                    },
-                    None,
-                );
-                node.block.stmts = vec![catch_stmt, shutdown_stmt, tail];
+            if is_async {
+                // Async main: can't use catch_unwind (sync closure can't contain .await).
+                // Insert shutdown before the tail expression if there is one.
+                if has_return_type && !existing_stmts.is_empty() {
+                    let (body, tail) = existing_stmts.split_at(existing_stmts.len() - 1);
+                    let mut stmts: Vec<syn::Stmt> = body.to_vec();
+                    stmts.push(shutdown_stmt);
+                    stmts.extend(tail.to_vec());
+                    node.block.stmts = stmts;
+                } else {
+                    let mut stmts = existing_stmts;
+                    stmts.push(shutdown_stmt);
+                    node.block.stmts = stmts;
+                }
             } else {
-                // fn main(): re-panic if the body panicked.
-                let resume_stmt: syn::Stmt = syn::parse_quote! {
-                    if let Err(__piano_panic) = __piano_result {
-                        std::panic::resume_unwind(__piano_panic);
-                    }
+                // Sync main: wrap body in catch_unwind so guards drop on panic
+                // (recording timing data), then shutdown collects it, then re-panic.
+                let catch_stmt: syn::Stmt = syn::parse_quote! {
+                    let __piano_result = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| { #(#existing_stmts)* })
+                    );
                 };
-                node.block.stmts = vec![catch_stmt, shutdown_stmt, resume_stmt];
+                if has_return_type {
+                    let tail: syn::Stmt = syn::Stmt::Expr(
+                        syn::parse_quote! {
+                            match __piano_result {
+                                Ok(__piano_val) => __piano_val,
+                                Err(__piano_panic) => std::panic::resume_unwind(__piano_panic),
+                            }
+                        },
+                        None,
+                    );
+                    node.block.stmts = vec![catch_stmt, shutdown_stmt, tail];
+                } else {
+                    let resume_stmt: syn::Stmt = syn::parse_quote! {
+                        if let Err(__piano_panic) = __piano_result {
+                            std::panic::resume_unwind(__piano_panic);
+                        }
+                    };
+                    node.block.stmts = vec![catch_stmt, shutdown_stmt, resume_stmt];
+                }
             }
         }
         syn::visit_mut::visit_item_fn_mut(self, node);
@@ -823,6 +820,50 @@ fn main() -> ExitCode {
     }
 
     #[test]
+    fn injects_shutdown_async_main_no_catch_unwind() {
+        let source = r#"
+async fn main() {
+    do_stuff().await;
+}
+"#;
+        let result = inject_shutdown(source, None).unwrap();
+        assert!(
+            result.contains("piano_runtime::shutdown()"),
+            "should inject shutdown. Got:\n{result}"
+        );
+        assert!(
+            !result.contains("catch_unwind"),
+            "async main should NOT use catch_unwind. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn injects_shutdown_async_main_with_return_type() {
+        let source = r#"
+async fn main() -> ExitCode {
+    do_stuff().await;
+    ExitCode::SUCCESS
+}
+"#;
+        let result = inject_shutdown(source, None).unwrap();
+        assert!(
+            result.contains("piano_runtime::shutdown()"),
+            "should inject shutdown. Got:\n{result}"
+        );
+        assert!(
+            !result.contains("catch_unwind"),
+            "async main should NOT use catch_unwind. Got:\n{result}"
+        );
+        // shutdown should come before the tail expression
+        let shutdown_pos = result.find("piano_runtime::shutdown()").unwrap();
+        let exit_code_pos = result.rfind("ExitCode::SUCCESS").unwrap();
+        assert!(
+            shutdown_pos < exit_code_pos,
+            "shutdown should come before the tail expression. Got:\n{result}"
+        );
+    }
+
+    #[test]
     fn injects_fork_and_adopt_for_par_iter() {
         let source = r#"
 fn process_all(items: &[Item]) -> Vec<Result> {
@@ -988,7 +1029,7 @@ fn simple() {
     }
 
     #[test]
-    fn skips_async_fn_and_reports_it() {
+    fn instruments_async_fn() {
         let source = r#"
 async fn fetch_data(id: u32) -> String {
     format!("data-{id}")
@@ -996,14 +1037,13 @@ async fn fetch_data(id: u32) -> String {
 "#;
         let targets: HashSet<String> = ["fetch_data".to_string()].into();
         let result = instrument_source(source, &targets).unwrap();
-
         assert!(
-            !result.source.contains("piano_runtime::enter"),
-            "async function should NOT be instrumented. Got:\n{}",
+            result
+                .source
+                .contains("piano_runtime::enter(\"fetch_data\")"),
+            "async function SHOULD be instrumented. Got:\n{}",
             result.source
         );
-        assert_eq!(result.async_skipped.len(), 1);
-        assert_eq!(result.async_skipped[0], "fetch_data");
     }
 
     #[test]
@@ -1021,11 +1061,10 @@ fn compute(x: u64) -> u64 {
             "sync function should be instrumented. Got:\n{}",
             result.source
         );
-        assert!(result.async_skipped.is_empty());
     }
 
     #[test]
-    fn skips_async_impl_method() {
+    fn instruments_async_impl_method() {
         let source = r#"
 struct Client;
 
@@ -1037,18 +1076,17 @@ impl Client {
 "#;
         let targets: HashSet<String> = ["Client::fetch".to_string()].into();
         let result = instrument_source(source, &targets).unwrap();
-
         assert!(
-            !result.source.contains("piano_runtime::enter"),
-            "async impl method should NOT be instrumented. Got:\n{}",
+            result
+                .source
+                .contains("piano_runtime::enter(\"Client::fetch\")"),
+            "async impl method SHOULD be instrumented. Got:\n{}",
             result.source
         );
-        assert_eq!(result.async_skipped.len(), 1);
-        assert_eq!(result.async_skipped[0], "Client::fetch");
     }
 
     #[test]
-    fn skips_async_trait_default_method() {
+    fn instruments_async_trait_default_method() {
         let source = r#"
 trait Service {
     async fn handle(&self) -> String {
@@ -1058,13 +1096,12 @@ trait Service {
 "#;
         let targets: HashSet<String> = ["Service::handle".to_string()].into();
         let result = instrument_source(source, &targets).unwrap();
-
         assert!(
-            !result.source.contains("piano_runtime::enter"),
-            "async trait default method should NOT be instrumented. Got:\n{}",
+            result
+                .source
+                .contains("piano_runtime::enter(\"Service::handle\")"),
+            "async trait default method SHOULD be instrumented. Got:\n{}",
             result.source
         );
-        assert_eq!(result.async_skipped.len(), 1);
-        assert_eq!(result.async_skipped[0], "Service::handle");
     }
 }
