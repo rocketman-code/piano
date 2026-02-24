@@ -169,23 +169,108 @@ thread_local! {
 }
 
 /// RAII timing guard. Records elapsed time on drop.
+///
+/// Self-contained: carries its own timing state so that thread migration
+/// (e.g. async runtimes moving futures between worker threads) produces
+/// correct wall time instead of corrupting the enter thread's TLS stack.
 #[must_use = "dropping the guard immediately records ~0ms; bind it with `let _guard = ...`"]
 pub struct Guard {
-    /// Prevents manual construction outside this module.
-    _private: (),
+    name: &'static str,
+    start: Instant,
+    enter_thread: std::thread::ThreadId,
+    stack_depth: u16,
+    /// Saved alloc counters from enter(). Retained for future use when
+    /// migrated guards gain alloc attribution support.
+    #[allow(dead_code)]
+    saved_alloc: crate::alloc::AllocSnapshot,
 }
+
+// Guard must be Send so async runtimes can move futures containing guards
+// across worker threads. All fields are Send (Instant, ThreadId, &'static str,
+// u16, AllocSnapshot) so this is auto-derived, but we assert it at compile time
+// to catch accidental regressions (e.g. adding a Cell or Rc field).
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _check() {
+        _assert_send::<Guard>();
+    }
+};
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        let drop_thread = std::thread::current().id();
+        let migrated = drop_thread != self.enter_thread;
+
+        if migrated {
+            // Thread migration detected. Wall time is correct (Instant is
+            // cross-thread) but we cannot access the enter thread's TLS stack,
+            // alloc counters, or CPU clock. Record wall time only.
+            let elapsed_ns = self.start.elapsed().as_nanos() as u64;
+            let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
+            let start_ns = self.start.duration_since(epoch()).as_nanos() as u64;
+
+            RECORDS.with(|records| {
+                records
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(RawRecord {
+                        name: self.name,
+                        elapsed_ms,
+                        children_ms: 0.0,
+                        #[cfg(feature = "cpu-time")]
+                        cpu_self_ns: 0,
+                    });
+            });
+
+            let invocation = InvocationRecord {
+                name: self.name,
+                start_ns,
+                elapsed_ns,
+                // No children info available on the drop thread, so self =
+                // wall. May overcount when migrated children exist.
+                self_ns: elapsed_ns,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 0,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+                depth: self.stack_depth,
+            };
+
+            #[cfg(test)]
+            INVOCATIONS.with(|inv| {
+                inv.borrow_mut().push(invocation.clone());
+            });
+
+            FRAME_BUFFER.with(|buf| {
+                buf.borrow_mut().push(invocation);
+            });
+            // No frame boundary check: migrated guard's depth is from
+            // the enter thread, not meaningful for this thread's frames.
+            return;
+        }
+
+        // Same thread -- existing logic with orphan drain prefix.
         #[cfg(feature = "cpu-time")]
         let cpu_end_ns = crate::cpu_clock::cpu_now_ns();
 
-        // Read this scope's alloc counters and restore the parent's saved state.
         let scope_alloc = crate::alloc::ALLOC_COUNTERS
             .try_with(|cell| cell.get())
             .unwrap_or_default();
 
         STACK.with(|stack| {
+            // Drain orphaned entries left by migrated child guards.
+            {
+                let mut s = stack.borrow_mut();
+                while s.last().map_or(false, |e| e.depth > self.stack_depth) {
+                    let orphan = s.pop().unwrap();
+                    let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
+                        cell.set(orphan.saved_alloc);
+                    });
+                }
+            }
+
             let entry = match stack.borrow_mut().pop() {
                 Some(e) => e,
                 None => {
@@ -211,7 +296,6 @@ impl Drop for Guard {
             #[cfg(feature = "cpu-time")]
             let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
 
-            // Safe to re-borrow: the RefMut from pop() was dropped above.
             if let Some(parent) = stack.borrow_mut().last_mut() {
                 parent.children_ms += elapsed_ms;
                 #[cfg(feature = "cpu-time")]
@@ -252,7 +336,6 @@ impl Drop for Guard {
                 inv.borrow_mut().push(invocation.clone());
             });
 
-            // Frame boundary detection: push to buffer, aggregate on depth-0 return.
             FRAME_BUFFER.with(|buf| {
                 buf.borrow_mut().push(invocation);
             });
@@ -273,6 +356,13 @@ impl Drop for Guard {
 pub fn enter(name: &'static str) -> Guard {
     // Touch EPOCH so relative timestamps are anchored to process start.
     let _ = epoch();
+    let start = Instant::now();
+    // Captured here in enter() but stored only in Guard, not StackEntry.
+    // StackEntry lives in thread-local storage and is always accessed from its
+    // own thread, so it never needs to know which thread created it. Guard, on
+    // the other hand, can be moved across threads by async runtimes, so it
+    // carries the originating thread ID to detect migration in Drop.
+    let enter_thread = std::thread::current().id();
 
     // Save current alloc counters and zero them for this scope.
     let saved_alloc = crate::alloc::ALLOC_COUNTERS
@@ -283,11 +373,11 @@ pub fn enter(name: &'static str) -> Guard {
         })
         .unwrap_or_default();
 
-    STACK.with(|stack| {
+    let depth = STACK.with(|stack| {
         let depth = stack.borrow().len() as u16;
         stack.borrow_mut().push(StackEntry {
             name,
-            start: Instant::now(),
+            start,
             #[cfg(feature = "cpu-time")]
             cpu_start_ns: crate::cpu_clock::cpu_now_ns(),
             children_ms: 0.0,
@@ -296,8 +386,16 @@ pub fn enter(name: &'static str) -> Guard {
             saved_alloc,
             depth,
         });
+        depth
     });
-    Guard { _private: () }
+
+    Guard {
+        name,
+        start,
+        enter_thread,
+        stack_depth: depth,
+        saved_alloc,
+    }
 }
 
 /// Register a function name so it appears in output even if never called.
@@ -1682,6 +1780,201 @@ mod tests {
             parent.self_ms,
             child.self_ms,
             parent.total_ms,
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Async / migration tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn async_guard_same_thread() {
+        reset();
+        {
+            let _outer = enter("outer");
+            burn_cpu(5_000);
+            {
+                let _inner = enter("inner");
+                burn_cpu(10_000);
+            }
+            burn_cpu(5_000);
+        }
+        let records = collect();
+        let outer = records.iter().find(|r| r.name == "outer").unwrap();
+        let inner = records.iter().find(|r| r.name == "inner").unwrap();
+        assert!(
+            outer.self_ms < outer.total_ms,
+            "self should be less than total"
+        );
+        let diff = (inner.self_ms - inner.total_ms).abs();
+        assert!(diff < inner.total_ms * 0.1, "inner is leaf: self ~ total");
+    }
+
+    #[test]
+    fn async_guard_migrated_wall_time() {
+        reset();
+        let guard = enter("migrating_fn");
+        burn_cpu(10_000);
+
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                burn_cpu(10_000);
+                drop(guard);
+            });
+        });
+
+        let records = collect_all();
+        let rec = records.iter().find(|r| r.name == "migrating_fn");
+        assert!(
+            rec.is_some(),
+            "migrated guard should still produce a record"
+        );
+        assert!(
+            rec.unwrap().total_ms > 0.5,
+            "wall time should reflect work on both threads"
+        );
+    }
+
+    #[test]
+    fn async_guard_orphan_cleanup() {
+        reset();
+        {
+            let _parent = enter("parent");
+            burn_cpu(5_000);
+
+            let child = enter("child");
+            burn_cpu(5_000);
+
+            std::thread::scope(|s| {
+                s.spawn(move || {
+                    burn_cpu(5_000);
+                    drop(child);
+                });
+            });
+
+            burn_cpu(5_000);
+        }
+
+        let records = collect();
+        let parent = records.iter().find(|r| r.name == "parent").unwrap();
+        assert_eq!(parent.calls, 1, "parent should have exactly 1 call");
+        assert!(parent.total_ms > 0.0, "parent wall time should be positive");
+        assert!(parent.self_ms > 0.0, "parent self time should be positive");
+    }
+
+    #[test]
+    fn async_guard_nested_migration() {
+        reset();
+        {
+            let _parent = enter("gp_parent");
+            burn_cpu(5_000);
+            {
+                let _child = enter("gp_child");
+                burn_cpu(5_000);
+
+                let grandchild = enter("gp_grandchild");
+                burn_cpu(5_000);
+
+                std::thread::scope(|s| {
+                    s.spawn(move || {
+                        drop(grandchild);
+                    });
+                });
+
+                burn_cpu(5_000);
+            }
+            burn_cpu(5_000);
+        }
+
+        let records = collect();
+        let parent = records.iter().find(|r| r.name == "gp_parent").unwrap();
+        let child = records.iter().find(|r| r.name == "gp_child").unwrap();
+        assert_eq!(parent.calls, 1);
+        assert_eq!(child.calls, 1);
+        assert!(parent.self_ms > 0.0, "parent not corrupted");
+        assert!(child.self_ms > 0.0, "child not corrupted");
+        assert!(
+            parent.self_ms < parent.total_ms,
+            "parent has child time subtracted"
+        );
+    }
+
+    #[test]
+    fn async_guard_alloc_restore_on_orphan() {
+        // When a child guard migrates, its stack entry's saved_alloc is
+        // orphaned. During the parent's drop, the orphan drain restores
+        // those saved counters to ALLOC_COUNTERS before the parent's own
+        // saved_alloc is restored. This ensures the grandparent scope
+        // sees consistent alloc state after the parent completes.
+        reset();
+
+        // Set a known alloc baseline before any guards.
+        crate::alloc::ALLOC_COUNTERS.with(|cell| {
+            cell.set(crate::alloc::AllocSnapshot {
+                alloc_count: 42,
+                alloc_bytes: 4200,
+                free_count: 0,
+                free_bytes: 0,
+            });
+        });
+
+        {
+            let _parent = enter("alloc_parent");
+            // enter() saved {42, 4200} and zeroed counters.
+            // Simulate allocations in parent scope.
+            crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                cell.set(crate::alloc::AllocSnapshot {
+                    alloc_count: 10,
+                    alloc_bytes: 1000,
+                    free_count: 0,
+                    free_bytes: 0,
+                });
+            });
+
+            let child = enter("alloc_child");
+            // enter() saved {10, 1000} and zeroed counters.
+
+            std::thread::scope(|s| {
+                s.spawn(move || {
+                    drop(child);
+                });
+            });
+            // child's stack entry is now orphaned with saved_alloc = {10, 1000}.
+        }
+        // After parent drops: orphan drain restores {10, 1000}, then parent
+        // restores its own saved {42, 4200}. ALLOC_COUNTERS should be {42, 4200}.
+        let restored = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
+        assert_eq!(
+            restored.alloc_count, 42,
+            "grandparent alloc_count should be restored after orphan drain"
+        );
+        assert_eq!(
+            restored.alloc_bytes, 4200,
+            "grandparent alloc_bytes should be restored after orphan drain"
+        );
+    }
+
+    #[cfg(feature = "cpu-time")]
+    #[test]
+    fn async_guard_cpu_time_skipped_on_migration() {
+        reset();
+        let guard = enter("cpu_migrated");
+        burn_cpu(20_000);
+
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                burn_cpu(20_000);
+                drop(guard);
+            });
+        });
+
+        let records = collect_all();
+        let rec = records.iter().find(|r| r.name == "cpu_migrated").unwrap();
+        assert!(rec.total_ms > 0.0, "wall time captured");
+        assert!(
+            rec.cpu_self_ms == 0.0,
+            "cpu_self_ms should be exactly 0 for migrated guard, got {:.3}",
+            rec.cpu_self_ms
         );
     }
 }
