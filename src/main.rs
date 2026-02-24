@@ -294,7 +294,6 @@ fn build_project(
 
     // Rewrite each target file in staging.
     let mut all_concurrency: Vec<(String, String)> = Vec::new();
-    let mut all_async_skipped: Vec<String> = Vec::new();
     for target in &targets {
         let target_set: HashSet<String> = target.functions.iter().cloned().collect();
         let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
@@ -312,22 +311,7 @@ fn build_project(
             })?;
 
         all_concurrency.extend(result.concurrency);
-        all_async_skipped.extend(result.async_skipped);
         std::fs::write(&staged_file, result.source)?;
-    }
-
-    // Warn about async functions that were skipped.
-    if !all_async_skipped.is_empty() {
-        eprintln!(
-            "warning: skipped {} async function(s) that cannot be instrumented:",
-            all_async_skipped.len()
-        );
-        for name in &all_async_skipped {
-            eprintln!("           {name}");
-        }
-        eprintln!("         Async functions may move across threads at .await points,");
-        eprintln!("         breaking TLS-based profiling.");
-        eprintln!("         See https://github.com/rocketman-code/piano/issues/53");
     }
 
     // Warn if parallel code was detected without --cpu-time.
