@@ -24,7 +24,7 @@ use piano::rewrite::{
     name = "piano",
     about = "Automated instrumentation-based profiling for Rust",
     version,
-    after_help = "Workflow: piano build [OPTIONS], run the built binary, then piano report"
+    after_help = "Workflow: piano profile [OPTIONS] (or: piano build, run the binary, piano report)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -60,6 +60,49 @@ enum Commands {
         /// Capture per-thread CPU time alongside wall time (Unix only).
         #[arg(long)]
         cpu_time: bool,
+    },
+    /// Build, execute, and report in one step.
+    /// Pass arguments to the binary after --.
+    Profile {
+        /// Instrument functions matching a substring (repeatable).
+        #[arg(long = "fn", value_name = "PATTERN")]
+        fn_patterns: Vec<String>,
+
+        /// Instrument all functions in a file (repeatable).
+        #[arg(long = "file", value_name = "PATH")]
+        file_patterns: Vec<PathBuf>,
+
+        /// Instrument all functions in a module (repeatable).
+        #[arg(long = "mod", value_name = "NAME")]
+        mod_patterns: Vec<String>,
+
+        /// Project root (defaults to current directory).
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+
+        /// Path to piano-runtime source (for development before publishing).
+        #[arg(long)]
+        runtime_path: Option<PathBuf>,
+
+        /// Capture per-thread CPU time alongside wall time (Unix only).
+        #[arg(long)]
+        cpu_time: bool,
+
+        /// Show all functions, including those with zero calls.
+        #[arg(long)]
+        all: bool,
+
+        /// Show per-frame breakdown with spike detection.
+        #[arg(long)]
+        frames: bool,
+
+        /// Suppress warning when program exits with non-zero code.
+        #[arg(long)]
+        ignore_exit_code: bool,
+
+        /// Arguments to pass to the instrumented binary (after --).
+        #[arg(last = true)]
+        args: Vec<String>,
     },
     /// Show the latest profiling run (or a specific one).
     Report {
@@ -113,20 +156,44 @@ fn run(cli: Cli) -> Result<(), Error> {
             runtime_path,
             cpu_time,
         ),
+        Commands::Profile {
+            fn_patterns,
+            file_patterns,
+            mod_patterns,
+            project,
+            runtime_path,
+            cpu_time,
+            all,
+            frames,
+            ignore_exit_code,
+            args,
+        } => cmd_profile(
+            fn_patterns,
+            file_patterns,
+            mod_patterns,
+            project,
+            runtime_path,
+            cpu_time,
+            all,
+            frames,
+            ignore_exit_code,
+            args,
+        ),
         Commands::Report { run, all, frames } => cmd_report(run, all, frames),
         Commands::Diff { a, b } => cmd_diff(a, b),
         Commands::Tag { name } => cmd_tag(name),
     }
 }
 
-fn cmd_build(
+/// Build an instrumented binary and return (binary_path, runs_dir).
+fn build_project(
     fn_patterns: Vec<String>,
     file_patterns: Vec<PathBuf>,
     mod_patterns: Vec<String>,
     project: PathBuf,
     runtime_path: Option<PathBuf>,
     cpu_time: bool,
-) -> Result<(), Error> {
+) -> Result<(PathBuf, PathBuf), Error> {
     if !project.exists() {
         return Err(Error::BuildFailed(format!(
             "project directory does not exist: {}",
@@ -283,6 +350,8 @@ fn cmd_build(
     // Inject register calls into the binary entry point for all instrumented functions.
     let bin_entry = find_bin_entry_point(&member_staging)?;
     let main_file = member_staging.join(&bin_entry);
+    let target_dir = project.join("target").join("piano");
+    let runs_dir = target_dir.join("runs");
     {
         let all_fn_names: Vec<String> = targets
             .iter()
@@ -312,8 +381,6 @@ fn cmd_build(
                 source,
             })?;
 
-        let target_dir = project.join("target").join("piano");
-        let runs_dir = target_dir.join("runs");
         let runs_dir_str = runs_dir.to_string_lossy().to_string();
         let rewritten = inject_shutdown(&rewritten, Some(&runs_dir_str)).map_err(|source| {
             Error::ParseError {
@@ -325,15 +392,86 @@ fn cmd_build(
     }
 
     // Build the instrumented binary.
-    let target_dir = project.join("target").join("piano");
     let binary = build_instrumented(staging.path(), &target_dir, package_name.as_deref())?;
 
+    Ok((binary, runs_dir))
+}
+
+fn cmd_build(
+    fn_patterns: Vec<String>,
+    file_patterns: Vec<PathBuf>,
+    mod_patterns: Vec<String>,
+    project: PathBuf,
+    runtime_path: Option<PathBuf>,
+    cpu_time: bool,
+) -> Result<(), Error> {
+    let (binary, _runs_dir) = build_project(
+        fn_patterns,
+        file_patterns,
+        mod_patterns,
+        project,
+        runtime_path,
+        cpu_time,
+    )?;
     eprintln!("built: {}", binary.display());
     if !std::io::stdout().is_terminal() {
         println!("{}", binary.display());
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_profile(
+    fn_patterns: Vec<String>,
+    file_patterns: Vec<PathBuf>,
+    mod_patterns: Vec<String>,
+    project: PathBuf,
+    runtime_path: Option<PathBuf>,
+    cpu_time: bool,
+    show_all: bool,
+    frames: bool,
+    ignore_exit_code: bool,
+    args: Vec<String>,
+) -> Result<(), Error> {
+    let (binary, runs_dir) = build_project(
+        fn_patterns,
+        file_patterns,
+        mod_patterns,
+        project,
+        runtime_path,
+        cpu_time,
+    )?;
+    eprintln!("built: {}", binary.display());
+
+    let status = std::process::Command::new(&binary)
+        .args(&args)
+        .status()
+        .map_err(|e| Error::RunFailed(format!("failed to run {}: {e}", binary.display())))?;
+
+    if !status.success() && !ignore_exit_code {
+        if let Some(code) = status.code() {
+            eprintln!(
+                "warning: program exited with code {code} — profiling results may be incomplete"
+            );
+        } else {
+            eprintln!(
+                "warning: program terminated by signal — profiling results may be incomplete"
+            );
+        }
+    }
+
+    // Point cmd_report at the project's runs directory so it works even when
+    // CWD differs from the --project path. Skip if already set — the user
+    // or test harness may have overridden it, and the runtime's shutdown_to()
+    // respects PIANO_RUNS_DIR too.
+    if std::env::var_os("PIANO_RUNS_DIR").is_none() {
+        // SAFETY: single-threaded CLI at this point — no concurrent env reads.
+        unsafe { std::env::set_var("PIANO_RUNS_DIR", &runs_dir) };
+    }
+
+    eprintln!();
+    cmd_report(None, show_all, frames)
 }
 
 fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result<(), Error> {

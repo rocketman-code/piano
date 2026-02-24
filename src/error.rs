@@ -15,6 +15,9 @@ pub enum Error {
     #[error("build failed: {0}")]
     BuildFailed(String),
 
+    #[error("run failed: {0}")]
+    RunFailed(String),
+
     #[error("no piano runs found in {} -- run `piano build` and execute the instrumented binary first", .0.display())]
     NoRuns(PathBuf),
 
