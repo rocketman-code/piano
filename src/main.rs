@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -311,7 +312,9 @@ fn cmd_build(
     let binary = build_instrumented(staging.path(), &target_dir, package_name.as_deref())?;
 
     eprintln!("built: {}", binary.display());
-    println!("{}", binary.display());
+    if !std::io::stdout().is_terminal() {
+        println!("{}", binary.display());
+    }
 
     Ok(())
 }
