@@ -4,6 +4,7 @@
 
 mod alloc;
 mod collector;
+mod cpu_clock;
 
 pub use alloc::PianoAllocator;
 #[cfg(test)]
