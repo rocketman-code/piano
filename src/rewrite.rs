@@ -9,6 +9,8 @@ pub struct InstrumentResult {
     /// Functions that contain concurrency patterns, with the pattern name.
     /// e.g. [("concurrent_discover", "rayon::scope"), ("process_all", "par_iter")]
     pub concurrency: Vec<(String, String)>,
+    /// Async functions that were skipped (cannot be instrumented safely).
+    pub async_skipped: Vec<String>,
 }
 
 /// Rewrite `source` so that every function whose name (or qualified name) is in
@@ -27,11 +29,13 @@ pub fn instrument_source(
         current_impl: None,
         current_trait: None,
         concurrency: Vec::new(),
+        async_skipped: Vec::new(),
     };
     instrumenter.visit_file_mut(&mut file);
     Ok(InstrumentResult {
         source: prettyplease::unparse(&file),
         concurrency: instrumenter.concurrency,
+        async_skipped: instrumenter.async_skipped,
     })
 }
 
@@ -57,6 +61,8 @@ struct Instrumenter {
     current_trait: Option<String>,
     /// Collected concurrency info: (function_name, pattern_name).
     concurrency: Vec<(String, String)>,
+    /// Async functions that were skipped.
+    async_skipped: Vec<String>,
 }
 
 impl Instrumenter {
@@ -343,7 +349,11 @@ fn inject_adopt_in_stmts(stmts: &mut [syn::Stmt]) {
 impl VisitMut for Instrumenter {
     fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
         let name = node.sig.ident.to_string();
-        self.inject_guard(&mut node.block, &name);
+        if node.sig.asyncness.is_some() && self.targets.contains(&name) {
+            self.async_skipped.push(name);
+        } else {
+            self.inject_guard(&mut node.block, &name);
+        }
         syn::visit_mut::visit_item_fn_mut(self, node);
     }
 
@@ -361,7 +371,11 @@ impl VisitMut for Instrumenter {
             Some(ty) => format!("{ty}::{method}"),
             None => method,
         };
-        self.inject_guard(&mut node.block, &qualified);
+        if node.sig.asyncness.is_some() && self.targets.contains(&qualified) {
+            self.async_skipped.push(qualified);
+        } else {
+            self.inject_guard(&mut node.block, &qualified);
+        }
         syn::visit_mut::visit_impl_item_fn_mut(self, node);
     }
 
@@ -380,7 +394,11 @@ impl VisitMut for Instrumenter {
                 Some(trait_name) => format!("{trait_name}::{method}"),
                 None => method,
             };
-            self.inject_guard(block, &qualified);
+            if node.sig.asyncness.is_some() && self.targets.contains(&qualified) {
+                self.async_skipped.push(qualified);
+            } else {
+                self.inject_guard(block, &qualified);
+            }
         }
         syn::visit_mut::visit_trait_item_fn_mut(self, node);
     }
@@ -922,5 +940,86 @@ fn simple() {
         let targets: HashSet<String> = ["simple".to_string()].into();
         let result = instrument_source(source, &targets).unwrap();
         assert!(result.concurrency.is_empty());
+    }
+
+    #[test]
+    fn skips_async_fn_and_reports_it() {
+        let source = r#"
+async fn fetch_data(id: u32) -> String {
+    format!("data-{id}")
+}
+"#;
+        let targets: HashSet<String> = ["fetch_data".to_string()].into();
+        let result = instrument_source(source, &targets).unwrap();
+
+        assert!(
+            !result.source.contains("piano_runtime::enter"),
+            "async function should NOT be instrumented. Got:\n{}",
+            result.source
+        );
+        assert_eq!(result.async_skipped.len(), 1);
+        assert_eq!(result.async_skipped[0], "fetch_data");
+    }
+
+    #[test]
+    fn does_not_skip_sync_fn() {
+        let source = r#"
+fn compute(x: u64) -> u64 {
+    x * 2
+}
+"#;
+        let targets: HashSet<String> = ["compute".to_string()].into();
+        let result = instrument_source(source, &targets).unwrap();
+
+        assert!(
+            result.source.contains("piano_runtime::enter(\"compute\")"),
+            "sync function should be instrumented. Got:\n{}",
+            result.source
+        );
+        assert!(result.async_skipped.is_empty());
+    }
+
+    #[test]
+    fn skips_async_impl_method() {
+        let source = r#"
+struct Client;
+
+impl Client {
+    async fn fetch(&self) -> String {
+        "data".to_string()
+    }
+}
+"#;
+        let targets: HashSet<String> = ["Client::fetch".to_string()].into();
+        let result = instrument_source(source, &targets).unwrap();
+
+        assert!(
+            !result.source.contains("piano_runtime::enter"),
+            "async impl method should NOT be instrumented. Got:\n{}",
+            result.source
+        );
+        assert_eq!(result.async_skipped.len(), 1);
+        assert_eq!(result.async_skipped[0], "Client::fetch");
+    }
+
+    #[test]
+    fn skips_async_trait_default_method() {
+        let source = r#"
+trait Service {
+    async fn handle(&self) -> String {
+        "ok".to_string()
+    }
+}
+"#;
+        let targets: HashSet<String> = ["Service::handle".to_string()].into();
+        let result = instrument_source(source, &targets).unwrap();
+
+        assert!(
+            !result.source.contains("piano_runtime::enter"),
+            "async trait default method should NOT be instrumented. Got:\n{}",
+            result.source
+        );
+        assert_eq!(result.async_skipped.len(), 1);
+        assert_eq!(result.async_skipped[0], "Service::handle");
     }
 }
