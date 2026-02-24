@@ -1,10 +1,10 @@
 # piano
 
-Automated instrumentation-based profiling for Rust. Point it at some functions, get back timing, percentiles, and allocation counts per frame.
+Automated instrumentation-based profiling for Rust. Point it at your project, get back timing, percentiles, and allocation counts per frame.
 
 ```
-$ piano build --fn parse --fn resolve
-found 3 function(s) across 2 file(s)
+$ piano build
+found 5 function(s) across 3 file(s)
 built: target/piano/debug/my-project
 
 $ ./target/piano/debug/my-project
@@ -20,7 +20,7 @@ parse_item                                    108    94.58ms     0.87ms     1.14
 3000 frames
 ```
 
-Piano rewrites your source at the AST level to inject RAII timing guards and an allocation-tracking allocator, builds the instrumented binary, and flushes per-frame results to `~/.piano/runs/` on process exit. Your original source is never modified.
+Piano rewrites your source at the AST level to inject RAII timing guards and an allocation-tracking allocator, builds the instrumented binary, and flushes per-frame results to `target/piano/runs/` on process exit. Your original source is never modified.
 
 ## Install
 
@@ -34,7 +34,15 @@ Requires Rust 1.88+.
 
 ### Instrument and build
 
-Target functions by name, file, or module:
+By default, `piano build` instruments all functions in your project:
+
+```
+$ piano build
+found 5 function(s) across 3 file(s)
+built: target/piano/debug/my-project
+```
+
+Narrow scope by name, file, or module:
 
 ```
 $ piano build --fn parse                    # functions containing "parse"
@@ -86,6 +94,16 @@ parse_item                                   94.58ms     88.12ms     -6.46ms    
 
 `piano report` and `piano diff` accept file paths or tag names.
 
+### CPU time
+
+Add `--cpu-time` to measure per-thread CPU time alongside wall-clock time (Linux + macOS, 64-bit only):
+
+```
+$ piano build --cpu-time
+```
+
+The report adds CPU columns so you can distinguish computation from I/O or sleeping.
+
 ### Multi-threaded programs
 
 Programs using rayon or `std::thread::spawn` work out of the box. Each thread writes its own timing data with a shared `run_id`. `piano report` consolidates all files from the same run automatically.
@@ -104,9 +122,9 @@ Two crates: `piano` (CLI, AST rewriting, build orchestration) and `piano-runtime
 
 ## Limitations
 
-- Wall-clock timing, not CPU time. Sleeping or blocked I/O counts as elapsed time.
+- Wall-clock timing by default. Use `--cpu-time` to add per-thread CPU time (Linux + macOS only).
 - Functions shorter than the guard overhead (~120ns) will have noisy measurements.
-- Each thread's call tree is independent. Cross-thread relationships (spawned tasks, async executors) appear as separate profiles.
+- Async functions are not yet supported (skipped with a warning).
 - Allocation tracking counts heap operations only (`alloc`/`dealloc`). Stack allocations and memory-mapped regions are not tracked.
 
 ## License
