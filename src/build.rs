@@ -49,19 +49,32 @@ pub(crate) enum RuntimeSource<'a> {
 
 /// Add `piano-runtime` as a dependency in the staged project's Cargo.toml.
 /// Uses `toml_edit` for structured manipulation (never string replacement).
-pub fn inject_runtime_dependency(staging_dir: &Path, runtime_version: &str) -> Result<(), Error> {
-    inject_runtime(staging_dir, RuntimeSource::Version(runtime_version))
+pub fn inject_runtime_dependency(
+    staging_dir: &Path,
+    runtime_version: &str,
+    features: &[&str],
+) -> Result<(), Error> {
+    inject_runtime(
+        staging_dir,
+        RuntimeSource::Version(runtime_version),
+        features,
+    )
 }
 
 /// Add `piano-runtime` as a path dependency in the staged project's Cargo.toml.
 pub fn inject_runtime_path_dependency(
     staging_dir: &Path,
     runtime_path: &Path,
+    features: &[&str],
 ) -> Result<(), Error> {
-    inject_runtime(staging_dir, RuntimeSource::Path(runtime_path))
+    inject_runtime(staging_dir, RuntimeSource::Path(runtime_path), features)
 }
 
-fn inject_runtime(staging_dir: &Path, source: RuntimeSource<'_>) -> Result<(), Error> {
+fn inject_runtime(
+    staging_dir: &Path,
+    source: RuntimeSource<'_>,
+    features: &[&str],
+) -> Result<(), Error> {
     let cargo_toml_path = staging_dir.join("Cargo.toml");
     let content = std::fs::read_to_string(&cargo_toml_path)?;
 
@@ -74,16 +87,35 @@ fn inject_runtime(staging_dir: &Path, source: RuntimeSource<'_>) -> Result<(), E
         doc["dependencies"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
 
-    match source {
-        RuntimeSource::Version(v) => {
-            doc["dependencies"]["piano-runtime"] = toml_edit::value(v);
+    if features.is_empty() {
+        match source {
+            RuntimeSource::Version(v) => {
+                doc["dependencies"]["piano-runtime"] = toml_edit::value(v);
+            }
+            RuntimeSource::Path(p) => {
+                let mut table = toml_edit::InlineTable::new();
+                table.insert("path", p.to_string_lossy().as_ref().into());
+                doc["dependencies"]["piano-runtime"] =
+                    toml_edit::Item::Value(toml_edit::Value::InlineTable(table));
+            }
         }
-        RuntimeSource::Path(p) => {
-            let mut table = toml_edit::InlineTable::new();
-            table.insert("path", p.to_string_lossy().as_ref().into());
-            doc["dependencies"]["piano-runtime"] =
-                toml_edit::Item::Value(toml_edit::Value::InlineTable(table));
+    } else {
+        let mut table = toml_edit::InlineTable::new();
+        match source {
+            RuntimeSource::Version(v) => {
+                table.insert("version", v.into());
+            }
+            RuntimeSource::Path(p) => {
+                table.insert("path", p.to_string_lossy().as_ref().into());
+            }
         }
+        let mut feat_array = toml_edit::Array::new();
+        for f in features {
+            feat_array.push(*f);
+        }
+        table.insert("features", toml_edit::Value::Array(feat_array));
+        doc["dependencies"]["piano-runtime"] =
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(table));
     }
 
     std::fs::write(&cargo_toml_path, doc.to_string())?;
@@ -289,7 +321,7 @@ serde = "1"
 "#;
         create_file(staging.path(), "Cargo.toml", toml_content);
 
-        inject_runtime_dependency(staging.path(), "0.1.0").unwrap();
+        inject_runtime_dependency(staging.path(), "0.1.0", &[]).unwrap();
 
         let result = std::fs::read_to_string(staging.path().join("Cargo.toml")).unwrap();
         let doc: DocumentMut = result.parse().unwrap();
@@ -323,12 +355,41 @@ version = "0.1.0"
 "#;
         create_file(staging.path(), "Cargo.toml", toml_content);
 
-        inject_runtime_dependency(staging.path(), "0.2.0").unwrap();
+        inject_runtime_dependency(staging.path(), "0.2.0", &[]).unwrap();
 
         let result = std::fs::read_to_string(staging.path().join("Cargo.toml")).unwrap();
         let doc: DocumentMut = result.parse().unwrap();
 
         assert_eq!(doc["dependencies"]["piano-runtime"].as_str(), Some("0.2.0"),);
+    }
+
+    #[test]
+    fn inject_dependency_with_features() {
+        let staging = TempDir::new().unwrap();
+        let toml_content = r#"[package]
+name = "test"
+version = "0.1.0"
+edition = "2021"
+"#;
+        create_file(staging.path(), "Cargo.toml", toml_content);
+
+        inject_runtime_dependency(staging.path(), "0.3.0", &["cpu-time"]).unwrap();
+
+        let result = std::fs::read_to_string(staging.path().join("Cargo.toml")).unwrap();
+        assert!(
+            result.contains("cpu-time"),
+            "should inject cpu-time feature: {result}"
+        );
+        assert!(
+            result.contains("piano-runtime"),
+            "should inject piano-runtime: {result}"
+        );
+        // Verify it parses as valid TOML with version and features
+        let doc: DocumentMut = result.parse().unwrap();
+        let dep = doc["dependencies"]["piano-runtime"]
+            .as_inline_table()
+            .unwrap();
+        assert_eq!(dep.get("version").and_then(|v| v.as_str()), Some("0.3.0"));
     }
 
     #[test]

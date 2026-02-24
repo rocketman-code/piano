@@ -52,6 +52,10 @@ enum Commands {
         /// Path to piano-runtime source (for development before publishing).
         #[arg(long)]
         runtime_path: Option<PathBuf>,
+
+        /// Capture per-thread CPU time alongside wall time (Unix only).
+        #[arg(long)]
+        cpu_time: bool,
     },
     /// Show the latest profiling run (or a specific one).
     Report {
@@ -96,12 +100,14 @@ fn run(cli: Cli) -> Result<(), Error> {
             mod_patterns,
             project,
             runtime_path,
+            cpu_time,
         } => cmd_build(
             fn_patterns,
             file_patterns,
             mod_patterns,
             project,
             runtime_path,
+            cpu_time,
         ),
         Commands::Report { run, all, frames } => cmd_report(run, all, frames),
         Commands::Diff { a, b } => cmd_diff(a, b),
@@ -115,6 +121,7 @@ fn cmd_build(
     mod_patterns: Vec<String>,
     project: PathBuf,
     runtime_path: Option<PathBuf>,
+    cpu_time: bool,
 ) -> Result<(), Error> {
     let project = std::fs::canonicalize(&project)?;
 
@@ -190,17 +197,19 @@ fn cmd_build(
     };
 
     // Inject piano-runtime dependency.
+    let features: Vec<&str> = if cpu_time { vec!["cpu-time"] } else { vec![] };
     match runtime_path {
         Some(ref path) => {
             let abs_path = std::fs::canonicalize(path)?;
-            inject_runtime_path_dependency(&member_staging, &abs_path)?;
+            inject_runtime_path_dependency(&member_staging, &abs_path, &features)?;
         }
         None => {
-            inject_runtime_dependency(&member_staging, env!("PIANO_RUNTIME_VERSION"))?;
+            inject_runtime_dependency(&member_staging, env!("PIANO_RUNTIME_VERSION"), &features)?;
         }
     }
 
     // Rewrite each target file in staging.
+    let mut all_concurrency: Vec<(String, String)> = Vec::new();
     for target in &targets {
         let target_set: HashSet<String> = target.functions.iter().cloned().collect();
         let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
@@ -211,13 +220,31 @@ fn cmd_build(
                 source,
             })?;
 
-        let rewritten =
+        let result =
             instrument_source(&source, &target_set).map_err(|source| Error::ParseError {
                 path: staged_file.clone(),
                 source,
             })?;
 
-        std::fs::write(&staged_file, rewritten)?;
+        all_concurrency.extend(result.concurrency);
+        std::fs::write(&staged_file, result.source)?;
+    }
+
+    // Warn if parallel code was detected without --cpu-time.
+    if !cpu_time && !all_concurrency.is_empty() {
+        if all_concurrency.len() == 1 {
+            let (func, pattern) = &all_concurrency[0];
+            eprintln!("warning: {func} uses {pattern} but --cpu-time is not enabled.");
+            eprintln!("         Wall time will include time blocked waiting for workers.");
+            eprintln!("         Re-run with --cpu-time to separate CPU from wall time.");
+        } else {
+            eprintln!("warning: parallel code profiled without --cpu-time:");
+            for (func, pattern) in &all_concurrency {
+                eprintln!("           {func} ({pattern})");
+            }
+            eprintln!("         Wall time will include time blocked waiting for workers.");
+            eprintln!("         Re-run with --cpu-time to separate CPU from wall time.");
+        }
     }
 
     // Inject register calls into the binary entry point for all instrumented functions.

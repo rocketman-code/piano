@@ -3,21 +3,36 @@ use std::collections::HashSet;
 use quote::quote;
 use syn::visit_mut::VisitMut;
 
+/// Result of instrumenting a source file.
+pub struct InstrumentResult {
+    pub source: String,
+    /// Functions that contain concurrency patterns, with the pattern name.
+    /// e.g. [("concurrent_discover", "rayon::scope"), ("process_all", "par_iter")]
+    pub concurrency: Vec<(String, String)>,
+}
+
 /// Rewrite `source` so that every function whose name (or qualified name) is in
 /// `targets` gets an RAII timing guard injected as its first statement.
 ///
 /// Top-level functions match by bare name (e.g. "walk"). Impl methods match by
 /// "Type::method" (e.g. "Walker::walk"). Trait default methods match by "Trait::method" (e.g. "Drawable::draw").
 ///
-pub fn instrument_source(source: &str, targets: &HashSet<String>) -> Result<String, syn::Error> {
+pub fn instrument_source(
+    source: &str,
+    targets: &HashSet<String>,
+) -> Result<InstrumentResult, syn::Error> {
     let mut file: syn::File = syn::parse_str(source)?;
     let mut instrumenter = Instrumenter {
         targets: targets.clone(),
         current_impl: None,
         current_trait: None,
+        concurrency: Vec::new(),
     };
     instrumenter.visit_file_mut(&mut file);
-    Ok(prettyplease::unparse(&file))
+    Ok(InstrumentResult {
+        source: prettyplease::unparse(&file),
+        concurrency: instrumenter.concurrency,
+    })
 }
 
 /// Method names that indicate parallel iterator chains.
@@ -33,15 +48,19 @@ const PARALLEL_ITER_METHODS: &[&str] = &[
 
 /// Function/method path segments that indicate spawn/scope boundaries.
 const SPAWN_FUNCTIONS: &[&str] = &["spawn", "scope", "scope_fifo", "join"];
+/// Scope-like functions whose closures coordinate workers (don't adopt, recurse body).
+const SCOPE_FUNCTIONS: &[&str] = &["scope", "scope_fifo"];
 
 struct Instrumenter {
     targets: HashSet<String>,
     current_impl: Option<String>,
     current_trait: Option<String>,
+    /// Collected concurrency info: (function_name, pattern_name).
+    concurrency: Vec<(String, String)>,
 }
 
 impl Instrumenter {
-    fn inject_guard(&self, block: &mut syn::Block, name: &str) {
+    fn inject_guard(&mut self, block: &mut syn::Block, name: &str) {
         if !self.targets.contains(name) {
             return;
         }
@@ -52,15 +71,20 @@ impl Instrumenter {
 
         // If the function body contains concurrency calls, inject fork
         // and adopt in the relevant closures.
-        if block_contains_concurrency(block) {
-            let fork_stmt: syn::Stmt = syn::parse_quote! {
-                let _piano_ctx = piano_runtime::fork();
+        if let Some(pattern) = find_concurrency_pattern(block) {
+            self.concurrency.push((name.to_string(), pattern));
+            let fork_owned_stmt: syn::Stmt = syn::parse_quote! {
+                let _piano_ctx_owned = piano_runtime::fork();
             };
-            // Insert after the guard (position 1)
-            block.stmts.insert(1, fork_stmt);
+            let fork_ref_stmt: syn::Stmt = syn::parse_quote! {
+                let _piano_ctx = _piano_ctx_owned.as_ref();
+            };
+            // Insert after the guard (position 1, 2)
+            block.stmts.insert(1, fork_owned_stmt);
+            block.stmts.insert(2, fork_ref_stmt);
 
             // Walk the remaining statements and inject adopt into closures
-            for stmt in block.stmts.iter_mut().skip(2) {
+            for stmt in block.stmts.iter_mut().skip(3) {
                 match stmt {
                     syn::Stmt::Expr(expr, _) => {
                         inject_adopt_in_concurrency_closures(expr, false);
@@ -77,50 +101,63 @@ impl Instrumenter {
     }
 }
 
-/// Check if a block contains a known concurrency method call.
-fn block_contains_concurrency(block: &syn::Block) -> bool {
-    block.stmts.iter().any(stmt_contains_concurrency)
+/// Find the first concurrency pattern in a block and return its name.
+///
+/// For method calls matching PARALLEL_ITER_METHODS: returns the method name (e.g. "par_iter").
+/// For method calls matching SPAWN_FUNCTIONS: returns the method name (e.g. "spawn").
+/// For function calls matching SPAWN_FUNCTIONS: returns the full path (e.g. "rayon::scope").
+fn find_concurrency_pattern(block: &syn::Block) -> Option<String> {
+    block.stmts.iter().find_map(find_pattern_in_stmt)
 }
 
-fn stmt_contains_concurrency(stmt: &syn::Stmt) -> bool {
+fn find_pattern_in_stmt(stmt: &syn::Stmt) -> Option<String> {
     match stmt {
-        syn::Stmt::Expr(e, _) => contains_concurrency_call(e),
+        syn::Stmt::Expr(e, _) => find_pattern_in_expr(e),
         syn::Stmt::Local(local) => local
             .init
             .as_ref()
-            .is_some_and(|init| contains_concurrency_call(&init.expr)),
-        _ => false,
+            .and_then(|init| find_pattern_in_expr(&init.expr)),
+        _ => None,
     }
 }
 
-fn contains_concurrency_call(expr: &syn::Expr) -> bool {
+fn find_pattern_in_expr(expr: &syn::Expr) -> Option<String> {
     match expr {
         syn::Expr::MethodCall(mc) => {
             let method = mc.method.to_string();
-            if PARALLEL_ITER_METHODS.contains(&method.as_str())
-                || SPAWN_FUNCTIONS.contains(&method.as_str())
-            {
-                return true;
+            if PARALLEL_ITER_METHODS.contains(&method.as_str()) {
+                return Some(method);
             }
-            if contains_concurrency_call(&mc.receiver) {
-                return true;
+            if SPAWN_FUNCTIONS.contains(&method.as_str()) {
+                return Some(method);
             }
-            mc.args.iter().any(contains_concurrency_call)
+            if let Some(p) = find_pattern_in_expr(&mc.receiver) {
+                return Some(p);
+            }
+            mc.args.iter().find_map(find_pattern_in_expr)
         }
         syn::Expr::Call(call) => {
             if let syn::Expr::Path(path) = &*call.func {
                 let last_seg = path.path.segments.last().map(|s| s.ident.to_string());
-                if let Some(name) = last_seg
+                if let Some(ref name) = last_seg
                     && SPAWN_FUNCTIONS.contains(&name.as_str())
                 {
-                    return true;
+                    // Build the full path, e.g. "rayon::scope"
+                    let full_path: String = path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    return Some(full_path);
                 }
             }
-            call.args.iter().any(contains_concurrency_call)
+            call.args.iter().find_map(find_pattern_in_expr)
         }
-        syn::Expr::Block(b) => b.block.stmts.iter().any(stmt_contains_concurrency),
-        syn::Expr::Closure(c) => contains_concurrency_call(&c.body),
-        _ => false,
+        syn::Expr::Block(b) => b.block.stmts.iter().find_map(find_pattern_in_stmt),
+        syn::Expr::Closure(c) => find_pattern_in_expr(&c.body),
+        _ => None,
     }
 }
 
@@ -132,6 +169,7 @@ fn inject_adopt_in_concurrency_closures(expr: &mut syn::Expr, in_parallel_chain:
             let method = mc.method.to_string();
             let is_par = PARALLEL_ITER_METHODS.contains(&method.as_str());
             let is_spawn = SPAWN_FUNCTIONS.contains(&method.as_str());
+            let is_scope = SCOPE_FUNCTIONS.contains(&method.as_str());
 
             // Recurse into receiver first
             inject_adopt_in_concurrency_closures(&mut mc.receiver, in_parallel_chain);
@@ -140,8 +178,18 @@ fn inject_adopt_in_concurrency_closures(expr: &mut syn::Expr, in_parallel_chain:
             let chain_active =
                 in_parallel_chain || is_par || receiver_has_parallel_method(&mc.receiver);
 
-            // If in a parallel chain or this is a spawn call, inject adopt into closure args
-            if (chain_active && !is_par) || is_spawn {
+            if is_scope {
+                // Scope closures are coordinators, not workers — don't adopt,
+                // but recurse into their body to find nested spawn calls.
+                for arg in &mut mc.args {
+                    if let syn::Expr::Closure(closure) = arg {
+                        recurse_closure_body_for_spawns(closure);
+                    } else {
+                        inject_adopt_in_concurrency_closures(arg, false);
+                    }
+                }
+            } else if (chain_active && !is_par) || is_spawn {
+                // Worker closures: inject adopt so their time is attributed.
                 for arg in &mut mc.args {
                     if let syn::Expr::Closure(closure) = arg {
                         inject_adopt_at_closure_start(closure);
@@ -157,16 +205,27 @@ fn inject_adopt_in_concurrency_closures(expr: &mut syn::Expr, in_parallel_chain:
             }
         }
         syn::Expr::Call(call) => {
-            let is_spawn = if let syn::Expr::Path(path) = &*call.func {
-                path.path
-                    .segments
-                    .last()
-                    .map(|s| SPAWN_FUNCTIONS.contains(&s.ident.to_string().as_str()))
-                    .unwrap_or(false)
+            let func_name = if let syn::Expr::Path(path) = &*call.func {
+                path.path.segments.last().map(|s| s.ident.to_string())
             } else {
-                false
+                None
             };
-            if is_spawn {
+            let is_spawn = func_name
+                .as_ref()
+                .is_some_and(|n| SPAWN_FUNCTIONS.contains(&n.as_str()));
+            let is_scope = func_name
+                .as_ref()
+                .is_some_and(|n| SCOPE_FUNCTIONS.contains(&n.as_str()));
+
+            if is_scope {
+                for arg in &mut call.args {
+                    if let syn::Expr::Closure(closure) = arg {
+                        recurse_closure_body_for_spawns(closure);
+                    } else {
+                        inject_adopt_in_concurrency_closures(arg, false);
+                    }
+                }
+            } else if is_spawn {
                 for arg in &mut call.args {
                     if let syn::Expr::Closure(closure) = arg {
                         inject_adopt_at_closure_start(closure);
@@ -187,6 +246,37 @@ fn inject_adopt_in_concurrency_closures(expr: &mut syn::Expr, in_parallel_chain:
                 }
             }
         }
+        syn::Expr::ForLoop(f) => {
+            for stmt in &mut f.body.stmts {
+                if let syn::Stmt::Expr(e, _) = stmt {
+                    inject_adopt_in_concurrency_closures(e, false);
+                }
+            }
+        }
+        syn::Expr::While(w) => {
+            for stmt in &mut w.body.stmts {
+                if let syn::Stmt::Expr(e, _) = stmt {
+                    inject_adopt_in_concurrency_closures(e, false);
+                }
+            }
+        }
+        syn::Expr::Loop(l) => {
+            for stmt in &mut l.body.stmts {
+                if let syn::Stmt::Expr(e, _) = stmt {
+                    inject_adopt_in_concurrency_closures(e, false);
+                }
+            }
+        }
+        syn::Expr::If(i) => {
+            for stmt in &mut i.then_branch.stmts {
+                if let syn::Stmt::Expr(e, _) = stmt {
+                    inject_adopt_in_concurrency_closures(e, false);
+                }
+            }
+            if let Some((_, else_branch)) = &mut i.else_branch {
+                inject_adopt_in_concurrency_closures(else_branch, false);
+            }
+        }
         _ => {}
     }
 }
@@ -204,7 +294,7 @@ fn receiver_has_parallel_method(expr: &syn::Expr) -> bool {
 
 fn inject_adopt_at_closure_start(closure: &mut syn::ExprClosure) {
     let adopt_stmt: syn::Stmt = syn::parse_quote! {
-        let _piano_adopt = _piano_ctx.as_ref().map(|c| piano_runtime::adopt(c));
+        let _piano_adopt = _piano_ctx.map(|c| piano_runtime::adopt(c));
     };
     match &mut *closure.body {
         syn::Expr::Block(block) => {
@@ -218,6 +308,34 @@ fn inject_adopt_at_closure_start(closure: &mut syn::ExprClosure) {
                     #existing
                 }
             };
+        }
+    }
+}
+
+/// Recurse into a closure body to find nested spawn calls and inject adopt.
+/// Used for scope/scope_fifo closures where the closure is the coordinator,
+/// not a worker — we don't adopt the coordinator, but its spawn calls need adopt.
+fn recurse_closure_body_for_spawns(closure: &mut syn::ExprClosure) {
+    if let syn::Expr::Block(block) = &mut *closure.body {
+        inject_adopt_in_stmts(&mut block.block.stmts);
+    }
+}
+
+/// Walk statements, injecting adopt into spawn closures.
+/// `_piano_ctx` is `Option<&SpanContext>` which is `Copy`, so `move` closures
+/// can capture it without ownership issues.
+fn inject_adopt_in_stmts(stmts: &mut [syn::Stmt]) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            syn::Stmt::Expr(e, _) => {
+                inject_adopt_in_concurrency_closures(e, false);
+            }
+            syn::Stmt::Local(local) => {
+                if let Some(init) = &mut local.init {
+                    inject_adopt_in_concurrency_closures(&mut init.expr, false);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -425,7 +543,7 @@ fn other() {
 }
 "#;
         let targets: HashSet<String> = ["walk".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets).unwrap().source;
 
         assert!(
             result.contains("piano_runtime::enter(\"walk\")"),
@@ -449,7 +567,7 @@ impl Walker {
 }
 "#;
         let targets: HashSet<String> = ["Walker::walk".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets).unwrap().source;
 
         assert!(
             result.contains("piano_runtime::enter(\"Walker::walk\")"),
@@ -465,7 +583,7 @@ fn compute(x: i32, y: i32) -> i32 {
 }
 "#;
         let targets: HashSet<String> = ["compute".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets).unwrap().source;
 
         assert!(
             result.contains("fn compute(x: i32, y: i32) -> i32"),
@@ -486,7 +604,7 @@ fn b() {}
 fn c() {}
 "#;
         let targets: HashSet<String> = ["a".to_string(), "c".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets).unwrap().source;
 
         assert!(
             result.contains("piano_runtime::enter(\"a\")"),
@@ -568,7 +686,7 @@ fn main() {
 }
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets).unwrap().source;
 
         assert!(
             !result.contains("piano_runtime::init()"),
@@ -651,7 +769,7 @@ fn process_all(items: &[Item]) -> Vec<Result> {
 }
 "#;
         let targets: HashSet<String> = ["process_all".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets).unwrap().source;
 
         assert!(
             result.contains("piano_runtime::enter(\"process_all\")"),
@@ -677,7 +795,7 @@ fn do_work() {
 }
 "#;
         let targets: HashSet<String> = ["do_work".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets).unwrap().source;
 
         assert!(
             result.contains("piano_runtime::fork()"),
@@ -700,7 +818,7 @@ fn parallel_work() {
 }
 "#;
         let targets: HashSet<String> = ["parallel_work".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets).unwrap().source;
 
         assert!(
             result.contains("piano_runtime::fork()"),
@@ -713,6 +831,40 @@ fn parallel_work() {
     }
 
     #[test]
+    fn rayon_scope_spawn_in_loop_with_move_closures() {
+        // Simulates real rayon pattern: s.spawn(move |_| { ... }) in a for loop.
+        // `_piano_ctx` is `Option<&SpanContext>` which is Copy, so move closures work.
+        let source = r#"
+fn concurrent_discover() {
+    rayon::scope(|s| {
+        for i in 0..4 {
+            s.spawn(move |_| {
+                do_work(i);
+            });
+        }
+    });
+}
+"#;
+        let targets: HashSet<String> = ["concurrent_discover".to_string()].into();
+        let result = instrument_source(source, &targets).unwrap().source;
+
+        assert!(
+            result.contains("piano_runtime::fork()"),
+            "should inject fork. Got:\n{result}"
+        );
+        assert!(
+            result.contains("piano_runtime::adopt"),
+            "should inject adopt in spawn closures. Got:\n{result}"
+        );
+        // The scope closure itself should NOT have an adopt (it's the coordinator).
+        // The adopt should only be inside the s.spawn closures.
+        // Verify by checking the generated code compiles structurally.
+        let parsed: syn::File = syn::parse_str(&result)
+            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
+        assert!(!parsed.items.is_empty());
+    }
+
+    #[test]
     fn no_fork_inject_in_non_target_function() {
         let source = r#"
 fn not_targeted() {
@@ -720,11 +872,55 @@ fn not_targeted() {
 }
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets).unwrap().source;
 
         assert!(
             !result.contains("piano_runtime::fork()"),
             "should NOT inject fork in non-target function. Got:\n{result}"
         );
+    }
+
+    #[test]
+    fn reports_concurrency_for_par_iter() {
+        let source = r#"
+fn process_all(items: &[Item]) -> Vec<Result> {
+    items.par_iter()
+         .map(|item| transform(item))
+         .collect()
+}
+"#;
+        let targets: HashSet<String> = ["process_all".to_string()].into();
+        let result = instrument_source(source, &targets).unwrap();
+        assert_eq!(result.concurrency.len(), 1);
+        assert_eq!(result.concurrency[0].0, "process_all");
+        assert_eq!(result.concurrency[0].1, "par_iter");
+    }
+
+    #[test]
+    fn reports_concurrency_for_rayon_scope() {
+        let source = r#"
+fn concurrent_discover() {
+    rayon::scope(|s| {
+        s.spawn(|_| { work(); });
+    });
+}
+"#;
+        let targets: HashSet<String> = ["concurrent_discover".to_string()].into();
+        let result = instrument_source(source, &targets).unwrap();
+        assert_eq!(result.concurrency.len(), 1);
+        assert_eq!(result.concurrency[0].0, "concurrent_discover");
+        assert_eq!(result.concurrency[0].1, "rayon::scope");
+    }
+
+    #[test]
+    fn no_concurrency_for_regular_function() {
+        let source = r#"
+fn simple() {
+    do_stuff();
+}
+"#;
+        let targets: HashSet<String> = ["simple".to_string()].into();
+        let result = instrument_source(source, &targets).unwrap();
+        assert!(result.concurrency.is_empty());
     }
 }
