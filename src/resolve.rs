@@ -25,92 +25,110 @@ pub struct ResolvedTarget {
 /// Resolve user-provided target specs against the source tree rooted at `src_dir`.
 ///
 /// Returns one `ResolvedTarget` per file that contains at least one matching function.
-/// Errors if no functions match any spec.
+/// When `specs` is empty, collects all functions from all files (instrument-everything mode).
+/// When `specs` is non-empty, errors if no functions match any spec.
 pub fn resolve_targets(src_dir: &Path, specs: &[TargetSpec]) -> Result<Vec<ResolvedTarget>, Error> {
     let rs_files = walk_rs_files(src_dir)?;
 
     let mut results: Vec<ResolvedTarget> = Vec::new();
 
-    for spec in specs {
-        match spec {
-            TargetSpec::Fn(pattern) => {
-                for file in &rs_files {
-                    let source =
-                        std::fs::read_to_string(file).map_err(|source| Error::RunReadError {
-                            path: file.clone(),
-                            source,
+    if specs.is_empty() {
+        // No specs = instrument all functions in all files.
+        for file in &rs_files {
+            let source = std::fs::read_to_string(file).map_err(|source| Error::RunReadError {
+                path: file.clone(),
+                source,
+            })?;
+            let all_fns = extract_functions(&source, file);
+            if !all_fns.is_empty() {
+                merge_into(&mut results, file, all_fns);
+            }
+        }
+    } else {
+        for spec in specs {
+            match spec {
+                TargetSpec::Fn(pattern) => {
+                    for file in &rs_files {
+                        let source = std::fs::read_to_string(file).map_err(|source| {
+                            Error::RunReadError {
+                                path: file.clone(),
+                                source,
+                            }
                         })?;
-                    let all_fns = extract_functions(&source, file);
-                    let matched: Vec<String> = all_fns
-                        .into_iter()
-                        .filter(|name| {
-                            // Match against the bare function name (after any Type:: prefix).
-                            let bare = name.rsplit("::").next().unwrap_or(name);
-                            bare.contains(pattern.as_str())
-                        })
-                        .collect();
-                    if !matched.is_empty() {
-                        merge_into(&mut results, file, matched);
+                        let all_fns = extract_functions(&source, file);
+                        let matched: Vec<String> = all_fns
+                            .into_iter()
+                            .filter(|name| {
+                                // Match against the bare function name (after any Type:: prefix).
+                                let bare = name.rsplit("::").next().unwrap_or(name);
+                                bare.contains(pattern.as_str())
+                            })
+                            .collect();
+                        if !matched.is_empty() {
+                            merge_into(&mut results, file, matched);
+                        }
                     }
                 }
-            }
-            TargetSpec::File(file_path) => {
-                // Find files whose path ends with the given relative path.
-                let matching_files: Vec<&PathBuf> =
-                    rs_files.iter().filter(|f| f.ends_with(file_path)).collect();
-                for file in matching_files {
-                    let source =
-                        std::fs::read_to_string(file).map_err(|source| Error::RunReadError {
-                            path: file.clone(),
-                            source,
+                TargetSpec::File(file_path) => {
+                    // Find files whose path ends with the given relative path.
+                    let matching_files: Vec<&PathBuf> =
+                        rs_files.iter().filter(|f| f.ends_with(file_path)).collect();
+                    for file in matching_files {
+                        let source = std::fs::read_to_string(file).map_err(|source| {
+                            Error::RunReadError {
+                                path: file.clone(),
+                                source,
+                            }
                         })?;
-                    let all_fns = extract_functions(&source, file);
-                    if !all_fns.is_empty() {
-                        merge_into(&mut results, file, all_fns);
+                        let all_fns = extract_functions(&source, file);
+                        if !all_fns.is_empty() {
+                            merge_into(&mut results, file, all_fns);
+                        }
                     }
                 }
-            }
-            TargetSpec::Mod(module_name) => {
-                // Look for files under a directory named `module_name` (e.g. walker/mod.rs,
-                // walker/sub.rs) or a file named `module_name.rs`.
-                for file in &rs_files {
-                    let is_mod_file = file
-                        .parent()
-                        .and_then(|p| p.file_name())
-                        .is_some_and(|dir| dir == module_name.as_str());
-                    let is_named_file = file
-                        .file_stem()
-                        .is_some_and(|stem| stem == module_name.as_str());
+                TargetSpec::Mod(module_name) => {
+                    // Look for files under a directory named `module_name` (e.g. walker/mod.rs,
+                    // walker/sub.rs) or a file named `module_name.rs`.
+                    for file in &rs_files {
+                        let is_mod_file = file
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .is_some_and(|dir| dir == module_name.as_str());
+                        let is_named_file = file
+                            .file_stem()
+                            .is_some_and(|stem| stem == module_name.as_str());
 
-                    if !is_mod_file && !is_named_file {
-                        continue;
-                    }
+                        if !is_mod_file && !is_named_file {
+                            continue;
+                        }
 
-                    let source =
-                        std::fs::read_to_string(file).map_err(|source| Error::RunReadError {
-                            path: file.clone(),
-                            source,
+                        let source = std::fs::read_to_string(file).map_err(|source| {
+                            Error::RunReadError {
+                                path: file.clone(),
+                                source,
+                            }
                         })?;
-                    let all_fns = extract_functions(&source, file);
-                    if !all_fns.is_empty() {
-                        merge_into(&mut results, file, all_fns);
+                        let all_fns = extract_functions(&source, file);
+                        if !all_fns.is_empty() {
+                            merge_into(&mut results, file, all_fns);
+                        }
                     }
                 }
             }
         }
-    }
 
-    if results.is_empty() {
-        let desc = specs
-            .iter()
-            .map(|s| match s {
-                TargetSpec::Fn(p) => format!("--fn {p}"),
-                TargetSpec::File(p) => format!("--file {}", p.display()),
-                TargetSpec::Mod(m) => format!("--mod {m}"),
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(Error::NoTargetsFound(desc));
+        if results.is_empty() {
+            let desc = specs
+                .iter()
+                .map(|s| match s {
+                    TargetSpec::Fn(p) => format!("--fn {p}"),
+                    TargetSpec::File(p) => format!("--file {}", p.display()),
+                    TargetSpec::Mod(m) => format!("--mod {m}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::NoTargetsFound(desc));
+        }
     }
 
     // Sort by file path for deterministic output.
@@ -479,6 +497,51 @@ mod tests {
         assert!(
             all_fns.contains(&"walk_dir"),
             "should still find valid functions"
+        );
+    }
+
+    #[test]
+    fn resolve_empty_specs_returns_all_functions() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        let specs: Vec<TargetSpec> = vec![];
+        let results = resolve_targets(&tmp.path().join("src"), &specs).unwrap();
+
+        let all_fns: Vec<&str> = results
+            .iter()
+            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .collect();
+
+        // Should find functions from all files: main.rs, resolver.rs, walker/mod.rs, with_tests.rs
+        assert!(all_fns.contains(&"main"), "should include main");
+        assert!(
+            all_fns.contains(&"walk"),
+            "should include walk from main.rs"
+        );
+        assert!(
+            all_fns.contains(&"helper"),
+            "should include helper from resolver.rs"
+        );
+        assert!(
+            all_fns.contains(&"Resolver::resolve"),
+            "should include impl methods"
+        );
+        assert!(
+            all_fns.contains(&"walk_dir"),
+            "should include walk_dir from walker"
+        );
+        assert!(all_fns.contains(&"scan"), "should include scan from walker");
+        assert!(
+            all_fns.contains(&"production_fn"),
+            "should include production_fn"
+        );
+
+        // Should still skip test functions
+        assert!(!all_fns.contains(&"test_something"), "should skip #[test]");
+        assert!(
+            !all_fns.contains(&"it_works"),
+            "should skip test in cfg(test)"
         );
     }
 
