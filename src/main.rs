@@ -31,7 +31,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Instrument matching functions and build the project.
+    /// Instrument and build the project. Profiles all functions by default;
+    /// use --fn, --file, or --mod to narrow scope.
     Build {
         /// Instrument functions matching a substring (repeatable).
         #[arg(long = "fn", value_name = "PATTERN")]
@@ -137,12 +138,6 @@ fn cmd_build(
         specs.push(TargetSpec::Mod(m));
     }
 
-    if specs.is_empty() {
-        return Err(Error::NoTargetsFound(
-            "no targets specified (use --fn, --file, or --mod)".into(),
-        ));
-    }
-
     // Resolve targets against the project source.
     let src_dir = project.join("src");
     let targets = resolve_targets(&src_dir, &specs)?;
@@ -153,6 +148,13 @@ fn cmd_build(
         total_fns,
         targets.len()
     );
+    const INSTRUMENT_ALL_WARN_THRESHOLD: usize = 200;
+    if specs.is_empty() && total_fns > INSTRUMENT_ALL_WARN_THRESHOLD {
+        eprintln!(
+            "warning: instrumenting {total_fns} functions may add overhead — \
+             use --fn, --file, or --mod to narrow scope"
+        );
+    }
     for target in &targets {
         let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
         eprintln!("  {}:", relative.display());
