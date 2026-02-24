@@ -22,7 +22,8 @@ use piano::rewrite::{
 #[command(
     name = "piano",
     about = "Automated instrumentation-based profiling for Rust",
-    version
+    version,
+    after_help = "Workflow: piano build [OPTIONS], run the built binary, then piano report"
 )]
 struct Cli {
     #[command(subcommand)]
