@@ -253,7 +253,8 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
 
 /// Format a run as a text table sorted by self_ms descending.
 ///
-/// When `show_all` is false, entries with zero calls are hidden.
+/// When `show_all` is false, entries with zero calls are hidden and a
+/// footer indicates how many were omitted.
 pub fn format_table(run: &Run, show_all: bool) -> String {
     let mut entries = run.functions.clone();
     let total_count = entries.len();
@@ -313,7 +314,7 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
 /// Format frame-level data as a table with percentile and allocation columns.
 ///
 /// Columns: Function | Calls | Self | p50 | p99 | Allocs | Bytes
-/// Footer: frame count summary.
+/// Footer: frame count summary and hidden-function count when applicable.
 pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> String {
     struct FnStats {
         name: String,
@@ -384,6 +385,7 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
     }
 
     let mut entries: Vec<FnStats> = stats_map.into_values().collect();
+    let total_count = frame_data.fn_names.len();
     if !show_all {
         entries.retain(|e| e.total_calls > 0);
     }
@@ -450,6 +452,12 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
 
     let n_frames = frame_data.frames.len();
     out.push_str(&format!("\n{n_frames} frames"));
+
+    let hidden = total_count - entries.len();
+    if hidden > 0 {
+        let label = if hidden == 1 { "function" } else { "functions" };
+        out.push_str(&format!("\n{hidden} {label} hidden; use --all to show"));
+    }
 
     out
 }
@@ -1456,12 +1464,20 @@ mod tests {
             !table.contains("unused"),
             "should hide zero-call function by default. Got:\n{table}"
         );
+        assert!(
+            table.contains("1 function hidden; use --all to show"),
+            "should show hidden footer. Got:\n{table}"
+        );
 
         // show_all=true should include "unused"
         let table_all = format_table_with_frames(&frame_data, true);
         assert!(
             table_all.contains("unused"),
             "should show zero-call function with show_all. Got:\n{table_all}"
+        );
+        assert!(
+            !table_all.contains("hidden"),
+            "should not show footer with show_all. Got:\n{table_all}"
         );
     }
 
@@ -1799,6 +1815,10 @@ mod tests {
         assert!(table.contains("CPU"), "should show CPU column");
         assert!(table.contains("active"), "should show active fn");
         assert!(!table.contains("unused"), "should hide unused fn");
+        assert!(
+            table.contains("1 function hidden; use --all to show"),
+            "should show hidden footer. Got:\n{table}"
+        );
 
         // With --all: shows both, CPU column still present.
         let table_all = format_table_with_frames(&frame_data, true);
@@ -1806,6 +1826,10 @@ mod tests {
         assert!(
             table_all.contains("unused"),
             "should show unused fn with --all. Got:\n{table_all}"
+        );
+        assert!(
+            !table_all.contains("hidden"),
+            "should not show footer with show_all. Got:\n{table_all}"
         );
     }
 
