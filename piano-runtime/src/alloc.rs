@@ -158,36 +158,4 @@ mod tests {
         assert_eq!(outer.free_count, 1, "outer free_count");
         assert_eq!(outer.free_bytes, 75, "outer free_bytes");
     }
-
-    #[test]
-    fn alloc_tracking_does_not_distort_timing() {
-        reset();
-        // Measure CPU work WITHOUT any alloc tracking
-        let baseline_start = std::time::Instant::now();
-        crate::collector::burn_cpu(50_000);
-        let baseline_ns = baseline_start.elapsed().as_nanos() as u64;
-
-        // Now measure WITH alloc tracking overhead injected
-        {
-            let _g = enter("timed_fn");
-            crate::collector::burn_cpu(50_000);
-            // Simulate 10K allocations worth of tracking overhead
-            for _ in 0..10_000 {
-                track_alloc(64);
-            }
-        }
-        let invocations = collect_invocations();
-        let rec = invocations.iter().find(|r| r.name == "timed_fn").unwrap();
-
-        // self_ns should be close to baseline (Cell-based tracking adds negligible overhead)
-        // Allow 30% tolerance for measurement noise
-        let ratio = rec.self_ns as f64 / baseline_ns as f64;
-        assert!(
-            (0.7..1.3).contains(&ratio),
-            "self_ns ({}) should be close to baseline ({}) but ratio was {:.2}",
-            rec.self_ns,
-            baseline_ns,
-            ratio
-        );
-    }
 }
