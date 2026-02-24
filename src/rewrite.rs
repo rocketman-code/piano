@@ -480,7 +480,7 @@ pub fn inject_global_allocator(
     Ok(prettyplease::unparse(&file))
 }
 
-/// Inject `piano_runtime::shutdown()` as the last statement in `fn main`.
+/// Wrap `fn main`'s body in `catch_unwind` and inject `piano_runtime::shutdown()`.
 pub fn inject_shutdown(source: &str) -> Result<String, syn::Error> {
     let mut file: syn::File = syn::parse_str(source)?;
     let mut injector = ShutdownInjector;
@@ -495,37 +495,39 @@ impl VisitMut for ShutdownInjector {
         if node.sig.ident == "main" {
             let has_return_type = !matches!(&node.sig.output, syn::ReturnType::Default);
 
-            // Wrap existing body in a block so all guards drop before shutdown.
-            // This ensures main's own timing guard records before shutdown collects.
+            // Wrap existing body in catch_unwind so guards drop on panic
+            // (recording timing data), then shutdown collects it, then re-panic.
             let existing_stmts = std::mem::take(&mut node.block.stmts);
 
+            let catch_stmt: syn::Stmt = syn::parse_quote! {
+                let __piano_result = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| { #(#existing_stmts)* })
+                );
+            };
+            let shutdown_stmt: syn::Stmt = syn::parse_quote! {
+                piano_runtime::shutdown();
+            };
+
             if has_return_type {
-                // fn main() -> T: capture the body's result, shutdown, return it.
-                let inner_block: syn::Expr = syn::parse_quote! {
-                    {
-                        #(#existing_stmts)*
-                    }
-                };
-                let combined: syn::Stmt = syn::parse_quote! {
-                    let __piano_result = #inner_block;
-                };
-                let shutdown_stmt: syn::Stmt = syn::parse_quote! {
-                    piano_runtime::shutdown();
-                };
-                let return_expr: syn::Stmt =
-                    syn::Stmt::Expr(syn::parse_quote! { __piano_result }, None);
-                node.block.stmts = vec![combined, shutdown_stmt, return_expr];
+                // fn main() -> T: match on result, resume_unwind on panic.
+                let tail: syn::Stmt = syn::Stmt::Expr(
+                    syn::parse_quote! {
+                        match __piano_result {
+                            Ok(__piano_val) => __piano_val,
+                            Err(__piano_panic) => std::panic::resume_unwind(__piano_panic),
+                        }
+                    },
+                    None,
+                );
+                node.block.stmts = vec![catch_stmt, shutdown_stmt, tail];
             } else {
-                // fn main(): original behavior — run body then shutdown.
-                let inner_block: syn::Stmt = syn::parse_quote! {
-                    {
-                        #(#existing_stmts)*
+                // fn main(): re-panic if the body panicked.
+                let resume_stmt: syn::Stmt = syn::parse_quote! {
+                    if let Err(__piano_panic) = __piano_result {
+                        std::panic::resume_unwind(__piano_panic);
                     }
                 };
-                let shutdown_stmt: syn::Stmt = syn::parse_quote! {
-                    piano_runtime::shutdown();
-                };
-                node.block.stmts = vec![inner_block, shutdown_stmt];
+                node.block.stmts = vec![catch_stmt, shutdown_stmt, resume_stmt];
             }
         }
         syn::visit_mut::visit_item_fn_mut(self, node);
@@ -713,7 +715,7 @@ fn main() {
     }
 
     #[test]
-    fn injects_shutdown_at_end_of_main() {
+    fn injects_shutdown_with_catch_unwind() {
         let source = r#"
 fn main() {
     do_stuff();
@@ -723,6 +725,14 @@ fn main() {
         assert!(
             result.contains("piano_runtime::shutdown()"),
             "should inject shutdown. Got:\n{result}"
+        );
+        assert!(
+            result.contains("catch_unwind"),
+            "should wrap body in catch_unwind. Got:\n{result}"
+        );
+        assert!(
+            result.contains("resume_unwind"),
+            "should re-panic on caught panic. Got:\n{result}"
         );
         let shutdown_pos = result.find("piano_runtime::shutdown()").unwrap();
         let do_stuff_pos = result.find("do_stuff()").unwrap();
@@ -742,10 +752,13 @@ fn main() -> ExitCode {
 }
 "#;
         let result = inject_shutdown(source).unwrap();
-        // Must contain shutdown
         assert!(
             result.contains("piano_runtime::shutdown()"),
             "should inject shutdown. Got:\n{result}"
+        );
+        assert!(
+            result.contains("catch_unwind"),
+            "should wrap body in catch_unwind for return-type main. Got:\n{result}"
         );
         // Must preserve ExitCode as the tail expression (not discard it)
         // The rewritten code should compile — ExitCode must be returned after shutdown.
