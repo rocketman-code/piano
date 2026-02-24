@@ -34,7 +34,8 @@ enum Commands {
     /// Instrument and build the project. Profiles all functions by default;
     /// use --fn, --file, or --mod to narrow scope.
     Build {
-        /// Instrument functions matching a substring (repeatable).
+        /// Instrument functions whose name contains PATTERN (repeatable).
+        /// e.g. --fn parse matches parse, parse_line, MyStruct::try_parse.
         #[arg(long = "fn", value_name = "PATTERN")]
         fn_patterns: Vec<String>,
 
