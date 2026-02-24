@@ -32,6 +32,8 @@ pub struct FnEntry {
     pub total_ms: f64,
     pub self_ms: f64,
     #[serde(default)]
+    pub cpu_self_ms: Option<f64>,
+    #[serde(default)]
     pub alloc_count: u64,
     #[serde(default)]
     pub alloc_bytes: u64,
@@ -48,6 +50,7 @@ pub struct FrameFnEntry {
     pub fn_id: usize,
     pub calls: u64,
     pub self_ns: u64,
+    pub cpu_self_ns: Option<u64>,
     pub alloc_count: u32,
     pub alloc_bytes: u64,
     pub free_count: u32,
@@ -62,6 +65,8 @@ struct NdjsonHeader {
     run_id: Option<String>,
     timestamp_ms: u128,
     functions: Vec<String>,
+    #[serde(default)]
+    has_cpu_time: bool,
 }
 
 /// NDJSON frame line.
@@ -78,6 +83,8 @@ struct NdjsonFnEntry {
     id: usize,
     calls: u64,
     self_ns: u64,
+    #[serde(default)]
+    csn: Option<u64>,
     #[serde(default)]
     ac: u32,
     #[serde(default)]
@@ -140,6 +147,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
                 fn_id: f.id,
                 calls: f.calls,
                 self_ns: f.self_ns,
+                cpu_self_ns: f.csn,
                 alloc_count: f.ac,
                 alloc_bytes: f.ab,
                 free_count: f.fc,
@@ -150,14 +158,16 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
     }
 
     // Aggregate into Run for backward compatibility.
-    let mut fn_agg: HashMap<usize, (u64, u64, u64, u64)> = HashMap::new();
+    let has_cpu = header.has_cpu_time;
+    let mut fn_agg: HashMap<usize, (u64, u64, u64, u64, u64)> = HashMap::new();
     for frame in &frames {
         for entry in frame {
-            let agg = fn_agg.entry(entry.fn_id).or_insert((0, 0, 0, 0));
+            let agg = fn_agg.entry(entry.fn_id).or_insert((0, 0, 0, 0, 0));
             agg.0 += entry.calls;
             agg.1 += entry.self_ns;
             agg.2 += entry.alloc_count as u64;
             agg.3 += entry.alloc_bytes;
+            agg.4 += entry.cpu_self_ns.unwrap_or(0);
         }
     }
 
@@ -167,14 +177,19 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         .iter()
         .enumerate()
         .map(|(fn_id, name)| {
-            let (calls, self_ns, alloc_count, alloc_bytes) =
-                fn_agg.get(&fn_id).copied().unwrap_or((0, 0, 0, 0));
+            let (calls, self_ns, alloc_count, alloc_bytes, cpu_self_ns) =
+                fn_agg.get(&fn_id).copied().unwrap_or((0, 0, 0, 0, 0));
             let self_ms = self_ns as f64 / 1_000_000.0;
             FnEntry {
                 name: name.clone(),
                 calls,
                 total_ms: self_ms, // NDJSON format has no total_ms; approximate with self_ms
                 self_ms,
+                cpu_self_ms: if has_cpu {
+                    Some(cpu_self_ns as f64 / 1_000_000.0)
+                } else {
+                    None
+                },
                 alloc_count,
                 alloc_bytes,
             }
@@ -210,18 +225,39 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    let has_cpu = entries.iter().any(|e| e.cpu_self_ms.is_some());
+
     let mut out = String::new();
-    out.push_str(&format!(
-        "{:<40} {:>8} {:>10} {:>10}\n",
-        "Function", "Calls", "Total", "Self"
-    ));
-    out.push_str(&format!("{}\n", "-".repeat(72)));
+    if has_cpu {
+        out.push_str(&format!(
+            "{:<40} {:>8} {:>10} {:>10} {:>10}\n",
+            "Function", "Calls", "Total", "Self", "CPU"
+        ));
+        out.push_str(&format!("{}\n", "-".repeat(84)));
+    } else {
+        out.push_str(&format!(
+            "{:<40} {:>8} {:>10} {:>10}\n",
+            "Function", "Calls", "Total", "Self"
+        ));
+        out.push_str(&format!("{}\n", "-".repeat(72)));
+    }
 
     for entry in &entries {
-        out.push_str(&format!(
-            "{:<40} {:>8} {:>9.2}ms {:>9.2}ms\n",
-            entry.name, entry.calls, entry.total_ms, entry.self_ms
-        ));
+        if has_cpu {
+            let cpu_str = match entry.cpu_self_ms {
+                Some(v) => format!("{v:>9.2}ms"),
+                None => format!("{:>11}", "-"),
+            };
+            out.push_str(&format!(
+                "{:<40} {:>8} {:>9.2}ms {:>9.2}ms {}\n",
+                entry.name, entry.calls, entry.total_ms, entry.self_ms, cpu_str
+            ));
+        } else {
+            out.push_str(&format!(
+                "{:<40} {:>8} {:>9.2}ms {:>9.2}ms\n",
+                entry.name, entry.calls, entry.total_ms, entry.self_ms
+            ));
+        }
     }
     out
 }
@@ -235,10 +271,16 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
         name: String,
         total_calls: u64,
         total_self_ns: u64,
+        total_cpu_self_ns: Option<u64>,
         total_allocs: u64,
         total_alloc_bytes: u64,
         per_frame_self_ns: Vec<u64>,
     }
+
+    let has_cpu = frame_data
+        .frames
+        .iter()
+        .any(|f| f.iter().any(|e| e.cpu_self_ns.is_some()));
 
     let mut stats_map: HashMap<usize, FnStats> = HashMap::new();
     for frame in &frame_data.frames {
@@ -255,12 +297,16 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
                     .unwrap_or_else(|| format!("<fn_{}>", entry.fn_id)),
                 total_calls: 0,
                 total_self_ns: 0,
+                total_cpu_self_ns: if has_cpu { Some(0) } else { None },
                 total_allocs: 0,
                 total_alloc_bytes: 0,
                 per_frame_self_ns: Vec::new(),
             });
             stats.total_calls += entry.calls;
             stats.total_self_ns += entry.self_ns;
+            if let (Some(total), Some(cpu)) = (&mut stats.total_cpu_self_ns, entry.cpu_self_ns) {
+                *total += cpu;
+            }
             stats.total_allocs += entry.alloc_count as u64;
             stats.total_alloc_bytes += entry.alloc_bytes;
             stats.per_frame_self_ns.push(entry.self_ns);
@@ -281,6 +327,7 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
                 name: name.clone(),
                 total_calls: 0,
                 total_self_ns: 0,
+                total_cpu_self_ns: if has_cpu { Some(0) } else { None },
                 total_allocs: 0,
                 total_alloc_bytes: 0,
                 per_frame_self_ns: Vec::new(),
@@ -308,11 +355,19 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
     }
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "{:<40} {:>8} {:>10} {:>10} {:>10} {:>8} {:>10}\n",
-        "Function", "Calls", "Self", "p50", "p99", "Allocs", "Bytes"
-    ));
-    out.push_str(&format!("{}\n", "-".repeat(100)));
+    if has_cpu {
+        out.push_str(&format!(
+            "{:<40} {:>8} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10}\n",
+            "Function", "Calls", "Self", "CPU", "p50", "p99", "Allocs", "Bytes"
+        ));
+        out.push_str(&format!("{}\n", "-".repeat(112)));
+    } else {
+        out.push_str(&format!(
+            "{:<40} {:>8} {:>10} {:>10} {:>10} {:>8} {:>10}\n",
+            "Function", "Calls", "Self", "p50", "p99", "Allocs", "Bytes"
+        ));
+        out.push_str(&format!("{}\n", "-".repeat(100)));
+    }
 
     for e in &entries {
         let self_str = format_ns(e.total_self_ns);
@@ -321,10 +376,28 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
         let p50_str = format_ns(p50);
         let p99_str = format_ns(p99);
         let bytes_str = format_bytes(e.total_alloc_bytes);
-        out.push_str(&format!(
-            "{:<40} {:>8} {:>10} {:>10} {:>10} {:>8} {:>10}\n",
-            e.name, e.total_calls, self_str, p50_str, p99_str, e.total_allocs, bytes_str
-        ));
+        if has_cpu {
+            let cpu_str = match e.total_cpu_self_ns {
+                Some(ns) => format_ns(ns),
+                None => format!("{:>10}", "-"),
+            };
+            out.push_str(&format!(
+                "{:<40} {:>8} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10}\n",
+                e.name,
+                e.total_calls,
+                self_str,
+                cpu_str,
+                p50_str,
+                p99_str,
+                e.total_allocs,
+                bytes_str
+            ));
+        } else {
+            out.push_str(&format!(
+                "{:<40} {:>8} {:>10} {:>10} {:>10} {:>8} {:>10}\n",
+                e.name, e.total_calls, self_str, p50_str, p99_str, e.total_allocs, bytes_str
+            ));
+        }
     }
 
     let n_frames = frame_data.frames.len();
@@ -451,23 +524,29 @@ pub fn diff_runs(a: &Run, b: &Run) -> String {
     names.sort_unstable();
     names.dedup();
 
-    // Check if either run has alloc data.
+    // Check if either run has alloc data or CPU data.
     let has_allocs = a.functions.iter().any(|f| f.alloc_count > 0)
         || b.functions.iter().any(|f| f.alloc_count > 0);
+    let has_cpu = a.functions.iter().any(|f| f.cpu_self_ms.is_some())
+        || b.functions.iter().any(|f| f.cpu_self_ms.is_some());
 
     let mut out = String::new();
-    if has_allocs {
-        out.push_str(&format!(
-            "{:<40} {:>10} {:>10} {:>10} {:>10} {:>10}\n",
-            "Function", "Before", "After", "Delta", "Allocs", "A.Delta"
-        ));
-        out.push_str(&format!("{}\n", "-".repeat(94)));
-    } else {
-        out.push_str(&format!(
-            "{:<40} {:>10} {:>10} {:>10}\n",
+    // Build header based on available columns.
+    {
+        let mut header = format!(
+            "{:<40} {:>10} {:>10} {:>10}",
             "Function", "Before", "After", "Delta"
-        ));
-        out.push_str(&format!("{}\n", "-".repeat(74)));
+        );
+        if has_cpu {
+            header.push_str(&format!(" {:>10} {:>10}", "CPU.Bef", "CPU.Aft"));
+        }
+        if has_allocs {
+            header.push_str(&format!(" {:>10} {:>10}", "Allocs", "A.Delta"));
+        }
+        header.push('\n');
+        let width = header.trim_end().len();
+        out.push_str(&header);
+        out.push_str(&format!("{}\n", "-".repeat(width)));
     }
 
     for name in &names {
@@ -475,18 +554,28 @@ pub fn diff_runs(a: &Run, b: &Run) -> String {
         let after = b_map.get(name).map_or(0.0, |e| e.self_ms);
         let delta = after - before;
 
-        if has_allocs {
-            let allocs_before = a_map.get(name).map_or(0i64, |e| e.alloc_count as i64);
-            let allocs_after = b_map.get(name).map_or(0i64, |e| e.alloc_count as i64);
-            let allocs_delta = allocs_after - allocs_before;
-            out.push_str(&format!(
-                "{name:<40} {before:>9.2}ms {after:>9.2}ms {delta:>+9.2}ms {allocs_after:>10} {allocs_delta:>+10}\n",
-            ));
-        } else {
-            out.push_str(&format!(
-                "{name:<40} {before:>9.2}ms {after:>9.2}ms {delta:>+9.2}ms\n",
-            ));
+        out.push_str(&format!(
+            "{name:<40} {before:>9.2}ms {after:>9.2}ms {delta:>+9.2}ms",
+        ));
+
+        if has_cpu {
+            let cpu_before = a_map.get(name).and_then(|e| e.cpu_self_ms);
+            let cpu_after = b_map.get(name).and_then(|e| e.cpu_self_ms);
+            let fmt_cpu = |v: Option<f64>| match v {
+                Some(ms) => format!("{ms:>9.2}ms"),
+                None => format!("{:>11}", "-"),
+            };
+            out.push_str(&format!(" {} {}", fmt_cpu(cpu_before), fmt_cpu(cpu_after)));
         }
+
+        if has_allocs {
+            let allocs_after = b_map.get(name).map_or(0i64, |e| e.alloc_count as i64);
+            let allocs_before = a_map.get(name).map_or(0i64, |e| e.alloc_count as i64);
+            let allocs_delta = allocs_after - allocs_before;
+            out.push_str(&format!(" {allocs_after:>10} {allocs_delta:>+10}"));
+        }
+
+        out.push('\n');
     }
     out
 }
@@ -543,12 +632,16 @@ fn merge_runs(runs: &[&Run]) -> Run {
                 calls: 0,
                 total_ms: 0.0,
                 self_ms: 0.0,
+                cpu_self_ms: None,
                 alloc_count: 0,
                 alloc_bytes: 0,
             });
             entry.calls += f.calls;
             entry.total_ms += f.total_ms;
             entry.self_ms += f.self_ms;
+            if let Some(cpu) = f.cpu_self_ms {
+                *entry.cpu_self_ms.get_or_insert(0.0) += cpu;
+            }
             entry.alloc_count += f.alloc_count;
             entry.alloc_bytes += f.alloc_bytes;
         }
@@ -1040,6 +1133,7 @@ mod tests {
                         fn_id: 0,
                         calls: 1,
                         self_ns: 2_000_000,
+                        cpu_self_ns: None,
                         alloc_count: 10,
                         alloc_bytes: 4096,
                         free_count: 8,
@@ -1049,6 +1143,7 @@ mod tests {
                         fn_id: 1,
                         calls: 1,
                         self_ns: 1_000_000,
+                        cpu_self_ns: None,
                         alloc_count: 0,
                         alloc_bytes: 0,
                         free_count: 0,
@@ -1060,6 +1155,7 @@ mod tests {
                         fn_id: 0,
                         calls: 1,
                         self_ns: 8_000_000,
+                        cpu_self_ns: None,
                         alloc_count: 50,
                         alloc_bytes: 16384,
                         free_count: 40,
@@ -1069,6 +1165,7 @@ mod tests {
                         fn_id: 1,
                         calls: 1,
                         self_ns: 1_100_000,
+                        cpu_self_ns: None,
                         alloc_count: 0,
                         alloc_bytes: 0,
                         free_count: 0,
@@ -1100,6 +1197,7 @@ mod tests {
                 calls: 3,
                 total_ms: 12.0,
                 self_ms: 10.0,
+                cpu_self_ms: None,
                 alloc_count: 100,
                 alloc_bytes: 8192,
             }],
@@ -1113,6 +1211,7 @@ mod tests {
                 calls: 3,
                 total_ms: 9.0,
                 self_ms: 8.0,
+                cpu_self_ms: None,
                 alloc_count: 50,
                 alloc_bytes: 4096,
             }],
@@ -1135,6 +1234,7 @@ mod tests {
                         fn_id: 0,
                         calls: 1,
                         self_ns: 2_000_000,
+                        cpu_self_ns: None,
                         alloc_count: 10,
                         alloc_bytes: 4096,
                         free_count: 8,
@@ -1144,6 +1244,7 @@ mod tests {
                         fn_id: 1,
                         calls: 1,
                         self_ns: 1_000_000,
+                        cpu_self_ns: None,
                         alloc_count: 0,
                         alloc_bytes: 0,
                         free_count: 0,
@@ -1155,6 +1256,7 @@ mod tests {
                         fn_id: 0,
                         calls: 1,
                         self_ns: 2_100_000,
+                        cpu_self_ns: None,
                         alloc_count: 10,
                         alloc_bytes: 4096,
                         free_count: 8,
@@ -1164,6 +1266,7 @@ mod tests {
                         fn_id: 1,
                         calls: 1,
                         self_ns: 1_000_000,
+                        cpu_self_ns: None,
                         alloc_count: 0,
                         alloc_bytes: 0,
                         free_count: 0,
@@ -1176,6 +1279,7 @@ mod tests {
                         fn_id: 0,
                         calls: 1,
                         self_ns: 12_000_000,
+                        cpu_self_ns: None,
                         alloc_count: 50,
                         alloc_bytes: 16384,
                         free_count: 40,
@@ -1185,6 +1289,7 @@ mod tests {
                         fn_id: 1,
                         calls: 1,
                         self_ns: 1_100_000,
+                        cpu_self_ns: None,
                         alloc_count: 0,
                         alloc_bytes: 0,
                         free_count: 0,
@@ -1237,6 +1342,7 @@ mod tests {
                 fn_id: 0,
                 calls: 1,
                 self_ns: 1_000_000,
+                cpu_self_ns: None,
                 alloc_count: 0,
                 alloc_bytes: 0,
                 free_count: 0,
@@ -1268,6 +1374,7 @@ mod tests {
                 fn_id: 0,
                 calls: 1,
                 self_ns: 1_000_000,
+                cpu_self_ns: None,
                 alloc_count: 0,
                 alloc_bytes: 0,
                 free_count: 0,
@@ -1279,5 +1386,376 @@ mod tests {
             table.contains(long_name),
             "should show full function name '{long_name}', not truncated. Got:\n{table}"
         );
+    }
+
+    #[test]
+    fn format_table_shows_cpu_column_when_present() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "compute".into(),
+                calls: 10,
+                total_ms: 50.0,
+                self_ms: 40.0,
+                cpu_self_ms: Some(35.0),
+                ..Default::default()
+            }],
+        };
+        let table = format_table(&run, false);
+        assert!(
+            table.contains("CPU"),
+            "should have CPU column header. Got:\n{table}"
+        );
+        assert!(
+            table.contains("35.00"),
+            "should show CPU ms value. Got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn format_table_hides_cpu_column_when_absent() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "compute".into(),
+                calls: 10,
+                total_ms: 50.0,
+                self_ms: 40.0,
+                ..Default::default()
+            }],
+        };
+        let table = format_table(&run, false);
+        assert!(
+            !table.contains("CPU"),
+            "should not have CPU column. Got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn format_table_with_frames_shows_cpu_column() {
+        let frame_data = FrameData {
+            fn_names: vec!["compute".into()],
+            frames: vec![vec![FrameFnEntry {
+                fn_id: 0,
+                calls: 1,
+                self_ns: 5_000_000,
+                cpu_self_ns: Some(4_000_000),
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            }]],
+        };
+        let table = format_table_with_frames(&frame_data, false);
+        assert!(
+            table.contains("CPU"),
+            "should have CPU column header. Got:\n{table}"
+        );
+        assert!(
+            table.contains("4.00ms"),
+            "should show CPU value. Got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn diff_shows_cpu_columns_when_present() {
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 1,
+                total_ms: 10.0,
+                self_ms: 10.0,
+                cpu_self_ms: Some(8.0),
+                ..Default::default()
+            }],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 1,
+                total_ms: 12.0,
+                self_ms: 12.0,
+                cpu_self_ms: Some(10.0),
+                ..Default::default()
+            }],
+        };
+        let diff = diff_runs(&a, &b);
+        assert!(
+            diff.contains("CPU.Bef"),
+            "should have CPU.Bef column. Got:\n{diff}"
+        );
+        assert!(
+            diff.contains("CPU.Aft"),
+            "should have CPU.Aft column. Got:\n{diff}"
+        );
+        assert!(
+            diff.contains("8.00"),
+            "should show before CPU. Got:\n{diff}"
+        );
+        assert!(
+            diff.contains("10.00"),
+            "should show after CPU. Got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn load_ndjson_with_cpu_time() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"format_version":2,"run_id":"cpu_1","timestamp_ms":1000,"functions":["compute"],"has_cpu_time":true}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":5000000,"csn":4000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        let path = dir.path().join("1000.ndjson");
+        fs::write(&path, content).unwrap();
+
+        let (run, frame_data) = load_ndjson(&path).unwrap();
+        let compute = run.functions.iter().find(|f| f.name == "compute").unwrap();
+        assert!(compute.cpu_self_ms.is_some(), "should have cpu_self_ms");
+        assert!(
+            (compute.cpu_self_ms.unwrap() - 4.0).abs() < 0.01,
+            "expected ~4.0ms, got {}",
+            compute.cpu_self_ms.unwrap()
+        );
+
+        let frame_entry = &frame_data.frames[0][0];
+        assert_eq!(frame_entry.cpu_self_ns, Some(4_000_000));
+    }
+
+    #[test]
+    fn load_ndjson_without_cpu_time_has_no_cpu_data() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"format_version":2,"run_id":"no_cpu","timestamp_ms":1000,"functions":["update"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":2000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        let path = dir.path().join("1000.ndjson");
+        fs::write(&path, content).unwrap();
+
+        let (run, frame_data) = load_ndjson(&path).unwrap();
+        let update = run.functions.iter().find(|f| f.name == "update").unwrap();
+        assert!(
+            update.cpu_self_ms.is_none(),
+            "should not have cpu_self_ms when has_cpu_time is absent"
+        );
+        assert_eq!(frame_data.frames[0][0].cpu_self_ns, None);
+
+        // Report should not show CPU column.
+        let table = format_table(&run, false);
+        assert!(
+            !table.contains("CPU"),
+            "should not show CPU column for non-CPU NDJSON. Got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn diff_mixed_cpu_one_with_one_without() {
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 1,
+                total_ms: 10.0,
+                self_ms: 10.0,
+                cpu_self_ms: Some(8.0),
+                ..Default::default()
+            }],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 1,
+                total_ms: 12.0,
+                self_ms: 12.0,
+                // No CPU data.
+                ..Default::default()
+            }],
+        };
+        // Should still render CPU columns (because A has CPU data).
+        let diff = diff_runs(&a, &b);
+        assert!(
+            diff.contains("CPU.Bef"),
+            "should show CPU columns when either run has CPU data. Got:\n{diff}"
+        );
+        assert!(
+            diff.contains("8.00"),
+            "should show A's CPU value. Got:\n{diff}"
+        );
+        // B's missing CPU renders as "-", not a misleading 0.00ms.
+        // Extract the CPU.Aft column value from the data row.
+        let data_line = diff.lines().find(|l| l.contains("work")).unwrap();
+        assert!(
+            data_line.ends_with('-'),
+            "missing CPU should render as dash, not 0.00ms. Got:\n{data_line}"
+        );
+    }
+
+    #[test]
+    fn diff_neither_has_cpu_hides_cpu_columns() {
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 1,
+                total_ms: 10.0,
+                self_ms: 10.0,
+                ..Default::default()
+            }],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 1,
+                total_ms: 12.0,
+                self_ms: 12.0,
+                ..Default::default()
+            }],
+        };
+        let diff = diff_runs(&a, &b);
+        assert!(
+            !diff.contains("CPU"),
+            "should not show CPU columns when neither run has CPU data. Got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn format_table_cpu_with_all_includes_zero_call() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![
+                FnEntry {
+                    name: "active".into(),
+                    calls: 5,
+                    total_ms: 20.0,
+                    self_ms: 15.0,
+                    cpu_self_ms: Some(12.0),
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "unused".into(),
+                    cpu_self_ms: Some(0.0),
+                    ..Default::default()
+                },
+            ],
+        };
+        // Without --all: hides unused.
+        let table = format_table(&run, false);
+        assert!(table.contains("CPU"), "should have CPU column");
+        assert!(!table.contains("unused"), "should hide zero-call fn");
+
+        // With --all: shows unused with CPU column present.
+        let table_all = format_table(&run, true);
+        assert!(table_all.contains("CPU"), "should have CPU column");
+        assert!(
+            table_all.contains("unused"),
+            "should show zero-call fn with --all. Got:\n{table_all}"
+        );
+    }
+
+    #[test]
+    fn format_table_with_frames_cpu_and_all() {
+        let frame_data = FrameData {
+            fn_names: vec!["active".into(), "unused".into()],
+            frames: vec![vec![FrameFnEntry {
+                fn_id: 0,
+                calls: 1,
+                self_ns: 5_000_000,
+                cpu_self_ns: Some(4_000_000),
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            }]],
+        };
+        // Without --all: hides unused, shows CPU.
+        let table = format_table_with_frames(&frame_data, false);
+        assert!(table.contains("CPU"), "should show CPU column");
+        assert!(table.contains("active"), "should show active fn");
+        assert!(!table.contains("unused"), "should hide unused fn");
+
+        // With --all: shows both, CPU column still present.
+        let table_all = format_table_with_frames(&frame_data, true);
+        assert!(table_all.contains("CPU"), "should show CPU column");
+        assert!(
+            table_all.contains("unused"),
+            "should show unused fn with --all. Got:\n{table_all}"
+        );
+    }
+
+    #[test]
+    fn format_table_with_frames_no_cpu_in_data() {
+        let frame_data = FrameData {
+            fn_names: vec!["update".into()],
+            frames: vec![vec![FrameFnEntry {
+                fn_id: 0,
+                calls: 1,
+                self_ns: 2_000_000,
+                cpu_self_ns: None,
+                alloc_count: 5,
+                alloc_bytes: 1024,
+                free_count: 3,
+                free_bytes: 512,
+            }]],
+        };
+        let table = format_table_with_frames(&frame_data, false);
+        assert!(
+            !table.contains("CPU"),
+            "should not show CPU column when no CPU data. Got:\n{table}"
+        );
+        assert!(table.contains("update"), "should still show function");
+    }
+
+    #[test]
+    fn merge_runs_mixed_cpu_data() {
+        let run_a = Run {
+            run_id: Some("test_1".into()),
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 5,
+                total_ms: 20.0,
+                self_ms: 15.0,
+                cpu_self_ms: Some(10.0),
+                ..Default::default()
+            }],
+        };
+        let run_b = Run {
+            run_id: Some("test_1".into()),
+            timestamp_ms: 1001,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 3,
+                total_ms: 12.0,
+                self_ms: 9.0,
+                // No CPU data in this run.
+                ..Default::default()
+            }],
+        };
+        let merged = merge_runs(&[&run_a, &run_b]);
+        let work = merged.functions.iter().find(|f| f.name == "work").unwrap();
+        assert_eq!(work.calls, 8);
+        // CPU should be Some(10.0) — only accumulated from runs that have it.
+        assert_eq!(work.cpu_self_ms, Some(10.0));
     }
 }
