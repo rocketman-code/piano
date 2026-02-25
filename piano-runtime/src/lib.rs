@@ -8,9 +8,11 @@ mod cpu_clock;
 
 pub use alloc::PianoAllocator;
 #[cfg(test)]
+pub use collector::clear_runs_dir;
+#[cfg(test)]
 pub use collector::collect_invocations;
 pub use collector::{
     adopt, collect, collect_all, collect_frames, enter, flush, fork, init, register, reset,
-    shutdown, shutdown_to, AdoptGuard, FrameFnSummary, FunctionRecord, Guard, InvocationRecord,
-    SpanContext,
+    set_runs_dir, shutdown, shutdown_to, AdoptGuard, FrameFnSummary, FunctionRecord, Guard,
+    InvocationRecord, SpanContext,
 };
