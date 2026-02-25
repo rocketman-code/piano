@@ -96,9 +96,9 @@ pub struct FrameFnSummary {
     pub self_ns: u64,
     #[cfg(feature = "cpu-time")]
     pub cpu_self_ns: u64,
-    pub alloc_count: u32,
+    pub alloc_count: u64,
     pub alloc_bytes: u64,
-    pub free_count: u32,
+    pub free_count: u64,
     pub free_bytes: u64,
 }
 
@@ -111,9 +111,9 @@ pub struct InvocationRecord {
     pub self_ns: u64,
     #[cfg(feature = "cpu-time")]
     pub cpu_self_ns: u64,
-    pub alloc_count: u32,
+    pub alloc_count: u64,
     pub alloc_bytes: u64,
-    pub free_count: u32,
+    pub free_count: u64,
     pub free_bytes: u64,
     pub depth: u16,
 }
@@ -664,7 +664,7 @@ fn write_ndjson(
     // Header line: metadata + function name table
     write!(
         f,
-        "{{\"format_version\":2,\"run_id\":\"{}\",\"timestamp_ms\":{}",
+        "{{\"format_version\":3,\"run_id\":\"{}\",\"timestamp_ms\":{}",
         run_id, ts
     )?;
     #[cfg(feature = "cpu-time")]
@@ -1474,7 +1474,7 @@ mod tests {
         let lines: Vec<&str> = content.lines().collect();
 
         // First line is header
-        assert!(lines[0].contains("\"format_version\":2"));
+        assert!(lines[0].contains("\"format_version\":3"));
         assert!(lines[0].contains("\"functions\""));
 
         // Remaining lines are frames

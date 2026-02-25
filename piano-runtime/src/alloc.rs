@@ -6,9 +6,9 @@ use std::cell::Cell;
 /// destructor -> safe for use in global allocator TLS on all Rust versions.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct AllocSnapshot {
-    pub(crate) alloc_count: u32,
+    pub(crate) alloc_count: u64,
     pub(crate) alloc_bytes: u64,
-    pub(crate) free_count: u32,
+    pub(crate) free_count: u64,
     pub(crate) free_bytes: u64,
 }
 
@@ -157,5 +157,43 @@ mod tests {
         assert_eq!(outer.alloc_bytes, 400, "outer alloc_bytes");
         assert_eq!(outer.free_count, 1, "outer free_count");
         assert_eq!(outer.free_bytes, 75, "outer free_bytes");
+    }
+
+    #[test]
+    fn alloc_count_holds_values_above_u32_max() {
+        reset();
+        let large: u64 = u32::MAX as u64 + 100;
+        ALLOC_COUNTERS.with(|cell| {
+            cell.set(AllocSnapshot {
+                alloc_count: large,
+                alloc_bytes: 0,
+                free_count: large,
+                free_bytes: 0,
+            });
+        });
+        {
+            let _g = enter("large_count");
+            // Simulate one more allocation inside the scope
+            track_alloc(64);
+            track_dealloc(32);
+        }
+        let invocations = collect_invocations();
+        let rec = invocations
+            .iter()
+            .find(|r| r.name == "large_count")
+            .unwrap();
+        assert_eq!(rec.alloc_count, 1, "should see only in-scope allocation");
+        assert_eq!(rec.free_count, 1, "should see only in-scope deallocation");
+
+        // Verify the TLS counter was restored to the large value
+        let restored = ALLOC_COUNTERS.with(|cell| cell.get());
+        assert_eq!(
+            restored.alloc_count, large,
+            "alloc_count should preserve values above u32::MAX"
+        );
+        assert_eq!(
+            restored.free_count, large,
+            "free_count should preserve values above u32::MAX"
+        );
     }
 }
