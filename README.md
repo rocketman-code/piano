@@ -3,14 +3,11 @@
 Automated instrumentation-based profiling for Rust. Point it at your project, get back timing, percentiles, and allocation counts per frame.
 
 ```
-$ piano build
+$ piano profile
 found 5 function(s) across 3 file(s)
 built: target/piano/debug/my-project
-
-$ ./target/piano/debug/my-project
 ... normal program output ...
 
-$ piano report
 Function                                    Calls       Self        p50        p99   Allocs      Bytes
 ----------------------------------------------------------------------------------------------------
 parse                                          12   341.21ms    28.11ms    32.44ms      840     62.5KB
@@ -18,6 +15,19 @@ resolve                                        47   141.13ms     2.98ms     3.22
 parse_item                                    108    94.58ms     0.87ms     1.14ms     1620    126.3KB
 
 3000 frames
+```
+
+Or step by step:
+
+```
+$ piano build
+found 5 function(s) across 3 file(s)
+built: target/piano/debug/my-project
+
+$ piano run
+... normal program output ...
+
+$ piano report
 ```
 
 Piano rewrites your source at the AST level to inject RAII timing guards and an allocation-tracking allocator, builds the instrumented binary, and flushes per-frame results to `target/piano/runs/` on process exit. Your original source is never modified.
@@ -53,6 +63,25 @@ $ piano build --fn parse --fn resolve       # multiple patterns
 ```
 
 The instrumented binary is written to `target/piano/debug/<name>`.
+
+### Execute the instrumented binary
+
+`piano run` finds and executes the most recently built instrumented binary:
+
+```
+$ piano run
+$ piano run -- --input data.csv --verbose    # pass arguments after --
+```
+
+It looks in `target/piano/debug/` and picks the most recent executable. Piano exits with the binary's exit code.
+
+### One-step profiling
+
+`piano profile` combines build, execute, and report into one command:
+
+```
+$ piano profile --fn parse -- --input data.csv
+```
 
 ### Per-frame profiling
 
@@ -124,7 +153,7 @@ Two crates: `piano` (CLI, AST rewriting, build orchestration) and `piano-runtime
 
 - Wall-clock timing by default. Use `--cpu-time` to add per-thread CPU time (Linux + macOS only).
 - Functions shorter than the guard overhead (~120ns) will have noisy measurements.
-- Async functions are not yet supported (skipped with a warning).
+- Async functions record wall time only when futures migrate across threads (self-time may overcount).
 - Allocation tracking counts heap operations only (`alloc`/`dealloc`). Stack allocations and memory-mapped regions are not tracked.
 
 ## License
