@@ -652,9 +652,9 @@ pub fn diff_runs(a: &Run, b: &Run) -> String {
         }
 
         if has_allocs {
-            let allocs_after = b_map.get(name).map_or(0i64, |e| e.alloc_count as i64);
-            let allocs_before = a_map.get(name).map_or(0i64, |e| e.alloc_count as i64);
-            let allocs_delta = allocs_after - allocs_before;
+            let allocs_after = b_map.get(name).map_or(0u64, |e| e.alloc_count);
+            let allocs_before = a_map.get(name).map_or(0u64, |e| e.alloc_count);
+            let allocs_delta = allocs_after as i128 - allocs_before as i128;
             out.push_str(&format!(" {allocs_after:>10} {allocs_delta:>+10}"));
         }
 
@@ -1389,6 +1389,51 @@ mod tests {
         assert!(
             diff.contains("-50"),
             "should show alloc count delta: {diff}"
+        );
+    }
+
+    #[test]
+    fn diff_alloc_count_does_not_wrap_above_i64_max() {
+        let large_count: u64 = i64::MAX as u64 + 1_000;
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "alloc_heavy".into(),
+                calls: 1,
+                total_ms: 1.0,
+                self_ms: 1.0,
+                cpu_self_ms: None,
+                alloc_count: large_count,
+                alloc_bytes: 0,
+            }],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "alloc_heavy".into(),
+                calls: 1,
+                total_ms: 1.0,
+                self_ms: 1.0,
+                cpu_self_ms: None,
+                alloc_count: 0,
+                alloc_bytes: 0,
+            }],
+        };
+        let diff = diff_runs(&a, &b);
+        // Extract the A.Delta column value from the alloc_heavy row.
+        // With the old `as i64` cast, large_count wraps to negative i64 and
+        // the delta becomes a large positive number (wrong direction).
+        let line = diff.lines().find(|l| l.contains("alloc_heavy")).unwrap();
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Last field is A.Delta (alloc delta).
+        let delta_str = fields.last().unwrap();
+        assert!(
+            delta_str.starts_with('-'),
+            "alloc delta should be negative (decrease from {large_count} to 0), got: {delta_str}"
         );
     }
 
