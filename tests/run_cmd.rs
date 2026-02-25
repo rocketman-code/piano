@@ -1,4 +1,4 @@
-//! Integration test for `piano profile` — build + execute + report in one step.
+//! Integration tests for `piano profile` and `piano run`.
 
 use std::fs;
 use std::path::Path;
@@ -235,5 +235,123 @@ fn run_command_passes_args_after_separator() {
     assert!(
         stdout.contains("args: --input data.csv --verbose"),
         "program should receive the passed args, got: {stdout}"
+    );
+}
+
+#[test]
+fn run_executes_last_built_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("mini");
+    create_mini_project(&project_dir);
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Step 1: build
+    let build_output = Command::new(piano_bin)
+        .args(["build", "--fn", "work", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    assert!(
+        build_output.status.success(),
+        "piano build failed: {}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    // Step 2: run (from project directory so target/piano/debug/ is found)
+    let run_output = Command::new(piano_bin)
+        .arg("run")
+        .current_dir(&project_dir)
+        .output()
+        .expect("failed to run piano run");
+
+    let stdout = String::from_utf8_lossy(&run_output.stdout);
+    let stderr = String::from_utf8_lossy(&run_output.stderr);
+
+    assert!(
+        run_output.status.success(),
+        "piano run failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    assert!(
+        stdout.contains("result: 499500"),
+        "program output should appear, got stdout: {stdout}"
+    );
+
+    assert!(
+        stderr.contains("running:"),
+        "should show which binary is running, got stderr: {stderr}"
+    );
+}
+
+#[test]
+fn run_passes_args_via_separator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("echo-args");
+    create_echo_args_project(&project_dir);
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Build first
+    let build_output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    assert!(build_output.status.success());
+
+    // Run with args
+    let run_output = Command::new(piano_bin)
+        .args(["run", "--", "--input", "data.csv", "--verbose"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("failed to run piano run with args");
+
+    let stdout = String::from_utf8_lossy(&run_output.stdout);
+
+    assert!(
+        run_output.status.success(),
+        "piano run with args failed: {}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    assert!(
+        stdout.contains("args: --input data.csv --verbose"),
+        "program should receive the passed args, got: {stdout}"
+    );
+}
+
+#[test]
+fn run_errors_when_no_binary_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+
+    // Run from empty directory -- no target/piano/debug/
+    let output = Command::new(piano_bin)
+        .arg("run")
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to run piano run");
+
+    assert!(
+        !output.status.success(),
+        "piano run should fail when no binary exists"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("piano build"),
+        "error should mention piano build, got: {stderr}"
     );
 }

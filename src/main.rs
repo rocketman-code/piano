@@ -25,7 +25,7 @@ use piano::rewrite::{
     name = "piano",
     about = "Automated instrumentation-based profiling for Rust",
     version,
-    after_help = "Workflow: piano profile [OPTIONS] (or: piano build, run the binary, piano report)"
+    after_help = "Workflow: piano profile [OPTIONS] (or: piano build, piano run, piano report)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -61,6 +61,13 @@ enum Commands {
         /// Capture per-thread CPU time alongside wall time (Unix only).
         #[arg(long)]
         cpu_time: bool,
+    },
+    /// Execute the last-built instrumented binary.
+    /// Pass arguments to the binary after --.
+    Run {
+        /// Arguments to pass to the instrumented binary (after --).
+        #[arg(last = true)]
+        args: Vec<String>,
     },
     /// Build, execute, and report in one step.
     /// Pass arguments to the binary after --.
@@ -157,6 +164,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             runtime_path,
             cpu_time,
         ),
+        Commands::Run { args } => cmd_run(args),
         Commands::Profile {
             fn_patterns,
             file_patterns,
@@ -404,6 +412,49 @@ fn cmd_build(
     }
 
     Ok(())
+}
+
+fn find_latest_binary() -> Result<PathBuf, Error> {
+    let dir = PathBuf::from("target/piano/debug");
+    if !dir.is_dir() {
+        return Err(Error::NoBinary(dir));
+    }
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // Skip files with extensions (e.g. .d, .fingerprint) -- binaries have no extension on unix
+        if path.extension().is_some() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if entry.metadata()?.permissions().mode() & 0o111 == 0 {
+                continue; // not executable
+            }
+        }
+        let mtime = entry.metadata()?.modified()?;
+        if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
+            best = Some((path, mtime));
+        }
+    }
+    best.map(|(p, _)| p).ok_or(Error::NoBinary(dir))
+}
+
+fn cmd_run(args: Vec<String>) -> Result<(), Error> {
+    let binary = find_latest_binary()?;
+    eprintln!("running: {}", binary.display());
+
+    let status = std::process::Command::new(&binary)
+        .args(&args)
+        .status()
+        .map_err(|e| Error::RunFailed(format!("failed to run {}: {e}", binary.display())))?;
+
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 #[allow(clippy::too_many_arguments)]
