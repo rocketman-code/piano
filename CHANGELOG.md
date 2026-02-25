@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `piano profile` command: one-step build, execute, and report workflow with `--ignore-exit-code` and `--` argument passthrough
+- `piano run` command: execute the last-built instrumented binary with `--` argument passthrough
+- Async function instrumentation: async functions are now profiled instead of skipped; Guard detects thread migration and records wall time safely across `.await` points
+
 ## [0.5.1] - 2026-02-24
 
 ### Fixed
@@ -30,7 +38,7 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - Unparseable source files are skipped with a warning instead of aborting
-- Async functions are skipped with a warning (instrumentation not yet supported)
+- Async functions skipped with a warning
 - Cross-thread functions correctly merged into NDJSON report
 - Symlinks followed when staging project files for instrumentation
 - Bare stdout path suppressed in interactive terminals (no more duplicate path output)
