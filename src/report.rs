@@ -43,6 +43,9 @@ pub struct FnEntry {
 pub struct FrameData {
     pub fn_names: Vec<String>,
     pub frames: Vec<Vec<FrameFnEntry>>,
+    /// Function IDs that were merged from companion JSON (worker-thread data).
+    /// These lack per-frame granularity, so percentile columns show "-".
+    pub companion_fn_ids: HashSet<usize>,
 }
 
 /// Per-function entry within a single frame.
@@ -161,6 +164,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
     // NDJSON only has main-thread frame data (from collect_frames TLS).
     // The companion JSON has all threads (from collect_all Arc registry).
     let mut fn_names = header.functions;
+    let mut companion_fn_ids: HashSet<usize> = HashSet::new();
     let json_companion = path.with_extension("json");
     if json_companion.exists() {
         match std::fs::read_to_string(&json_companion)
@@ -180,6 +184,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
                     if !existing.contains(&fn_entry.name) {
                         let new_id = fn_names.len();
                         fn_names.push(fn_entry.name.clone());
+                        companion_fn_ids.insert(new_id);
                         // Add aggregate data to first frame. Worker threads lack
                         // frame boundaries, so we can't assign to specific frames.
                         if let Some(first_frame) = frames.first_mut() {
@@ -253,7 +258,11 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         source_format: RunFormat::Ndjson,
     };
 
-    let frame_data = FrameData { fn_names, frames };
+    let frame_data = FrameData {
+        fn_names,
+        frames,
+        companion_fn_ids,
+    };
 
     Ok((run, frame_data))
 }
@@ -331,6 +340,7 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
         total_allocs: u64,
         total_alloc_bytes: u64,
         per_frame_self_ns: Vec<u64>,
+        is_companion: bool,
     }
 
     let has_cpu = frame_data
@@ -345,18 +355,20 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
 
         for entry in frame {
             seen.insert(entry.fn_id, true);
-            let stats = stats_map.entry(entry.fn_id).or_insert_with(|| FnStats {
+            let fn_id = entry.fn_id;
+            let stats = stats_map.entry(fn_id).or_insert_with(|| FnStats {
                 name: frame_data
                     .fn_names
-                    .get(entry.fn_id)
+                    .get(fn_id)
                     .cloned()
-                    .unwrap_or_else(|| format!("<fn_{}>", entry.fn_id)),
+                    .unwrap_or_else(|| format!("<fn_{fn_id}>")),
                 total_calls: 0,
                 total_self_ns: 0,
                 total_cpu_self_ns: if has_cpu { Some(0) } else { None },
                 total_allocs: 0,
                 total_alloc_bytes: 0,
                 per_frame_self_ns: Vec::new(),
+                is_companion: frame_data.companion_fn_ids.contains(&fn_id),
             });
             stats.total_calls += entry.calls;
             stats.total_self_ns += entry.self_ns;
@@ -369,8 +381,12 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
         }
 
         // Functions not present in this frame get a zero entry.
+        // Skip companion-merged functions — they lack per-frame granularity.
         for (fn_id, present) in &seen {
-            if !present && let Some(stats) = stats_map.get_mut(fn_id) {
+            if !present
+                && !frame_data.companion_fn_ids.contains(fn_id)
+                && let Some(stats) = stats_map.get_mut(fn_id)
+            {
                 stats.per_frame_self_ns.push(0);
             }
         }
@@ -387,6 +403,7 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
                 total_allocs: 0,
                 total_alloc_bytes: 0,
                 per_frame_self_ns: Vec::new(),
+                is_companion: frame_data.companion_fn_ids.contains(&fn_id),
             });
         }
     }
@@ -428,10 +445,13 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
 
     for e in &entries {
         let self_str = format_ns(e.total_self_ns);
-        let p50 = percentile(&e.per_frame_self_ns, 50.0);
-        let p99 = percentile(&e.per_frame_self_ns, 99.0);
-        let p50_str = format_ns(p50);
-        let p99_str = format_ns(p99);
+        let (p50_str, p99_str) = if e.is_companion {
+            (format!("{:>10}", "-"), format!("{:>10}", "-"))
+        } else {
+            let p50 = percentile(&e.per_frame_self_ns, 50.0);
+            let p99 = percentile(&e.per_frame_self_ns, 99.0);
+            (format_ns(p50), format_ns(p99))
+        };
         let bytes_str = format_bytes(e.total_alloc_bytes);
         if has_cpu {
             let cpu_str = match e.total_cpu_self_ns {
@@ -1320,6 +1340,7 @@ mod tests {
                     },
                 ],
             ],
+            companion_fn_ids: HashSet::new(),
         };
         let table = format_table_with_frames(&frame_data, true);
         assert!(table.contains("p50"), "should have p50 column");
@@ -1444,6 +1465,7 @@ mod tests {
                     },
                 ],
             ],
+            companion_fn_ids: HashSet::new(),
         };
         let table = format_frames_table(&frame_data);
         assert!(table.contains("Frame"), "should have Frame column header");
@@ -1495,6 +1517,7 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
+            companion_fn_ids: HashSet::new(),
         };
         // Default (show_all=false) should hide "unused"
         let table = format_table_with_frames(&frame_data, false);
@@ -1535,6 +1558,7 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
+            companion_fn_ids: HashSet::new(),
         };
         let table = format_table_with_frames(&frame_data, false);
         assert!(
@@ -1604,6 +1628,7 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
+            companion_fn_ids: HashSet::new(),
         };
         let table = format_table_with_frames(&frame_data, false);
         assert!(
@@ -1848,6 +1873,7 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
+            companion_fn_ids: HashSet::new(),
         };
         // Without --all: hides unused, shows CPU.
         let table = format_table_with_frames(&frame_data, false);
@@ -1886,6 +1912,7 @@ mod tests {
                 free_count: 3,
                 free_bytes: 512,
             }]],
+            companion_fn_ids: HashSet::new(),
         };
         let table = format_table_with_frames(&frame_data, false);
         assert!(
@@ -2269,6 +2296,104 @@ mod tests {
         assert!(
             has_entry,
             "worker_fn should have a frame entry with calls=50"
+        );
+    }
+
+    #[test]
+    fn companion_merged_functions_show_dash_for_percentiles() {
+        // Worker-thread functions merged from companion JSON only have data in
+        // frame 0. With multiple frames, their p50/p99 would misleadingly show
+        // 0ns. Instead, companion-merged functions should show "-" for percentiles.
+        let mut companion_fn_ids = HashSet::new();
+        companion_fn_ids.insert(2); // "worker_fn" is companion-merged
+
+        let frame_data = FrameData {
+            fn_names: vec!["main_fn".into(), "update".into(), "worker_fn".into()],
+            frames: vec![
+                vec![
+                    FrameFnEntry {
+                        fn_id: 0,
+                        calls: 1,
+                        self_ns: 5_000_000,
+                        cpu_self_ns: None,
+                        alloc_count: 0,
+                        alloc_bytes: 0,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                    FrameFnEntry {
+                        fn_id: 1,
+                        calls: 1,
+                        self_ns: 2_000_000,
+                        cpu_self_ns: None,
+                        alloc_count: 0,
+                        alloc_bytes: 0,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                    // worker_fn only appears in frame 0
+                    FrameFnEntry {
+                        fn_id: 2,
+                        calls: 50,
+                        self_ns: 3_000_000,
+                        cpu_self_ns: None,
+                        alloc_count: 100,
+                        alloc_bytes: 5000,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                ],
+                vec![
+                    FrameFnEntry {
+                        fn_id: 0,
+                        calls: 1,
+                        self_ns: 4_000_000,
+                        cpu_self_ns: None,
+                        alloc_count: 0,
+                        alloc_bytes: 0,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                    FrameFnEntry {
+                        fn_id: 1,
+                        calls: 1,
+                        self_ns: 2_500_000,
+                        cpu_self_ns: None,
+                        alloc_count: 0,
+                        alloc_bytes: 0,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                    // worker_fn absent from frame 1
+                ],
+            ],
+            companion_fn_ids,
+        };
+
+        let table = format_table_with_frames(&frame_data, false);
+
+        // worker_fn should show "-" for p50/p99, not "0ns"
+        let worker_line = table
+            .lines()
+            .find(|l| l.contains("worker_fn"))
+            .expect("worker_fn should appear in table");
+        assert!(
+            worker_line.contains("-"),
+            "worker_fn should show '-' for percentiles, got: {worker_line}"
+        );
+        assert!(
+            !worker_line.contains("0ns"),
+            "worker_fn should NOT show '0ns' for percentiles, got: {worker_line}"
+        );
+
+        // Regular functions should still show normal percentiles
+        let main_line = table
+            .lines()
+            .find(|l| l.contains("main_fn"))
+            .expect("main_fn should appear in table");
+        assert!(
+            !main_line.contains("-"),
+            "main_fn should show real percentiles, not '-', got: {main_line}"
         );
     }
 }
