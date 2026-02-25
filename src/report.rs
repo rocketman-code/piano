@@ -169,6 +169,13 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         {
             Ok(json_run) => {
                 let existing: HashSet<String> = fn_names.iter().cloned().collect();
+                let has_new = json_run
+                    .functions
+                    .iter()
+                    .any(|f| !existing.contains(&f.name));
+                if has_new && frames.is_empty() {
+                    frames.push(Vec::new());
+                }
                 for fn_entry in &json_run.functions {
                     if !existing.contains(&fn_entry.name) {
                         let new_id = fn_names.len();
@@ -2210,6 +2217,58 @@ mod tests {
         assert_eq!(
             entry.free_count, large_fc,
             "fc field should deserialize values above u32::MAX"
+        );
+    }
+
+    #[test]
+    fn load_ndjson_empty_frames_preserves_companion_data() {
+        // NDJSON with header but zero frame lines is valid.
+        // Companion JSON has worker-thread functions.
+        // Bug: fn_names grows but frames stays empty, so metrics are silently dropped.
+        let dir = TempDir::new().unwrap();
+
+        // Header only, no frame lines.
+        let ndjson = r#"{"format_version":2,"run_id":"empty_1","timestamp_ms":9000,"functions":["main_fn"]}
+"#;
+        fs::write(dir.path().join("9000.ndjson"), ndjson).unwrap();
+
+        let json = r#"{
+            "run_id": "empty_1",
+            "timestamp_ms": 9000,
+            "functions": [
+                {"name": "main_fn", "calls": 1, "total_ms": 10.0, "self_ms": 10.0},
+                {"name": "worker_fn", "calls": 50, "total_ms": 3.0, "self_ms": 3.0}
+            ]
+        }"#;
+        fs::write(dir.path().join("9000.json"), json).unwrap();
+
+        let ndjson_path = dir.path().join("9000.ndjson");
+        let (run, frame_data) = load_ndjson(&ndjson_path).unwrap();
+
+        // worker_fn should be merged with its metrics, not zeroed out.
+        let worker = run
+            .functions
+            .iter()
+            .find(|f| f.name == "worker_fn")
+            .expect("worker_fn should be present in run");
+        assert_eq!(
+            worker.calls, 50,
+            "worker_fn should have 50 calls, not 0 (silent data loss)"
+        );
+
+        // FrameData should also contain the worker data.
+        let worker_id = frame_data
+            .fn_names
+            .iter()
+            .position(|n| n == "worker_fn")
+            .expect("worker_fn should be in fn_names");
+        let has_entry = frame_data
+            .frames
+            .iter()
+            .any(|frame| frame.iter().any(|e| e.fn_id == worker_id && e.calls == 50));
+        assert!(
+            has_entry,
+            "worker_fn should have a frame entry with calls=50"
         );
     }
 }
