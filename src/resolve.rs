@@ -214,6 +214,22 @@ fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
+/// Returns false for function signatures that cannot be instrumented:
+/// const fn (enter() is not const), unsafe fn, extern fn (non-Rust ABI).
+pub(crate) fn is_instrumentable(sig: &syn::Signature) -> bool {
+    if sig.constness.is_some() || sig.unsafety.is_some() {
+        return false;
+    }
+    if let Some(abi) = &sig.abi {
+        // `extern "Rust"` is fine; any other ABI (or bare `extern`) is not.
+        let is_rust_abi = abi.name.as_ref().is_some_and(|name| name.value() == "Rust");
+        if !is_rust_abi {
+            return false;
+        }
+    }
+    true
+}
+
 /// AST visitor that collects function names from a parsed Rust file.
 #[derive(Default)]
 struct FnCollector {
@@ -233,10 +249,9 @@ impl<'ast> Visit<'ast> for FnCollector {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if !has_attr(&node.attrs, "test") {
+        if !has_attr(&node.attrs, "test") && is_instrumentable(&node.sig) {
             self.functions.push(node.sig.ident.to_string());
         }
-        // Continue visiting nested items (closures etc. are not collected).
         syn::visit::visit_item_fn(self, node);
     }
 
@@ -248,7 +263,7 @@ impl<'ast> Visit<'ast> for FnCollector {
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if !has_attr(&node.attrs, "test") {
+        if !has_attr(&node.attrs, "test") && is_instrumentable(&node.sig) {
             let method_name = node.sig.ident.to_string();
             if let Some(ref impl_name) = self.current_impl {
                 self.functions.push(format!("{impl_name}::{method_name}"));
@@ -267,8 +282,7 @@ impl<'ast> Visit<'ast> for FnCollector {
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-        // Only collect if the method has a default body.
-        if node.default.is_some() {
+        if node.default.is_some() && is_instrumentable(&node.sig) {
             let method_name = node.sig.ident.to_string();
             if let Some(ref trait_name) = self.current_trait {
                 self.functions.push(format!("{trait_name}::{method_name}"));
@@ -324,6 +338,24 @@ fn helper() {}
         fs::write(
             src.join("walker").join("mod.rs"),
             "pub fn walk_dir() {}\nfn scan() {}\n",
+        )
+        .unwrap();
+
+        fs::write(
+            src.join("special_fns.rs"),
+            "\
+const fn fixed_size() -> usize { 42 }
+unsafe fn dangerous() -> i32 { 0 }
+extern \"C\" fn ffi_callback() {}
+fn normal_fn() {}
+
+struct Widget;
+impl Widget {
+    const fn none() -> Option<Self> { None }
+    unsafe fn raw_ptr(&self) -> *const u8 { std::ptr::null() }
+    fn valid_method(&self) {}
+}
+",
         )
         .unwrap();
 
@@ -542,6 +574,40 @@ mod tests {
         assert!(
             !all_fns.contains(&"it_works"),
             "should skip test in cfg(test)"
+        );
+    }
+
+    #[test]
+    fn resolve_skips_const_unsafe_extern_functions() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        let specs = [TargetSpec::File("special_fns.rs".into())];
+        let results = resolve_targets(&tmp.path().join("src"), &specs).unwrap();
+
+        let all_fns: Vec<&str> = results
+            .iter()
+            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .collect();
+
+        // Should include normal functions
+        assert!(all_fns.contains(&"normal_fn"), "should include normal_fn");
+        assert!(
+            all_fns.contains(&"Widget::valid_method"),
+            "should include Widget::valid_method"
+        );
+
+        // Should skip const/unsafe/extern
+        assert!(!all_fns.contains(&"fixed_size"), "should skip const fn");
+        assert!(!all_fns.contains(&"dangerous"), "should skip unsafe fn");
+        assert!(!all_fns.contains(&"ffi_callback"), "should skip extern fn");
+        assert!(
+            !all_fns.contains(&"Widget::none"),
+            "should skip const impl method"
+        );
+        assert!(
+            !all_fns.contains(&"Widget::raw_ptr"),
+            "should skip unsafe impl method"
         );
     }
 
