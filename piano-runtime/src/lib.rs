@@ -5,11 +5,12 @@
 mod alloc;
 mod collector;
 mod cpu_clock;
+mod tsc;
 
 pub use alloc::PianoAllocator;
 #[cfg(test)]
 pub use collector::clear_runs_dir;
-#[cfg(test)]
+#[cfg(any(test, feature = "_test_internals"))]
 pub use collector::collect_invocations;
 pub use collector::{
     adopt, collect, collect_all, collect_frames, enter, flush, fork, init, register, reset,

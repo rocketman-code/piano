@@ -1,8 +1,8 @@
-//! Integration test: piano-runtime compiles on Rust 1.56.
+//! Integration test: piano-runtime compiles on Rust 1.59.
 //!
 //! piano-runtime is injected as a dependency of the target project, so it must
-//! compile under the target's toolchain. This test pins Rust 1.56 (the edition
-//! 2021 floor) to verify the runtime works on the oldest supported compiler.
+//! compile under the target's toolchain. This test pins Rust 1.59 (the inline
+//! asm stabilization floor) to verify the runtime works on the oldest supported compiler.
 
 use std::fs;
 use std::path::Path;
@@ -58,15 +58,15 @@ fn compute() -> u64 {
 }
 
 #[test]
-fn piano_runtime_compiles_on_rust_1_56() {
-    if !has_toolchain("1.56.0") {
-        eprintln!("skipping: Rust 1.56.0 not installed (rustup toolchain install 1.56.0)");
+fn piano_runtime_compiles_on_rust_1_59() {
+    if !has_toolchain("1.59.0") {
+        eprintln!("skipping: Rust 1.59.0 not installed (rustup toolchain install 1.59.0)");
         return;
     }
 
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("msrv_test");
-    create_project_pinned_to(&project_dir, "1.56.0");
+    create_project_pinned_to(&project_dir, "1.59.0");
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -85,7 +85,7 @@ fn piano_runtime_compiles_on_rust_1_56() {
 
     assert!(
         output.status.success(),
-        "piano build failed on Rust 1.56:\nstderr: {stderr}\nstdout: {stdout}"
+        "piano build failed on Rust 1.59:\nstderr: {stderr}\nstdout: {stdout}"
     );
 
     // Run the instrumented binary.
@@ -105,7 +105,7 @@ fn piano_runtime_compiles_on_rust_1_56() {
 
     assert!(
         run_output.status.success(),
-        "instrumented binary failed on Rust 1.56:\n{}",
+        "instrumented binary failed on Rust 1.59:\n{}",
         String::from_utf8_lossy(&run_output.stderr)
     );
 
@@ -128,6 +128,6 @@ fn piano_runtime_compiles_on_rust_1_56() {
 
     assert!(
         !run_files.is_empty(),
-        "expected profiling data on Rust 1.56"
+        "expected profiling data on Rust 1.59"
     );
 }

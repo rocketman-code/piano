@@ -2,8 +2,8 @@
 
 ## Rust Style
 
-- Edition 2024 (CLI), Edition 2021 (piano-runtime, MSRV 1.56)
-- MSRV: 1.88 (CLI), 1.56 (runtime -- broad compatibility for user projects)
+- Edition 2024 (CLI), Edition 2021 (piano-runtime, MSRV 1.59)
+- MSRV: 1.88 (CLI), 1.59 (runtime -- broad compatibility for user projects)
 - `cargo clippy --workspace --all-targets -- -D warnings` (strict, enforced in CI)
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` (documentation must compile cleanly, enforced in CI)
 - Idiomatic Rust: prefer stdlib patterns (iterators, if-let chains, Result propagation with `?`) over manual indexing or `process::exit` (except at the CLI boundary in `main.rs`)
@@ -32,7 +32,7 @@ Integration tests in `tests/`. No unit tests in source files currently.
 - `cpu_time.rs` -- CPU time feature pipeline
 - `integration_frames.rs` -- per-frame NDJSON output
 - `alloc_threaded.rs` -- allocation tracking across threads
-- `msrv_compat.rs` -- runtime compiles on Rust 1.56
+- `msrv_compat.rs` -- runtime compiles on Rust 1.59
 - `strict_lints.rs` -- runtime compiles with strict warnings
 - `workspace_member.rs` -- workspace member instrumentation
 - `custom_bin_path.rs` -- non-default binary entry points
@@ -44,7 +44,7 @@ Five jobs, all on ubuntu-latest:
 1. `fmt` -- `cargo fmt --check`
 2. `clippy` -- `cargo clippy --workspace --all-targets -- -D warnings`
 3. `test` -- `cargo test --workspace`
-4. `msrv` -- tests on Rust 1.88 (CLI MSRV) + installs 1.56 for runtime MSRV test
+4. `msrv` -- tests on Rust 1.88 (CLI MSRV) + installs 1.59 for runtime MSRV test
 5. `doc` -- `cargo doc --workspace --no-deps` with `-D warnings`
 
 Triggers: push to main, all pull requests.

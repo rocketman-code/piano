@@ -152,7 +152,7 @@ Two crates: `piano` (CLI, AST rewriting, build orchestration) and `piano-runtime
 ## Limitations
 
 - Wall-clock timing by default. Use `--cpu-time` to add per-thread CPU time (Linux + macOS only).
-- Functions shorter than the guard overhead (~120ns) will have noisy measurements.
+- Functions shorter than the guard overhead (~12ns on x86-64, sub-nanosecond on Apple Silicon) will have noisy measurements.
 - Async functions record wall time only when futures migrate across threads (self-time may overcount).
 - Allocation tracking counts heap operations only (`alloc`/`dealloc`). Stack allocations and memory-mapped regions are not tracked.
 
