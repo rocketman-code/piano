@@ -56,5 +56,3 @@ Format: `v0.x.y` (e.g., `v0.1.0`, `v0.2.0`). Tag the version bump commit.
 `CHANGELOG.md` in the repo root, following [Keep a Changelog](https://keepachangelog.com/) format.
 Each release maps to a closed GitHub milestone (when milestones are used).
 Update the changelog as part of the release commit, before tagging.
-
-Note: `CHANGELOG.md` does not exist yet. Create it during the first release.
