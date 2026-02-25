@@ -128,10 +128,10 @@ fn frame_pipeline_build_run_report() {
     let content = fs::read_to_string(ndjson_files[0].path()).unwrap();
     let lines: Vec<&str> = content.lines().collect();
 
-    // Header should have format_version 2 and function names.
+    // Header should have format_version 3 and function names.
     assert!(
-        lines[0].contains("\"format_version\":2"),
-        "header should have format_version 2"
+        lines[0].contains("\"format_version\":3"),
+        "header should have format_version 3"
     );
     assert!(
         lines[0].contains("\"functions\""),

@@ -51,9 +51,9 @@ pub struct FrameFnEntry {
     pub calls: u64,
     pub self_ns: u64,
     pub cpu_self_ns: Option<u64>,
-    pub alloc_count: u32,
+    pub alloc_count: u64,
     pub alloc_bytes: u64,
-    pub free_count: u32,
+    pub free_count: u64,
     pub free_bytes: u64,
 }
 
@@ -86,11 +86,11 @@ struct NdjsonFnEntry {
     #[serde(default)]
     csn: Option<u64>,
     #[serde(default)]
-    ac: u32,
+    ac: u64,
     #[serde(default)]
     ab: u64,
     #[serde(default)]
-    fc: u32,
+    fc: u64,
     #[serde(default)]
     fb: u64,
 }
@@ -183,7 +183,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
                                 cpu_self_ns: fn_entry
                                     .cpu_self_ms
                                     .map(|ms| (ms * 1_000_000.0) as u64),
-                                alloc_count: fn_entry.alloc_count as u32,
+                                alloc_count: fn_entry.alloc_count,
                                 alloc_bytes: fn_entry.alloc_bytes,
                                 free_count: 0,
                                 free_bytes: 0,
@@ -209,7 +209,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
             let agg = fn_agg.entry(entry.fn_id).or_insert((0, 0, 0, 0, 0));
             agg.0 += entry.calls;
             agg.1 += entry.self_ns;
-            agg.2 += entry.alloc_count as u64;
+            agg.2 += entry.alloc_count;
             agg.3 += entry.alloc_bytes;
             agg.4 += entry.cpu_self_ns.unwrap_or(0);
         }
@@ -356,7 +356,7 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
             if let (Some(total), Some(cpu)) = (&mut stats.total_cpu_self_ns, entry.cpu_self_ns) {
                 *total += cpu;
             }
-            stats.total_allocs += entry.alloc_count as u64;
+            stats.total_allocs += entry.alloc_count;
             stats.total_alloc_bytes += entry.alloc_bytes;
             stats.per_frame_self_ns.push(entry.self_ns);
         }
@@ -511,7 +511,7 @@ pub fn format_frames_table(frame_data: &FrameData) -> String {
             out.push_str(&format!(" {:>width$}", format_ns(ns), width = fn_col_width));
         }
 
-        let allocs: u64 = frame.iter().map(|e| e.alloc_count as u64).sum();
+        let allocs: u64 = frame.iter().map(|e| e.alloc_count).sum();
         let bytes: u64 = frame.iter().map(|e| e.alloc_bytes).sum();
         out.push_str(&format!(" {:>8} {:>10}", allocs, format_bytes(bytes)));
 
@@ -2137,5 +2137,79 @@ mod tests {
 
         let result = find_ndjson_by_run_id(&runs_dir, "nonexistent").unwrap();
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn companion_json_merge_preserves_large_alloc_counts() {
+        // Regression test: FrameFnEntry.alloc_count was previously u32, and
+        // the companion JSON merge path used `as u32` which silently truncated
+        // values above u32::MAX. Verify the u64 widening preserves large values.
+        let dir = TempDir::new().unwrap();
+
+        let ndjson = r#"{"format_version":3,"run_id":"alloc_1","timestamp_ms":7000,"functions":["main_fn"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":1000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        fs::write(dir.path().join("7000.ndjson"), ndjson).unwrap();
+
+        let large_alloc_count: u64 = 5_000_000_000; // exceeds u32::MAX (4,294,967,295)
+        let json = format!(
+            r#"{{
+            "run_id": "alloc_1",
+            "timestamp_ms": 7000,
+            "functions": [
+                {{"name": "main_fn", "calls": 1, "total_ms": 1.0, "self_ms": 1.0}},
+                {{"name": "heavy_alloc", "calls": 100, "total_ms": 5.0, "self_ms": 5.0, "alloc_count": {large_alloc_count}, "alloc_bytes": 40000000000}}
+            ]
+        }}"#
+        );
+        fs::write(dir.path().join("7000.json"), json).unwrap();
+
+        let ndjson_path = dir.path().join("7000.ndjson");
+        let (_run, frame_data) = load_ndjson(&ndjson_path).unwrap();
+
+        // Find the merged worker-thread function.
+        let heavy_id = frame_data
+            .fn_names
+            .iter()
+            .position(|n| n == "heavy_alloc")
+            .expect("heavy_alloc should be merged from companion JSON");
+
+        let entry = frame_data.frames[0]
+            .iter()
+            .find(|e| e.fn_id == heavy_id)
+            .expect("heavy_alloc should have a frame entry");
+
+        assert_eq!(
+            entry.alloc_count, large_alloc_count,
+            "alloc_count should preserve values above u32::MAX without truncation"
+        );
+    }
+
+    #[test]
+    fn ndjson_deserializes_large_alloc_counts() {
+        // NDJSON ac/fc fields should support values above u32::MAX.
+        let dir = TempDir::new().unwrap();
+
+        let large_ac: u64 = 5_000_000_000;
+        let large_fc: u64 = 4_500_000_000;
+        let ndjson = format!(
+            r#"{{"format_version":3,"run_id":"large_ac","timestamp_ms":8000,"functions":["allocator"]}}
+{{"frame":0,"fns":[{{"id":0,"calls":1,"self_ns":1000000,"ac":{large_ac},"ab":50000,"fc":{large_fc},"fb":40000}}]}}
+"#
+        );
+        fs::write(dir.path().join("8000.ndjson"), &ndjson).unwrap();
+
+        let ndjson_path = dir.path().join("8000.ndjson");
+        let (_run, frame_data) = load_ndjson(&ndjson_path).unwrap();
+
+        let entry = &frame_data.frames[0][0];
+        assert_eq!(
+            entry.alloc_count, large_ac,
+            "ac field should deserialize values above u32::MAX"
+        );
+        assert_eq!(
+            entry.free_count, large_fc,
+            "fc field should deserialize values above u32::MAX"
+        );
     }
 }
