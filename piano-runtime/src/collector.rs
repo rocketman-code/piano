@@ -73,6 +73,20 @@ fn run_id() -> &'static str {
 /// Process-start epoch for relative timestamps.
 static EPOCH: SyncOnceCell<Instant> = SyncOnceCell::new();
 
+/// Explicit runs directory set by the CLI via `set_runs_dir()`.
+///
+/// When set, `runs_dir()` returns this path instead of the env-var /
+/// home-directory fallback. This ensures `flush()` and `shutdown()` write
+/// to the same project-local directory that `shutdown_to()` uses.
+///
+/// Uses `SyncOnceCell<Mutex<_>>` instead of `static Mutex` because
+/// `Mutex::new` is not `const fn` on Rust < 1.63 (runtime MSRV is 1.56).
+static RUNS_DIR: SyncOnceCell<Mutex<Option<PathBuf>>> = SyncOnceCell::new();
+
+fn runs_dir_lock() -> &'static Mutex<Option<PathBuf>> {
+    RUNS_DIR.get_or_init(|| Mutex::new(None))
+}
+
 fn epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)
 }
@@ -596,12 +610,37 @@ fn timestamp_ms() -> u128 {
         .as_millis()
 }
 
+/// Configure the directory where run files should be written.
+///
+/// Called by CLI-injected code at the start of `main()` so that both
+/// `flush()` and `shutdown()` write to the project-local directory.
+/// `PIANO_RUNS_DIR` env var still takes priority (for testing and user
+/// overrides).
+pub fn set_runs_dir(dir: &str) {
+    *runs_dir_lock().lock().unwrap_or_else(|e| e.into_inner()) = Some(PathBuf::from(dir));
+}
+
+/// Clear the configured runs directory.
+///
+/// Exposed for testing. Not part of the public API.
+#[cfg(test)]
+pub fn clear_runs_dir() {
+    *runs_dir_lock().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Return the directory where run files should be written.
 ///
-/// Uses `PIANO_RUNS_DIR` env var if set, otherwise `~/.piano/runs/`.
+/// Priority: `PIANO_RUNS_DIR` env var > `set_runs_dir()` > `~/.piano/runs/`.
 fn runs_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("PIANO_RUNS_DIR") {
         return Some(PathBuf::from(dir));
+    }
+    if let Some(dir) = runs_dir_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return Some(dir);
     }
     dirs_fallback().map(|home| home.join(".piano").join("runs"))
 }
@@ -1952,6 +1991,86 @@ mod tests {
             restored.alloc_bytes, 4200,
             "grandparent alloc_bytes should be restored after orphan drain"
         );
+    }
+
+    #[test]
+    fn set_runs_dir_used_by_flush() {
+        // set_runs_dir() should configure where flush() writes data,
+        // without requiring PIANO_RUNS_DIR env var or ~/.piano/ fallback.
+        reset();
+        {
+            let _g = enter("set_dir_fn");
+            burn_cpu(5_000);
+        }
+
+        let tmp = std::env::temp_dir().join(format!("piano_setdir_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Configure runs dir via set_runs_dir, NOT env var.
+        set_runs_dir(tmp.to_str().unwrap());
+        flush();
+
+        // Clear the global so other tests aren't affected.
+        clear_runs_dir();
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            !files.is_empty(),
+            "flush() should write to set_runs_dir() path, got no files in {tmp:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn shutdown_to_sets_runs_dir_for_flush() {
+        // shutdown_to() should set the global runs dir so that any
+        // earlier flush() calls (e.g. from panic hooks) would have
+        // used the same directory. After shutdown_to(), the dir should
+        // be set so future flushes also use it.
+        reset();
+
+        // Produce data, then call set_runs_dir + flush to simulate
+        // the scenario where the CLI injects set_runs_dir at start
+        // of main, and flush() is called mid-program.
+        let tmp = std::env::temp_dir().join(format!("piano_shutdown_to_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // First: set_runs_dir early (like CLI injection at start of main)
+        set_runs_dir(tmp.to_str().unwrap());
+
+        // Generate some data and flush mid-program.
+        {
+            let _g = enter("mid_flush_fn");
+            burn_cpu(5_000);
+        }
+        flush();
+
+        // Generate more data.
+        {
+            let _g = enter("shutdown_fn");
+            burn_cpu(5_000);
+        }
+
+        // shutdown_to uses the same dir.
+        shutdown_to(tmp.to_str().unwrap());
+        clear_runs_dir();
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        // Should have files from both flush and shutdown_to.
+        assert!(
+            files.len() >= 2,
+            "expected files from both flush() and shutdown_to(), got {} in {tmp:?}",
+            files.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[cfg(feature = "cpu-time")]

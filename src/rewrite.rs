@@ -491,6 +491,14 @@ impl ShutdownInjector {
             },
         }
     }
+
+    fn set_runs_dir_stmt(&self) -> Option<syn::Stmt> {
+        self.runs_dir.as_ref().map(|dir| {
+            syn::parse_quote! {
+                piano_runtime::set_runs_dir(#dir);
+            }
+        })
+    }
 }
 
 impl VisitMut for ShutdownInjector {
@@ -501,21 +509,23 @@ impl VisitMut for ShutdownInjector {
 
             let existing_stmts = std::mem::take(&mut node.block.stmts);
             let shutdown_stmt = self.shutdown_stmt();
+            let set_dir_stmt = self.set_runs_dir_stmt();
 
             if is_async {
                 // Async main: can't use catch_unwind (sync closure can't contain .await).
                 // Insert shutdown before the tail expression if there is one.
+                let mut stmts: Vec<syn::Stmt> = Vec::new();
+                stmts.extend(set_dir_stmt);
                 if has_return_type && !existing_stmts.is_empty() {
                     let (body, tail) = existing_stmts.split_at(existing_stmts.len() - 1);
-                    let mut stmts: Vec<syn::Stmt> = body.to_vec();
+                    stmts.extend(body.to_vec());
                     stmts.push(shutdown_stmt);
                     stmts.extend(tail.to_vec());
-                    node.block.stmts = stmts;
                 } else {
-                    let mut stmts = existing_stmts;
+                    stmts.extend(existing_stmts);
                     stmts.push(shutdown_stmt);
-                    node.block.stmts = stmts;
                 }
+                node.block.stmts = stmts;
             } else {
                 // Sync main: wrap body in catch_unwind so guards drop on panic
                 // (recording timing data), then shutdown collects it, then re-panic.
@@ -524,6 +534,10 @@ impl VisitMut for ShutdownInjector {
                         std::panic::AssertUnwindSafe(|| { #(#existing_stmts)* })
                     );
                 };
+                let mut stmts: Vec<syn::Stmt> = Vec::new();
+                stmts.extend(set_dir_stmt);
+                stmts.push(catch_stmt);
+                stmts.push(shutdown_stmt);
                 if has_return_type {
                     let tail: syn::Stmt = syn::Stmt::Expr(
                         syn::parse_quote! {
@@ -534,15 +548,16 @@ impl VisitMut for ShutdownInjector {
                         },
                         None,
                     );
-                    node.block.stmts = vec![catch_stmt, shutdown_stmt, tail];
+                    stmts.push(tail);
                 } else {
                     let resume_stmt: syn::Stmt = syn::parse_quote! {
                         if let Err(__piano_panic) = __piano_result {
                             std::panic::resume_unwind(__piano_panic);
                         }
                     };
-                    node.block.stmts = vec![catch_stmt, shutdown_stmt, resume_stmt];
+                    stmts.push(resume_stmt);
                 }
+                node.block.stmts = stmts;
             }
         }
         syn::visit_mut::visit_item_fn_mut(self, node);
@@ -772,6 +787,27 @@ fn main() {
     }
 
     #[test]
+    fn injects_set_runs_dir_at_start_of_main() {
+        let source = r#"
+fn main() {
+    do_stuff();
+}
+"#;
+        let result = inject_shutdown(source, Some("/project/target/piano/runs")).unwrap();
+        assert!(
+            result.contains("piano_runtime::set_runs_dir"),
+            "should inject set_runs_dir when runs_dir is provided. Got:\n{result}"
+        );
+        // set_runs_dir should appear BEFORE catch_unwind (i.e. before the body)
+        let set_pos = result.find("set_runs_dir").unwrap();
+        let catch_pos = result.find("catch_unwind").unwrap();
+        assert!(
+            set_pos < catch_pos,
+            "set_runs_dir should come before catch_unwind. Got:\n{result}"
+        );
+    }
+
+    #[test]
     fn injects_shutdown_preserves_main_return_type() {
         let source = r#"
 use std::process::ExitCode;
@@ -860,6 +896,27 @@ async fn main() -> ExitCode {
         assert!(
             shutdown_pos < exit_code_pos,
             "shutdown should come before the tail expression. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn injects_set_runs_dir_in_async_main() {
+        let source = r#"
+async fn main() {
+    do_stuff().await;
+}
+"#;
+        let result = inject_shutdown(source, Some("/project/target/piano/runs")).unwrap();
+        assert!(
+            result.contains("piano_runtime::set_runs_dir"),
+            "should inject set_runs_dir for async main. Got:\n{result}"
+        );
+        // set_runs_dir should come before the user's code
+        let set_pos = result.find("set_runs_dir").unwrap();
+        let stuff_pos = result.find("do_stuff").unwrap();
+        assert!(
+            set_pos < stuff_pos,
+            "set_runs_dir should come before user code. Got:\n{result}"
         );
     }
 
