@@ -23,12 +23,13 @@ use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{compiler_fence, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Thread-safe, initialize-once cell using `Once` + `UnsafeCell`.
 ///
-/// Equivalent to `OnceLock` (stabilized in 1.70) but works on Rust 1.56+.
+/// Equivalent to `OnceLock` (stabilized in 1.70) but works on Rust 1.59+.
 /// The `Once` primitive guarantees single-writer semantics; after initialization
 /// the value is read-only, so there are no data races.
 struct SyncOnceCell<T> {
@@ -80,7 +81,7 @@ static EPOCH: SyncOnceCell<Instant> = SyncOnceCell::new();
 /// to the same project-local directory that `shutdown_to()` uses.
 ///
 /// Uses `SyncOnceCell<Mutex<_>>` instead of `static Mutex` because
-/// `Mutex::new` is not `const fn` on Rust < 1.63 (runtime MSRV is 1.56).
+/// `Mutex::new` is not `const fn` on Rust < 1.63 (runtime MSRV is 1.59).
 static RUNS_DIR: SyncOnceCell<Mutex<Option<PathBuf>>> = SyncOnceCell::new();
 
 fn runs_dir_lock() -> &'static Mutex<Option<PathBuf>> {
@@ -88,7 +89,13 @@ fn runs_dir_lock() -> &'static Mutex<Option<PathBuf>> {
 }
 
 fn epoch() -> Instant {
-    *EPOCH.get_or_init(Instant::now)
+    *EPOCH.get_or_init(|| {
+        crate::tsc::calibrate();
+        let tsc_val = crate::tsc::read();
+        let now = Instant::now();
+        crate::tsc::set_epoch_tsc(tsc_val);
+        now
+    })
 }
 
 /// Aggregated timing data for a single function.
@@ -135,12 +142,11 @@ pub struct InvocationRecord {
 /// Entry on the thread-local timing stack.
 pub(crate) struct StackEntry {
     pub(crate) name: &'static str,
-    pub(crate) start: Instant,
-    #[cfg(feature = "cpu-time")]
-    pub(crate) cpu_start_ns: u64,
     pub(crate) children_ms: f64,
     #[cfg(feature = "cpu-time")]
     pub(crate) cpu_children_ns: u64,
+    #[cfg(feature = "cpu-time")]
+    pub(crate) cpu_start_ns: u64,
     /// Saved ALLOC_COUNTERS from before this scope, restored on Guard::drop.
     pub(crate) saved_alloc: crate::alloc::AllocSnapshot,
     pub(crate) depth: u16,
@@ -174,7 +180,7 @@ thread_local! {
         arc
     };
     static REGISTERED: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
-    #[cfg(test)]
+    #[cfg(any(test, feature = "_test_internals"))]
     static INVOCATIONS: RefCell<Vec<InvocationRecord>> = RefCell::new(Vec::new());
     /// Invocations accumulated within the current frame (cleared on frame boundary).
     static FRAME_BUFFER: RefCell<Vec<InvocationRecord>> = RefCell::new(Vec::new());
@@ -182,203 +188,248 @@ thread_local! {
     static FRAMES: RefCell<Vec<Vec<FrameFnSummary>>> = RefCell::new(Vec::new());
 }
 
+/// Sequential per-thread identifier. Cheaper than `std::thread::current().id()`
+/// and packable into a u64 alongside the stack depth.
+static NEXT_THREAD_COOKIE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+thread_local! {
+    static THREAD_COOKIE: u64 = NEXT_THREAD_COOKIE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Pack a thread cookie (48 bits) and stack depth (16 bits) into a single u64.
+#[inline(always)]
+fn pack_cookie_depth(cookie: u64, depth: u16) -> u64 {
+    (cookie << 16) | depth as u64
+}
+
+/// Unpack the thread cookie from a packed u64.
+#[inline(always)]
+fn unpack_cookie(packed: u64) -> u64 {
+    packed >> 16
+}
+
+/// Unpack the stack depth from a packed u64.
+#[inline(always)]
+fn unpack_depth(packed: u64) -> u16 {
+    packed as u16
+}
+
 /// RAII timing guard. Records elapsed time on drop.
 ///
-/// Self-contained: carries its own timing state so that thread migration
-/// (e.g. async runtimes moving futures between worker threads) produces
-/// correct wall time instead of corrupting the enter thread's TLS stack.
+/// 16 bytes: fits in two registers on both x86_64 (rax+rdx) and
+/// aarch64 (x0+x1), eliminating all memory stores from the
+/// measurement window.
+///
+/// Uses a raw hardware counter (`rdtsc` / `cntvct_el0`) instead of
+/// `Instant::now()` to minimize clock-read cost. The tsc-to-nanosecond
+/// conversion happens in `drop_cold`, outside the measurement window.
 #[must_use = "dropping the guard immediately records ~0ms; bind it with `let _guard = ...`"]
 pub struct Guard {
-    name: &'static str,
-    start: Instant,
-    enter_thread: std::thread::ThreadId,
-    stack_depth: u16,
-    /// Saved alloc counters from enter(). Retained for future use when
-    /// migrated guards gain alloc attribution support.
-    #[allow(dead_code)]
-    saved_alloc: crate::alloc::AllocSnapshot,
+    start_tsc: u64,
+    /// High 48 bits: thread cookie, low 16 bits: stack depth.
+    packed: u64,
 }
 
 // Guard must be Send so async runtimes can move futures containing guards
-// across worker threads. All fields are Send (Instant, ThreadId, &'static str,
-// u16, AllocSnapshot) so this is auto-derived, but we assert it at compile time
-// to catch accidental regressions (e.g. adding a Cell or Rc field).
+// across worker threads.
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _check() {
         _assert_send::<Guard>();
     }
+    // Verify Guard is exactly 16 bytes (fits in 2 registers).
+    fn _assert_size() {
+        let _ = core::mem::transmute::<Guard, [u8; 16]>;
+    }
 };
 
-impl Drop for Guard {
-    fn drop(&mut self) {
-        let drop_thread = std::thread::current().id();
-        let migrated = drop_thread != self.enter_thread;
+/// Bookkeeping half of Guard::drop(): thread check, alloc restore, stack pop,
+/// recording. Kept out-of-line so the inlined drop is just a counter read + call.
+#[inline(never)]
+fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_ns: u64) {
+    let drop_cookie = THREAD_COOKIE.with(|c| *c);
+    let enter_cookie = unpack_cookie(guard.packed);
+    let migrated = drop_cookie != enter_cookie;
 
-        if migrated {
-            // Thread migration detected. Wall time is correct (Instant is
-            // cross-thread) but we cannot access the enter thread's TLS stack,
-            // alloc counters, or CPU clock. Record wall time only.
-            let elapsed_ns = self.start.elapsed().as_nanos() as u64;
-            let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
-            let start_ns = self.start.duration_since(epoch()).as_nanos() as u64;
+    if migrated {
+        // Thread migration detected. TSC is cross-thread on modern hardware.
+        // Name and depth are unavailable (stored in enter thread's TLS).
+        let elapsed_ns = crate::tsc::elapsed_ns(guard.start_tsc, end_tsc);
+        let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
+        let start_ns = crate::tsc::ticks_to_epoch_ns(guard.start_tsc, crate::tsc::epoch_tsc());
 
-            RECORDS.with(|records| {
-                records
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(RawRecord {
-                        name: self.name,
-                        elapsed_ms,
-                        children_ms: 0.0,
-                        #[cfg(feature = "cpu-time")]
-                        cpu_self_ns: 0,
-                    });
-            });
+        RECORDS.with(|records| {
+            records
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(RawRecord {
+                    name: "<migrated>",
+                    elapsed_ms,
+                    children_ms: 0.0,
+                    #[cfg(feature = "cpu-time")]
+                    cpu_self_ns: 0,
+                });
+        });
 
-            let invocation = InvocationRecord {
-                name: self.name,
-                start_ns,
-                elapsed_ns,
-                // No children info available on the drop thread, so self =
-                // wall. May overcount when migrated children exist.
-                self_ns: elapsed_ns,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns: 0,
-                alloc_count: 0,
-                alloc_bytes: 0,
-                free_count: 0,
-                free_bytes: 0,
-                depth: self.stack_depth,
-            };
+        let invocation = InvocationRecord {
+            name: "<migrated>",
+            start_ns,
+            elapsed_ns,
+            // No children info available on the drop thread, so self =
+            // wall. May overcount when migrated children exist.
+            self_ns: elapsed_ns,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 0,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
+            depth: 0,
+        };
 
-            #[cfg(test)]
-            INVOCATIONS.with(|inv| {
-                inv.borrow_mut().push(invocation.clone());
-            });
+        #[cfg(any(test, feature = "_test_internals"))]
+        INVOCATIONS.with(|inv| {
+            inv.borrow_mut().push(invocation.clone());
+        });
 
-            FRAME_BUFFER.with(|buf| {
-                buf.borrow_mut().push(invocation);
-            });
-            // No frame boundary check: migrated guard's depth is from
-            // the enter thread, not meaningful for this thread's frames.
-            return;
+        FRAME_BUFFER.with(|buf| {
+            buf.borrow_mut().push(invocation);
+        });
+        // No frame boundary check: migrated guard's depth is from
+        // the enter thread, not meaningful for this thread's frames.
+        return;
+    }
+
+    // Same thread -- existing logic with orphan drain prefix.
+    let scope_alloc = crate::alloc::ALLOC_COUNTERS
+        .try_with(|cell| cell.get())
+        .unwrap_or_default();
+
+    STACK.with(|stack| {
+        // Drain orphaned entries left by migrated child guards.
+        {
+            let mut s = stack.borrow_mut();
+            let guard_depth = unpack_depth(guard.packed);
+            while s.last().map_or(false, |e| e.depth > guard_depth) {
+                let orphan = s.pop().unwrap();
+                let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
+                    cell.set(orphan.saved_alloc);
+                });
+            }
         }
 
-        // Same thread -- existing logic with orphan drain prefix.
+        let entry = match stack.borrow_mut().pop() {
+            Some(e) => e,
+            None => {
+                eprintln!("piano-runtime: guard dropped without matching stack entry (bug)");
+                return;
+            }
+        };
+
+        // Restore parent's saved alloc counters.
+        let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
+            cell.set(entry.saved_alloc);
+        });
+
+        let elapsed_ns = crate::tsc::elapsed_ns(guard.start_tsc, end_tsc);
+        let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
+        let children_ns = (entry.children_ms * 1_000_000.0) as u64;
+        let self_ns = elapsed_ns.saturating_sub(children_ns);
+        let start_ns = crate::tsc::ticks_to_epoch_ns(guard.start_tsc, crate::tsc::epoch_tsc());
+        let children_ms = entry.children_ms;
+
+        #[cfg(feature = "cpu-time")]
+        let cpu_elapsed_ns = cpu_end_ns.saturating_sub(entry.cpu_start_ns);
+        #[cfg(feature = "cpu-time")]
+        let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
+
+        if let Some(parent) = stack.borrow_mut().last_mut() {
+            parent.children_ms += elapsed_ms;
+            #[cfg(feature = "cpu-time")]
+            {
+                parent.cpu_children_ns += cpu_elapsed_ns;
+            }
+        }
+
+        RECORDS.with(|records| {
+            records
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(RawRecord {
+                    name: entry.name,
+                    elapsed_ms,
+                    children_ms,
+                    #[cfg(feature = "cpu-time")]
+                    cpu_self_ns,
+                });
+        });
+
+        let invocation = InvocationRecord {
+            name: entry.name,
+            start_ns,
+            elapsed_ns,
+            self_ns,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns,
+            alloc_count: scope_alloc.alloc_count,
+            alloc_bytes: scope_alloc.alloc_bytes,
+            free_count: scope_alloc.free_count,
+            free_bytes: scope_alloc.free_bytes,
+            depth: entry.depth,
+        };
+
+        #[cfg(any(test, feature = "_test_internals"))]
+        INVOCATIONS.with(|inv| {
+            inv.borrow_mut().push(invocation.clone());
+        });
+
+        FRAME_BUFFER.with(|buf| {
+            buf.borrow_mut().push(invocation);
+        });
+        if entry.depth == 0 {
+            FRAME_BUFFER.with(|buf| {
+                let buffer = buf.borrow_mut().drain(..).collect::<Vec<_>>();
+                let summary = aggregate_frame(&buffer);
+                FRAMES.with(|frames| {
+                    frames.borrow_mut().push(summary);
+                });
+            });
+        }
+    });
+}
+
+impl Drop for Guard {
+    /// Inlined so the counter read (`rdtsc`/`cntvct_el0`) happens at the drop
+    /// site as a single inline instruction.
+    /// `compiler_fence` prevents the compiler from hoisting Guard field loads
+    /// before the counter read.
+    #[inline(always)]
+    fn drop(&mut self) {
+        let end_tsc = crate::tsc::read();
         #[cfg(feature = "cpu-time")]
         let cpu_end_ns = crate::cpu_clock::cpu_now_ns();
 
-        let scope_alloc = crate::alloc::ALLOC_COUNTERS
-            .try_with(|cell| cell.get())
-            .unwrap_or_default();
+        // Prevent the compiler from moving Guard field reads (needed by
+        // drop_cold) before the counter read above.
+        compiler_fence(Ordering::SeqCst);
 
-        STACK.with(|stack| {
-            // Drain orphaned entries left by migrated child guards.
-            {
-                let mut s = stack.borrow_mut();
-                while s.last().map_or(false, |e| e.depth > self.stack_depth) {
-                    let orphan = s.pop().unwrap();
-                    let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
-                        cell.set(orphan.saved_alloc);
-                    });
-                }
-            }
-
-            let entry = match stack.borrow_mut().pop() {
-                Some(e) => e,
-                None => {
-                    eprintln!("piano-runtime: guard dropped without matching stack entry (bug)");
-                    return;
-                }
-            };
-
-            // Restore parent's saved alloc counters.
-            let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
-                cell.set(entry.saved_alloc);
-            });
-
-            let elapsed_ns = entry.start.elapsed().as_nanos() as u64;
-            let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
-            let children_ns = (entry.children_ms * 1_000_000.0) as u64;
-            let self_ns = elapsed_ns.saturating_sub(children_ns);
-            let start_ns = entry.start.duration_since(epoch()).as_nanos() as u64;
-            let children_ms = entry.children_ms;
-
+        drop_cold(
+            self,
+            end_tsc,
             #[cfg(feature = "cpu-time")]
-            let cpu_elapsed_ns = cpu_end_ns.saturating_sub(entry.cpu_start_ns);
-            #[cfg(feature = "cpu-time")]
-            let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
-
-            if let Some(parent) = stack.borrow_mut().last_mut() {
-                parent.children_ms += elapsed_ms;
-                #[cfg(feature = "cpu-time")]
-                {
-                    parent.cpu_children_ns += cpu_elapsed_ns;
-                }
-            }
-
-            RECORDS.with(|records| {
-                records
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(RawRecord {
-                        name: entry.name,
-                        elapsed_ms,
-                        children_ms,
-                        #[cfg(feature = "cpu-time")]
-                        cpu_self_ns,
-                    });
-            });
-
-            let invocation = InvocationRecord {
-                name: entry.name,
-                start_ns,
-                elapsed_ns,
-                self_ns,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns,
-                alloc_count: scope_alloc.alloc_count,
-                alloc_bytes: scope_alloc.alloc_bytes,
-                free_count: scope_alloc.free_count,
-                free_bytes: scope_alloc.free_bytes,
-                depth: entry.depth,
-            };
-
-            #[cfg(test)]
-            INVOCATIONS.with(|inv| {
-                inv.borrow_mut().push(invocation.clone());
-            });
-
-            FRAME_BUFFER.with(|buf| {
-                buf.borrow_mut().push(invocation);
-            });
-            if entry.depth == 0 {
-                FRAME_BUFFER.with(|buf| {
-                    let buffer = buf.borrow_mut().drain(..).collect::<Vec<_>>();
-                    let summary = aggregate_frame(&buffer);
-                    FRAMES.with(|frames| {
-                        frames.borrow_mut().push(summary);
-                    });
-                });
-            }
-        });
+            cpu_end_ns,
+        );
     }
 }
 
-/// Start timing a function. Returns a Guard that records the measurement on drop.
-pub fn enter(name: &'static str) -> Guard {
-    // Touch EPOCH so relative timestamps are anchored to process start.
+/// Bookkeeping half of enter(): epoch, alloc save, stack push.
+/// Returns a packed u64 (thread cookie << 16 | depth).
+#[inline(never)]
+fn enter_cold(name: &'static str) -> u64 {
     let _ = epoch();
-    let start = Instant::now();
-    // Captured here in enter() but stored only in Guard, not StackEntry.
-    // StackEntry lives in thread-local storage and is always accessed from its
-    // own thread, so it never needs to know which thread created it. Guard, on
-    // the other hand, can be moved across threads by async runtimes, so it
-    // carries the originating thread ID to detect migration in Drop.
-    let enter_thread = std::thread::current().id();
 
-    // Save current alloc counters and zero them for this scope.
+    let cookie = THREAD_COOKIE.with(|c| *c);
+
     let saved_alloc = crate::alloc::ALLOC_COUNTERS
         .try_with(|cell| {
             let snap = cell.get();
@@ -387,29 +438,40 @@ pub fn enter(name: &'static str) -> Guard {
         })
         .unwrap_or_default();
 
+    #[cfg(feature = "cpu-time")]
+    let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
+
     let depth = STACK.with(|stack| {
         let depth = stack.borrow().len() as u16;
         stack.borrow_mut().push(StackEntry {
             name,
-            start,
-            #[cfg(feature = "cpu-time")]
-            cpu_start_ns: crate::cpu_clock::cpu_now_ns(),
             children_ms: 0.0,
             #[cfg(feature = "cpu-time")]
             cpu_children_ns: 0,
+            #[cfg(feature = "cpu-time")]
+            cpu_start_ns,
             saved_alloc,
             depth,
         });
         depth
     });
 
-    Guard {
-        name,
-        start,
-        enter_thread,
-        stack_depth: depth,
-        saved_alloc,
-    }
+    pack_cookie_depth(cookie, depth)
+}
+
+/// Start timing a function. Returns a Guard that records the measurement on drop.
+///
+/// Inlined so the counter read (`rdtsc`/`cntvct_el0`) happens at the call
+/// site as a single inline instruction — no function call, no vDSO overhead.
+///
+/// Guard is 16 bytes: fits in two registers on both x86_64 and aarch64,
+/// so the compiler keeps it in registers across the call — zero memory
+/// stores inside the measurement window.
+#[inline(always)]
+pub fn enter(name: &'static str) -> Guard {
+    let packed = enter_cold(name);
+    let start_tsc = crate::tsc::read();
+    Guard { start_tsc, packed }
 }
 
 /// Register a function name so it appears in output even if never called.
@@ -498,7 +560,7 @@ pub fn collect() -> Vec<FunctionRecord> {
 }
 
 /// Return all raw per-invocation records (not aggregated).
-#[cfg(test)]
+#[cfg(any(test, feature = "_test_internals"))]
 pub fn collect_invocations() -> Vec<InvocationRecord> {
     INVOCATIONS.with(|inv| inv.borrow().clone())
 }
@@ -535,7 +597,7 @@ fn aggregate_frame(records: &[InvocationRecord]) -> Vec<FrameFnSummary> {
         entry.free_bytes += rec.free_bytes;
     }
     #[allow(clippy::iter_kv_map)]
-    // into_values() requires Rust 1.54; we support 1.56 but keep the pattern uniform
+    // into_values() requires Rust 1.54; we support 1.59 but keep the pattern uniform
     map.into_iter().map(|(_, v)| v).collect()
 }
 
@@ -576,7 +638,7 @@ pub fn reset() {
         records.lock().unwrap_or_else(|e| e.into_inner()).clear();
     });
     REGISTERED.with(|reg| reg.borrow_mut().clear());
-    #[cfg(test)]
+    #[cfg(any(test, feature = "_test_internals"))]
     INVOCATIONS.with(|inv| inv.borrow_mut().clear());
     FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
     FRAMES.with(|frames| frames.borrow_mut().clear());
@@ -662,8 +724,7 @@ fn write_json(records: &[FunctionRecord], path: &std::path::Path) -> std::io::Re
     let run_id = run_id();
     write!(
         f,
-        "{{\"run_id\":\"{}\",\"timestamp_ms\":{},\"functions\":[",
-        run_id, ts
+        "{{\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts},\"functions\":["
     )?;
     for (i, rec) in records.iter().enumerate() {
         if i > 0 {
@@ -703,8 +764,7 @@ fn write_ndjson(
     // Header line: metadata + function name table
     write!(
         f,
-        "{{\"format_version\":3,\"run_id\":\"{}\",\"timestamp_ms\":{}",
-        run_id, ts
+        "{{\"format_version\":3,\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts}"
     )?;
     #[cfg(feature = "cpu-time")]
     write!(f, ",\"has_cpu_time\":true")?;
@@ -714,7 +774,7 @@ fn write_ndjson(
             write!(f, ",")?;
         }
         let name = name.replace('\\', "\\\\").replace('"', "\\\"");
-        write!(f, "\"{}\"", name)?;
+        write!(f, "\"{name}\"")?;
     }
     writeln!(f, "]}}")?;
 
@@ -724,7 +784,7 @@ fn write_ndjson(
 
     // One line per frame
     for (frame_idx, frame) in frames.iter().enumerate() {
-        write!(f, "{{\"frame\":{},\"fns\":[", frame_idx)?;
+        write!(f, "{{\"frame\":{frame_idx},\"fns\":[")?;
         for (i, s) in frame.iter().enumerate() {
             if i > 0 {
                 write!(f, ",")?;
@@ -831,14 +891,14 @@ fn shutdown_impl(dir: &std::path::Path) {
                 }
             }
         }
-        let path = dir.join(format!("{}.ndjson", ts));
+        let path = dir.join(format!("{ts}.ndjson"));
         let _ = write_ndjson(&frames, &fn_names, &path);
     }
 
     // Always write aggregated cross-thread data (JSON format).
     let records = collect_all();
     if !records.is_empty() {
-        let path = dir.join(format!("{}.json", ts));
+        let path = dir.join(format!("{ts}.json"));
         let _ = write_json(&records, &path);
     }
 }
@@ -893,6 +953,8 @@ impl Drop for SpanContext {
 #[must_use = "dropping AdoptGuard immediately records ~0ms; bind it with `let _guard = ...`"]
 pub struct AdoptGuard {
     #[cfg(feature = "cpu-time")]
+    cpu_start_ns: u64,
+    #[cfg(feature = "cpu-time")]
     ctx_children_cpu_ns: Arc<Mutex<u64>>,
 }
 
@@ -915,7 +977,7 @@ impl Drop for AdoptGuard {
             #[cfg(feature = "cpu-time")]
             {
                 let cpu_elapsed_ns =
-                    crate::cpu_clock::cpu_now_ns().saturating_sub(entry.cpu_start_ns);
+                    crate::cpu_clock::cpu_now_ns().saturating_sub(self.cpu_start_ns);
                 let mut cpu_children = self
                     .ctx_children_cpu_ns
                     .lock()
@@ -958,21 +1020,26 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
         })
         .unwrap_or_default();
 
+    #[cfg(feature = "cpu-time")]
+    let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
+
     STACK.with(|stack| {
         let depth = stack.borrow().len() as u16;
         stack.borrow_mut().push(StackEntry {
             name: ctx.parent_name,
-            start: Instant::now(),
-            #[cfg(feature = "cpu-time")]
-            cpu_start_ns: crate::cpu_clock::cpu_now_ns(),
             children_ms: 0.0,
             #[cfg(feature = "cpu-time")]
             cpu_children_ns: 0,
+            #[cfg(feature = "cpu-time")]
+            cpu_start_ns,
             saved_alloc,
             depth,
         });
     });
+
     AdoptGuard {
+        #[cfg(feature = "cpu-time")]
+        cpu_start_ns,
         #[cfg(feature = "cpu-time")]
         ctx_children_cpu_ns: Arc::clone(&ctx.children_cpu_ns),
     }
@@ -1863,10 +1930,10 @@ mod tests {
         });
 
         let records = collect_all();
-        let rec = records.iter().find(|r| r.name == "migrating_fn");
+        let rec = records.iter().find(|r| r.name == "<migrated>");
         assert!(
             rec.is_some(),
-            "migrated guard should still produce a record"
+            "migrated guard should still produce a record with <migrated> name"
         );
         assert!(
             rec.unwrap().total_ms > 0.5,
@@ -2088,7 +2155,7 @@ mod tests {
         });
 
         let records = collect_all();
-        let rec = records.iter().find(|r| r.name == "cpu_migrated").unwrap();
+        let rec = records.iter().find(|r| r.name == "<migrated>").unwrap();
         assert!(rec.total_ms > 0.0, "wall time captured");
         assert!(
             rec.cpu_self_ms == 0.0,
