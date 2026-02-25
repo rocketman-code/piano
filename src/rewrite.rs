@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use quote::quote;
 use syn::visit_mut::VisitMut;
 
+use crate::resolve::is_instrumentable;
+
 /// Result of instrumenting a source file.
 pub struct InstrumentResult {
     pub source: String,
@@ -342,8 +344,10 @@ fn inject_adopt_in_stmts(stmts: &mut [syn::Stmt]) {
 
 impl VisitMut for Instrumenter {
     fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
-        let name = node.sig.ident.to_string();
-        self.inject_guard(&mut node.block, &name);
+        if is_instrumentable(&node.sig) {
+            let name = node.sig.ident.to_string();
+            self.inject_guard(&mut node.block, &name);
+        }
         syn::visit_mut::visit_item_fn_mut(self, node);
     }
 
@@ -356,12 +360,14 @@ impl VisitMut for Instrumenter {
     }
 
     fn visit_impl_item_fn_mut(&mut self, node: &mut syn::ImplItemFn) {
-        let method = node.sig.ident.to_string();
-        let qualified = match &self.current_impl {
-            Some(ty) => format!("{ty}::{method}"),
-            None => method,
-        };
-        self.inject_guard(&mut node.block, &qualified);
+        if is_instrumentable(&node.sig) {
+            let method = node.sig.ident.to_string();
+            let qualified = match &self.current_impl {
+                Some(ty) => format!("{ty}::{method}"),
+                None => method,
+            };
+            self.inject_guard(&mut node.block, &qualified);
+        }
         syn::visit_mut::visit_impl_item_fn_mut(self, node);
     }
 
@@ -375,12 +381,14 @@ impl VisitMut for Instrumenter {
 
     fn visit_trait_item_fn_mut(&mut self, node: &mut syn::TraitItemFn) {
         if let Some(block) = &mut node.default {
-            let method = node.sig.ident.to_string();
-            let qualified = match &self.current_trait {
-                Some(trait_name) => format!("{trait_name}::{method}"),
-                None => method,
-            };
-            self.inject_guard(block, &qualified);
+            if is_instrumentable(&node.sig) {
+                let method = node.sig.ident.to_string();
+                let qualified = match &self.current_trait {
+                    Some(trait_name) => format!("{trait_name}::{method}"),
+                    None => method,
+                };
+                self.inject_guard(block, &qualified);
+            }
         }
         syn::visit_mut::visit_trait_item_fn_mut(self, node);
     }
