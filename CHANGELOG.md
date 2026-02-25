@@ -7,11 +7,29 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-02-25
+
 ### Added
 
 - `piano profile` command: one-step build, execute, and report workflow with `--ignore-exit-code` and `--` argument passthrough
 - `piano run` command: execute the last-built instrumented binary with `--` argument passthrough
 - Async function instrumentation: async functions are now profiled instead of skipped; Guard detects thread migration and records wall time safely across `.await` points
+- Calibration harness for measuring instrumentation bias and overhead
+
+### Fixed
+
+- Allocation counter widened from u32 to u64, preventing silent truncation on high-allocation programs (#55)
+- Synthetic frames created for companion-merged worker threads, preventing silent data loss (#57)
+- Worker-thread percentiles show "-" instead of misleading aggregated values (#56)
+- `flush()` writes to project-local `target/piano/runs/` instead of global directory (#84)
+- `diff_runs` uses i128 for alloc_count delta, preventing wrap on extreme values (#101)
+- `const`, `unsafe`, and `extern` functions skipped during instrumentation instead of causing compile errors (#102)
+- Fork/adopt injection skipped for detached thread spawns (`std::thread::spawn`, `rayon::spawn`), preventing lifetime errors (#103)
+
+### Changed
+
+- Runtime timing uses hardware TSC counters (Apple Silicon CNTVCT, x86 RDTSC) instead of `Instant::now()`, reducing per-call overhead
+- Timestamp capture reordered to minimize bias in self-time measurement
 
 ## [0.5.1] - 2026-02-24
 
