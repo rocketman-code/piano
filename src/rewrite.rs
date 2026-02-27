@@ -22,10 +22,12 @@ pub struct InstrumentResult {
 pub fn instrument_source(
     source: &str,
     targets: &HashSet<String>,
+    instrument_macros: bool,
 ) -> Result<InstrumentResult, syn::Error> {
     let mut file: syn::File = syn::parse_str(source)?;
     let mut instrumenter = Instrumenter {
         targets: targets.clone(),
+        instrument_macros,
         current_impl: None,
         current_trait: None,
         concurrency: Vec::new(),
@@ -103,6 +105,7 @@ fn inject_await_checks(block: &mut syn::Block) {
 
 struct Instrumenter {
     targets: HashSet<String>,
+    instrument_macros: bool,
     current_impl: Option<String>,
     current_trait: Option<String>,
     /// Collected concurrency info: (function_name, pattern_name).
@@ -412,6 +415,439 @@ fn inject_adopt_in_stmts(stmts: &mut [syn::Stmt]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// macro_rules! token-stream scanning
+// ---------------------------------------------------------------------------
+
+/// Result of matching a fn pattern in a flat token vector.
+struct FnMatch {
+    /// The tokens that form the function name (either a single Ident for
+    /// literal names, or [Punct('$'), Ident] for metavar names).
+    name_tokens: Vec<proc_macro2::TokenTree>,
+    /// Index of the brace Group containing the function body.
+    body_index: usize,
+}
+
+/// Check whether an `ItemMacro` is a `macro_rules!` definition.
+fn is_macro_rules(item: &syn::ItemMacro) -> bool {
+    item.mac.path.is_ident("macro_rules")
+}
+
+/// Top-level entry: scan a macro_rules! token stream for rule arms and
+/// instrument any fn items found in each arm's template body.
+fn instrument_macro_tokens(tokens: &mut proc_macro2::TokenStream) {
+    let mut tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
+    let len = tts.len();
+    let mut i = 0;
+    let mut modified = false;
+
+    while i < len {
+        // Look for `=> { ... }` — the pattern separator followed by the
+        // template group. The `=>` is two Punct tokens: `=` then `>`.
+        if is_fat_arrow(&tts, i) {
+            let template_idx = i + 2;
+            if template_idx < len {
+                if let proc_macro2::TokenTree::Group(ref group) = tts[template_idx] {
+                    // Templates can use brace, paren, or bracket delimiters.
+                    let mut inner: Vec<proc_macro2::TokenTree> =
+                        group.stream().into_iter().collect();
+                    inject_fn_guards_in_tokens(&mut inner);
+                    let new_stream: proc_macro2::TokenStream = inner.into_iter().collect();
+                    let mut new_group = proc_macro2::Group::new(group.delimiter(), new_stream);
+                    new_group.set_span(group.span());
+                    tts[template_idx] = proc_macro2::TokenTree::Group(new_group);
+                    modified = true;
+                }
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+
+    if modified {
+        *tokens = tts.into_iter().collect();
+    }
+}
+
+/// Check if tokens[i..i+2] form a fat arrow `=>`.
+fn is_fat_arrow(tokens: &[proc_macro2::TokenTree], i: usize) -> bool {
+    if i + 1 >= tokens.len() {
+        return false;
+    }
+    matches!(
+        (&tokens[i], &tokens[i + 1]),
+        (
+            proc_macro2::TokenTree::Punct(eq),
+            proc_macro2::TokenTree::Punct(gt),
+        ) if eq.as_char() == '=' && eq.spacing() == proc_macro2::Spacing::Joint && gt.as_char() == '>'
+    )
+}
+
+/// Scan a flat token vector for fn patterns and inject guards into each
+/// matched function body. Recurses into brace groups to handle fn items
+/// inside impl blocks within macro templates.
+fn inject_fn_guards_in_tokens(tokens: &mut [proc_macro2::TokenTree]) {
+    let mut i = 0;
+    while i < tokens.len() {
+        // Skip non-instrumentable fn definitions (const fn, unsafe fn, extern fn)
+        // so we don't accidentally match the inner `fn` keyword.
+        if let Some(skip_to) = skip_non_instrumentable_fn(tokens, i) {
+            i = skip_to;
+            continue;
+        }
+
+        if let Some(fm) = match_fn_pattern(tokens, i) {
+            let body_idx = fm.body_index;
+            // Build the guard token stream for this function name.
+            let guard = make_guard_tokens(&fm.name_tokens);
+            let guard_tts: Vec<proc_macro2::TokenTree> = guard.into_iter().collect();
+
+            // Inject guard tokens at the start of the body brace group.
+            if let proc_macro2::TokenTree::Group(ref group) = tokens[body_idx] {
+                let mut body_tts: Vec<proc_macro2::TokenTree> =
+                    group.stream().into_iter().collect();
+                for (j, tt) in guard_tts.into_iter().enumerate() {
+                    body_tts.insert(j, tt);
+                }
+                let new_stream: proc_macro2::TokenStream = body_tts.into_iter().collect();
+                let mut new_group =
+                    proc_macro2::Group::new(proc_macro2::Delimiter::Brace, new_stream);
+                new_group.set_span(group.span());
+                tokens[body_idx] = proc_macro2::TokenTree::Group(new_group);
+            }
+            // Advance past the body group.
+            i = body_idx + 1;
+        } else {
+            // Recurse into brace groups (handles fn inside impl blocks, etc.).
+            if let proc_macro2::TokenTree::Group(ref group) = tokens[i] {
+                if group.delimiter() == proc_macro2::Delimiter::Brace {
+                    let mut inner: Vec<proc_macro2::TokenTree> =
+                        group.stream().into_iter().collect();
+                    inject_fn_guards_in_tokens(&mut inner);
+                    let new_stream: proc_macro2::TokenStream = inner.into_iter().collect();
+                    let mut new_group =
+                        proc_macro2::Group::new(proc_macro2::Delimiter::Brace, new_stream);
+                    new_group.set_span(group.span());
+                    tokens[i] = proc_macro2::TokenTree::Group(new_group);
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+/// If the token at position `i` starts a non-instrumentable fn definition
+/// (const fn, unsafe fn, extern fn, extern "ABI" fn), return the index just
+/// past the body brace group so the caller can skip the entire definition.
+/// Returns None if this is not a non-instrumentable fn.
+///
+/// Unlike match_fn_pattern, this requires `fn` to immediately follow the
+/// modifier(s). A `const SIZE: usize = 42;` is NOT a const fn — we must not
+/// greedily scan forward and swallow the next real fn.
+fn skip_non_instrumentable_fn(tokens: &[proc_macro2::TokenTree], i: usize) -> Option<usize> {
+    let len = tokens.len();
+    let mut pos = i;
+
+    // Optional: pub [(...)]
+    if is_ident(tokens, pos, "pub") {
+        pos += 1;
+        if pos < len {
+            if let proc_macro2::TokenTree::Group(g) = &tokens[pos] {
+                if g.delimiter() == proc_macro2::Delimiter::Parenthesis {
+                    pos += 1;
+                }
+            }
+        }
+    }
+
+    // Must see one of: const, unsafe, extern — then `fn` must follow immediately.
+    if is_ident(tokens, pos, "const") {
+        pos += 1;
+    } else if is_ident(tokens, pos, "unsafe") {
+        pos += 1;
+        // unsafe extern "ABI" fn
+        if is_ident(tokens, pos, "extern") {
+            pos += 1;
+            if pos < len {
+                if let proc_macro2::TokenTree::Literal(_) = &tokens[pos] {
+                    pos += 1; // skip ABI string like "C"
+                }
+            }
+        }
+    } else if is_ident(tokens, pos, "extern") {
+        pos += 1;
+        // extern "ABI" fn
+        if pos < len {
+            if let proc_macro2::TokenTree::Literal(_) = &tokens[pos] {
+                pos += 1; // skip ABI string like "C"
+            }
+        }
+    } else {
+        return None;
+    }
+
+    // `fn` must be the very next token — no greedy scanning.
+    if !is_ident(tokens, pos, "fn") {
+        return None;
+    }
+
+    // Skip past fn, name, params, return type to find the body brace group.
+    pos += 1;
+    while pos < len {
+        if let proc_macro2::TokenTree::Group(g) = &tokens[pos] {
+            if g.delimiter() == proc_macro2::Delimiter::Brace {
+                return Some(pos + 1);
+            }
+        }
+        pos += 1;
+    }
+
+    None
+}
+
+/// Try to match a fn pattern starting at position `start`:
+///   [pub [( ... )]]? [async]? fn NAME ( ... ) [-> ...]? { ... }
+///
+/// Rejects const fn, unsafe fn, and extern fn (matching is_instrumentable).
+/// NAME can be an Ident (literal name) or $metavar (Punct('$') + Ident).
+fn match_fn_pattern(tokens: &[proc_macro2::TokenTree], start: usize) -> Option<FnMatch> {
+    let len = tokens.len();
+    let mut pos = start;
+
+    // Check for non-instrumentable prefixes: const, unsafe, extern.
+    // If we see any of these before `fn`, skip this position.
+    if is_ident(tokens, pos, "const")
+        || is_ident(tokens, pos, "unsafe")
+        || is_ident(tokens, pos, "extern")
+    {
+        return None;
+    }
+
+    // Optional: `pub` with optional visibility group like `pub(crate)`.
+    if is_ident(tokens, pos, "pub") {
+        pos += 1;
+        if pos >= len {
+            return None;
+        }
+        // Skip optional visibility restriction group: `(crate)`, `(super)`, etc.
+        if let proc_macro2::TokenTree::Group(g) = &tokens[pos] {
+            if g.delimiter() == proc_macro2::Delimiter::Parenthesis {
+                pos += 1;
+                if pos >= len {
+                    return None;
+                }
+            }
+        }
+
+        // After pub, check for non-instrumentable prefixes.
+        if is_ident(tokens, pos, "const")
+            || is_ident(tokens, pos, "unsafe")
+            || is_ident(tokens, pos, "extern")
+        {
+            return None;
+        }
+    }
+
+    // Optional: `async`.
+    if is_ident(tokens, pos, "async") {
+        pos += 1;
+        if pos >= len {
+            return None;
+        }
+    }
+
+    // Required: `fn`.
+    if !is_ident(tokens, pos, "fn") {
+        return None;
+    }
+    pos += 1;
+    if pos >= len {
+        return None;
+    }
+
+    // Required: NAME — either a plain Ident or $metavar (Punct('$') + Ident).
+    let name_tokens: Vec<proc_macro2::TokenTree>;
+    if let proc_macro2::TokenTree::Punct(p) = &tokens[pos] {
+        if p.as_char() == '$' {
+            // Metavar: $name
+            if pos + 1 >= len {
+                return None;
+            }
+            if let proc_macro2::TokenTree::Ident(_) = &tokens[pos + 1] {
+                name_tokens = vec![tokens[pos].clone(), tokens[pos + 1].clone()];
+                pos += 2;
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    } else if let proc_macro2::TokenTree::Ident(_) = &tokens[pos] {
+        name_tokens = vec![tokens[pos].clone()];
+        pos += 1;
+    } else {
+        return None;
+    }
+
+    if pos >= len {
+        return None;
+    }
+
+    // Optional: generic parameters `<...>`. In macro token streams, angle
+    // brackets are individual Punct tokens, so we track nesting depth to skip
+    // past the entire generic parameter list.
+    if let proc_macro2::TokenTree::Punct(p) = &tokens[pos] {
+        if p.as_char() == '<' {
+            let mut depth = 1u32;
+            pos += 1;
+            while pos < len && depth > 0 {
+                if let proc_macro2::TokenTree::Punct(p) = &tokens[pos] {
+                    match p.as_char() {
+                        '<' => depth += 1,
+                        '>' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                pos += 1;
+            }
+            if depth > 0 || pos >= len {
+                return None;
+            }
+        }
+    }
+
+    // Required: parameter list (parenthesized group).
+    if let proc_macro2::TokenTree::Group(g) = &tokens[pos] {
+        if g.delimiter() != proc_macro2::Delimiter::Parenthesis {
+            return None;
+        }
+    } else {
+        return None;
+    }
+    pos += 1;
+
+    // Optional: return type `-> ...` — skip tokens until we find a brace group.
+    while pos < len {
+        if let proc_macro2::TokenTree::Group(g) = &tokens[pos] {
+            if g.delimiter() == proc_macro2::Delimiter::Brace {
+                break;
+            }
+        }
+        pos += 1;
+    }
+
+    if pos >= len {
+        return None;
+    }
+
+    // Required: body (brace group).
+    if let proc_macro2::TokenTree::Group(g) = &tokens[pos] {
+        if g.delimiter() == proc_macro2::Delimiter::Brace {
+            return Some(FnMatch {
+                name_tokens,
+                body_index: pos,
+            });
+        }
+    }
+
+    None
+}
+
+/// Check if tokens[i] is an Ident matching the given name.
+fn is_ident(tokens: &[proc_macro2::TokenTree], i: usize, name: &str) -> bool {
+    if i >= tokens.len() {
+        return false;
+    }
+    matches!(&tokens[i], proc_macro2::TokenTree::Ident(ident) if *ident == name)
+}
+
+/// Build the guard statement tokens for a function name.
+///
+/// For a literal name like `initialize`:
+///   `let _piano_guard = piano_runtime::enter("initialize");`
+///
+/// For a metavar name like `$name`:
+///   `let _piano_guard = piano_runtime::enter(stringify!($name));`
+fn make_guard_tokens(name_tokens: &[proc_macro2::TokenTree]) -> proc_macro2::TokenStream {
+    let is_metavar = name_tokens.len() == 2
+        && matches!(&name_tokens[0], proc_macro2::TokenTree::Punct(p) if p.as_char() == '$');
+
+    if is_metavar {
+        // For metavar names, we need to build:
+        //   let _piano_guard = piano_runtime::enter(stringify!($name));
+        // We construct the tokens manually because `quote!` doesn't emit `$`.
+        let dollar = proc_macro2::Punct::new('$', proc_macro2::Spacing::Alone);
+        let metavar_ident = name_tokens[1].clone();
+
+        // Build: stringify!($name)
+        let stringify_inner: proc_macro2::TokenStream =
+            vec![proc_macro2::TokenTree::Punct(dollar), metavar_ident]
+                .into_iter()
+                .collect();
+        // Build the full statement using manual token construction
+        // (quote! cannot emit raw $ tokens for macro metavariables).
+        let stringify_call: proc_macro2::TokenStream = {
+            let span = proc_macro2::Span::call_site();
+            vec![
+                proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("stringify", span)),
+                proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                    '!',
+                    proc_macro2::Spacing::Alone,
+                )),
+                proc_macro2::TokenTree::Group(proc_macro2::Group::new(
+                    proc_macro2::Delimiter::Parenthesis,
+                    stringify_inner,
+                )),
+            ]
+            .into_iter()
+            .collect()
+        };
+
+        // Build: let _piano_guard = piano_runtime::enter(stringify!($name));
+        let enter_arg =
+            proc_macro2::Group::new(proc_macro2::Delimiter::Parenthesis, stringify_call);
+
+        let span = proc_macro2::Span::call_site();
+        vec![
+            proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("let", span)),
+            proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("_piano_guard", span)),
+            proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                '=',
+                proc_macro2::Spacing::Alone,
+            )),
+            proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("piano_runtime", span)),
+            proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                ':',
+                proc_macro2::Spacing::Joint,
+            )),
+            proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                ':',
+                proc_macro2::Spacing::Alone,
+            )),
+            proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("enter", span)),
+            proc_macro2::TokenTree::Group(enter_arg),
+            proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                ';',
+                proc_macro2::Spacing::Alone,
+            )),
+        ]
+        .into_iter()
+        .collect()
+    } else {
+        // Literal name — use quote! for cleaner generation.
+        let name_str = match &name_tokens[0] {
+            proc_macro2::TokenTree::Ident(ident) => ident.to_string(),
+            _ => unreachable!(
+                "match_fn_pattern guarantees name_tokens[0] is Ident for literal names"
+            ),
+        };
+        quote! {
+            let _piano_guard = piano_runtime::enter(#name_str);
+        }
+    }
+}
+
 impl VisitMut for Instrumenter {
     fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
         if is_instrumentable(&node.sig) {
@@ -464,6 +900,13 @@ impl VisitMut for Instrumenter {
             }
         }
         syn::visit_mut::visit_trait_item_fn_mut(self, node);
+    }
+
+    fn visit_item_macro_mut(&mut self, node: &mut syn::ItemMacro) {
+        if self.instrument_macros && is_macro_rules(node) {
+            instrument_macro_tokens(&mut node.mac.tokens);
+        }
+        syn::visit_mut::visit_item_macro_mut(self, node);
     }
 }
 
@@ -674,7 +1117,7 @@ fn other() {
 }
 "#;
         let targets: HashSet<String> = ["walk".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap().source;
+        let result = instrument_source(source, &targets, false).unwrap().source;
 
         assert!(
             result.contains("piano_runtime::enter(\"walk\")"),
@@ -698,7 +1141,7 @@ impl Walker {
 }
 "#;
         let targets: HashSet<String> = ["Walker::walk".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap().source;
+        let result = instrument_source(source, &targets, false).unwrap().source;
 
         assert!(
             result.contains("piano_runtime::enter(\"Walker::walk\")"),
@@ -714,7 +1157,7 @@ fn compute(x: i32, y: i32) -> i32 {
 }
 "#;
         let targets: HashSet<String> = ["compute".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap().source;
+        let result = instrument_source(source, &targets, false).unwrap().source;
 
         assert!(
             result.contains("fn compute(x: i32, y: i32) -> i32"),
@@ -735,7 +1178,7 @@ fn b() {}
 fn c() {}
 "#;
         let targets: HashSet<String> = ["a".to_string(), "c".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap().source;
+        let result = instrument_source(source, &targets, false).unwrap().source;
 
         assert!(
             result.contains("piano_runtime::enter(\"a\")"),
@@ -817,7 +1260,7 @@ fn main() {
 }
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets).unwrap().source;
+        let result = instrument_source(source, &targets, false).unwrap().source;
 
         assert!(
             !result.contains("piano_runtime::init()"),
@@ -1011,7 +1454,7 @@ fn process_all(items: &[Item]) -> Vec<Result> {
 }
 "#;
         let targets: HashSet<String> = ["process_all".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap().source;
+        let result = instrument_source(source, &targets, false).unwrap().source;
 
         assert!(
             result.contains("piano_runtime::enter(\"process_all\")"),
@@ -1037,7 +1480,7 @@ fn do_work() {
 }
 "#;
         let targets: HashSet<String> = ["do_work".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
 
         assert!(
             !result.source.contains("piano_runtime::fork()"),
@@ -1075,7 +1518,7 @@ fn mixed() {
 }
 "#;
         let targets: HashSet<String> = ["mixed".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
 
         // Fork should be injected (rayon::scope triggers it)
         assert!(
@@ -1110,7 +1553,7 @@ fn do_work() {
 }
 "#;
         let targets: HashSet<String> = ["do_work".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
 
         assert!(
             !result.source.contains("piano_runtime::fork()"),
@@ -1127,7 +1570,7 @@ fn do_work() {
 }
 "#;
         let targets: HashSet<String> = ["do_work".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
 
         assert!(
             result.concurrency.is_empty(),
@@ -1147,7 +1590,7 @@ fn parallel_work() {
 }
 "#;
         let targets: HashSet<String> = ["parallel_work".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap().source;
+        let result = instrument_source(source, &targets, false).unwrap().source;
 
         assert!(
             result.contains("piano_runtime::fork()"),
@@ -1175,7 +1618,7 @@ fn concurrent_discover() {
 }
 "#;
         let targets: HashSet<String> = ["concurrent_discover".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap().source;
+        let result = instrument_source(source, &targets, false).unwrap().source;
 
         assert!(
             result.contains("piano_runtime::fork()"),
@@ -1201,7 +1644,7 @@ fn not_targeted() {
 }
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets).unwrap().source;
+        let result = instrument_source(source, &targets, false).unwrap().source;
 
         assert!(
             !result.contains("piano_runtime::fork()"),
@@ -1219,7 +1662,7 @@ fn process_all(items: &[Item]) -> Vec<Result> {
 }
 "#;
         let targets: HashSet<String> = ["process_all".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
         assert_eq!(result.concurrency.len(), 1);
         assert_eq!(result.concurrency[0].0, "process_all");
         assert_eq!(result.concurrency[0].1, "par_iter");
@@ -1235,7 +1678,7 @@ fn concurrent_discover() {
 }
 "#;
         let targets: HashSet<String> = ["concurrent_discover".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
         assert_eq!(result.concurrency.len(), 1);
         assert_eq!(result.concurrency[0].0, "concurrent_discover");
         assert_eq!(result.concurrency[0].1, "rayon::scope");
@@ -1249,7 +1692,7 @@ fn simple() {
 }
 "#;
         let targets: HashSet<String> = ["simple".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
         assert!(result.concurrency.is_empty());
     }
 
@@ -1261,7 +1704,7 @@ async fn fetch_data(id: u32) -> String {
 }
 "#;
         let targets: HashSet<String> = ["fetch_data".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
         assert!(
             result
                 .source
@@ -1279,7 +1722,7 @@ fn compute(x: u64) -> u64 {
 }
 "#;
         let targets: HashSet<String> = ["compute".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
 
         assert!(
             result.source.contains("piano_runtime::enter(\"compute\")"),
@@ -1300,7 +1743,7 @@ impl Client {
 }
 "#;
         let targets: HashSet<String> = ["Client::fetch".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
         assert!(
             result
                 .source
@@ -1320,7 +1763,7 @@ trait Service {
 }
 "#;
         let targets: HashSet<String> = ["Service::handle".to_string()].into();
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
         assert!(
             result
                 .source
@@ -1341,7 +1784,7 @@ async fn do_work() {
     save().await;
 }
 "#;
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
         let check_count = result.source.matches("_piano_guard.check()").count();
         assert_eq!(
             check_count, 2,
@@ -1359,7 +1802,7 @@ fn do_work() {
     process();
 }
 "#;
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
         assert_eq!(
             result.source.matches("_piano_guard.check()").count(),
             0,
@@ -1376,12 +1819,274 @@ async fn not_targeted() {
     fetch().await;
 }
 "#;
-        let result = instrument_source(source, &targets).unwrap();
+        let result = instrument_source(source, &targets, false).unwrap();
         assert_eq!(
             result.source.matches("_piano_guard.check()").count(),
             0,
             "non-target async fn should not get check() calls. Got:\n{}",
             result.source
+        );
+    }
+
+    #[test]
+    fn instruments_fn_in_macro_rules_metavar_name() {
+        let source = r#"
+macro_rules! make_handler {
+    ($name:ident) => {
+        fn $name() {
+            do_work();
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        assert!(
+            result.contains("stringify!"),
+            "macro fn with metavar name should use stringify!. Got:\n{result}"
+        );
+        assert!(
+            result.contains("piano_runtime::enter"),
+            "macro fn should get a guard. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn instruments_fn_in_macro_rules_literal_name() {
+        let source = r#"
+macro_rules! setup {
+    () => {
+        fn initialize() {
+            startup();
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        assert!(
+            result.contains(r#"piano_runtime::enter("initialize")"#),
+            "macro fn with literal name should use string literal. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn instruments_pub_async_fn_in_macro_rules() {
+        let source = r#"
+macro_rules! make_async {
+    ($name:ident) => {
+        pub async fn $name() {
+            work().await;
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        assert!(
+            result.contains("piano_runtime::enter"),
+            "pub async fn in macro should be instrumented. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn skips_const_unsafe_extern_fn_in_macro_rules() {
+        let source = r#"
+macro_rules! special_fns {
+    () => {
+        const fn fixed() -> usize { 42 }
+        unsafe fn danger() {}
+        extern "C" fn ffi() {}
+        pub const fn pub_fixed() -> usize { 42 }
+        pub unsafe fn pub_danger() {}
+        pub extern "C" fn pub_ffi() {}
+        fn normal() { work(); }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        assert!(
+            result.contains(r#"piano_runtime::enter("normal")"#),
+            "normal fn should be instrumented. Got:\n{result}"
+        );
+        let enter_count = result.matches("piano_runtime::enter").count();
+        assert_eq!(
+            enter_count, 1,
+            "only normal fn should be instrumented, not const/unsafe/extern. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn const_variable_does_not_swallow_next_fn() {
+        let source = r#"
+macro_rules! with_const {
+    () => {
+        const SIZE: usize = 42;
+        fn process() { work(); }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        assert!(
+            result.contains(r#"piano_runtime::enter("process")"#),
+            "fn after const variable should still be instrumented. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn instruments_multiple_fns_in_one_macro_rule() {
+        let source = r#"
+macro_rules! make_pair {
+    ($a:ident, $b:ident) => {
+        fn $a() { work_a(); }
+        fn $b() { work_b(); }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        let enter_count = result.matches("piano_runtime::enter").count();
+        assert_eq!(
+            enter_count, 2,
+            "both fns in macro should be instrumented. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn instruments_multiple_macro_rules_arms() {
+        let source = r#"
+macro_rules! multi {
+    (one $name:ident) => {
+        fn $name() { one(); }
+    };
+    (two $name:ident) => {
+        fn $name() { two(); }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        let enter_count = result.matches("piano_runtime::enter").count();
+        assert_eq!(
+            enter_count, 2,
+            "fn in each rule arm should be instrumented. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn macro_without_fn_unchanged() {
+        let source = r#"
+macro_rules! log {
+    ($msg:expr) => {
+        println!("{}", $msg);
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        assert!(
+            !result.contains("piano_runtime::enter"),
+            "macro without fn should not be modified. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn instruments_fn_in_paren_delimited_macro_template() {
+        let source = r#"
+macro_rules! make {
+    ($name:ident) => (
+        fn $name() { work(); }
+    );
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        assert!(
+            result.contains("piano_runtime::enter"),
+            "fn in paren-delimited template should be instrumented. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn instrument_macros_false_skips_macros() {
+        let source = r#"
+macro_rules! make {
+    ($name:ident) => {
+        fn $name() { work(); }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, false).unwrap().source;
+
+        assert!(
+            !result.contains("piano_runtime::enter"),
+            "instrument_macros=false should skip macro instrumentation. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn instruments_generic_fn_in_macro_rules() {
+        let source = r#"
+macro_rules! make_generic {
+    ($name:ident) => {
+        fn $name<T: std::fmt::Display>(val: T) -> String {
+            format!("{}", val)
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        assert!(
+            result.contains("piano_runtime::enter"),
+            "generic fn in macro should be instrumented. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn instruments_fn_in_impl_block_in_macro_rules() {
+        let source = r#"
+macro_rules! make_impl {
+    ($ty:ident) => {
+        impl $ty {
+            fn process() {
+                work();
+            }
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        assert!(
+            result.contains(r#"piano_runtime::enter("process")"#),
+            "fn inside impl block in macro should be instrumented. Got:\n{result}"
         );
     }
 }

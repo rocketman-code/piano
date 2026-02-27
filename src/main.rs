@@ -302,6 +302,7 @@ fn build_project(
     }
 
     // Rewrite each target file in staging.
+    let instrument_macros = specs.is_empty();
     let mut all_concurrency: Vec<(String, String)> = Vec::new();
     for target in &targets {
         let target_set: HashSet<String> = target.functions.iter().cloned().collect();
@@ -314,9 +315,11 @@ fn build_project(
             })?;
 
         let result =
-            instrument_source(&source, &target_set).map_err(|source| Error::ParseError {
-                path: staged_file.clone(),
-                source,
+            instrument_source(&source, &target_set, instrument_macros).map_err(|source| {
+                Error::ParseError {
+                    path: staged_file.clone(),
+                    source,
+                }
             })?;
 
         all_concurrency.extend(result.concurrency);
