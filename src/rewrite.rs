@@ -72,8 +72,13 @@ const SCOPE_FUNCTIONS: &[&str] = &["scope", "scope_fifo"];
 /// SpanContext stays on the parent thread.
 const FORK_TRIGGER_FUNCTIONS: &[&str] = &["scope", "scope_fifo", "join"];
 
-/// Check whether a statement's expression tree contains an `.await`.
-fn contains_await(stmt: &syn::Stmt) -> bool {
+/// Check whether a statement contains `.await` at its own expression level,
+/// excluding awaits inside sub-blocks of control-flow expressions (if, match,
+/// loop, while, for). Those sub-blocks are handled by the recursive visitor.
+///
+/// Also excludes closures, async blocks, and nested fn items since those are
+/// separate async contexts.
+fn stmt_has_direct_await(stmt: &syn::Stmt) -> bool {
     struct AwaitFinder {
         found: bool,
     }
@@ -81,26 +86,66 @@ fn contains_await(stmt: &syn::Stmt) -> bool {
         fn visit_expr_await(&mut self, _: &'ast syn::ExprAwait) {
             self.found = true;
         }
+        // Don't descend into closures -- separate async context.
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+        // Don't descend into async blocks -- separate async context.
+        fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+        // Don't descend into nested fn items -- they have their own guards.
+        fn visit_item_fn(&mut self, _: &'ast syn::ItemFn) {}
+        // Don't descend into sub-blocks of control-flow expressions.
+        // The recursive VisitMut will process those blocks separately.
+        fn visit_block(&mut self, _: &'ast syn::Block) {}
     }
     let mut finder = AwaitFinder { found: false };
     syn::visit::Visit::visit_stmt(&mut finder, stmt);
     finder.found
 }
 
-/// Inject `_piano_guard.check();` after each statement containing `.await`.
+/// Recursively inject `_piano_guard.check();` after each statement that
+/// directly contains `.await`, at every nesting depth.
+///
+/// Uses `VisitMut` to walk into if/match/loop/while/for/block bodies so
+/// that `check()` is placed immediately after the `.await`, not after the
+/// enclosing top-level statement.
 fn inject_await_checks(block: &mut syn::Block) {
-    let mut new_stmts = Vec::with_capacity(block.stmts.len() * 2);
-    for stmt in block.stmts.drain(..) {
-        let has_await = contains_await(&stmt);
-        new_stmts.push(stmt);
-        if has_await {
-            let check_stmt: syn::Stmt = syn::parse_quote! {
-                _piano_guard.check();
-            };
-            new_stmts.push(check_stmt);
+    struct AwaitCheckInjector;
+
+    impl AwaitCheckInjector {
+        /// Process a block's statements: for each statement that directly
+        /// contains `.await`, insert a `check()` call after it. Then recurse
+        /// into nested blocks within each statement.
+        fn process_block(&mut self, block: &mut syn::Block) {
+            let mut new_stmts = Vec::with_capacity(block.stmts.len() * 2);
+            for mut stmt in block.stmts.drain(..) {
+                let has_await = stmt_has_direct_await(&stmt);
+                // Recurse into nested blocks within this statement first.
+                self.visit_stmt_mut(&mut stmt);
+                new_stmts.push(stmt);
+                if has_await {
+                    let check_stmt: syn::Stmt = syn::parse_quote! {
+                        _piano_guard.check();
+                    };
+                    new_stmts.push(check_stmt);
+                }
+            }
+            block.stmts = new_stmts;
         }
     }
-    block.stmts = new_stmts;
+
+    impl VisitMut for AwaitCheckInjector {
+        fn visit_block_mut(&mut self, block: &mut syn::Block) {
+            self.process_block(block);
+        }
+
+        // Don't descend into closures -- separate async context.
+        fn visit_expr_closure_mut(&mut self, _: &mut syn::ExprClosure) {}
+        // Don't descend into async blocks -- separate async context.
+        fn visit_expr_async_mut(&mut self, _: &mut syn::ExprAsync) {}
+        // Don't descend into nested fn items -- they have their own guards.
+        fn visit_item_fn_mut(&mut self, _: &mut syn::ItemFn) {}
+    }
+
+    AwaitCheckInjector.process_block(block);
 }
 
 struct Instrumenter {
@@ -2087,6 +2132,260 @@ fn main() {}
         assert!(
             result.contains(r#"piano_runtime::enter("process")"#),
             "fn inside impl block in macro should be instrumented. Got:\n{result}"
+        );
+    }
+
+    // -- Nested .await check() injection tests --
+    //
+    // These tests verify check() is injected INSIDE nested blocks, directly
+    // after the .await, not just after the enclosing top-level statement.
+
+    /// Assert that `needle_a` appears before `needle_b` in `haystack`.
+    fn assert_appears_before(haystack: &str, needle_a: &str, needle_b: &str, context: &str) {
+        let pos_a = haystack
+            .find(needle_a)
+            .unwrap_or_else(|| panic!("{needle_a} not found in output. {context}:\n{haystack}"));
+        let pos_b = haystack
+            .find(needle_b)
+            .unwrap_or_else(|| panic!("{needle_b} not found in output. {context}:\n{haystack}"));
+        assert!(
+            pos_a < pos_b,
+            "{needle_a} should appear before {needle_b} ({context}). Got:\n{haystack}",
+        );
+    }
+
+    #[test]
+    fn injects_check_inside_if_block_not_after_it() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        // The .await is inside the if block. check() must appear between
+        // fetch().await and process(), not after the closing brace of `if`.
+        let source = r#"
+async fn example() {
+    if condition {
+        fetch().await;
+        process();
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        // check() must appear before process() (i.e. inside the if block),
+        // not after the if statement.
+        assert_appears_before(
+            &result.source,
+            "_piano_guard.check()",
+            "process()",
+            "inside if block",
+        );
+    }
+
+    #[test]
+    fn injects_check_inside_match_arm() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example(x: u32) {
+    match x {
+        0 => {
+            fetch().await;
+            process();
+        }
+        _ => {}
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert_appears_before(
+            &result.source,
+            "_piano_guard.check()",
+            "process()",
+            "inside match arm",
+        );
+    }
+
+    #[test]
+    fn injects_check_inside_loop() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    loop {
+        fetch().await;
+        process();
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert_appears_before(
+            &result.source,
+            "_piano_guard.check()",
+            "process()",
+            "inside loop",
+        );
+    }
+
+    #[test]
+    fn injects_check_at_every_nesting_depth() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    if condition {
+        fetch().await;
+        if other {
+            save().await;
+            cleanup();
+        }
+    }
+    send().await;
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        let check_count = result.source.matches("_piano_guard.check()").count();
+        assert_eq!(
+            check_count, 3,
+            "should inject check() after every .await at any depth. Got:\n{}",
+            result.source
+        );
+        // Verify the innermost check() is between save().await and cleanup()
+        let save_pos = result.source.find("save()").unwrap();
+        let cleanup_pos = result.source.find("cleanup()").unwrap();
+        let check_between = result.source[save_pos..cleanup_pos].contains("_piano_guard.check()");
+        assert!(
+            check_between,
+            "check() should appear between save().await and cleanup(). Got:\n{}",
+            result.source,
+        );
+    }
+
+    #[test]
+    fn injects_check_inside_else_block() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    if condition {
+        sync_work();
+    } else {
+        fetch().await;
+        process();
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert_appears_before(
+            &result.source,
+            "_piano_guard.check()",
+            "process()",
+            "inside else block",
+        );
+    }
+
+    #[test]
+    fn injects_check_inside_while_let_body() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    while let Some(item) = iter.next() {
+        process(item).await;
+        log();
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert_appears_before(
+            &result.source,
+            "_piano_guard.check()",
+            "log()",
+            "inside while let body",
+        );
+    }
+
+    #[test]
+    fn injects_check_inside_for_loop_body() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    for item in items {
+        process(item).await;
+        log();
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert_appears_before(
+            &result.source,
+            "_piano_guard.check()",
+            "log()",
+            "inside for loop body",
+        );
+    }
+
+    #[test]
+    fn injects_check_inside_bare_block() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    {
+        fetch().await;
+        process();
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert_appears_before(
+            &result.source,
+            "_piano_guard.check()",
+            "process()",
+            "inside bare block",
+        );
+    }
+
+    #[test]
+    fn injects_check_after_await_in_condition_expression() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    if stream.next().await.is_some() {
+        process();
+    }
+    cleanup();
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        // The .await is in the condition, so check() goes after the whole if statement
+        assert_eq!(
+            result.source.matches("_piano_guard.check()").count(),
+            1,
+            "expected exactly 1 check() call",
+        );
+        assert_appears_before(
+            &result.source,
+            "process()",
+            "_piano_guard.check()",
+            "check() should be after the if block containing process()",
+        );
+        assert_appears_before(
+            &result.source,
+            "_piano_guard.check()",
+            "cleanup()",
+            "after if with .await in condition",
+        );
+    }
+
+    #[test]
+    fn no_check_injection_inside_closure_or_async_block() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    let f = || async { fetch().await; };
+    let g = async { save().await; };
+    send().await;
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        // Only one check() -- after send().await. The closure and async block
+        // have separate async contexts with their own guards.
+        let check_count = result.source.matches("_piano_guard.check()").count();
+        assert_eq!(
+            check_count, 1,
+            "expected 1 check() (after send().await only), got {check_count}:\n{}",
+            result.source,
         );
     }
 }
