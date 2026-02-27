@@ -7,6 +7,21 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-02-27
+
+### Added
+
+- Accurate async self-time: migration-safe Guard with phantom StackEntry tracks self-time correctly when async tasks migrate across threads (#94)
+- Guard::check() injected after `.await` at any nesting depth (if, match, loop, etc.), not just top-level statements (#142)
+- Function names preserved for migrated async guards; no more `<migrated>` bucket in reports (#116)
+- Phantom StackEntry cleanup on intermediate threads during multi-hop async migration via deferred cleanup queue (#141)
+- Instrument `fn` items inside `macro_rules!` definitions when profiling all functions (#143)
+
+### Changed
+
+- StackEntry uses packed `u64` identity field (cookie + name_id + depth) instead of separate `depth` and `cookie_low` fields
+- Guard::check() uses recursive VisitMut-based injection instead of flat top-level iteration
+
 ## [0.6.0] - 2026-02-25
 
 ### Added
