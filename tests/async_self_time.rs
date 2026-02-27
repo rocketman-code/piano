@@ -182,8 +182,8 @@ fn async_self_time_accuracy() {
         "expensive_child should have non-zero self_ms (it does real work)"
     );
 
-    // parent_fn might appear under its own name (no migration) or as
-    // <migrated> (migration detected). Check whichever is present.
+    // Migrated guards now preserve the real function name, so parent_fn
+    // always appears under its own name.
     if let Some(parent_self) = extract_field(&content, "parent_fn", "self_ms") {
         assert!(
             parent_self < child_self,
@@ -192,22 +192,12 @@ fn async_self_time_accuracy() {
         );
     }
 
-    // If migration occurred, <migrated> aggregates migrated invocations.
-    // Its self_ms must be strictly less than its total_ms, because children
-    // were subtracted. (self < total is a tautology for functions WITH
-    // children -- it only fails when the bug makes self = total.)
-    if let (Some(mig_self), Some(mig_total)) = (
-        extract_field(&content, "<migrated>", "self_ms"),
-        extract_field(&content, "<migrated>", "total_ms"),
-    ) {
-        if mig_total > 0.1 {
-            assert!(
-                mig_self < mig_total,
-                "<migrated> self_ms ({mig_self:.3}) must be < total_ms ({mig_total:.3}) \
-                 -- children time should have been subtracted"
-            );
-        }
-    }
+    // Migrated guards now preserve their real function names, so there
+    // should be no "<migrated>" bucket in the output.
+    assert!(
+        extract_field(&content, "<migrated>", "self_ms").is_none(),
+        "should not have a <migrated> bucket -- migrated guards preserve real names"
+    );
 }
 
 /// Extract a float field from the JSON output for a given function name.
