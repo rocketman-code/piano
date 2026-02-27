@@ -149,11 +149,12 @@ pub(crate) struct StackEntry {
     pub(crate) cpu_start_ns: u64,
     /// Saved ALLOC_COUNTERS from before this scope, restored on Guard::drop.
     pub(crate) saved_alloc: crate::alloc::AllocSnapshot,
-    pub(crate) depth: u16,
-    /// Low 32 bits of the thread cookie that owns this entry's Guard.
-    /// Regular entries: current thread's cookie (same thread pushed it).
-    /// Phantom entries: migrated Guard's original thread cookie (different thread).
-    pub(crate) cookie_low: u32,
+    /// Packed identity: (thread_cookie << 16) | stack_depth.
+    ///
+    /// Regular entries: current thread's cookie + depth (matches its Guard.packed).
+    /// Phantom entries: the migrated Guard's original packed identity (different
+    /// thread cookie), used as a unique key for PHANTOM_ARCS / PHANTOM_FWD lookup.
+    pub(crate) packed: u64,
 }
 
 /// Raw measurement produced when a Guard drops.
@@ -211,8 +212,15 @@ thread_local! {
     static FRAMES: RefCell<Vec<Vec<FrameFnSummary>>> = RefCell::new(Vec::new());
     /// Per-thread phantom forwarding Arcs. When a phantom StackEntry exists on
     /// this thread (from Guard::check()), the corresponding Arc is stored here
-    /// so child drops can write through to it. Keyed by the phantom's cookie_low.
-    static PHANTOM_ARCS: RefCell<Vec<(u32, PhantomFwdArc)>> = RefCell::new(Vec::new());
+    /// so child drops can write through to it. Keyed by the guard's packed
+    /// identity (cookie << 16 | depth) for exact matching.
+    ///
+    /// Known bounded leak: entries on intermediate threads (A -> B -> C, where
+    /// the guard leaves B for C) are not cleaned up by B since cross-thread TLS
+    /// cleanup is not possible. Each entry is small (u64 + Arc pointer). When
+    /// the vec exceeds 64 entries, stale entries whose Arc strong count is 1
+    /// (meaning the PHANTOM_FWD entry was already removed) are pruned.
+    static PHANTOM_ARCS: RefCell<Vec<(u64, PhantomFwdArc)>> = RefCell::new(Vec::new());
 }
 
 /// Sequential per-thread identifier. Cheaper than `std::thread::current().id()`
@@ -291,39 +299,43 @@ impl Guard {
         // Children will update it via the normal parent fast path.
         STACK.with(|stack| {
             let mut s = stack.borrow_mut();
-            // Check if phantom already exists for this guard
+            // Check if phantom already exists for this guard (exact packed match).
             let already_has = s
                 .iter()
-                .any(|e| e.cookie_low == enter_cookie as u32 && e.name == "<phantom>");
+                .any(|e| e.packed == self.packed && e.name == "<phantom>");
             if already_has {
                 return;
             }
 
-            // Read forwarded children_ms from a previous thread's phantom
+            // Read forwarded children_ms from a previous thread's phantom and
+            // create a new forwarding Arc in a single lock acquisition
             // (multi-hop migration: A -> B -> C). The previous thread's
             // phantom wrote its children_ms to the forwarding Arc.
-            let forwarded_children_ms = {
+            let fwd_arc = {
                 let mut fwd = phantom_fwd().lock().unwrap_or_else(|e| e.into_inner());
-                fwd.remove(&self.packed)
+                let forwarded = fwd
+                    .remove(&self.packed)
                     .map(|arc| *arc.lock().unwrap_or_else(|e| e.into_inner()))
-                    .unwrap_or(0.0)
+                    .unwrap_or(0.0);
+                let arc = Arc::new(Mutex::new(forwarded));
+                fwd.insert(self.packed, Arc::clone(&arc));
+                arc
             };
 
-            // Create a new forwarding Arc for this phantom so that if the
-            // guard migrates again, the next thread can read our children_ms.
-            let fwd_arc = Arc::new(Mutex::new(forwarded_children_ms));
-            {
-                let mut fwd = phantom_fwd().lock().unwrap_or_else(|e| e.into_inner());
-                fwd.insert(self.packed, Arc::clone(&fwd_arc));
-            }
+            let forwarded_children_ms = *fwd_arc.lock().unwrap_or_else(|e| e.into_inner());
 
             // Store the Arc in this thread's local phantom map so that
-            // child drops can write through to it.
+            // child drops can write through to it. Prune stale entries
+            // when the vec exceeds 64 (bounded leak from intermediate
+            // threads whose guard migrated away without cleanup).
             PHANTOM_ARCS.with(|arcs| {
-                arcs.borrow_mut().push((enter_cookie as u32, fwd_arc));
+                let mut a = arcs.borrow_mut();
+                if a.len() > 64 {
+                    a.retain(|(_, arc)| Arc::strong_count(arc) > 1);
+                }
+                a.push((self.packed, fwd_arc));
             });
 
-            let depth = s.len() as u16;
             s.push(StackEntry {
                 name: "<phantom>",
                 children_ms: forwarded_children_ms,
@@ -332,8 +344,7 @@ impl Guard {
                 #[cfg(feature = "cpu-time")]
                 cpu_start_ns: 0,
                 saved_alloc: crate::alloc::AllocSnapshot::new(),
-                depth,
-                cookie_low: enter_cookie as u32,
+                packed: self.packed,
             });
         });
     }
@@ -360,7 +371,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             let mut s = stack.borrow_mut();
             if let Some(pos) = s
                 .iter()
-                .rposition(|e| e.cookie_low == enter_cookie as u32 && e.name == "<phantom>")
+                .rposition(|e| e.packed == guard.packed && e.name == "<phantom>")
             {
                 let phantom = s.remove(pos);
                 phantom.children_ms
@@ -426,7 +437,10 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         {
             let mut s = stack.borrow_mut();
             let guard_depth = unpack_depth(guard.packed);
-            while s.last().map_or(false, |e| e.depth > guard_depth) {
+            while s
+                .last()
+                .map_or(false, |e| unpack_depth(e.packed) > guard_depth)
+            {
                 let orphan = s.pop().unwrap();
                 let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
                     cell.set(orphan.saved_alloc);
@@ -464,11 +478,11 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             // If parent is a phantom (cookie differs from this thread),
             // write through to its forwarding Arc so subsequent thread
             // hops can read the accumulated children_ms.
-            if parent.cookie_low != drop_cookie as u32 {
+            if unpack_cookie(parent.packed) != drop_cookie {
                 let children = parent.children_ms;
-                let ck = parent.cookie_low;
+                let pk = parent.packed;
                 PHANTOM_ARCS.with(|arcs| {
-                    if let Some((_, arc)) = arcs.borrow().iter().find(|(c, _)| *c == ck) {
+                    if let Some((_, arc)) = arcs.borrow().iter().find(|(k, _)| *k == pk) {
                         *arc.lock().unwrap_or_else(|e| e.into_inner()) = children;
                     }
                 });
@@ -503,7 +517,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             alloc_bytes: scope_alloc.alloc_bytes,
             free_count: scope_alloc.free_count,
             free_bytes: scope_alloc.free_bytes,
-            depth: entry.depth,
+            depth: unpack_depth(entry.packed),
         };
 
         #[cfg(any(test, feature = "_test_internals"))]
@@ -514,7 +528,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         FRAME_BUFFER.with(|buf| {
             buf.borrow_mut().push(invocation);
         });
-        if entry.depth == 0 {
+        if unpack_depth(entry.packed) == 0 {
             FRAME_BUFFER.with(|buf| {
                 let buffer = buf.borrow_mut().drain(..).collect::<Vec<_>>();
                 let summary = aggregate_frame(&buffer);
@@ -569,8 +583,9 @@ fn enter_cold(name: &'static str) -> u64 {
     #[cfg(feature = "cpu-time")]
     let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
 
-    let depth = STACK.with(|stack| {
+    STACK.with(|stack| {
         let depth = stack.borrow().len() as u16;
+        let packed = pack_cookie_depth(cookie, depth);
         stack.borrow_mut().push(StackEntry {
             name,
             children_ms: 0.0,
@@ -579,13 +594,10 @@ fn enter_cold(name: &'static str) -> u64 {
             #[cfg(feature = "cpu-time")]
             cpu_start_ns,
             saved_alloc,
-            depth,
-            cookie_low: cookie as u32,
+            packed,
         });
-        depth
-    });
-
-    pack_cookie_depth(cookie, depth)
+        packed
+    })
 }
 
 /// Start timing a function. Returns a Guard that records the measurement on drop.
@@ -761,6 +773,10 @@ pub fn collect_all() -> Vec<FunctionRecord> {
 }
 
 /// Clear all collected timing data for the current thread.
+///
+/// Note: PHANTOM_FWD is a global registry (not thread-local) and is NOT
+/// cleared here to avoid interfering with other threads' in-flight phantom
+/// forwarding. Use `reset_all()` (test-only) to clear global state.
 pub fn reset() {
     STACK.with(|stack| stack.borrow_mut().clear());
     RECORDS.with(|records| {
@@ -790,6 +806,11 @@ pub fn reset_all() {
     for arc in &arcs {
         arc.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
+    // Clear global phantom forwarding registry.
+    phantom_fwd()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     // Clear the calling thread's local state.
     reset();
 }
@@ -1164,8 +1185,7 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
             #[cfg(feature = "cpu-time")]
             cpu_start_ns,
             saved_alloc,
-            depth,
-            cookie_low: cookie as u32,
+            packed: pack_cookie_depth(cookie, depth),
         });
     });
 
@@ -2454,10 +2474,18 @@ mod tests {
 
     #[test]
     fn phantom_on_second_migration_captures_children() {
-        // A→B→C migration: guard enters on A, migrates to B (phantom on B,
+        // A->B->C migration: guard enters on A, migrates to B (phantom on B,
         // child on B updates it), migrates to C (phantom on C, child on C
         // updates it), drops on C. Both B's and C's phantom children should
         // be subtracted from the migrated record's self_ns.
+        //
+        // Note on intermediate thread cleanup: the phantom StackEntry left on
+        // thread B is cleaned up by the orphan drain mechanism (existing
+        // behavior in drop_cold). This test focuses on the children_ms
+        // forwarding aspect -- verifying that B's accumulated children are
+        // propagated to C via the PHANTOM_FWD registry. The PHANTOM_ARCS
+        // entry on B is a known bounded leak (small: u64 + Arc pointer),
+        // pruned when the vec exceeds 64 entries.
         reset();
         let guard = enter("bc_parent");
         let (guard, b_invocations) = std::thread::scope(|s| {
