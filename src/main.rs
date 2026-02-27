@@ -329,18 +329,10 @@ fn build_project(
 
     // Warn if parallel code was detected without --cpu-time.
     if !cpu_time && !all_concurrency.is_empty() {
-        if all_concurrency.len() == 1 {
-            let (func, pattern) = &all_concurrency[0];
-            eprintln!("warning: {func} uses {pattern} but --cpu-time is not enabled.");
-            eprintln!("         Wall time will include time blocked waiting for workers.");
-            eprintln!("         Re-run with --cpu-time to separate CPU from wall time.");
-        } else {
-            eprintln!("warning: parallel code profiled without --cpu-time:");
-            for (func, pattern) in &all_concurrency {
-                eprintln!("           {func} ({pattern})");
-            }
-            eprintln!("         Wall time will include time blocked waiting for workers.");
-            eprintln!("         Re-run with --cpu-time to separate CPU from wall time.");
+        for (func, _pattern) in &all_concurrency {
+            eprintln!(
+                "warning: {func} spawns parallel work -- add --cpu-time to see computation time"
+            );
         }
     }
 
