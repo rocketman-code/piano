@@ -127,7 +127,9 @@ pub fn resolve_targets(src_dir: &Path, specs: &[TargetSpec]) -> Result<Vec<Resol
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(Error::NoTargetsFound(desc));
+
+            let hint = build_suggestion_hint(specs, &rs_files);
+            return Err(Error::NoTargetsFound { specs: desc, hint });
         }
     }
 
@@ -307,6 +309,84 @@ fn type_name_from_type(ty: &syn::Type) -> String {
     }
 }
 
+/// Levenshtein edit distance between two strings.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b_len = b.len();
+    let mut row: Vec<usize> = (0..=b_len).collect();
+
+    for (i, a_ch) in a.chars().enumerate() {
+        let mut prev = i;
+        row[0] = i + 1;
+        for (j, b_ch) in b.chars().enumerate() {
+            let cost = if a_ch == b_ch { prev } else { prev + 1 };
+            prev = row[j + 1];
+            row[j + 1] = cost.min(row[j] + 1).min(prev + 1);
+        }
+    }
+
+    row[b_len]
+}
+
+/// Build a recovery hint for the NoTargetsFound error.
+///
+/// For `--fn` specs: computes Levenshtein suggestions against all function names.
+/// Falls back to showing function count with guidance when no close matches exist.
+fn build_suggestion_hint(specs: &[TargetSpec], rs_files: &[PathBuf]) -> String {
+    // Collect --fn patterns only; other spec types don't get suggestions.
+    let fn_patterns: Vec<&str> = specs
+        .iter()
+        .filter_map(|s| match s {
+            TargetSpec::Fn(p) => Some(p.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    if fn_patterns.is_empty() {
+        return String::new();
+    }
+
+    // Collect all instrumentable function names across all files.
+    let mut all_names: Vec<String> = Vec::new();
+    for file in rs_files {
+        let Ok(source) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        all_names.extend(extract_functions(&source, file));
+    }
+    all_names.sort();
+    all_names.dedup();
+
+    let total_count = all_names.len();
+
+    // Find Levenshtein-close matches for each pattern.
+    let mut suggestions: Vec<String> = Vec::new();
+    for pattern in &fn_patterns {
+        let threshold = pattern.len() / 3;
+        let mut scored: Vec<(usize, &String)> = all_names
+            .iter()
+            .filter_map(|name| {
+                let bare = name.rsplit("::").next().unwrap_or(name);
+                let dist = levenshtein(pattern, bare).min(levenshtein(pattern, name));
+                if dist <= threshold && dist > 0 {
+                    Some((dist, name))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        scored.sort_by_key(|(d, _)| *d);
+        suggestions.extend(scored.iter().take(5).map(|(_, name)| (*name).clone()));
+    }
+    suggestions.sort();
+    suggestions.dedup();
+
+    if !suggestions.is_empty() {
+        format!(". Did you mean: {}?", suggestions.join(", "))
+    } else {
+        format!(". Found {total_count} functions, none matched. Run without --fn to instrument all")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -465,7 +545,15 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("nonexistent_xyz"),
-            "error should mention the pattern"
+            "error should mention the pattern: {err}"
+        );
+        assert!(
+            err.contains("Found 10 functions"),
+            "error should show function count: {err}"
+        );
+        assert!(
+            err.contains("Run without --fn"),
+            "error should suggest running without --fn: {err}"
         );
     }
 
@@ -612,6 +700,67 @@ mod tests {
     }
 
     #[test]
+    fn no_match_error_includes_suggestions_for_typo() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        // "heper" is close to "helper" (distance 1, threshold = 5/3 = 1, so distance <= 1 passes).
+        let specs = [TargetSpec::Fn("heper".into())];
+        let result = resolve_targets(&tmp.path().join("src"), &specs);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("helper"),
+            "error should suggest 'helper' for typo 'heper': {err}"
+        );
+        assert!(
+            err.contains("Did you mean"),
+            "error should include 'Did you mean' phrasing: {err}"
+        );
+    }
+
+    #[test]
+    fn levenshtein_basic_cases() {
+        assert_eq!(levenshtein("", ""), 0);
+        assert_eq!(levenshtein("abc", "abc"), 0);
+        assert_eq!(levenshtein("abc", ""), 3);
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("parse", "prase"), 2); // swap = 2 edits
+        assert_eq!(levenshtein("walk", "wlak"), 2);
+        assert_eq!(levenshtein("a", "b"), 1);
+    }
+
+    #[test]
+    fn no_match_error_shows_count_for_large_project() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+
+        // Create a file with 20 functions to verify the count fallback path.
+        let mut code = String::new();
+        for i in 0..20 {
+            code.push_str(&format!("fn func_{i}() {{}}\n"));
+        }
+        fs::write(src.join("many.rs"), &code).unwrap();
+
+        let specs = [TargetSpec::Fn("nonexistent".into())];
+        let result = resolve_targets(&src, &specs);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Found 20 functions"),
+            "error should show function count: {err}"
+        );
+        assert!(
+            err.contains("Run without --fn"),
+            "error should suggest running without --fn: {err}"
+        );
+    }
+
+    #[test]
     fn no_match_error_shows_clean_patterns() {
         let tmp = TempDir::new().unwrap();
         create_test_project(tmp.path());
@@ -620,8 +769,8 @@ mod tests {
         let result = resolve_targets(&tmp.path().join("src"), &specs);
         let err = result.unwrap_err().to_string();
         assert!(
-            err.starts_with("no functions matched:"),
-            "error should start with 'no functions matched:': {err}"
+            err.starts_with("no functions matched"),
+            "error should start with 'no functions matched': {err}"
         );
         assert!(
             err.contains("--fn zzz_nonexistent"),
