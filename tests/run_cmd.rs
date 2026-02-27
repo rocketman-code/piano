@@ -178,6 +178,44 @@ fn run_command_ignore_exit_code_suppresses_warning() {
     );
 }
 
+#[test]
+fn profile_suppresses_no_runs_error_on_nonzero_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("exit-one");
+    create_exit_one_project(&project_dir);
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Create the runs dir so cmd_report hits NoRuns (empty dir) not an IO error.
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let output = Command::new(piano_bin)
+        .args(["profile", "--fn", "work", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run piano profile");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should contain the exit code warning.
+    assert!(
+        stderr.contains("exited with code"),
+        "should warn about non-zero exit, got: {stderr}"
+    );
+
+    // Should NOT contain the NoRuns error -- that's cascading noise.
+    assert!(
+        !stderr.contains("no piano runs found"),
+        "should suppress NoRuns when program exited non-zero, got: {stderr}"
+    );
+}
+
 fn create_echo_args_project(dir: &Path) {
     fs::create_dir_all(dir.join("src")).unwrap();
 
