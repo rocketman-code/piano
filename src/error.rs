@@ -37,6 +37,9 @@ pub enum Error {
     #[error("invalid tag name: {0}")]
     InvalidTagName(String),
 
+    #[error("profiling data was not written -- check disk space and permissions for {}", .0.display())]
+    NoDataWritten(PathBuf),
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }

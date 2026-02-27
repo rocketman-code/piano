@@ -512,7 +512,22 @@ fn cmd_profile(
     }
 
     eprintln!();
-    cmd_report(None, show_all, frames)
+    match cmd_report(None, show_all, frames) {
+        Ok(()) => Ok(()),
+        Err(Error::NoRuns) if !status.success() && !ignore_exit_code => {
+            // Program failed and produced no data. The program's own error
+            // output is the primary affordance (UX principle 6). Suppress
+            // Piano's NoRuns to avoid cascading errors.
+            Ok(())
+        }
+        Err(Error::NoRuns) => {
+            // Program exited successfully but no data was written.
+            // Something went wrong with the runtime's write -- give an
+            // actionable message.
+            Err(Error::NoDataWritten(runs_dir))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result<(), Error> {
