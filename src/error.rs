@@ -18,11 +18,11 @@ pub enum Error {
     #[error("run failed: {0}")]
     RunFailed(String),
 
-    #[error("no instrumented binary found in {} -- run `piano build` first", .0.display())]
-    NoBinary(PathBuf),
+    #[error("no instrumented binary found -- run `piano build` first")]
+    NoBinary,
 
-    #[error("no piano runs found in {} -- run `piano build` and execute the instrumented binary first", .0.display())]
-    NoRuns(PathBuf),
+    #[error("no piano runs found -- run `piano profile` to generate one")]
+    NoRuns,
 
     #[error("failed to read run file {}: {source}", path.display())]
     RunReadError {

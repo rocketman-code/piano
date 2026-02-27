@@ -848,7 +848,7 @@ pub fn load_run_by_id(runs_dir: &Path, run_id: &str) -> Result<Run, Error> {
         }
     }
     if matching.is_empty() {
-        return Err(Error::NoRuns(runs_dir.to_path_buf()));
+        return Err(Error::NoRuns);
     }
     let refs: Vec<&Run> = matching.iter().collect();
     Ok(merge_runs(&refs))
@@ -863,7 +863,7 @@ pub fn load_run_by_id(runs_dir: &Path, run_id: &str) -> Result<Run, Error> {
 pub fn load_latest_run(runs_dir: &Path) -> Result<Run, Error> {
     let all_files = collect_run_files(runs_dir)?;
     if all_files.is_empty() {
-        return Err(Error::NoRuns(runs_dir.to_path_buf()));
+        return Err(Error::NoRuns);
     }
 
     let mut runs: Vec<Run> = Vec::new();
@@ -875,7 +875,7 @@ pub fn load_latest_run(runs_dir: &Path) -> Result<Run, Error> {
     }
 
     if runs.is_empty() {
-        return Err(Error::NoRuns(runs_dir.to_path_buf()));
+        return Err(Error::NoRuns);
     }
 
     // Find the latest run_id by max timestamp.
