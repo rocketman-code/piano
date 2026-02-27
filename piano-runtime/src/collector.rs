@@ -168,6 +168,25 @@ struct RawRecord {
 
 type ThreadRecordArc = Arc<Mutex<Vec<RawRecord>>>;
 
+/// Shared children_ms accumulator for phantom forwarding across thread hops.
+///
+/// When an async guard migrates through multiple threads (A -> B -> C), the
+/// phantom on thread B accumulates children_ms from B's children. This Arc
+/// mirrors those updates so that when `check()` runs on C, it can read B's
+/// accumulated children and seed C's phantom. Keyed by the guard's packed
+/// identity (cookie << 16 | depth).
+type PhantomFwdArc = Arc<Mutex<f64>>;
+
+/// Global registry mapping guard identity -> forwarding Arc.
+///
+/// `check()` inserts an entry when pushing a phantom. On re-migration,
+/// `check()` reads and replaces the entry. `drop_cold` reads and removes it.
+static PHANTOM_FWD: SyncOnceCell<Mutex<HashMap<u64, PhantomFwdArc>>> = SyncOnceCell::new();
+
+fn phantom_fwd() -> &'static Mutex<HashMap<u64, PhantomFwdArc>> {
+    PHANTOM_FWD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Global registry of per-thread record storage.
 /// Each thread registers its Arc on first access. collect_all() iterates all Arcs.
 static THREAD_RECORDS: SyncOnceCell<Mutex<Vec<ThreadRecordArc>>> = SyncOnceCell::new();
@@ -190,6 +209,10 @@ thread_local! {
     static FRAME_BUFFER: RefCell<Vec<InvocationRecord>> = RefCell::new(Vec::new());
     /// Completed per-frame summaries.
     static FRAMES: RefCell<Vec<Vec<FrameFnSummary>>> = RefCell::new(Vec::new());
+    /// Per-thread phantom forwarding Arcs. When a phantom StackEntry exists on
+    /// this thread (from Guard::check()), the corresponding Arc is stored here
+    /// so child drops can write through to it. Keyed by the phantom's cookie_low.
+    static PHANTOM_ARCS: RefCell<Vec<(u32, PhantomFwdArc)>> = RefCell::new(Vec::new());
 }
 
 /// Sequential per-thread identifier. Cheaper than `std::thread::current().id()`
@@ -275,10 +298,35 @@ impl Guard {
             if already_has {
                 return;
             }
+
+            // Read forwarded children_ms from a previous thread's phantom
+            // (multi-hop migration: A -> B -> C). The previous thread's
+            // phantom wrote its children_ms to the forwarding Arc.
+            let forwarded_children_ms = {
+                let mut fwd = phantom_fwd().lock().unwrap_or_else(|e| e.into_inner());
+                fwd.remove(&self.packed)
+                    .map(|arc| *arc.lock().unwrap_or_else(|e| e.into_inner()))
+                    .unwrap_or(0.0)
+            };
+
+            // Create a new forwarding Arc for this phantom so that if the
+            // guard migrates again, the next thread can read our children_ms.
+            let fwd_arc = Arc::new(Mutex::new(forwarded_children_ms));
+            {
+                let mut fwd = phantom_fwd().lock().unwrap_or_else(|e| e.into_inner());
+                fwd.insert(self.packed, Arc::clone(&fwd_arc));
+            }
+
+            // Store the Arc in this thread's local phantom map so that
+            // child drops can write through to it.
+            PHANTOM_ARCS.with(|arcs| {
+                arcs.borrow_mut().push((enter_cookie as u32, fwd_arc));
+            });
+
             let depth = s.len() as u16;
             s.push(StackEntry {
                 name: "<phantom>",
-                children_ms: 0.0,
+                children_ms: forwarded_children_ms,
                 #[cfg(feature = "cpu-time")]
                 cpu_children_ns: 0,
                 #[cfg(feature = "cpu-time")]
@@ -306,7 +354,8 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
 
         // Post-migration children (Case 2): find and pop our phantom
         // StackEntry. Its children_ms was updated by children via the
-        // normal parent fast path.
+        // normal parent fast path, and seeded with forwarded children
+        // from previous thread hops (multi-hop migration).
         let phantom_children_ms = STACK.with(|stack| {
             let mut s = stack.borrow_mut();
             if let Some(pos) = s
@@ -319,6 +368,12 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                 0.0
             }
         });
+
+        // Clean up the forwarding registry entry for this guard.
+        {
+            let mut fwd = phantom_fwd().lock().unwrap_or_else(|e| e.into_inner());
+            fwd.remove(&guard.packed);
+        }
 
         let children_ns = (phantom_children_ms * 1_000_000.0) as u64;
         let self_ns = elapsed_ns.saturating_sub(children_ns);
@@ -406,6 +461,18 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
 
         if let Some(parent) = stack.borrow_mut().last_mut() {
             parent.children_ms += elapsed_ms;
+            // If parent is a phantom (cookie differs from this thread),
+            // write through to its forwarding Arc so subsequent thread
+            // hops can read the accumulated children_ms.
+            if parent.cookie_low != drop_cookie as u32 {
+                let children = parent.children_ms;
+                let ck = parent.cookie_low;
+                PHANTOM_ARCS.with(|arcs| {
+                    if let Some((_, arc)) = arcs.borrow().iter().find(|(c, _)| *c == ck) {
+                        *arc.lock().unwrap_or_else(|e| e.into_inner()) = children;
+                    }
+                });
+            }
             #[cfg(feature = "cpu-time")]
             {
                 parent.cpu_children_ns += cpu_elapsed_ns;
@@ -704,6 +771,7 @@ pub fn reset() {
     INVOCATIONS.with(|inv| inv.borrow_mut().clear());
     FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
     FRAMES.with(|frames| frames.borrow_mut().clear());
+    PHANTOM_ARCS.with(|arcs| arcs.borrow_mut().clear());
 }
 
 /// Clear collected timing data across ALL threads, plus the calling thread's
@@ -2386,12 +2454,13 @@ mod tests {
 
     #[test]
     fn phantom_on_second_migration_captures_children() {
-        // B→C migration: guard enters on A, migrates to B (phantom on B,
+        // A→B→C migration: guard enters on A, migrates to B (phantom on B,
         // child on B updates it), migrates to C (phantom on C, child on C
-        // updates it), drops on C. C's phantom children are subtracted.
+        // updates it), drops on C. Both B's and C's phantom children should
+        // be subtracted from the migrated record's self_ns.
         reset();
         let guard = enter("bc_parent");
-        let (guard, _b_invocations) = std::thread::scope(|s| {
+        let (guard, b_invocations) = std::thread::scope(|s| {
             s.spawn(move || {
                 guard.check();
                 {
@@ -2404,6 +2473,12 @@ mod tests {
             .join()
             .unwrap()
         });
+
+        let b_child_ns = b_invocations
+            .iter()
+            .find(|r| r.name == "b_child")
+            .expect("b_child invocation")
+            .elapsed_ns;
 
         let c_invocations = std::thread::scope(|s| {
             s.spawn(move || {
@@ -2419,18 +2494,34 @@ mod tests {
             .unwrap()
         });
 
+        let c_child_ns = c_invocations
+            .iter()
+            .find(|r| r.name == "c_child")
+            .expect("c_child invocation")
+            .elapsed_ns;
+
         let migrated = c_invocations
             .iter()
             .find(|r| r.name == "<migrated>")
             .expect("should have migrated record");
 
-        // C's phantom captures c_child's time. B's phantom is leaked
-        // (documented limitation: no cross-thread phantom forwarding yet).
+        // Both B's and C's children should be subtracted from self_ns.
+        // The migrated record's children_ns should account for both
+        // b_child and c_child elapsed times.
+        let children_ns = migrated.elapsed_ns - migrated.self_ns;
         assert!(
             migrated.self_ns < migrated.elapsed_ns,
-            "self_ns ({}) should be < elapsed_ns ({}) with children on C",
+            "self_ns ({}) should be < elapsed_ns ({}) with children on B and C",
             migrated.self_ns,
             migrated.elapsed_ns,
+        );
+        // Verify B's children were forwarded: children_ns should be at
+        // least b_child + c_child (with some tolerance for timing noise).
+        let expected_children_min = (b_child_ns + c_child_ns) / 2;
+        assert!(
+            children_ns >= expected_children_min,
+            "children_ns ({children_ns}) should include both b_child ({b_child_ns}) \
+             and c_child ({c_child_ns}) (min threshold: {expected_children_min})",
         );
     }
 
