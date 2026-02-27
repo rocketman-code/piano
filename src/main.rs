@@ -349,6 +349,7 @@ fn build_project(
     let main_file = member_staging.join(&bin_entry);
     let target_dir = project.join("target").join("piano");
     let runs_dir = target_dir.join("runs");
+    std::fs::create_dir_all(&runs_dir)?;
     {
         let all_fn_names: Vec<String> = targets
             .iter()
