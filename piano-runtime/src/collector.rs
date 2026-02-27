@@ -150,6 +150,10 @@ pub(crate) struct StackEntry {
     /// Saved ALLOC_COUNTERS from before this scope, restored on Guard::drop.
     pub(crate) saved_alloc: crate::alloc::AllocSnapshot,
     pub(crate) depth: u16,
+    /// Low 32 bits of the thread cookie that owns this entry's Guard.
+    /// Regular entries: current thread's cookie (same thread pushed it).
+    /// Phantom entries: migrated Guard's original thread cookie (different thread).
+    pub(crate) cookie_low: u32,
 }
 
 /// Raw measurement produced when a Guard drops.
@@ -243,6 +247,50 @@ const _: () = {
     }
 };
 
+impl Guard {
+    /// Check for thread migration after an .await point.
+    ///
+    /// If the Guard has migrated to a different thread, pushes a phantom
+    /// StackEntry onto the new thread's stack so that children can update
+    /// it via the normal parent fast path. Also registers the Guard as
+    /// migrated so the original thread can clean up the orphaned entry.
+    ///
+    /// No-op if still on the same thread. Idempotent: safe to call
+    /// multiple times (skips if phantom already exists on current stack).
+    pub fn check(&self) {
+        let current_cookie = THREAD_COOKIE.with(|c| *c);
+        let enter_cookie = unpack_cookie(self.packed);
+        if current_cookie == enter_cookie {
+            return; // Same thread, no migration
+        }
+
+        // Push phantom on current thread's stack (idempotent).
+        // Children will update it via the normal parent fast path.
+        STACK.with(|stack| {
+            let mut s = stack.borrow_mut();
+            // Check if phantom already exists for this guard
+            let already_has = s
+                .iter()
+                .any(|e| e.cookie_low == enter_cookie as u32 && e.name == "<phantom>");
+            if already_has {
+                return;
+            }
+            let depth = s.len() as u16;
+            s.push(StackEntry {
+                name: "<phantom>",
+                children_ms: 0.0,
+                #[cfg(feature = "cpu-time")]
+                cpu_children_ns: 0,
+                #[cfg(feature = "cpu-time")]
+                cpu_start_ns: 0,
+                saved_alloc: crate::alloc::AllocSnapshot::new(),
+                depth,
+                cookie_low: enter_cookie as u32,
+            });
+        });
+    }
+}
+
 /// Bookkeeping half of Guard::drop(): thread check, alloc restore, stack pop,
 /// recording. Kept out-of-line so the inlined drop is just a counter read + call.
 #[inline(never)]
@@ -252,11 +300,28 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
     let migrated = drop_cookie != enter_cookie;
 
     if migrated {
-        // Thread migration detected. TSC is cross-thread on modern hardware.
-        // Name and depth are unavailable (stored in enter thread's TLS).
         let elapsed_ns = crate::tsc::elapsed_ns(guard.start_tsc, end_tsc);
         let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
         let start_ns = crate::tsc::ticks_to_epoch_ns(guard.start_tsc, crate::tsc::epoch_tsc());
+
+        // Post-migration children (Case 2): find and pop our phantom
+        // StackEntry. Its children_ms was updated by children via the
+        // normal parent fast path.
+        let phantom_children_ms = STACK.with(|stack| {
+            let mut s = stack.borrow_mut();
+            if let Some(pos) = s
+                .iter()
+                .rposition(|e| e.cookie_low == enter_cookie as u32 && e.name == "<phantom>")
+            {
+                let phantom = s.remove(pos);
+                phantom.children_ms
+            } else {
+                0.0
+            }
+        });
+
+        let children_ns = (phantom_children_ms * 1_000_000.0) as u64;
+        let self_ns = elapsed_ns.saturating_sub(children_ns);
 
         RECORDS.with(|records| {
             records
@@ -265,7 +330,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                 .push(RawRecord {
                     name: "<migrated>",
                     elapsed_ms,
-                    children_ms: 0.0,
+                    children_ms: phantom_children_ms,
                     #[cfg(feature = "cpu-time")]
                     cpu_self_ns: 0,
                 });
@@ -275,9 +340,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             name: "<migrated>",
             start_ns,
             elapsed_ns,
-            // No children info available on the drop thread, so self =
-            // wall. May overcount when migrated children exist.
-            self_ns: elapsed_ns,
+            self_ns,
             #[cfg(feature = "cpu-time")]
             cpu_self_ns: 0,
             alloc_count: 0,
@@ -295,8 +358,6 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         FRAME_BUFFER.with(|buf| {
             buf.borrow_mut().push(invocation);
         });
-        // No frame boundary check: migrated guard's depth is from
-        // the enter thread, not meaningful for this thread's frames.
         return;
     }
 
@@ -452,6 +513,7 @@ fn enter_cold(name: &'static str) -> u64 {
             cpu_start_ns,
             saved_alloc,
             depth,
+            cookie_low: cookie as u32,
         });
         depth
     });
@@ -1023,6 +1085,7 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
     #[cfg(feature = "cpu-time")]
     let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
 
+    let cookie = THREAD_COOKIE.with(|c| *c);
     STACK.with(|stack| {
         let depth = stack.borrow().len() as u16;
         stack.borrow_mut().push(StackEntry {
@@ -1034,6 +1097,7 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
             cpu_start_ns,
             saved_alloc,
             depth,
+            cookie_low: cookie as u32,
         });
     });
 
@@ -1270,7 +1334,13 @@ mod tests {
             burn_cpu(50_000);
         }
         let records = collect();
-        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records.len(),
+            2,
+            "expected 2 records, got {}: {:?}",
+            records.len(),
+            records.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
         assert_eq!(
             records[0].name, "slow",
             "expected slow first, got {:?}",
@@ -2162,5 +2232,234 @@ mod tests {
             "cpu_self_ms should be exactly 0 for migrated guard, got {:.3}",
             rec.cpu_self_ms
         );
+    }
+
+    #[test]
+    fn stack_entry_is_64_bytes() {
+        assert_eq!(
+            core::mem::size_of::<StackEntry>(),
+            64,
+            "StackEntry must be exactly 64 bytes to preserve lsl #6 indexing"
+        );
+    }
+
+    #[test]
+    fn guard_check_pushes_phantom_on_migration() {
+        reset();
+        let guard = enter("check_parent");
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                guard.check();
+                STACK.with(|stack| {
+                    let s = stack.borrow();
+                    assert_eq!(s.len(), 1, "phantom should be pushed");
+                    assert_eq!(s[0].name, "<phantom>");
+                });
+                drop(guard);
+            });
+        });
+    }
+
+    #[test]
+    fn guard_check_is_noop_on_same_thread() {
+        reset();
+        let guard = enter("same_thread");
+        guard.check();
+        STACK.with(|stack| {
+            let s = stack.borrow();
+            assert_eq!(s.len(), 1, "no phantom on same thread");
+            assert_eq!(s[0].name, "same_thread");
+        });
+        drop(guard);
+    }
+
+    #[test]
+    fn guard_check_is_idempotent() {
+        reset();
+        let guard = enter("idempotent");
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                guard.check();
+                guard.check();
+                STACK.with(|stack| {
+                    let s = stack.borrow();
+                    assert_eq!(s.len(), 1, "only one phantom after two checks");
+                });
+                drop(guard);
+            });
+        });
+    }
+
+    #[test]
+    fn migrated_parent_subtracts_post_migration_children() {
+        reset();
+        let parent_guard = enter("mig_parent");
+        let invocations = std::thread::scope(|s| {
+            s.spawn(move || {
+                parent_guard.check();
+                {
+                    let _child = enter("mig_child");
+                    burn_cpu(20_000);
+                }
+                drop(parent_guard);
+                collect_invocations()
+            })
+            .join()
+            .unwrap()
+        });
+
+        let parent_inv = invocations
+            .iter()
+            .find(|r| r.name == "<migrated>")
+            .expect("migrated parent should produce an invocation");
+        let child_inv = invocations
+            .iter()
+            .find(|r| r.name == "mig_child")
+            .expect("child should produce an invocation");
+
+        assert!(
+            parent_inv.self_ns < parent_inv.elapsed_ns,
+            "self_ns ({}) should be < elapsed_ns ({}) after subtracting child",
+            parent_inv.self_ns,
+            parent_inv.elapsed_ns,
+        );
+        assert!(
+            child_inv.elapsed_ns > 500_000,
+            "child should have substantial elapsed time, got {}",
+            child_inv.elapsed_ns,
+        );
+    }
+
+    #[test]
+    fn migrated_record_has_children_subtracted_in_collect() {
+        reset();
+        let parent_guard = enter("rec_parent");
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                parent_guard.check();
+                {
+                    let _child = enter("rec_child");
+                    burn_cpu(20_000);
+                }
+                drop(parent_guard);
+            });
+        });
+
+        let records = collect_all();
+        let parent_rec = records
+            .iter()
+            .find(|r| r.name == "<migrated>")
+            .expect("migrated parent in collect_all");
+
+        assert!(
+            parent_rec.self_ms < parent_rec.total_ms,
+            "self_ms ({:.3}) should be < total_ms ({:.3})",
+            parent_rec.self_ms,
+            parent_rec.total_ms,
+        );
+    }
+
+    #[test]
+    fn root_function_does_not_affect_migrated_guard() {
+        reset();
+        {
+            let _root = enter("root_fn");
+            burn_cpu(20_000);
+        }
+
+        let guard = std::thread::scope(|s| s.spawn(|| enter("other_thread")).join().unwrap());
+        guard.check();
+        drop(guard);
+
+        let invocations = collect_invocations();
+        let migrated = invocations
+            .iter()
+            .find(|r| r.name == "<migrated>")
+            .expect("should have a migrated record");
+
+        assert_eq!(
+            migrated.self_ns, migrated.elapsed_ns,
+            "migrated guard with no children: self_ns ({}) should equal elapsed_ns ({})",
+            migrated.self_ns, migrated.elapsed_ns,
+        );
+    }
+
+    #[test]
+    fn phantom_on_second_migration_captures_children() {
+        // B→C migration: guard enters on A, migrates to B (phantom on B,
+        // child on B updates it), migrates to C (phantom on C, child on C
+        // updates it), drops on C. C's phantom children are subtracted.
+        reset();
+        let guard = enter("bc_parent");
+        let (guard, _b_invocations) = std::thread::scope(|s| {
+            s.spawn(move || {
+                guard.check();
+                {
+                    let _child = enter("b_child");
+                    burn_cpu(10_000);
+                }
+                let inv = collect_invocations();
+                (guard, inv)
+            })
+            .join()
+            .unwrap()
+        });
+
+        let c_invocations = std::thread::scope(|s| {
+            s.spawn(move || {
+                guard.check();
+                {
+                    let _child = enter("c_child");
+                    burn_cpu(10_000);
+                }
+                drop(guard);
+                collect_invocations()
+            })
+            .join()
+            .unwrap()
+        });
+
+        let migrated = c_invocations
+            .iter()
+            .find(|r| r.name == "<migrated>")
+            .expect("should have migrated record");
+
+        // C's phantom captures c_child's time. B's phantom is leaked
+        // (documented limitation: no cross-thread phantom forwarding yet).
+        assert!(
+            migrated.self_ns < migrated.elapsed_ns,
+            "self_ns ({}) should be < elapsed_ns ({}) with children on C",
+            migrated.self_ns,
+            migrated.elapsed_ns,
+        );
+    }
+
+    #[test]
+    fn multiple_checks_on_same_thread_are_idempotent() {
+        reset();
+        let guard = enter("multi_check");
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                guard.check();
+                {
+                    let _child1 = enter("child1");
+                    burn_cpu(10_000);
+                }
+                guard.check();
+                {
+                    let _child2 = enter("child2");
+                    burn_cpu(10_000);
+                }
+                STACK.with(|stack| {
+                    let s = stack.borrow();
+                    assert_eq!(s.len(), 1, "only one phantom on stack");
+                    assert!(
+                        s[0].children_ms > 0.0,
+                        "phantom should have accumulated children_ms"
+                    );
+                });
+                drop(guard);
+            });
+        });
     }
 }
