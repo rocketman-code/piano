@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("no functions matched: {0}")]
-    NoTargetsFound(String),
+    #[error("no functions matched {specs}{hint}")]
+    NoTargetsFound { specs: String, hint: String },
 
     #[error("failed to parse {}: {source}", path.display())]
     ParseError {
