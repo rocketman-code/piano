@@ -308,16 +308,17 @@ fn build_project(
         let target_set: HashSet<String> = target.functions.iter().cloned().collect();
         let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
         let staged_file = member_staging.join("src").join(relative);
+        let display_path = PathBuf::from("src").join(relative);
         let source =
             std::fs::read_to_string(&staged_file).map_err(|source| Error::RunReadError {
-                path: staged_file.clone(),
+                path: display_path.clone(),
                 source,
             })?;
 
         let result =
             instrument_source(&source, &target_set, instrument_macros).map_err(|source| {
                 Error::ParseError {
-                    path: staged_file.clone(),
+                    path: display_path,
                     source,
                 }
             })?;
@@ -355,12 +356,12 @@ fn build_project(
             .collect();
         let main_source =
             std::fs::read_to_string(&main_file).map_err(|source| Error::RunReadError {
-                path: main_file.clone(),
+                path: bin_entry.clone(),
                 source,
             })?;
         let rewritten = inject_registrations(&main_source, &all_fn_names).map_err(|source| {
             Error::ParseError {
-                path: main_file.clone(),
+                path: bin_entry.clone(),
                 source,
             }
         })?;
@@ -373,14 +374,14 @@ fn build_project(
         };
         let rewritten =
             inject_global_allocator(&rewritten, existing).map_err(|source| Error::ParseError {
-                path: main_file.clone(),
+                path: bin_entry.clone(),
                 source,
             })?;
 
         let runs_dir_str = runs_dir.to_string_lossy().to_string();
         let rewritten = inject_shutdown(&rewritten, Some(&runs_dir_str)).map_err(|source| {
             Error::ParseError {
-                path: main_file.clone(),
+                path: bin_entry.clone(),
                 source,
             }
         })?;
@@ -420,7 +421,7 @@ fn cmd_build(
 fn find_latest_binary() -> Result<PathBuf, Error> {
     let dir = PathBuf::from("target/piano/debug");
     if !dir.is_dir() {
-        return Err(Error::NoBinary(dir));
+        return Err(Error::NoBinary);
     }
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
     for entry in std::fs::read_dir(&dir)? {
@@ -445,7 +446,7 @@ fn find_latest_binary() -> Result<PathBuf, Error> {
             best = Some((path, mtime));
         }
     }
-    best.map(|(p, _)| p).ok_or(Error::NoBinary(dir))
+    best.map(|(p, _)| p).ok_or(Error::NoBinary)
 }
 
 fn cmd_run(args: Vec<String>) -> Result<(), Error> {
@@ -576,9 +577,7 @@ fn cmd_tag(name: String) -> Result<(), Error> {
     let runs_dir = default_runs_dir()?;
     let tags_dir = default_tags_dir()?;
     let latest = load_latest_run(&runs_dir)?;
-    let run_id = latest
-        .run_id
-        .ok_or_else(|| Error::NoRuns(runs_dir.clone()))?;
+    let run_id = latest.run_id.ok_or(Error::NoRuns)?;
     save_tag(&tags_dir, &name, &run_id)?;
     eprintln!("tagged '{name}' -> {run_id}");
     Ok(())
@@ -602,7 +601,7 @@ fn default_runs_dir() -> Result<PathBuf, Error> {
     if local.is_dir() {
         return Ok(std::fs::canonicalize(local)?);
     }
-    Err(Error::NoRuns(local))
+    Err(Error::NoRuns)
 }
 
 fn default_tags_dir() -> Result<PathBuf, Error> {
@@ -619,5 +618,5 @@ fn default_tags_dir() -> Result<PathBuf, Error> {
         std::fs::create_dir_all(&local)?;
         return Ok(std::fs::canonicalize(local)?);
     }
-    Err(Error::NoRuns(runs_local))
+    Err(Error::NoRuns)
 }
