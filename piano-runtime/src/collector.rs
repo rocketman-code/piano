@@ -149,11 +149,12 @@ pub(crate) struct StackEntry {
     pub(crate) cpu_start_ns: u64,
     /// Saved ALLOC_COUNTERS from before this scope, restored on Guard::drop.
     pub(crate) saved_alloc: crate::alloc::AllocSnapshot,
-    pub(crate) depth: u16,
-    /// Low 32 bits of the thread cookie that owns this entry's Guard.
-    /// Regular entries: current thread's cookie (same thread pushed it).
-    /// Phantom entries: migrated Guard's original thread cookie (different thread).
-    pub(crate) cookie_low: u32,
+    /// Packed identity: `[cookie:32][name_id:16][depth:16]`.
+    ///
+    /// Regular entries: matches the Guard's packed value (same thread pushed it).
+    /// Phantom entries: the migrated Guard's packed identity (different thread
+    /// cookie), used as a unique key for PHANTOM_REGISTRY / PHANTOM_ARCS lookup.
+    pub(crate) packed: u64,
 }
 
 /// Raw measurement produced when a Guard drops.
@@ -167,6 +168,45 @@ struct RawRecord {
 }
 
 type ThreadRecordArc = Arc<Mutex<Vec<RawRecord>>>;
+
+/// Per-phantom tracking for cross-thread forwarding and cleanup.
+///
+/// When `check()` pushes a phantom on thread B, it registers a `PhantomInfo`
+/// in the global `PHANTOM_REGISTRY`. This enables:
+/// - Forwarding: children_ms accumulated on B is readable by C via the Arc.
+/// - Cleanup: `host_cookie` identifies B so the cleanup queue can target it.
+struct PhantomInfo {
+    /// Thread cookie of the thread hosting this phantom StackEntry.
+    host_cookie: u64,
+    /// Shared children_ms accumulator. The host thread writes to this Arc
+    /// (via PHANTOM_ARCS) when children update the phantom; the next thread
+    /// reads from it to seed its own phantom.
+    children_arc: Arc<Mutex<f64>>,
+}
+
+/// Global registry mapping guard packed identity -> phantom info.
+///
+/// `check()` inserts when pushing a phantom. On re-migration, `check()` reads
+/// the old entry (forwarding + cleanup scheduling) and inserts a new one.
+/// `drop_cold` removes the final entry.
+static PHANTOM_REGISTRY: SyncOnceCell<Mutex<HashMap<u64, PhantomInfo>>> = SyncOnceCell::new();
+
+fn phantom_registry() -> &'static Mutex<HashMap<u64, PhantomInfo>> {
+    PHANTOM_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cleanup queue: `(host_cookie, guard_packed)` pairs. Thread B drains entries
+/// where `host_cookie == B` on its next `enter_cold`, removing the stale phantom
+/// from its stack.
+static PHANTOM_CLEANUP: SyncOnceCell<Mutex<Vec<(u64, u64)>>> = SyncOnceCell::new();
+
+fn phantom_cleanup() -> &'static Mutex<Vec<(u64, u64)>> {
+    PHANTOM_CLEANUP.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Fast-path guard: skip the cleanup lock when the queue is empty.
+static HAS_PHANTOM_CLEANUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Global registry of per-thread record storage.
 /// Each thread registers its Arc on first access. collect_all() iterates all Arcs.
@@ -190,6 +230,10 @@ thread_local! {
     static FRAME_BUFFER: RefCell<Vec<InvocationRecord>> = RefCell::new(Vec::new());
     /// Completed per-frame summaries.
     static FRAMES: RefCell<Vec<Vec<FrameFnSummary>>> = RefCell::new(Vec::new());
+    /// Per-thread phantom forwarding Arcs. When a phantom StackEntry exists on
+    /// this thread (from Guard::check()), the corresponding Arc is stored here
+    /// so child drops can write through to it.
+    static PHANTOM_ARCS: RefCell<Vec<(u64, Arc<Mutex<f64>>)>> = RefCell::new(Vec::new());
 }
 
 /// Sequential per-thread identifier. Cheaper than `std::thread::current().id()`
@@ -357,24 +401,65 @@ impl Guard {
         // Children will update it via the normal parent fast path.
         STACK.with(|stack| {
             let mut s = stack.borrow_mut();
-            // Check if phantom already exists for this guard
+            // Check if phantom already exists for this guard (exact packed match).
             let already_has = s
                 .iter()
-                .any(|e| e.cookie_low == enter_cookie as u32 && e.name == "<phantom>");
+                .any(|e| e.packed == self.packed && e.name == "<phantom>");
             if already_has {
                 return;
             }
-            let depth = s.len() as u16;
+
+            // Read forwarded children_ms from a previous thread's phantom and
+            // schedule cleanup of the old host thread's phantom (multi-hop
+            // migration: A -> B -> C).
+            let (forwarded_children_ms, fwd_arc) = {
+                // Lock registry: remove old entry (if any) and insert new one.
+                let arc = Arc::new(Mutex::new(0.0));
+                let old_info = {
+                    let mut reg = phantom_registry().lock().unwrap_or_else(|e| e.into_inner());
+                    let old = reg.remove(&self.packed);
+                    reg.insert(
+                        self.packed,
+                        PhantomInfo {
+                            host_cookie: current_cookie,
+                            children_arc: Arc::clone(&arc),
+                        },
+                    );
+                    old
+                }; // registry lock dropped here
+
+                // Process old entry (if any) without holding registry lock.
+                let forwarded = if let Some(old) = old_info {
+                    // Schedule cleanup of old host's phantom.
+                    let mut cleanup = phantom_cleanup().lock().unwrap_or_else(|e| e.into_inner());
+                    cleanup.push((old.host_cookie, self.packed));
+                    HAS_PHANTOM_CLEANUP.store(true, Ordering::Relaxed);
+                    drop(cleanup); // cleanup lock dropped
+
+                    let val = *old.children_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    *arc.lock().unwrap_or_else(|e| e.into_inner()) = val;
+                    val
+                } else {
+                    0.0
+                };
+
+                (forwarded, arc)
+            };
+
+            // Store the Arc for write-through from child drops.
+            PHANTOM_ARCS.with(|arcs| {
+                arcs.borrow_mut().push((self.packed, fwd_arc));
+            });
+
             s.push(StackEntry {
                 name: "<phantom>",
-                children_ms: 0.0,
+                children_ms: forwarded_children_ms,
                 #[cfg(feature = "cpu-time")]
                 cpu_children_ns: 0,
                 #[cfg(feature = "cpu-time")]
                 cpu_start_ns: 0,
                 saved_alloc: crate::alloc::AllocSnapshot::new(),
-                depth,
-                cookie_low: enter_cookie as u32,
+                packed: self.packed,
             });
         });
     }
@@ -396,18 +481,28 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
 
         // Post-migration children (Case 2): find and pop our phantom
         // StackEntry. Its children_ms was updated by children via the
-        // normal parent fast path.
+        // normal parent fast path, and seeded with forwarded children
+        // from previous thread hops (multi-hop migration).
         let phantom_children_ms = STACK.with(|stack| {
             let mut s = stack.borrow_mut();
             if let Some(pos) = s
                 .iter()
-                .rposition(|e| e.cookie_low == enter_cookie as u32 && e.name == "<phantom>")
+                .rposition(|e| e.packed == guard.packed && e.name == "<phantom>")
             {
                 let phantom = s.remove(pos);
                 phantom.children_ms
             } else {
                 0.0
             }
+        });
+
+        // Clean up the phantom registry and PHANTOM_ARCS for this guard.
+        {
+            let mut reg = phantom_registry().lock().unwrap_or_else(|e| e.into_inner());
+            reg.remove(&guard.packed);
+        }
+        PHANTOM_ARCS.with(|arcs| {
+            arcs.borrow_mut().retain(|(pk, _)| *pk != guard.packed);
         });
 
         let children_ns = (phantom_children_ms * 1_000_000.0) as u64;
@@ -461,7 +556,10 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         {
             let mut s = stack.borrow_mut();
             let guard_depth = unpack_depth(guard.packed);
-            while s.last().map_or(false, |e| e.depth > guard_depth) {
+            while s
+                .last()
+                .map_or(false, |e| unpack_depth(e.packed) > guard_depth)
+            {
                 let orphan = s.pop().unwrap();
                 let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
                     cell.set(orphan.saved_alloc);
@@ -496,6 +594,18 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
 
         if let Some(parent) = stack.borrow_mut().last_mut() {
             parent.children_ms += elapsed_ms;
+            // If parent is a phantom (cookie differs from this thread),
+            // write through to its forwarding Arc so subsequent thread
+            // hops can read the accumulated children_ms.
+            if unpack_cookie(parent.packed) != drop_cookie {
+                let children = parent.children_ms;
+                let pk = parent.packed;
+                PHANTOM_ARCS.with(|arcs| {
+                    if let Some((_, arc)) = arcs.borrow().iter().find(|(k, _)| *k == pk) {
+                        *arc.lock().unwrap_or_else(|e| e.into_inner()) = children;
+                    }
+                });
+            }
             #[cfg(feature = "cpu-time")]
             {
                 parent.cpu_children_ns += cpu_elapsed_ns;
@@ -526,7 +636,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             alloc_bytes: scope_alloc.alloc_bytes,
             free_count: scope_alloc.free_count,
             free_bytes: scope_alloc.free_bytes,
-            depth: entry.depth,
+            depth: unpack_depth(entry.packed),
         };
 
         #[cfg(any(test, feature = "_test_internals"))]
@@ -537,7 +647,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         FRAME_BUFFER.with(|buf| {
             buf.borrow_mut().push(invocation);
         });
-        if entry.depth == 0 {
+        if unpack_depth(entry.packed) == 0 {
             FRAME_BUFFER.with(|buf| {
                 let buffer = buf.borrow_mut().drain(..).collect::<Vec<_>>();
                 let summary = aggregate_frame(&buffer);
@@ -573,6 +683,44 @@ impl Drop for Guard {
     }
 }
 
+/// Drain stale phantom StackEntries scheduled for cleanup on this thread.
+///
+/// Called from `enter_cold` before pushing the new entry. The cleanup queue
+/// is populated by `check()` on other threads when a guard re-migrates
+/// (e.g., A -> B -> C: C schedules B's phantom for cleanup).
+fn drain_phantom_cleanup(my_cookie: u64) {
+    if !HAS_PHANTOM_CLEANUP.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut queue = phantom_cleanup().lock().unwrap_or_else(|e| e.into_inner());
+    let mine: Vec<u64> = queue
+        .iter()
+        .filter(|(cookie, _)| *cookie == my_cookie)
+        .map(|(_, packed)| *packed)
+        .collect();
+    queue.retain(|(cookie, _)| *cookie != my_cookie);
+    if queue.is_empty() {
+        HAS_PHANTOM_CLEANUP.store(false, Ordering::Relaxed);
+    }
+    drop(queue);
+
+    if mine.is_empty() {
+        return;
+    }
+
+    // Remove matching phantom StackEntries from this thread's stack.
+    STACK.with(|stack| {
+        stack
+            .borrow_mut()
+            .retain(|e| !(e.name == "<phantom>" && mine.contains(&e.packed)));
+    });
+    // Remove matching PHANTOM_ARCS entries.
+    PHANTOM_ARCS.with(|arcs| {
+        arcs.borrow_mut()
+            .retain(|(packed, _)| !mine.contains(packed));
+    });
+}
+
 /// Bookkeeping half of enter(): epoch, alloc save, stack push, name interning.
 /// Returns a packed u64: `[cookie:32][name_id:16][depth:16]`.
 #[inline(never)]
@@ -580,6 +728,11 @@ fn enter_cold(name: &'static str) -> u64 {
     let _ = epoch();
 
     let cookie = THREAD_COOKIE.with(|c| *c);
+
+    // Drain stale phantoms before computing depth, so the new entry
+    // gets the correct stack position.
+    drain_phantom_cleanup(cookie);
+
     let name_id = intern_name(name);
 
     let saved_alloc = crate::alloc::ALLOC_COUNTERS
@@ -593,8 +746,9 @@ fn enter_cold(name: &'static str) -> u64 {
     #[cfg(feature = "cpu-time")]
     let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
 
-    let depth = STACK.with(|stack| {
+    STACK.with(|stack| {
         let depth = stack.borrow().len() as u16;
+        let packed = pack_cookie_name_depth(cookie, name_id, depth);
         stack.borrow_mut().push(StackEntry {
             name,
             children_ms: 0.0,
@@ -603,13 +757,10 @@ fn enter_cold(name: &'static str) -> u64 {
             #[cfg(feature = "cpu-time")]
             cpu_start_ns,
             saved_alloc,
-            depth,
-            cookie_low: cookie as u32,
+            packed,
         });
-        depth
-    });
-
-    pack_cookie_name_depth(cookie, name_id, depth)
+        packed
+    })
 }
 
 /// Start timing a function. Returns a Guard that records the measurement on drop.
@@ -785,6 +936,9 @@ pub fn collect_all() -> Vec<FunctionRecord> {
 }
 
 /// Clear all collected timing data for the current thread.
+///
+/// Also drains any pending phantom cleanup entries targeting this thread
+/// from the global queue, so stale phantoms don't leak across test runs.
 pub fn reset() {
     STACK.with(|stack| stack.borrow_mut().clear());
     RECORDS.with(|records| {
@@ -795,6 +949,10 @@ pub fn reset() {
     INVOCATIONS.with(|inv| inv.borrow_mut().clear());
     FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
     FRAMES.with(|frames| frames.borrow_mut().clear());
+    PHANTOM_ARCS.with(|arcs| arcs.borrow_mut().clear());
+    // Drain any pending cleanup entries for this thread from the global queue.
+    let cookie = THREAD_COOKIE.with(|c| *c);
+    drain_phantom_cleanup(cookie);
 }
 
 /// Clear collected timing data across ALL threads, plus the calling thread's
@@ -812,6 +970,16 @@ pub fn reset_all() {
     };
     for arc in &arcs {
         arc.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    // Clear global phantom state.
+    phantom_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    {
+        let mut cleanup = phantom_cleanup().lock().unwrap_or_else(|e| e.into_inner());
+        cleanup.clear();
+        HAS_PHANTOM_CLEANUP.store(false, Ordering::Relaxed);
     }
     // Clear the calling thread's local state.
     reset();
@@ -1187,8 +1355,7 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
             #[cfg(feature = "cpu-time")]
             cpu_start_ns,
             saved_alloc,
-            depth,
-            cookie_low: cookie as u32,
+            packed: pack_cookie_name_depth(cookie, intern_name(ctx.parent_name), depth),
         });
     });
 
@@ -2481,9 +2648,10 @@ mod tests {
 
     #[test]
     fn phantom_on_second_migration_captures_children() {
-        // B→C migration: guard enters on A, migrates to B (phantom on B,
+        // A->B->C migration: guard enters on A, migrates to B (phantom on B,
         // child on B updates it), migrates to C (phantom on C, child on C
-        // updates it), drops on C. C's phantom children are subtracted.
+        // updates it), drops on C. Both B's and C's phantom children should
+        // be subtracted from the migrated record's self_ns via forwarding.
         reset();
         let guard = enter("bc_parent");
         let (guard, _b_invocations) = std::thread::scope(|s| {
@@ -2514,18 +2682,38 @@ mod tests {
             .unwrap()
         });
 
+        let b_child_ns = _b_invocations
+            .iter()
+            .find(|r| r.name == "b_child")
+            .expect("b_child invocation")
+            .elapsed_ns;
+
+        let c_child_ns = c_invocations
+            .iter()
+            .find(|r| r.name == "c_child")
+            .expect("c_child invocation")
+            .elapsed_ns;
+
         let migrated = c_invocations
             .iter()
             .find(|r| r.name == "bc_parent")
             .expect("migrated guard should preserve name 'bc_parent'");
 
-        // C's phantom captures c_child's time. B's phantom is leaked
-        // (documented limitation: no cross-thread phantom forwarding yet).
+        // Both B's and C's children should be subtracted from self_ns.
+        let children_ns = migrated.elapsed_ns - migrated.self_ns;
         assert!(
             migrated.self_ns < migrated.elapsed_ns,
-            "self_ns ({}) should be < elapsed_ns ({}) with children on C",
+            "self_ns ({}) should be < elapsed_ns ({}) with children on B and C",
             migrated.self_ns,
             migrated.elapsed_ns,
+        );
+        // Verify B's children were forwarded: children_ns should account
+        // for both b_child and c_child (with tolerance for timing noise).
+        let expected_children_min = (b_child_ns + c_child_ns) / 2;
+        assert!(
+            children_ns >= expected_children_min,
+            "children_ns ({children_ns}) should include both b_child ({b_child_ns}) \
+             and c_child ({c_child_ns}) (min threshold: {expected_children_min})",
         );
     }
 
@@ -2675,5 +2863,94 @@ mod tests {
         assert_eq!(unpack_cookie(packed_zero), 0);
         assert_eq!(unpack_name_id(packed_zero), 0);
         assert_eq!(unpack_depth(packed_zero), 0);
+    }
+
+    #[test]
+    fn phantom_cleaned_up_on_intermediate_thread() {
+        // A -> B -> C migration: after the guard migrates from B to C, B's
+        // phantom StackEntry should be cleaned up so that subsequent functions
+        // on B get correct depth and frame boundaries.
+        //
+        // This test uses a long-lived thread B (via channels) so we can:
+        // 1. Send the guard to B (check() pushes phantom)
+        // 2. Send the guard to C (check() on C detects re-migration, drops on C)
+        // 3. Run a new function on B and verify correct behavior
+        use std::sync::mpsc;
+
+        reset();
+
+        let guard = enter("async_fn");
+
+        // Thread B: stays alive across the full test.
+        let (tx_guard_to_b, rx_guard_on_b) = mpsc::channel::<Guard>();
+        let (tx_guard_from_b, rx_guard_from_b) = mpsc::channel::<Guard>();
+        let (tx_verify, rx_verify) = mpsc::channel::<()>();
+        let (tx_results, rx_results) = mpsc::channel::<(u16, usize)>(); // (depth, frame_count)
+
+        let b_handle = std::thread::spawn(move || {
+            // Phase 1: receive guard, push phantom.
+            let guard = rx_guard_on_b.recv().unwrap();
+            guard.check();
+            // Send guard to main so it can go to C.
+            tx_guard_from_b.send(guard).unwrap();
+
+            // Phase 2: wait for signal that guard has been dropped on C.
+            rx_verify.recv().unwrap();
+
+            // Phase 3: run a new top-level function on B.
+            // Do NOT call reset() here -- that would clear the stack
+            // and mask the bug. Only clear invocations and frames so we
+            // can observe fresh results.
+            INVOCATIONS.with(|inv| inv.borrow_mut().clear());
+            FRAMES.with(|frames| frames.borrow_mut().clear());
+            FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
+
+            {
+                let _work = enter("b_later_work");
+                burn_cpu(1_000);
+            }
+
+            // Collect results: depth and frame count.
+            let invocations = collect_invocations();
+            let frames = collect_frames();
+
+            let work_rec = invocations
+                .iter()
+                .find(|r| r.name == "b_later_work")
+                .expect("should have b_later_work record");
+
+            tx_results.send((work_rec.depth, frames.len())).unwrap();
+        });
+
+        // Send guard to B.
+        tx_guard_to_b.send(guard).unwrap();
+        // Get guard back from B.
+        let guard = rx_guard_from_b.recv().unwrap();
+
+        // Send guard to C, where it drops.
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                guard.check();
+                drop(guard);
+            });
+        });
+
+        // Signal B that the guard has dropped.
+        tx_verify.send(()).unwrap();
+
+        // Get results from B.
+        let (depth, frame_count) = rx_results.recv().unwrap();
+        b_handle.join().unwrap();
+
+        // After phantom cleanup, b_later_work should be depth 0 (top-level on B).
+        assert_eq!(
+            depth, 0,
+            "b_later_work depth should be 0 after phantom cleanup (got {depth})"
+        );
+        // Frame boundary should have triggered (depth == 0).
+        assert_eq!(
+            frame_count, 1,
+            "should have 1 frame after b_later_work completes (got {frame_count})"
+        );
     }
 }
