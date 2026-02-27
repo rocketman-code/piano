@@ -70,6 +70,37 @@ const SCOPE_FUNCTIONS: &[&str] = &["scope", "scope_fifo"];
 /// SpanContext stays on the parent thread.
 const FORK_TRIGGER_FUNCTIONS: &[&str] = &["scope", "scope_fifo", "join"];
 
+/// Check whether a statement's expression tree contains an `.await`.
+fn contains_await(stmt: &syn::Stmt) -> bool {
+    struct AwaitFinder {
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for AwaitFinder {
+        fn visit_expr_await(&mut self, _: &'ast syn::ExprAwait) {
+            self.found = true;
+        }
+    }
+    let mut finder = AwaitFinder { found: false };
+    syn::visit::Visit::visit_stmt(&mut finder, stmt);
+    finder.found
+}
+
+/// Inject `_piano_guard.check();` after each statement containing `.await`.
+fn inject_await_checks(block: &mut syn::Block) {
+    let mut new_stmts = Vec::with_capacity(block.stmts.len() * 2);
+    for stmt in block.stmts.drain(..) {
+        let has_await = contains_await(&stmt);
+        new_stmts.push(stmt);
+        if has_await {
+            let check_stmt: syn::Stmt = syn::parse_quote! {
+                _piano_guard.check();
+            };
+            new_stmts.push(check_stmt);
+        }
+    }
+    block.stmts = new_stmts;
+}
+
 struct Instrumenter {
     targets: HashSet<String>,
     current_impl: Option<String>,
@@ -79,7 +110,7 @@ struct Instrumenter {
 }
 
 impl Instrumenter {
-    fn inject_guard(&mut self, block: &mut syn::Block, name: &str) {
+    fn inject_guard(&mut self, block: &mut syn::Block, name: &str, is_async: bool) {
         if !self.targets.contains(name) {
             return;
         }
@@ -87,6 +118,14 @@ impl Instrumenter {
             let _piano_guard = piano_runtime::enter(#name);
         };
         block.stmts.insert(0, guard_stmt);
+
+        // For async functions, inject check() after each .await statement
+        // so the phantom StackEntry is pushed on migration.
+        if is_async {
+            let guard_stmt = block.stmts.remove(0);
+            inject_await_checks(block);
+            block.stmts.insert(0, guard_stmt);
+        }
 
         // If the function body contains concurrency calls, inject fork
         // and adopt in the relevant closures.
@@ -377,7 +416,8 @@ impl VisitMut for Instrumenter {
     fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
         if is_instrumentable(&node.sig) {
             let name = node.sig.ident.to_string();
-            self.inject_guard(&mut node.block, &name);
+            let is_async = node.sig.asyncness.is_some();
+            self.inject_guard(&mut node.block, &name, is_async);
         }
         syn::visit_mut::visit_item_fn_mut(self, node);
     }
@@ -397,7 +437,8 @@ impl VisitMut for Instrumenter {
                 Some(ty) => format!("{ty}::{method}"),
                 None => method,
             };
-            self.inject_guard(&mut node.block, &qualified);
+            let is_async = node.sig.asyncness.is_some();
+            self.inject_guard(&mut node.block, &qualified, is_async);
         }
         syn::visit_mut::visit_impl_item_fn_mut(self, node);
     }
@@ -418,7 +459,8 @@ impl VisitMut for Instrumenter {
                     Some(trait_name) => format!("{trait_name}::{method}"),
                     None => method,
                 };
-                self.inject_guard(block, &qualified);
+                let is_async = node.sig.asyncness.is_some();
+                self.inject_guard(block, &qualified, is_async);
             }
         }
         syn::visit_mut::visit_trait_item_fn_mut(self, node);
@@ -1284,6 +1326,61 @@ trait Service {
                 .source
                 .contains("piano_runtime::enter(\"Service::handle\")"),
             "async trait default method SHOULD be instrumented. Got:\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn injects_check_after_await_in_async_fn() {
+        let targets: HashSet<String> = ["do_work".to_string()].into_iter().collect();
+        let source = r#"
+async fn do_work() {
+    setup();
+    fetch().await;
+    process();
+    save().await;
+}
+"#;
+        let result = instrument_source(source, &targets).unwrap();
+        let check_count = result.source.matches("_piano_guard.check()").count();
+        assert_eq!(
+            check_count, 2,
+            "should inject check() after each .await statement. Got:\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn no_check_injection_in_sync_fn() {
+        let targets: HashSet<String> = ["do_work".to_string()].into_iter().collect();
+        let source = r#"
+fn do_work() {
+    setup();
+    process();
+}
+"#;
+        let result = instrument_source(source, &targets).unwrap();
+        assert_eq!(
+            result.source.matches("_piano_guard.check()").count(),
+            0,
+            "sync fn should not get check() calls. Got:\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn no_check_injection_for_non_target_async_fn() {
+        let targets: HashSet<String> = ["other".to_string()].into_iter().collect();
+        let source = r#"
+async fn not_targeted() {
+    fetch().await;
+}
+"#;
+        let result = instrument_source(source, &targets).unwrap();
+        assert_eq!(
+            result.source.matches("_piano_guard.check()").count(),
+            0,
+            "non-target async fn should not get check() calls. Got:\n{}",
             result.source
         );
     }
