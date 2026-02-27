@@ -1181,7 +1181,9 @@ pub fn shutdown() {
         Some(d) => d,
         None => return,
     };
-    shutdown_impl(&dir);
+    if shutdown_impl(&dir) {
+        std::process::exit(70);
+    }
 }
 
 /// Like `shutdown`, but writes run files to the specified directory.
@@ -1190,14 +1192,19 @@ pub fn shutdown() {
 /// of the global `~/.piano/runs/`. `PIANO_RUNS_DIR` env var takes priority
 /// if set (for testing and user overrides).
 pub fn shutdown_to(dir: &str) {
-    if let Ok(override_dir) = std::env::var("PIANO_RUNS_DIR") {
-        shutdown_impl(std::path::Path::new(&override_dir));
+    let failed = if let Ok(override_dir) = std::env::var("PIANO_RUNS_DIR") {
+        shutdown_impl(std::path::Path::new(&override_dir))
     } else {
-        shutdown_impl(std::path::Path::new(dir));
+        shutdown_impl(std::path::Path::new(dir))
+    };
+    if failed {
+        std::process::exit(70);
     }
 }
 
-fn shutdown_impl(dir: &std::path::Path) {
+/// Returns `true` if any write failed.
+fn shutdown_impl(dir: &std::path::Path) -> bool {
+    let mut write_failed = false;
     let ts = timestamp_ms();
 
     // Write frame-level data if present (NDJSON format).
@@ -1213,15 +1220,28 @@ fn shutdown_impl(dir: &std::path::Path) {
             }
         }
         let path = dir.join(format!("{ts}.ndjson"));
-        let _ = write_ndjson(&frames, &fn_names, &path);
+        if let Err(e) = write_ndjson(&frames, &fn_names, &path) {
+            eprintln!(
+                "piano: failed to write profiling data to {}: {e}",
+                path.display()
+            );
+            write_failed = true;
+        }
     }
 
     // Always write aggregated cross-thread data (JSON format).
     let records = collect_all();
     if !records.is_empty() {
         let path = dir.join(format!("{ts}.json"));
-        let _ = write_json(&records, &path);
+        if let Err(e) = write_json(&records, &path) {
+            eprintln!(
+                "piano: failed to write profiling data to {}: {e}",
+                path.display()
+            );
+            write_failed = true;
+        }
     }
+    write_failed
 }
 
 /// Context for propagating parent-child CPU timing across thread boundaries.
@@ -2952,5 +2972,27 @@ mod tests {
             frame_count, 1,
             "should have 1 frame after b_later_work completes (got {frame_count})"
         );
+    }
+
+    #[test]
+    fn shutdown_impl_reports_write_errors_to_stderr() {
+        reset();
+        // Produce some data so shutdown_impl has something to write.
+        {
+            let _g = enter("write_err_test");
+        }
+
+        // Point at a path that cannot be a directory (a file, not a dir).
+        let tmp = std::env::temp_dir().join(format!("piano_write_err_{}", std::process::id()));
+        // Create a file where shutdown_impl expects a directory.
+        std::fs::write(&tmp, b"not a directory").unwrap();
+
+        // shutdown_impl should try to write and fail, printing to stderr.
+        // We can't easily capture stderr in a unit test, so instead verify
+        // that the function does not panic and returns normally.
+        shutdown_impl(&tmp);
+
+        // Clean up.
+        let _ = std::fs::remove_file(&tmp);
     }
 }
