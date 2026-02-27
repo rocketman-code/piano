@@ -764,22 +764,24 @@ fn merge_runs(runs: &[&Run]) -> Run {
 /// to prevent path traversal and confusing filesystem behavior.
 fn validate_tag_name(tag: &str) -> Result<(), Error> {
     if tag.is_empty() {
-        return Err(Error::InvalidTagName("tag name must not be empty".into()));
+        return Err(Error::InvalidTagName(
+            "provide a tag name (e.g., `baseline`, `v1`)".into(),
+        ));
     }
     if tag == "." || tag == ".." {
         return Err(Error::InvalidTagName(format!(
-            "'{tag}' is not a valid tag name"
+            "valid tags are plain names (e.g., `baseline`), got '{tag}'"
         )));
     }
     if tag.contains('/') || tag.contains('\\') {
-        return Err(Error::InvalidTagName(
-            "tag name must not contain path separators".into(),
-        ));
+        return Err(Error::InvalidTagName(format!(
+            "valid tags cannot include slashes, got '{tag}'"
+        )));
     }
     if tag.contains('\0') {
-        return Err(Error::InvalidTagName(
-            "tag name must not contain null bytes".into(),
-        ));
+        return Err(Error::InvalidTagName(format!(
+            "valid tags are printable text (e.g., `baseline`, `v1`), got '{tag}'"
+        )));
     }
     Ok(())
 }
