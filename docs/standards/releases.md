@@ -39,8 +39,8 @@ Batch related changes, release when there's a meaningful set of user-facing chan
 6. Bump version in both `Cargo.toml` and `piano-runtime/Cargo.toml`
 7. Run `cargo generate-lockfile --ignore-rust-version` (without this flag, cargo constrains all workspace deps to the lowest member MSRV, downgrading shared dependencies like clap)
 8. Commit: `chore(cargo): bump version to 0.x.y` -- this commit may only touch `Cargo.toml`, `piano-runtime/Cargo.toml`, and `Cargo.lock` (CI enforces this on `release/*` PRs)
-9. Tag: `git tag v0.x.y`
-10. Push: `git push && git push --tags`
+9. Open a PR (`release/v0.x.y` branch) -- main has branch protection, even version bumps go through a PR
+10. After merge, tag the merge commit: `git tag v0.x.y` and `git push --tags`
 11. Publish `piano-runtime` first: `cargo publish -p piano-runtime`
 12. Wait for crates.io to index, then publish `piano`: `cargo publish -p piano`
 13. Close the milestone on GitHub (if applicable)
