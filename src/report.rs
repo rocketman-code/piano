@@ -293,16 +293,16 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
     let mut out = String::new();
     if has_cpu {
         out.push_str(&format!(
-            "{HEADER}{:<40} {:>8} {:>10} {:>10} {:>10}{HEADER:#}\n",
-            "Function", "Calls", "Total", "Self", "CPU"
-        ));
-        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(84)));
-    } else {
-        out.push_str(&format!(
-            "{HEADER}{:<40} {:>8} {:>10} {:>10}{HEADER:#}\n",
-            "Function", "Calls", "Total", "Self"
+            "{HEADER}{:<40} {:>10} {:>10} {:>8}{HEADER:#}\n",
+            "Function", "Self", "CPU", "Calls"
         ));
         out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(72)));
+    } else {
+        out.push_str(&format!(
+            "{HEADER}{:<40} {:>10} {:>8}{HEADER:#}\n",
+            "Function", "Self", "Calls"
+        ));
+        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(60)));
     }
 
     for entry in &entries {
@@ -312,13 +312,13 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
                 None => format!("{:>11}", "-"),
             };
             out.push_str(&format!(
-                "{:<40} {:>8} {:>9.2}ms {:>9.2}ms {}\n",
-                entry.name, entry.calls, entry.total_ms, entry.self_ms, cpu_str
+                "{:<40} {:>9.2}ms {} {:>8}\n",
+                entry.name, entry.self_ms, cpu_str, entry.calls
             ));
         } else {
             out.push_str(&format!(
-                "{:<40} {:>8} {:>9.2}ms {:>9.2}ms\n",
-                entry.name, entry.calls, entry.total_ms, entry.self_ms
+                "{:<40} {:>9.2}ms {:>8}\n",
+                entry.name, entry.self_ms, entry.calls
             ));
         }
     }
@@ -336,7 +336,7 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
 
 /// Format frame-level data as a summary table with allocation columns.
 ///
-/// Columns: Function | Calls | Self | Allocs | Alloc Bytes
+/// Columns: Function | Self | Calls | Allocs | Alloc Bytes
 /// Footer: hidden-function count when applicable.
 pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> String {
     struct FnStats {
@@ -403,14 +403,14 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
     let mut out = String::new();
     if has_cpu {
         out.push_str(&format!(
-            "{HEADER}{:<40} {:>8} {:>10} {:>10} {:>8} {:>12}{HEADER:#}\n",
-            "Function", "Calls", "Self", "CPU", "Allocs", "Alloc Bytes"
+            "{HEADER}{:<40} {:>10} {:>10} {:>8} {:>8} {:>12}{HEADER:#}\n",
+            "Function", "Self", "CPU", "Calls", "Allocs", "Alloc Bytes"
         ));
         out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(93)));
     } else {
         out.push_str(&format!(
-            "{HEADER}{:<40} {:>8} {:>10} {:>8} {:>12}{HEADER:#}\n",
-            "Function", "Calls", "Self", "Allocs", "Alloc Bytes"
+            "{HEADER}{:<40} {:>10} {:>8} {:>8} {:>12}{HEADER:#}\n",
+            "Function", "Self", "Calls", "Allocs", "Alloc Bytes"
         ));
         out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(82)));
     }
@@ -424,13 +424,13 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
                 None => format!("{:>10}", "-"),
             };
             out.push_str(&format!(
-                "{:<40} {:>8} {:>10} {:>10} {:>8} {:>12}\n",
-                e.name, e.total_calls, self_str, cpu_str, e.total_allocs, bytes_str
+                "{:<40} {:>10} {:>10} {:>8} {:>8} {:>12}\n",
+                e.name, self_str, cpu_str, e.total_calls, e.total_allocs, bytes_str
             ));
         } else {
             out.push_str(&format!(
-                "{:<40} {:>8} {:>10} {:>8} {:>12}\n",
-                e.name, e.total_calls, self_str, e.total_allocs, bytes_str
+                "{:<40} {:>10} {:>8} {:>8} {:>12}\n",
+                e.name, self_str, e.total_calls, e.total_allocs, bytes_str
             ));
         }
     }
@@ -2335,6 +2335,130 @@ mod tests {
         assert!(
             has_entry,
             "worker_fn should have a frame entry with calls=50"
+        );
+    }
+
+    #[test]
+    fn format_table_with_frames_self_before_calls() {
+        let frame_data = FrameData {
+            fn_names: vec!["work".into()],
+            frames: vec![vec![FrameFnEntry {
+                fn_id: 0,
+                calls: 1,
+                self_ns: 5_000_000,
+                cpu_self_ns: None,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            }]],
+            companion_fn_ids: HashSet::new(),
+        };
+        let table = format_table_with_frames(&frame_data, false);
+        let self_pos = table.find("Self").expect("Self header missing");
+        let calls_pos = table.find("Calls").expect("Calls header missing");
+        assert!(
+            self_pos < calls_pos,
+            "Self column should appear before Calls. Got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn format_table_with_frames_cpu_column_order() {
+        let frame_data = FrameData {
+            fn_names: vec!["work".into()],
+            frames: vec![vec![FrameFnEntry {
+                fn_id: 0,
+                calls: 1,
+                self_ns: 5_000_000,
+                cpu_self_ns: Some(4_000_000),
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            }]],
+            companion_fn_ids: HashSet::new(),
+        };
+        let table = format_table_with_frames(&frame_data, false);
+        let self_pos = table.find("Self").expect("Self header missing");
+        let cpu_pos = table.find("CPU").expect("CPU header missing");
+        let calls_pos = table.find("Calls").expect("Calls header missing");
+        assert!(
+            self_pos < cpu_pos && cpu_pos < calls_pos,
+            "Column order should be Self | CPU | Calls. Got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn format_table_no_total_column() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 5,
+                total_ms: 20.0,
+                self_ms: 15.0,
+                ..Default::default()
+            }],
+        };
+        let table = format_table(&run, false);
+        assert!(
+            !table.contains("Total"),
+            "Total column should not appear. Got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn format_table_self_before_calls() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 5,
+                total_ms: 20.0,
+                self_ms: 15.0,
+                ..Default::default()
+            }],
+        };
+        let table = format_table(&run, false);
+        let self_pos = table.find("Self").expect("Self header missing");
+        let calls_pos = table.find("Calls").expect("Calls header missing");
+        assert!(
+            self_pos < calls_pos,
+            "Self column should appear before Calls. Got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn format_table_cpu_column_order() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 5,
+                total_ms: 20.0,
+                self_ms: 15.0,
+                cpu_self_ms: Some(12.0),
+                ..Default::default()
+            }],
+        };
+        let table = format_table(&run, false);
+        assert!(
+            !table.contains("Total"),
+            "Total column should not appear with CPU. Got:\n{table}"
+        );
+        let self_pos = table.find("Self").expect("Self header missing");
+        let cpu_pos = table.find("CPU").expect("CPU header missing");
+        let calls_pos = table.find("Calls").expect("Calls header missing");
+        assert!(
+            self_pos < cpu_pos && cpu_pos < calls_pos,
+            "Column order should be Self | CPU | Calls. Got:\n{table}"
         );
     }
 }
