@@ -234,6 +234,31 @@ thread_local! {
     /// this thread (from Guard::check()), the corresponding Arc is stored here
     /// so child drops can write through to it.
     static PHANTOM_ARCS: RefCell<Vec<(u64, Arc<Mutex<f64>>)>> = RefCell::new(Vec::new());
+    /// Reusable Vec for frame aggregation. Cleared and reused on each
+    /// depth-0 boundary to avoid per-frame heap allocation.
+    /// Linear scan is faster than HashMap for the typical 1-5 unique functions
+    /// per frame (no hashing, no bucket probing, no memset for clear).
+    static FRAME_AGG_VEC: RefCell<Vec<FrameFnSummary>> = RefCell::new(Vec::new());
+    /// Fast local buffer for RawRecords. Avoids the Mutex lock on RECORDS
+    /// for every drop_cold call. Flushed to RECORDS at depth-0 boundaries.
+    static RECORDS_BUF: RefCell<Vec<RawRecord>> = RefCell::new(Vec::new());
+}
+
+/// Drain RECORDS_BUF into the Mutex-guarded RECORDS.
+/// Called at depth-0 boundaries and before reading RECORDS.
+fn flush_records_buf() {
+    RECORDS_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if buf.is_empty() {
+            return;
+        }
+        RECORDS.with(|records| {
+            records
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(buf.drain(..));
+        });
+    });
 }
 
 /// Sequential per-thread identifier. Cheaper than `std::thread::current().id()`
@@ -508,6 +533,8 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         let children_ns = (phantom_children_ms * 1_000_000.0) as u64;
         let self_ns = elapsed_ns.saturating_sub(children_ns);
 
+        // Migrated path: push directly to Mutex-guarded RECORDS (not the
+        // fast buffer) because this thread has no depth-0 boundary to flush.
         RECORDS.with(|records| {
             records
                 .lock()
@@ -612,17 +639,14 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             }
         }
 
-        RECORDS.with(|records| {
-            records
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(RawRecord {
-                    name: entry.name,
-                    elapsed_ms,
-                    children_ms,
-                    #[cfg(feature = "cpu-time")]
-                    cpu_self_ns,
-                });
+        RECORDS_BUF.with(|buf| {
+            buf.borrow_mut().push(RawRecord {
+                name: entry.name,
+                elapsed_ms,
+                children_ms,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns,
+            });
         });
 
         let invocation = InvocationRecord {
@@ -647,13 +671,24 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         FRAME_BUFFER.with(|buf| {
             buf.borrow_mut().push(invocation);
         });
+
+        // Flush RECORDS_BUF at frame boundaries. Normally this is depth 0,
+        // but fork/adopt places an entry at depth 0 on worker threads,
+        // pushing real functions to depth 1+. Flush when all remaining
+        // stack entries are at depth 0 (all real work for this frame done).
+        let remaining_all_base = stack.borrow().iter().all(|e| unpack_depth(e.packed) == 0);
+        let is_frame_boundary = unpack_depth(entry.packed) == 0 || remaining_all_base;
+
+        if is_frame_boundary {
+            flush_records_buf();
+        }
         if unpack_depth(entry.packed) == 0 {
             FRAME_BUFFER.with(|buf| {
-                let buffer = buf.borrow_mut().drain(..).collect::<Vec<_>>();
-                let summary = aggregate_frame(&buffer);
-                FRAMES.with(|frames| {
-                    frames.borrow_mut().push(summary);
-                });
+                {
+                    let borrowed = buf.borrow();
+                    aggregate_frame_into_frames(&borrowed);
+                }
+                buf.borrow_mut().clear();
             });
         }
     });
@@ -857,6 +892,7 @@ fn aggregate(raw: &[RawRecord], registered: &[&str]) -> Vec<FunctionRecord> {
 /// Aggregate raw records into per-function summaries, sorted by self_ms descending.
 /// Reads only from the current thread's record storage.
 pub fn collect() -> Vec<FunctionRecord> {
+    flush_records_buf();
     RECORDS.with(|records| {
         let recs = records.lock().unwrap_or_else(|e| e.into_inner());
         REGISTERED.with(|reg| aggregate(&recs, &reg.borrow()))
@@ -874,35 +910,47 @@ pub fn collect_frames() -> Vec<Vec<FrameFnSummary>> {
     FRAMES.with(|frames| frames.borrow().clone())
 }
 
-/// Aggregate invocation records within a single frame into per-function summaries.
-fn aggregate_frame(records: &[InvocationRecord]) -> Vec<FrameFnSummary> {
-    let mut map: HashMap<&'static str, FrameFnSummary> = HashMap::new();
-    for rec in records {
-        let entry = map.entry(rec.name).or_insert(FrameFnSummary {
-            name: rec.name,
-            calls: 0,
-            self_ns: 0,
-            #[cfg(feature = "cpu-time")]
-            cpu_self_ns: 0,
-            alloc_count: 0,
-            alloc_bytes: 0,
-            free_count: 0,
-            free_bytes: 0,
-        });
-        entry.calls += 1;
-        entry.self_ns += rec.self_ns;
-        #[cfg(feature = "cpu-time")]
-        {
-            entry.cpu_self_ns += rec.cpu_self_ns;
+/// Aggregate invocation records and push directly into FRAMES.
+///
+/// Uses a thread-local reusable Vec with linear scan instead of HashMap.
+/// For the typical 1-5 unique functions per frame, linear scan avoids
+/// hashing, bucket probing, and memset overhead.
+fn aggregate_frame_into_frames(records: &[InvocationRecord]) {
+    FRAME_AGG_VEC.with(|vec_cell| {
+        let mut agg = vec_cell.borrow_mut();
+        agg.clear();
+        for rec in records {
+            // Linear scan: faster than HashMap for typical 1-5 unique functions.
+            // Function names are interned &'static str, so pointer comparison works.
+            if let Some(entry) = agg.iter_mut().find(|e| std::ptr::eq(e.name, rec.name)) {
+                entry.calls += 1;
+                entry.self_ns += rec.self_ns;
+                #[cfg(feature = "cpu-time")]
+                {
+                    entry.cpu_self_ns += rec.cpu_self_ns;
+                }
+                entry.alloc_count += rec.alloc_count;
+                entry.alloc_bytes += rec.alloc_bytes;
+                entry.free_count += rec.free_count;
+                entry.free_bytes += rec.free_bytes;
+            } else {
+                agg.push(FrameFnSummary {
+                    name: rec.name,
+                    calls: 1,
+                    self_ns: rec.self_ns,
+                    #[cfg(feature = "cpu-time")]
+                    cpu_self_ns: rec.cpu_self_ns,
+                    alloc_count: rec.alloc_count,
+                    alloc_bytes: rec.alloc_bytes,
+                    free_count: rec.free_count,
+                    free_bytes: rec.free_bytes,
+                });
+            }
         }
-        entry.alloc_count += rec.alloc_count;
-        entry.alloc_bytes += rec.alloc_bytes;
-        entry.free_count += rec.free_count;
-        entry.free_bytes += rec.free_bytes;
-    }
-    #[allow(clippy::iter_kv_map)]
-    // into_values() requires Rust 1.54; we support 1.59 but keep the pattern uniform
-    map.into_iter().map(|(_, v)| v).collect()
+        FRAMES.with(|frames| {
+            frames.borrow_mut().push(agg.clone());
+        });
+    });
 }
 
 /// Collect records from ALL threads via the global registry.
@@ -920,6 +968,9 @@ fn aggregate_frame(records: &[InvocationRecord]) -> Vec<FrameFnSummary> {
 /// `main()`, so calling `collect_all()` from `main()` (via `shutdown()`)
 /// sees every registered name.
 pub fn collect_all() -> Vec<FunctionRecord> {
+    // Flush the calling thread's local buffer so its records are visible.
+    // Other threads' buffers are flushed at their own depth-0 boundaries.
+    flush_records_buf();
     let arcs: Vec<ThreadRecordArc> = {
         let registry = thread_records().lock().unwrap_or_else(|e| e.into_inner());
         registry.clone()
@@ -941,6 +992,7 @@ pub fn collect_all() -> Vec<FunctionRecord> {
 /// from the global queue, so stale phantoms don't leak across test runs.
 pub fn reset() {
     STACK.with(|stack| stack.borrow_mut().clear());
+    RECORDS_BUF.with(|buf| buf.borrow_mut().clear());
     RECORDS.with(|records| {
         records.lock().unwrap_or_else(|e| e.into_inner()).clear();
     });
@@ -949,6 +1001,7 @@ pub fn reset() {
     INVOCATIONS.with(|inv| inv.borrow_mut().clear());
     FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
     FRAMES.with(|frames| frames.borrow_mut().clear());
+    FRAME_AGG_VEC.with(|v| v.borrow_mut().clear());
     PHANTOM_ARCS.with(|arcs| arcs.borrow_mut().clear());
     // Drain any pending cleanup entries for this thread from the global queue.
     let cookie = THREAD_COOKIE.with(|c| *c);
