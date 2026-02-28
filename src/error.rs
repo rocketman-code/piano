@@ -24,6 +24,14 @@ pub enum Error {
     #[error("no piano runs found -- run `piano profile` to generate one")]
     NoRuns,
 
+    #[error("need at least 2 runs to diff -- run `piano profile` to generate one")]
+    NotEnoughRuns,
+
+    #[error(
+        "piano diff takes 0 or 2 arguments\n\n  piano diff              compare the two most recent runs\n  piano diff <A> <B>      compare two specific runs (path or tag)"
+    )]
+    DiffArgCount,
+
     #[error("no run found for tag '{tag}' -- run piano tag to see available tags")]
     RunNotFound { tag: String },
 
