@@ -163,6 +163,26 @@ pub fn find_workspace_root(project_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Find the project root by walking up from `start_dir` looking for Cargo.toml.
+///
+/// Returns the canonicalized directory containing the nearest Cargo.toml.
+/// Starts checking `start_dir` itself, then walks up through parents.
+pub fn find_project_root(start_dir: &Path) -> Result<PathBuf, Error> {
+    let start = start_dir
+        .canonicalize()
+        .map_err(|_| Error::NoProjectFound(start_dir.to_path_buf()))?;
+    let mut dir = start.as_path();
+    loop {
+        if dir.join("Cargo.toml").exists() {
+            return Ok(dir.to_path_buf());
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return Err(Error::NoProjectFound(start_dir.to_path_buf())),
+        }
+    }
+}
+
 /// Find the binary entry point for a Cargo project.
 ///
 /// Reads `Cargo.toml` and resolves the entry point using Cargo's rules:
