@@ -49,7 +49,7 @@ pub struct FrameData {
     pub fn_names: Vec<String>,
     pub frames: Vec<Vec<FrameFnEntry>>,
     /// Function IDs that were merged from companion JSON (worker-thread data).
-    /// These lack per-frame granularity, so percentile columns show "-".
+    /// These lack per-frame granularity.
     pub companion_fn_ids: HashSet<usize>,
 }
 
@@ -334,10 +334,10 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
     out
 }
 
-/// Format frame-level data as a table with percentile and allocation columns.
+/// Format frame-level data as a summary table with allocation columns.
 ///
-/// Columns: Function | Calls | Self | p50 | p99 | Allocs | Bytes
-/// Footer: frame count summary and hidden-function count when applicable.
+/// Columns: Function | Calls | Self | Allocs | Alloc Bytes
+/// Footer: hidden-function count when applicable.
 pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> String {
     struct FnStats {
         name: String,
@@ -346,8 +346,6 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
         total_cpu_self_ns: Option<u64>,
         total_allocs: u64,
         total_alloc_bytes: u64,
-        per_frame_self_ns: Vec<u64>,
-        is_companion: bool,
     }
 
     let has_cpu = frame_data
@@ -357,11 +355,7 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
 
     let mut stats_map: HashMap<usize, FnStats> = HashMap::new();
     for frame in &frame_data.frames {
-        // Track which fn_ids appear in this frame (to fill zeros for missing ones).
-        let mut seen: HashMap<usize, bool> = stats_map.keys().map(|&k| (k, false)).collect();
-
         for entry in frame {
-            seen.insert(entry.fn_id, true);
             let fn_id = entry.fn_id;
             let stats = stats_map.entry(fn_id).or_insert_with(|| FnStats {
                 name: frame_data
@@ -374,8 +368,6 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
                 total_cpu_self_ns: if has_cpu { Some(0) } else { None },
                 total_allocs: 0,
                 total_alloc_bytes: 0,
-                per_frame_self_ns: Vec::new(),
-                is_companion: frame_data.companion_fn_ids.contains(&fn_id),
             });
             stats.total_calls += entry.calls;
             stats.total_self_ns += entry.self_ns;
@@ -384,18 +376,6 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
             }
             stats.total_allocs += entry.alloc_count;
             stats.total_alloc_bytes += entry.alloc_bytes;
-            stats.per_frame_self_ns.push(entry.self_ns);
-        }
-
-        // Functions not present in this frame get a zero entry.
-        // Skip companion-merged functions — they lack per-frame granularity.
-        for (fn_id, present) in &seen {
-            if !present
-                && !frame_data.companion_fn_ids.contains(fn_id)
-                && let Some(stats) = stats_map.get_mut(fn_id)
-            {
-                stats.per_frame_self_ns.push(0);
-            }
         }
     }
 
@@ -409,8 +389,6 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
                 total_cpu_self_ns: if has_cpu { Some(0) } else { None },
                 total_allocs: 0,
                 total_alloc_bytes: 0,
-                per_frame_self_ns: Vec::new(),
-                is_companion: frame_data.companion_fn_ids.contains(&fn_id),
             });
         }
     }
@@ -422,43 +400,23 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
     }
     entries.sort_by(|a, b| b.total_self_ns.cmp(&a.total_self_ns));
 
-    // Pad per-frame vectors so late-appearing functions have zeros for earlier frames.
-    let total_frames = frame_data.frames.len();
-    for e in &mut entries {
-        while e.per_frame_self_ns.len() < total_frames {
-            e.per_frame_self_ns.push(0);
-        }
-    }
-
-    // Sort per-frame vectors for percentile calculation.
-    for e in &mut entries {
-        e.per_frame_self_ns.sort_unstable();
-    }
-
     let mut out = String::new();
     if has_cpu {
         out.push_str(&format!(
-            "{HEADER}{:<40} {:>8} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10}{HEADER:#}\n",
-            "Function", "Calls", "Self", "CPU", "p50", "p99", "Allocs", "Bytes"
+            "{HEADER}{:<40} {:>8} {:>10} {:>10} {:>8} {:>12}{HEADER:#}\n",
+            "Function", "Calls", "Self", "CPU", "Allocs", "Alloc Bytes"
         ));
-        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(112)));
+        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(93)));
     } else {
         out.push_str(&format!(
-            "{HEADER}{:<40} {:>8} {:>10} {:>10} {:>10} {:>8} {:>10}{HEADER:#}\n",
-            "Function", "Calls", "Self", "p50", "p99", "Allocs", "Bytes"
+            "{HEADER}{:<40} {:>8} {:>10} {:>8} {:>12}{HEADER:#}\n",
+            "Function", "Calls", "Self", "Allocs", "Alloc Bytes"
         ));
-        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(100)));
+        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(82)));
     }
 
     for e in &entries {
         let self_str = format_ns(e.total_self_ns);
-        let (p50_str, p99_str) = if e.is_companion {
-            (format!("{:>10}", "-"), format!("{:>10}", "-"))
-        } else {
-            let p50 = percentile(&e.per_frame_self_ns, 50.0);
-            let p99 = percentile(&e.per_frame_self_ns, 99.0);
-            (format_ns(p50), format_ns(p99))
-        };
         let bytes_str = format_bytes(e.total_alloc_bytes);
         if has_cpu {
             let cpu_str = match e.total_cpu_self_ns {
@@ -466,26 +424,16 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
                 None => format!("{:>10}", "-"),
             };
             out.push_str(&format!(
-                "{:<40} {:>8} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10}\n",
-                e.name,
-                e.total_calls,
-                self_str,
-                cpu_str,
-                p50_str,
-                p99_str,
-                e.total_allocs,
-                bytes_str
+                "{:<40} {:>8} {:>10} {:>10} {:>8} {:>12}\n",
+                e.name, e.total_calls, self_str, cpu_str, e.total_allocs, bytes_str
             ));
         } else {
             out.push_str(&format!(
-                "{:<40} {:>8} {:>10} {:>10} {:>10} {:>8} {:>10}\n",
-                e.name, e.total_calls, self_str, p50_str, p99_str, e.total_allocs, bytes_str
+                "{:<40} {:>8} {:>10} {:>8} {:>12}\n",
+                e.name, e.total_calls, self_str, e.total_allocs, bytes_str
             ));
         }
     }
-
-    let n_frames = frame_data.frames.len();
-    out.push_str(&format!("{DIM}\n{n_frames} frames{DIM:#}"));
 
     let hidden = total_count - entries.len();
     if hidden > 0 {
@@ -500,7 +448,7 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
 
 /// Format per-frame breakdown table.
 ///
-/// Each row is one frame. Columns: Frame | Total | [one column per function] | Allocs | Bytes
+/// Each row is one frame. Columns: Frame | Total | [one column per function] | Allocs | Alloc Bytes
 /// Frames where total exceeds 2x median are flagged as spikes.
 pub fn format_frames_table(frame_data: &FrameData) -> String {
     let fn_names = &frame_data.fn_names;
@@ -527,10 +475,13 @@ pub fn format_frames_table(frame_data: &FrameData) -> String {
     for name in fn_names {
         out.push_str(&format!(" {name:>fn_col_width$}"));
     }
-    out.push_str(&format!(" {:>8} {:>10}{HEADER:#}\n", "Allocs", "Bytes"));
+    out.push_str(&format!(
+        " {:>8} {:>12}{HEADER:#}\n",
+        "Allocs", "Alloc Bytes"
+    ));
     out.push_str(&format!(
         "{DIM}{}{DIM:#}\n",
-        "-".repeat(32 + n_fns * (fn_col_width + 1))
+        "-".repeat(34 + n_fns * (fn_col_width + 1))
     ));
 
     // Rows.
@@ -549,7 +500,7 @@ pub fn format_frames_table(frame_data: &FrameData) -> String {
 
         let allocs: u64 = frame.iter().map(|e| e.alloc_count).sum();
         let bytes: u64 = frame.iter().map(|e| e.alloc_bytes).sum();
-        out.push_str(&format!(" {:>8} {:>10}", allocs, format_bytes(bytes)));
+        out.push_str(&format!(" {:>8} {:>12}", allocs, format_bytes(bytes)));
 
         if is_spike {
             out.push_str(" <<");
@@ -1330,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn format_table_with_frames_shows_percentiles_and_allocs() {
+    fn format_table_with_frames_shows_allocs() {
         let frame_data = FrameData {
             fn_names: vec!["update".into(), "physics".into()],
             frames: vec![
@@ -1382,15 +1333,19 @@ mod tests {
             companion_fn_ids: HashSet::new(),
         };
         let table = format_table_with_frames(&frame_data, true);
-        assert!(table.contains("p50"), "should have p50 column");
-        assert!(table.contains("p99"), "should have p99 column");
+        assert!(!table.contains("p50"), "should not have p50 column");
+        assert!(!table.contains("p99"), "should not have p99 column");
+        assert!(
+            !table.contains("frames"),
+            "should not have frame count footer"
+        );
         assert!(table.contains("Allocs"), "should have allocs column");
+        assert!(
+            table.contains("Alloc Bytes"),
+            "should have alloc bytes column"
+        );
         assert!(table.contains("update"), "should list update");
         assert!(table.contains("physics"), "should list physics");
-        assert!(
-            table.contains("frames"),
-            "should have frame count in footer"
-        );
     }
 
     #[test]
@@ -2380,104 +2335,6 @@ mod tests {
         assert!(
             has_entry,
             "worker_fn should have a frame entry with calls=50"
-        );
-    }
-
-    #[test]
-    fn companion_merged_functions_show_dash_for_percentiles() {
-        // Worker-thread functions merged from companion JSON only have data in
-        // frame 0. With multiple frames, their p50/p99 would misleadingly show
-        // 0ns. Instead, companion-merged functions should show "-" for percentiles.
-        let mut companion_fn_ids = HashSet::new();
-        companion_fn_ids.insert(2); // "worker_fn" is companion-merged
-
-        let frame_data = FrameData {
-            fn_names: vec!["main_fn".into(), "update".into(), "worker_fn".into()],
-            frames: vec![
-                vec![
-                    FrameFnEntry {
-                        fn_id: 0,
-                        calls: 1,
-                        self_ns: 5_000_000,
-                        cpu_self_ns: None,
-                        alloc_count: 0,
-                        alloc_bytes: 0,
-                        free_count: 0,
-                        free_bytes: 0,
-                    },
-                    FrameFnEntry {
-                        fn_id: 1,
-                        calls: 1,
-                        self_ns: 2_000_000,
-                        cpu_self_ns: None,
-                        alloc_count: 0,
-                        alloc_bytes: 0,
-                        free_count: 0,
-                        free_bytes: 0,
-                    },
-                    // worker_fn only appears in frame 0
-                    FrameFnEntry {
-                        fn_id: 2,
-                        calls: 50,
-                        self_ns: 3_000_000,
-                        cpu_self_ns: None,
-                        alloc_count: 100,
-                        alloc_bytes: 5000,
-                        free_count: 0,
-                        free_bytes: 0,
-                    },
-                ],
-                vec![
-                    FrameFnEntry {
-                        fn_id: 0,
-                        calls: 1,
-                        self_ns: 4_000_000,
-                        cpu_self_ns: None,
-                        alloc_count: 0,
-                        alloc_bytes: 0,
-                        free_count: 0,
-                        free_bytes: 0,
-                    },
-                    FrameFnEntry {
-                        fn_id: 1,
-                        calls: 1,
-                        self_ns: 2_500_000,
-                        cpu_self_ns: None,
-                        alloc_count: 0,
-                        alloc_bytes: 0,
-                        free_count: 0,
-                        free_bytes: 0,
-                    },
-                    // worker_fn absent from frame 1
-                ],
-            ],
-            companion_fn_ids,
-        };
-
-        let table = format_table_with_frames(&frame_data, false);
-
-        // worker_fn should show "-" for p50/p99, not "0ns"
-        let worker_line = table
-            .lines()
-            .find(|l| l.contains("worker_fn"))
-            .expect("worker_fn should appear in table");
-        assert!(
-            worker_line.contains("-"),
-            "worker_fn should show '-' for percentiles, got: {worker_line}"
-        );
-        assert!(
-            !worker_line.contains("0ns"),
-            "worker_fn should NOT show '0ns' for percentiles, got: {worker_line}"
-        );
-
-        // Regular functions should still show normal percentiles
-        let main_line = table
-            .lines()
-            .find(|l| l.contains("main_fn"))
-            .expect("main_fn should appear in table");
-        assert!(
-            !main_line.contains("-"),
-            "main_fn should show real percentiles, not '-', got: {main_line}"
         );
     }
 }
