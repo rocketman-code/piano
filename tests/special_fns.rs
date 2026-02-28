@@ -159,18 +159,18 @@ fn list_skipped_shows_excluded_functions() {
         "piano build --list-skipped failed:\nstderr: {stderr}\nstdout: {stdout}"
     );
 
-    // Should list all skipped functions with reasons.
+    // Should list all skipped functions with file paths and reasons.
     assert!(
-        stdout.contains("dangerous (unsafe)"),
-        "should list unsafe fn: {stdout}"
+        stdout.contains("src/main.rs: dangerous (unsafe)"),
+        "should list unsafe fn with path: {stdout}"
     );
     assert!(
-        stdout.contains("fixed_size (const)"),
-        "should list const fn: {stdout}"
+        stdout.contains("src/main.rs: fixed_size (const)"),
+        "should list const fn with path: {stdout}"
     );
     assert!(
-        stdout.contains("ffi_callback (extern)"),
-        "should list extern fn: {stdout}"
+        stdout.contains("src/main.rs: ffi_callback (extern)"),
+        "should list extern fn with path: {stdout}"
     );
 
     // Should NOT list normal functions.
@@ -178,7 +178,7 @@ fn list_skipped_shows_excluded_functions() {
         !stdout.contains("normal_work"),
         "should not list normal fn: {stdout}"
     );
-    assert!(!stdout.contains("main"), "should not list main: {stdout}");
+    assert!(!stdout.contains("main ("), "should not list main: {stdout}");
 }
 
 #[test]

@@ -45,6 +45,8 @@ impl std::fmt::Display for SkipReason {
 pub struct SkippedFunction {
     pub name: String,
     pub reason: SkipReason,
+    /// File path relative to the project root (e.g. "src/ffi.rs").
+    pub path: PathBuf,
 }
 
 /// Result of target resolution: resolved targets plus any skipped functions.
@@ -68,6 +70,14 @@ pub fn resolve_targets(
 ) -> Result<ResolveResult, Error> {
     let rs_files = walk_rs_files(src_dir)?;
 
+    // Compute a relative path like "src/main.rs" from an absolute file path.
+    let project_root = src_dir.parent().unwrap_or(src_dir);
+    let rel_path = |file: &Path| -> PathBuf {
+        file.strip_prefix(project_root)
+            .unwrap_or(file)
+            .to_path_buf()
+    };
+
     let mut results: Vec<ResolvedTarget> = Vec::new();
     let mut skipped: Vec<SkippedFunction> = Vec::new();
 
@@ -78,7 +88,7 @@ pub fn resolve_targets(
                 path: file.clone(),
                 source,
             })?;
-            let (all_fns, file_skipped) = extract_functions(&source, file);
+            let (all_fns, file_skipped) = extract_functions(&source, file, rel_path(file));
             if !all_fns.is_empty() {
                 merge_into(&mut results, file, all_fns);
             }
@@ -95,7 +105,8 @@ pub fn resolve_targets(
                                 source,
                             }
                         })?;
-                        let (all_fns, file_skipped) = extract_functions(&source, file);
+                        let (all_fns, file_skipped) =
+                            extract_functions(&source, file, rel_path(file));
                         let matched: Vec<String> = all_fns
                             .into_iter()
                             .filter(|name| {
@@ -138,7 +149,8 @@ pub fn resolve_targets(
                                 source,
                             }
                         })?;
-                        let (all_fns, file_skipped) = extract_functions(&source, file);
+                        let (all_fns, file_skipped) =
+                            extract_functions(&source, file, rel_path(file));
                         if !all_fns.is_empty() {
                             merge_into(&mut results, file, all_fns);
                         }
@@ -167,7 +179,8 @@ pub fn resolve_targets(
                                 source,
                             }
                         })?;
-                        let (all_fns, file_skipped) = extract_functions(&source, file);
+                        let (all_fns, file_skipped) =
+                            extract_functions(&source, file, rel_path(file));
                         if !all_fns.is_empty() {
                             merge_into(&mut results, file, all_fns);
                         }
@@ -251,7 +264,11 @@ fn walk_rs_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> 
 ///
 /// Functions annotated with `#[test]` and items inside `#[cfg(test)]` modules
 /// are excluded -- they are not useful instrumentation targets.
-fn extract_functions(source: &str, path: &Path) -> (Vec<String>, Vec<SkippedFunction>) {
+fn extract_functions(
+    source: &str,
+    path: &Path,
+    rel_path: PathBuf,
+) -> (Vec<String>, Vec<SkippedFunction>) {
     let syntax = match syn::parse_file(source) {
         Ok(f) => f,
         Err(e) => {
@@ -260,7 +277,13 @@ fn extract_functions(source: &str, path: &Path) -> (Vec<String>, Vec<SkippedFunc
         }
     };
 
-    let mut collector = FnCollector::default();
+    let mut collector = FnCollector {
+        functions: Vec::new(),
+        skipped: Vec::new(),
+        path: rel_path,
+        current_impl: None,
+        current_trait: None,
+    };
     collector.visit_file(&syntax);
     (collector.functions, collector.skipped)
 }
@@ -307,10 +330,11 @@ pub(crate) fn classify_skip(sig: &syn::Signature) -> Option<SkipReason> {
 }
 
 /// AST visitor that collects function names from a parsed Rust file.
-#[derive(Default)]
 struct FnCollector {
     functions: Vec<String>,
     skipped: Vec<SkippedFunction>,
+    /// File path relative to the project root (e.g. "src/core.rs").
+    path: PathBuf,
     /// When inside an `impl` block, holds the type name (e.g. "Resolver").
     current_impl: Option<String>,
     /// When inside a `trait` block, holds the trait name.
@@ -331,6 +355,7 @@ impl<'ast> Visit<'ast> for FnCollector {
                 self.skipped.push(SkippedFunction {
                     name: node.sig.ident.to_string(),
                     reason,
+                    path: self.path.clone(),
                 });
             } else {
                 self.functions.push(node.sig.ident.to_string());
@@ -358,6 +383,7 @@ impl<'ast> Visit<'ast> for FnCollector {
                 self.skipped.push(SkippedFunction {
                     name: qualified,
                     reason,
+                    path: self.path.clone(),
                 });
             } else {
                 self.functions.push(qualified);
@@ -385,6 +411,7 @@ impl<'ast> Visit<'ast> for FnCollector {
                 self.skipped.push(SkippedFunction {
                     name: qualified,
                     reason,
+                    path: self.path.clone(),
                 });
             } else {
                 self.functions.push(qualified);
@@ -449,7 +476,8 @@ fn build_suggestion_hint(specs: &[TargetSpec], rs_files: &[PathBuf]) -> String {
         let Ok(source) = std::fs::read_to_string(file) else {
             continue;
         };
-        let (fns, _skipped) = extract_functions(&source, file);
+        // path unused — only collecting function names for suggestions
+        let (fns, _skipped) = extract_functions(&source, file, PathBuf::new());
         all_names.extend(fns);
     }
     all_names.sort();
@@ -993,6 +1021,11 @@ mod tests {
         );
         assert_eq!(result.skipped[0].name, "dangerous");
         assert_eq!(result.skipped[0].reason, SkipReason::Unsafe);
+        assert_eq!(
+            result.skipped[0].path,
+            Path::new("src/special_fns.rs"),
+            "skipped function should have relative file path"
+        );
     }
 
     #[test]
@@ -1029,6 +1062,16 @@ mod tests {
             skipped_names.contains(&("Widget::raw_ptr", &SkipReason::Unsafe)),
             "should report unsafe impl method as skipped: {skipped_names:?}"
         );
+
+        // All skipped functions from this file should have the correct relative path.
+        for s in &result.skipped {
+            assert_eq!(
+                s.path,
+                Path::new("src/special_fns.rs"),
+                "skipped fn '{}' should have relative path src/special_fns.rs",
+                s.name
+            );
+        }
 
         let all_fns: Vec<&str> = result
             .targets
