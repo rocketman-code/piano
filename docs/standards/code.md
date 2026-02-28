@@ -39,6 +39,8 @@ Integration tests in `tests/`. No unit tests in source files currently.
 
 ## CI
 
+### ci.yml (all PRs + push to main)
+
 Five jobs, all on ubuntu-latest:
 
 1. `fmt` -- `cargo fmt --check`
@@ -47,4 +49,6 @@ Five jobs, all on ubuntu-latest:
 4. `msrv` -- tests on Rust 1.88 (CLI MSRV) + installs 1.59 for runtime MSRV test
 5. `doc` -- `cargo doc --workspace --no-deps` with `-D warnings`
 
-Triggers: push to main, all pull requests.
+### release.yml (release/* PRs only)
+
+1. `version-bump-scope` -- ensures `chore(cargo): bump version` commits only touch `Cargo.toml`, `piano-runtime/Cargo.toml`, and `Cargo.lock`
