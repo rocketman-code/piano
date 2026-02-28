@@ -765,7 +765,14 @@ fn resolve_diff_label(
 
 fn cmd_tag(name: Option<String>) -> Result<(), Error> {
     let Some(name) = name else {
-        let tags_dir = default_tags_dir()?;
+        let tags_dir = match default_tags_dir() {
+            Ok(dir) => dir,
+            Err(Error::NoRuns) => {
+                eprintln!("no tags saved");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         let mut entries: Vec<String> = std::fs::read_dir(&tags_dir)
             .map_err(|source| Error::RunReadError {
                 path: tags_dir.clone(),
@@ -780,6 +787,10 @@ fn cmd_tag(name: Option<String>) -> Result<(), Error> {
                 }
             })
             .collect();
+        if entries.is_empty() {
+            eprintln!("no tags saved");
+            return Ok(());
+        }
         entries.sort();
         for tag in &entries {
             println!("{tag}");
