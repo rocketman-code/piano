@@ -276,8 +276,12 @@ fn build_project(
     let ResolveResult { targets, skipped } = resolve_targets(&src_dir, &specs, exact)?;
 
     if list_skipped {
-        for s in &skipped {
-            println!("{}: {} ({})", s.path.display(), s.name, s.reason);
+        if skipped.is_empty() {
+            eprintln!("no functions skipped");
+        } else {
+            for s in &skipped {
+                println!("{}: {} ({})", s.path.display(), s.name, s.reason);
+            }
         }
         return Ok(None);
     }

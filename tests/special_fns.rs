@@ -249,3 +249,76 @@ fn build_no_warning_in_instrument_everything_mode() {
         "should NOT warn about skipped functions in instrument-everything mode: {stderr}"
     );
 }
+
+fn create_project_without_special_fns(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "normal"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "normal"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"fn work() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..1000 {
+        sum += i;
+    }
+    sum
+}
+
+fn main() {
+    let result = work();
+    println!("{result}");
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn list_skipped_shows_message_when_none_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("normal");
+    create_project_without_special_fns(&project_dir);
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["build", "--list-skipped", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build --list-skipped");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "piano build --list-skipped should succeed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    assert!(
+        stdout.is_empty(),
+        "stdout should be empty when no functions skipped: {stdout}"
+    );
+
+    assert!(
+        stderr.contains("no functions skipped"),
+        "stderr should say 'no functions skipped': {stderr}"
+    );
+}
