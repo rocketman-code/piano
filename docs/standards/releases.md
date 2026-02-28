@@ -38,7 +38,7 @@ Batch related changes, release when there's a meaningful set of user-facing chan
 5. Update `CHANGELOG.md`
 6. Bump version in both `Cargo.toml` and `piano-runtime/Cargo.toml`
 7. Run `cargo generate-lockfile --ignore-rust-version` (without this flag, cargo constrains all workspace deps to the lowest member MSRV, downgrading shared dependencies like clap)
-8. Commit: `chore(cargo): bump version to 0.x.y`
+8. Commit: `chore(cargo): bump version to 0.x.y` -- this commit may only touch `Cargo.toml`, `piano-runtime/Cargo.toml`, and `Cargo.lock` (CI enforces this on `release/*` PRs)
 9. Tag: `git tag v0.x.y`
 10. Push: `git push && git push --tags`
 11. Publish `piano-runtime` first: `cargo publish -p piano-runtime`
