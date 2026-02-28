@@ -22,6 +22,38 @@ pub struct ResolvedTarget {
     pub functions: Vec<String>,
 }
 
+/// Why a function was excluded from instrumentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    Unsafe,
+    Const,
+    ExternAbi,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipReason::Unsafe => write!(f, "unsafe"),
+            SkipReason::Const => write!(f, "const"),
+            SkipReason::ExternAbi => write!(f, "extern"),
+        }
+    }
+}
+
+/// A function that was in the target set but excluded from instrumentation.
+#[derive(Debug, Clone)]
+pub struct SkippedFunction {
+    pub name: String,
+    pub reason: SkipReason,
+}
+
+/// Result of target resolution: resolved targets plus any skipped functions.
+#[derive(Debug)]
+pub struct ResolveResult {
+    pub targets: Vec<ResolvedTarget>,
+    pub skipped: Vec<SkippedFunction>,
+}
+
 /// Resolve user-provided target specs against the source tree rooted at `src_dir`.
 ///
 /// Returns one `ResolvedTarget` per file that contains at least one matching function.
@@ -33,10 +65,11 @@ pub fn resolve_targets(
     src_dir: &Path,
     specs: &[TargetSpec],
     exact: bool,
-) -> Result<Vec<ResolvedTarget>, Error> {
+) -> Result<ResolveResult, Error> {
     let rs_files = walk_rs_files(src_dir)?;
 
     let mut results: Vec<ResolvedTarget> = Vec::new();
+    let mut skipped: Vec<SkippedFunction> = Vec::new();
 
     if specs.is_empty() {
         // No specs = instrument all functions in all files.
@@ -45,10 +78,11 @@ pub fn resolve_targets(
                 path: file.clone(),
                 source,
             })?;
-            let all_fns = extract_functions(&source, file);
+            let (all_fns, file_skipped) = extract_functions(&source, file);
             if !all_fns.is_empty() {
                 merge_into(&mut results, file, all_fns);
             }
+            skipped.extend(file_skipped);
         }
     } else {
         for spec in specs {
@@ -61,7 +95,7 @@ pub fn resolve_targets(
                                 source,
                             }
                         })?;
-                        let all_fns = extract_functions(&source, file);
+                        let (all_fns, file_skipped) = extract_functions(&source, file);
                         let matched: Vec<String> = all_fns
                             .into_iter()
                             .filter(|name| {
@@ -77,6 +111,18 @@ pub fn resolve_targets(
                         if !matched.is_empty() {
                             merge_into(&mut results, file, matched);
                         }
+                        let matched_skipped: Vec<SkippedFunction> = file_skipped
+                            .into_iter()
+                            .filter(|s| {
+                                let bare = s.name.rsplit("::").next().unwrap_or(&s.name);
+                                if exact {
+                                    bare == pattern.as_str() || s.name == pattern.as_str()
+                                } else {
+                                    bare.contains(pattern.as_str())
+                                }
+                            })
+                            .collect();
+                        skipped.extend(matched_skipped);
                     }
                 }
                 TargetSpec::File(file_path) => {
@@ -90,10 +136,11 @@ pub fn resolve_targets(
                                 source,
                             }
                         })?;
-                        let all_fns = extract_functions(&source, file);
+                        let (all_fns, file_skipped) = extract_functions(&source, file);
                         if !all_fns.is_empty() {
                             merge_into(&mut results, file, all_fns);
                         }
+                        skipped.extend(file_skipped);
                     }
                 }
                 TargetSpec::Mod(module_name) => {
@@ -118,16 +165,17 @@ pub fn resolve_targets(
                                 source,
                             }
                         })?;
-                        let all_fns = extract_functions(&source, file);
+                        let (all_fns, file_skipped) = extract_functions(&source, file);
                         if !all_fns.is_empty() {
                             merge_into(&mut results, file, all_fns);
                         }
+                        skipped.extend(file_skipped);
                     }
                 }
             }
         }
 
-        if results.is_empty() {
+        if results.is_empty() && skipped.is_empty() {
             let desc = specs
                 .iter()
                 .map(|s| match s {
@@ -150,7 +198,13 @@ pub fn resolve_targets(
         r.functions.dedup();
     }
 
-    Ok(results)
+    skipped.sort_by(|a, b| a.name.cmp(&b.name));
+    skipped.dedup_by(|a, b| a.name == b.name);
+
+    Ok(ResolveResult {
+        targets: results,
+        skipped,
+    })
 }
 
 /// Merge matched functions into the results vec, coalescing by file path.
@@ -195,18 +249,18 @@ fn walk_rs_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> 
 ///
 /// Functions annotated with `#[test]` and items inside `#[cfg(test)]` modules
 /// are excluded -- they are not useful instrumentation targets.
-fn extract_functions(source: &str, path: &Path) -> Vec<String> {
+fn extract_functions(source: &str, path: &Path) -> (Vec<String>, Vec<SkippedFunction>) {
     let syntax = match syn::parse_file(source) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("warning: skipping {}: {e}", path.display());
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
 
     let mut collector = FnCollector::default();
     collector.visit_file(&syntax);
-    collector.functions
+    (collector.functions, collector.skipped)
 }
 
 /// Check whether an attribute list contains a specific simple attribute (e.g. `#[test]`).
@@ -229,23 +283,32 @@ fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
 /// Returns false for function signatures that cannot be instrumented:
 /// const fn (enter() is not const), unsafe fn, extern fn (non-Rust ABI).
 pub(crate) fn is_instrumentable(sig: &syn::Signature) -> bool {
-    if sig.constness.is_some() || sig.unsafety.is_some() {
-        return false;
+    classify_skip(sig).is_none()
+}
+
+/// Classify why a function signature cannot be instrumented.
+/// Returns None if the function is instrumentable.
+pub(crate) fn classify_skip(sig: &syn::Signature) -> Option<SkipReason> {
+    if sig.unsafety.is_some() {
+        return Some(SkipReason::Unsafe);
+    }
+    if sig.constness.is_some() {
+        return Some(SkipReason::Const);
     }
     if let Some(abi) = &sig.abi {
-        // `extern "Rust"` is fine; any other ABI (or bare `extern`) is not.
         let is_rust_abi = abi.name.as_ref().is_some_and(|name| name.value() == "Rust");
         if !is_rust_abi {
-            return false;
+            return Some(SkipReason::ExternAbi);
         }
     }
-    true
+    None
 }
 
 /// AST visitor that collects function names from a parsed Rust file.
 #[derive(Default)]
 struct FnCollector {
     functions: Vec<String>,
+    skipped: Vec<SkippedFunction>,
     /// When inside an `impl` block, holds the type name (e.g. "Resolver").
     current_impl: Option<String>,
     /// When inside a `trait` block, holds the trait name.
@@ -261,8 +324,15 @@ impl<'ast> Visit<'ast> for FnCollector {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if !has_attr(&node.attrs, "test") && is_instrumentable(&node.sig) {
-            self.functions.push(node.sig.ident.to_string());
+        if !has_attr(&node.attrs, "test") {
+            if let Some(reason) = classify_skip(&node.sig) {
+                self.skipped.push(SkippedFunction {
+                    name: node.sig.ident.to_string(),
+                    reason,
+                });
+            } else {
+                self.functions.push(node.sig.ident.to_string());
+            }
         }
         syn::visit::visit_item_fn(self, node);
     }
@@ -275,12 +345,20 @@ impl<'ast> Visit<'ast> for FnCollector {
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if !has_attr(&node.attrs, "test") && is_instrumentable(&node.sig) {
+        if !has_attr(&node.attrs, "test") {
             let method_name = node.sig.ident.to_string();
-            if let Some(ref impl_name) = self.current_impl {
-                self.functions.push(format!("{impl_name}::{method_name}"));
+            let qualified = if let Some(ref impl_name) = self.current_impl {
+                format!("{impl_name}::{method_name}")
             } else {
-                self.functions.push(method_name);
+                method_name
+            };
+            if let Some(reason) = classify_skip(&node.sig) {
+                self.skipped.push(SkippedFunction {
+                    name: qualified,
+                    reason,
+                });
+            } else {
+                self.functions.push(qualified);
             }
         }
         syn::visit::visit_impl_item_fn(self, node);
@@ -294,12 +372,20 @@ impl<'ast> Visit<'ast> for FnCollector {
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-        if node.default.is_some() && is_instrumentable(&node.sig) {
+        if node.default.is_some() {
             let method_name = node.sig.ident.to_string();
-            if let Some(ref trait_name) = self.current_trait {
-                self.functions.push(format!("{trait_name}::{method_name}"));
+            let qualified = if let Some(ref trait_name) = self.current_trait {
+                format!("{trait_name}::{method_name}")
             } else {
-                self.functions.push(method_name);
+                method_name
+            };
+            if let Some(reason) = classify_skip(&node.sig) {
+                self.skipped.push(SkippedFunction {
+                    name: qualified,
+                    reason,
+                });
+            } else {
+                self.functions.push(qualified);
             }
         }
         syn::visit::visit_trait_item_fn(self, node);
@@ -361,7 +447,8 @@ fn build_suggestion_hint(specs: &[TargetSpec], rs_files: &[PathBuf]) -> String {
         let Ok(source) = std::fs::read_to_string(file) else {
             continue;
         };
-        all_names.extend(extract_functions(&source, file));
+        let (fns, _skipped) = extract_functions(&source, file);
+        all_names.extend(fns);
     }
     all_names.sort();
     all_names.dedup();
@@ -475,9 +562,10 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::Fn("walk".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
-        let all_fns: Vec<&str> = results
+        let all_fns: Vec<&str> = result
+            .targets
             .iter()
             .flat_map(|r| r.functions.iter().map(String::as_str))
             .collect();
@@ -497,9 +585,10 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::Fn("resolve".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
-        let all_fns: Vec<&str> = results
+        let all_fns: Vec<&str> = result
+            .targets
             .iter()
             .flat_map(|r| r.functions.iter().map(String::as_str))
             .collect();
@@ -520,10 +609,10 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::File("resolver.rs".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
-        assert_eq!(results.len(), 1);
-        let fns = &results[0].functions;
+        assert_eq!(result.targets.len(), 1);
+        let fns = &result.targets[0].functions;
         assert!(fns.contains(&"helper".to_string()));
         assert!(fns.contains(&"Resolver::internal_resolve".to_string()));
         assert!(fns.contains(&"Resolver::resolve".to_string()));
@@ -535,10 +624,10 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::Mod("walker".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
-        assert_eq!(results.len(), 1);
-        let fns = &results[0].functions;
+        assert_eq!(result.targets.len(), 1);
+        let fns = &result.targets[0].functions;
         assert!(fns.contains(&"walk_dir".to_string()));
         assert!(fns.contains(&"scan".to_string()));
     }
@@ -573,9 +662,10 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::File("with_tests.rs".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
-        let all_fns: Vec<&str> = results
+        let all_fns: Vec<&str> = result
+            .targets
             .iter()
             .flat_map(|r| r.functions.iter().map(String::as_str))
             .collect();
@@ -613,9 +703,10 @@ mod tests {
 
         // Should succeed despite the unparseable file.
         let specs = [TargetSpec::Fn("walk".into())];
-        let results = resolve_targets(&src, &specs, false).unwrap();
+        let result = resolve_targets(&src, &specs, false).unwrap();
 
-        let all_fns: Vec<&str> = results
+        let all_fns: Vec<&str> = result
+            .targets
             .iter()
             .flat_map(|r| r.functions.iter().map(String::as_str))
             .collect();
@@ -636,9 +727,10 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs: Vec<TargetSpec> = vec![];
-        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
-        let all_fns: Vec<&str> = results
+        let all_fns: Vec<&str> = result
+            .targets
             .iter()
             .flat_map(|r| r.functions.iter().map(String::as_str))
             .collect();
@@ -681,9 +773,10 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::File("special_fns.rs".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
-        let all_fns: Vec<&str> = results
+        let all_fns: Vec<&str> = result
+            .targets
             .iter()
             .flat_map(|r| r.functions.iter().map(String::as_str))
             .collect();
@@ -795,9 +888,10 @@ mod tests {
 
         // "walk" with exact=true should match only "walk", not "walk_dir".
         let specs = [TargetSpec::Fn("walk".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs, true).unwrap();
+        let result = resolve_targets(&tmp.path().join("src"), &specs, true).unwrap();
 
-        let all_fns: Vec<&str> = results
+        let all_fns: Vec<&str> = result
+            .targets
             .iter()
             .flat_map(|r| r.functions.iter().map(String::as_str))
             .collect();
@@ -816,9 +910,10 @@ mod tests {
 
         // Exact match should also work with qualified names like "Resolver::resolve".
         let specs = [TargetSpec::Fn("Resolver::resolve".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs, true).unwrap();
+        let result = resolve_targets(&tmp.path().join("src"), &specs, true).unwrap();
 
-        let all_fns: Vec<&str> = results
+        let all_fns: Vec<&str> = result
+            .targets
             .iter()
             .flat_map(|r| r.functions.iter().map(String::as_str))
             .collect();
@@ -848,5 +943,67 @@ mod tests {
             err.contains("no functions matched"),
             "error should say no functions matched: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_skipped_filtered_by_fn_pattern() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        // "dangerous" matches the unsafe fn "dangerous" but not "fixed_size" or "ffi_callback"
+        let specs = [TargetSpec::Fn("dangerous".into())];
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
+
+        assert_eq!(
+            result.skipped.len(),
+            1,
+            "only one skipped fn matches 'dangerous'"
+        );
+        assert_eq!(result.skipped[0].name, "dangerous");
+        assert_eq!(result.skipped[0].reason, SkipReason::Unsafe);
+    }
+
+    #[test]
+    fn resolve_reports_skipped_functions_with_reasons() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        let specs = [TargetSpec::File("special_fns.rs".into())];
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
+
+        let skipped_names: Vec<(&str, &SkipReason)> = result
+            .skipped
+            .iter()
+            .map(|s| (s.name.as_str(), &s.reason))
+            .collect();
+
+        assert!(
+            skipped_names.contains(&("fixed_size", &SkipReason::Const)),
+            "should report const fn as skipped: {skipped_names:?}"
+        );
+        assert!(
+            skipped_names.contains(&("dangerous", &SkipReason::Unsafe)),
+            "should report unsafe fn as skipped: {skipped_names:?}"
+        );
+        assert!(
+            skipped_names.contains(&("ffi_callback", &SkipReason::ExternAbi)),
+            "should report extern fn as skipped: {skipped_names:?}"
+        );
+        assert!(
+            skipped_names.contains(&("Widget::none", &SkipReason::Const)),
+            "should report const impl method as skipped: {skipped_names:?}"
+        );
+        assert!(
+            skipped_names.contains(&("Widget::raw_ptr", &SkipReason::Unsafe)),
+            "should report unsafe impl method as skipped: {skipped_names:?}"
+        );
+
+        let all_fns: Vec<&str> = result
+            .targets
+            .iter()
+            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .collect();
+        assert!(all_fns.contains(&"normal_fn"));
+        assert!(all_fns.contains(&"Widget::valid_method"));
     }
 }
