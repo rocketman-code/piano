@@ -6,8 +6,8 @@ use std::process;
 use clap::{Parser, Subcommand};
 
 use piano::build::{
-    build_instrumented, find_bin_entry_point, find_workspace_root, inject_runtime_dependency,
-    inject_runtime_path_dependency, prepare_staging,
+    build_instrumented, find_bin_entry_point, find_project_root, find_workspace_root,
+    inject_runtime_dependency, inject_runtime_path_dependency, prepare_staging,
 };
 use piano::error::Error;
 use piano::report::{
@@ -50,9 +50,9 @@ enum Commands {
         #[arg(long = "mod", value_name = "NAME")]
         mod_patterns: Vec<String>,
 
-        /// Project root (defaults to current directory).
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
+        /// Project root (auto-detected from Cargo.toml).
+        #[arg(long)]
+        project: Option<PathBuf>,
 
         /// Path to piano-runtime source (for development before publishing).
         #[arg(long)]
@@ -85,9 +85,9 @@ enum Commands {
         #[arg(long = "mod", value_name = "NAME")]
         mod_patterns: Vec<String>,
 
-        /// Project root (defaults to current directory).
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
+        /// Project root (auto-detected from Cargo.toml).
+        #[arg(long)]
+        project: Option<PathBuf>,
 
         /// Path to piano-runtime source (for development before publishing).
         #[arg(long)]
@@ -392,10 +392,14 @@ fn cmd_build(
     fn_patterns: Vec<String>,
     file_patterns: Vec<PathBuf>,
     mod_patterns: Vec<String>,
-    project: PathBuf,
+    project: Option<PathBuf>,
     runtime_path: Option<PathBuf>,
     cpu_time: bool,
 ) -> Result<(), Error> {
+    let project = match project {
+        Some(p) => p,
+        None => find_project_root(&std::env::current_dir()?)?,
+    };
     let (binary, _runs_dir) = build_project(
         fn_patterns,
         file_patterns,
@@ -464,7 +468,7 @@ fn cmd_profile(
     fn_patterns: Vec<String>,
     file_patterns: Vec<PathBuf>,
     mod_patterns: Vec<String>,
-    project: PathBuf,
+    project: Option<PathBuf>,
     runtime_path: Option<PathBuf>,
     cpu_time: bool,
     show_all: bool,
@@ -472,6 +476,10 @@ fn cmd_profile(
     ignore_exit_code: bool,
     args: Vec<String>,
 ) -> Result<(), Error> {
+    let project = match project {
+        Some(p) => p,
+        None => find_project_root(&std::env::current_dir()?)?,
+    };
     let (binary, runs_dir) = build_project(
         fn_patterns,
         file_patterns,
