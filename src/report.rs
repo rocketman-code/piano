@@ -1,7 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use anstyle::{Effects, Style};
+
 use crate::error::Error;
+
+const HEADER: Style = Style::new().bold();
+const DIM: Style = Style::new().effects(Effects::DIMMED);
 
 /// Describes the file format a Run was loaded from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -288,16 +293,16 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
     let mut out = String::new();
     if has_cpu {
         out.push_str(&format!(
-            "{:<40} {:>8} {:>10} {:>10} {:>10}\n",
+            "{HEADER}{:<40} {:>8} {:>10} {:>10} {:>10}{HEADER:#}\n",
             "Function", "Calls", "Total", "Self", "CPU"
         ));
-        out.push_str(&format!("{}\n", "-".repeat(84)));
+        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(84)));
     } else {
         out.push_str(&format!(
-            "{:<40} {:>8} {:>10} {:>10}\n",
+            "{HEADER}{:<40} {:>8} {:>10} {:>10}{HEADER:#}\n",
             "Function", "Calls", "Total", "Self"
         ));
-        out.push_str(&format!("{}\n", "-".repeat(72)));
+        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(72)));
     }
 
     for entry in &entries {
@@ -321,7 +326,9 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
         let hidden = total_count - entries.len();
         if hidden > 0 {
             let label = if hidden == 1 { "function" } else { "functions" };
-            out.push_str(&format!("\n{hidden} {label} hidden; use --all to show\n"));
+            out.push_str(&format!(
+                "{DIM}\n{hidden} {label} hidden; use --all to show\n{DIM:#}"
+            ));
         }
     }
     out
@@ -431,16 +438,16 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
     let mut out = String::new();
     if has_cpu {
         out.push_str(&format!(
-            "{:<40} {:>8} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10}\n",
+            "{HEADER}{:<40} {:>8} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10}{HEADER:#}\n",
             "Function", "Calls", "Self", "CPU", "p50", "p99", "Allocs", "Bytes"
         ));
-        out.push_str(&format!("{}\n", "-".repeat(112)));
+        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(112)));
     } else {
         out.push_str(&format!(
-            "{:<40} {:>8} {:>10} {:>10} {:>10} {:>8} {:>10}\n",
+            "{HEADER}{:<40} {:>8} {:>10} {:>10} {:>10} {:>8} {:>10}{HEADER:#}\n",
             "Function", "Calls", "Self", "p50", "p99", "Allocs", "Bytes"
         ));
-        out.push_str(&format!("{}\n", "-".repeat(100)));
+        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(100)));
     }
 
     for e in &entries {
@@ -478,12 +485,14 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
     }
 
     let n_frames = frame_data.frames.len();
-    out.push_str(&format!("\n{n_frames} frames"));
+    out.push_str(&format!("{DIM}\n{n_frames} frames{DIM:#}"));
 
     let hidden = total_count - entries.len();
     if hidden > 0 {
         let label = if hidden == 1 { "function" } else { "functions" };
-        out.push_str(&format!("\n{hidden} {label} hidden; use --all to show"));
+        out.push_str(&format!(
+            "{DIM}\n{hidden} {label} hidden; use --all to show{DIM:#}"
+        ));
     }
 
     out
@@ -514,13 +523,13 @@ pub fn format_frames_table(frame_data: &FrameData) -> String {
 
     // Header.
     let mut out = String::new();
-    out.push_str(&format!("{:>6} {:>10}", "Frame", "Total"));
+    out.push_str(&format!("{HEADER}{:>6} {:>10}", "Frame", "Total"));
     for name in fn_names {
         out.push_str(&format!(" {name:>fn_col_width$}"));
     }
-    out.push_str(&format!(" {:>8} {:>10} {}\n", "Allocs", "Bytes", ""));
+    out.push_str(&format!(" {:>8} {:>10}{HEADER:#}\n", "Allocs", "Bytes"));
     out.push_str(&format!(
-        "{}\n",
+        "{DIM}{}{DIM:#}\n",
         "-".repeat(32 + n_fns * (fn_col_width + 1))
     ));
 
@@ -553,7 +562,7 @@ pub fn format_frames_table(frame_data: &FrameData) -> String {
         .filter(|&&t| t > spike_threshold && median > 0)
         .count();
     out.push_str(&format!(
-        "\n{} frames | {} spikes (>2x median)\n",
+        "{DIM}\n{} frames | {} spikes (>2x median)\n{DIM:#}",
         frame_data.frames.len(),
         n_spikes
     ));
@@ -626,10 +635,9 @@ pub fn diff_runs(a: &Run, b: &Run) -> String {
         if has_allocs {
             header.push_str(&format!(" {:>10} {:>10}", "Allocs", "A.Delta"));
         }
-        header.push('\n');
-        let width = header.trim_end().len();
-        out.push_str(&header);
-        out.push_str(&format!("{}\n", "-".repeat(width)));
+        let width = header.len();
+        out.push_str(&format!("{HEADER}{header}{HEADER:#}\n"));
+        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(width)));
     }
 
     for name in &names {
