@@ -234,6 +234,7 @@ fn unique_skip_reasons(skipped: &[SkippedFunction]) -> String {
 /// Build an instrumented binary and return (binary_path, runs_dir).
 ///
 /// Returns `Ok(None)` when `--list-skipped` is used (early exit after printing).
+#[allow(clippy::too_many_arguments)]
 fn build_project(
     fn_patterns: Vec<String>,
     exact: bool,
@@ -465,6 +466,7 @@ fn build_project(
     Ok(Some((binary, runs_dir)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_build(
     fn_patterns: Vec<String>,
     exact: bool,
