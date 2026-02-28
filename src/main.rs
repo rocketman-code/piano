@@ -72,7 +72,8 @@ enum Commands {
     /// Build, execute, and report in one step.
     /// Pass arguments to the binary after --.
     Profile {
-        /// Instrument functions matching a substring (repeatable).
+        /// Instrument functions whose name contains PATTERN (repeatable).
+        /// e.g. --fn parse matches parse, parse_line, MyStruct::try_parse.
         #[arg(long = "fn", value_name = "PATTERN")]
         fn_patterns: Vec<String>,
 
