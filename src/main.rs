@@ -421,7 +421,8 @@ fn cmd_build(
 }
 
 fn find_latest_binary() -> Result<PathBuf, Error> {
-    let dir = PathBuf::from("target/piano/debug");
+    let project = find_project_root(&std::env::current_dir()?).map_err(|_| Error::NoBinary)?;
+    let dir = project.join("target/piano/debug");
     if !dir.is_dir() {
         return Err(Error::NoBinary);
     }
@@ -650,9 +651,10 @@ fn default_runs_dir() -> Result<PathBuf, Error> {
     if let Ok(dir) = std::env::var("PIANO_RUNS_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    let local = PathBuf::from("target/piano/runs");
+    let project = find_project_root(&std::env::current_dir()?).map_err(|_| Error::NoRuns)?;
+    let local = project.join("target/piano/runs");
     if local.is_dir() {
-        return Ok(std::fs::canonicalize(local)?);
+        return Ok(local);
     }
     Err(Error::NoRuns)
 }
@@ -661,15 +663,16 @@ fn default_tags_dir() -> Result<PathBuf, Error> {
     if let Ok(dir) = std::env::var("PIANO_TAGS_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    let local = PathBuf::from("target/piano/tags");
+    let project = find_project_root(&std::env::current_dir()?).map_err(|_| Error::NoRuns)?;
+    let local = project.join("target/piano/tags");
     if local.is_dir() {
-        return Ok(std::fs::canonicalize(local)?);
+        return Ok(local);
     }
     // Auto-create tags dir if runs exist (tags live alongside runs)
-    let runs_local = PathBuf::from("target/piano/runs");
+    let runs_local = project.join("target/piano/runs");
     if runs_local.is_dir() {
         std::fs::create_dir_all(&local)?;
-        return Ok(std::fs::canonicalize(local)?);
+        return Ok(local);
     }
     Err(Error::NoRuns)
 }
