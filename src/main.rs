@@ -136,9 +136,9 @@ enum Commands {
     },
     /// Compare two profiling runs.
     Diff {
-        /// First run file.
+        /// First run (path or tag).
         a: PathBuf,
-        /// Second run file.
+        /// Second run (path or tag).
         b: PathBuf,
     },
     /// Tag the latest run, or list existing tags (no args).
@@ -614,10 +614,25 @@ fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result
     Ok(())
 }
 
+/// Derive a display label from a diff argument.
+///
+/// Tag names pass through as-is; file paths use the filename stem.
+fn diff_label(arg: &Path) -> String {
+    if arg.exists() {
+        arg.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| arg.to_string_lossy().into_owned())
+    } else {
+        arg.to_string_lossy().into_owned()
+    }
+}
+
 fn cmd_diff(a: PathBuf, b: PathBuf) -> Result<(), Error> {
+    let label_a = diff_label(&a);
+    let label_b = diff_label(&b);
     let run_a = resolve_run_arg(&a)?;
     let run_b = resolve_run_arg(&b)?;
-    anstream::print!("{}", diff_runs(&run_a, &run_b));
+    anstream::print!("{}", diff_runs(&run_a, &run_b, &label_a, &label_b));
     Ok(())
 }
 

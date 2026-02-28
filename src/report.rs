@@ -548,10 +548,21 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Truncate a label to `max_len` characters, appending '…' if truncated.
+fn truncate_label(label: &str, max_len: usize) -> String {
+    if label.chars().count() <= max_len {
+        label.to_string()
+    } else {
+        let truncated: String = label.chars().take(max_len).collect();
+        format!("{truncated}\u{2026}")
+    }
+}
+
 /// Show the delta between two runs, comparing functions by name.
 ///
-/// Includes timing deltas and allocation deltas when alloc data is present.
-pub fn diff_runs(a: &Run, b: &Run) -> String {
+/// `label_a` and `label_b` are used as column headers (e.g. tag names or file stems).
+/// Labels longer than 20 characters are truncated with '…'.
+pub fn diff_runs(a: &Run, b: &Run, label_a: &str, label_b: &str) -> String {
     // Warn if comparing runs from different formats (total_ms may not be comparable).
     if a.source_format != b.source_format {
         eprintln!(
@@ -573,15 +584,28 @@ pub fn diff_runs(a: &Run, b: &Run) -> String {
     let has_cpu = a.functions.iter().any(|f| f.cpu_self_ms.is_some())
         || b.functions.iter().any(|f| f.cpu_self_ms.is_some());
 
+    let label_a = truncate_label(label_a, 20);
+    let label_b = truncate_label(label_b, 20);
+    // Column width: at least 10 (for data values like "12345.67ms"), or wider to fit label.
+    let col_a = label_a.chars().count().max(10);
+    let col_b = label_b.chars().count().max(10);
+
+    let cpu_label_a = format!("CPU.{label_a}");
+    let cpu_label_b = format!("CPU.{label_b}");
+    let cpu_col_a = cpu_label_a.chars().count().max(10);
+    let cpu_col_b = cpu_label_b.chars().count().max(10);
+
     let mut out = String::new();
     // Build header based on available columns.
     {
         let mut header = format!(
-            "{:<40} {:>10} {:>10} {:>10}",
-            "Function", "Before", "After", "Delta"
+            "{:<40} {:>col_a$} {:>col_b$} {:>10}",
+            "Function", label_a, label_b, "Delta"
         );
         if has_cpu {
-            header.push_str(&format!(" {:>10} {:>10}", "CPU.Bef", "CPU.Aft"));
+            header.push_str(&format!(
+                " {cpu_label_a:>cpu_col_a$} {cpu_label_b:>cpu_col_b$}"
+            ));
         }
         if has_allocs {
             header.push_str(&format!(" {:>10} {:>10}", "Allocs", "A.Delta"));
@@ -597,17 +621,23 @@ pub fn diff_runs(a: &Run, b: &Run) -> String {
         let delta = after - before;
 
         out.push_str(&format!(
-            "{name:<40} {before:>9.2}ms {after:>9.2}ms {delta:>+9.2}ms",
+            "{name:<40} {before:>w_a$.2}ms {after:>w_b$.2}ms {delta:>+9.2}ms",
+            w_a = col_a - 2,
+            w_b = col_b - 2,
         ));
 
         if has_cpu {
             let cpu_before = a_map.get(name).and_then(|e| e.cpu_self_ms);
             let cpu_after = b_map.get(name).and_then(|e| e.cpu_self_ms);
-            let fmt_cpu = |v: Option<f64>| match v {
-                Some(ms) => format!("{ms:>9.2}ms"),
-                None => format!("{:>11}", "-"),
+            let fmt_cpu = |v: Option<f64>, col_w: usize| match v {
+                Some(ms) => format!("{ms:>w$.2}ms", w = col_w - 2),
+                None => format!("{:>col_w$}", "-"),
             };
-            out.push_str(&format!(" {} {}", fmt_cpu(cpu_before), fmt_cpu(cpu_after)));
+            out.push_str(&format!(
+                " {} {}",
+                fmt_cpu(cpu_before, cpu_col_a),
+                fmt_cpu(cpu_after, cpu_col_b)
+            ));
         }
 
         if has_allocs {
@@ -966,7 +996,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let diff = diff_runs(&a, &b);
+        let diff = diff_runs(&a, &b, "Before", "After");
         assert!(diff.contains("walk"), "should mention walk");
         assert!(diff.contains("-2.00"), "should show negative delta: {diff}");
     }
@@ -1378,7 +1408,7 @@ mod tests {
                 alloc_bytes: 4096,
             }],
         };
-        let diff = diff_runs(&a, &b);
+        let diff = diff_runs(&a, &b, "Before", "After");
         assert!(diff.contains("Allocs"), "should have Allocs column header");
         assert!(
             diff.contains("-50"),
@@ -1417,7 +1447,7 @@ mod tests {
                 alloc_bytes: 0,
             }],
         };
-        let diff = diff_runs(&a, &b);
+        let diff = diff_runs(&a, &b, "Before", "After");
         // Extract the A.Delta column value from the alloc_heavy row.
         // With the old `as i64` cast, large_count wraps to negative i64 and
         // the delta becomes a large positive number (wrong direction).
@@ -1708,14 +1738,14 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let diff = diff_runs(&a, &b);
+        let diff = diff_runs(&a, &b, "Before", "After");
         assert!(
-            diff.contains("CPU.Bef"),
-            "should have CPU.Bef column. Got:\n{diff}"
+            diff.contains("CPU.Before"),
+            "should have CPU.Before column. Got:\n{diff}"
         );
         assert!(
-            diff.contains("CPU.Aft"),
-            "should have CPU.Aft column. Got:\n{diff}"
+            diff.contains("CPU.After"),
+            "should have CPU.After column. Got:\n{diff}"
         );
         assert!(
             diff.contains("8.00"),
@@ -1803,9 +1833,9 @@ mod tests {
             }],
         };
         // Should still render CPU columns (because A has CPU data).
-        let diff = diff_runs(&a, &b);
+        let diff = diff_runs(&a, &b, "Before", "After");
         assert!(
-            diff.contains("CPU.Bef"),
+            diff.contains("CPU.Before"),
             "should show CPU columns when either run has CPU data. Got:\n{diff}"
         );
         assert!(
@@ -1813,7 +1843,7 @@ mod tests {
             "should show A's CPU value. Got:\n{diff}"
         );
         // B's missing CPU renders as "-", not a misleading 0.00ms.
-        // Extract the CPU.Aft column value from the data row.
+        // Extract the CPU.After column value from the data row.
         let data_line = diff.lines().find(|l| l.contains("work")).unwrap();
         assert!(
             data_line.ends_with('-'),
@@ -1847,7 +1877,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let diff = diff_runs(&a, &b);
+        let diff = diff_runs(&a, &b, "Before", "After");
         assert!(
             !diff.contains("CPU"),
             "should not show CPU columns when neither run has CPU data. Got:\n{diff}"
@@ -2551,5 +2581,153 @@ mod tests {
         // All three functions should appear
         assert!(table.contains("main_fn"), "main_fn should appear in table");
         assert!(table.contains("update"), "update should appear in table");
+    }
+
+    #[test]
+    fn diff_uses_custom_labels_in_headers() {
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 1,
+                total_ms: 10.0,
+                self_ms: 10.0,
+                ..Default::default()
+            }],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 1,
+                total_ms: 12.0,
+                self_ms: 12.0,
+                ..Default::default()
+            }],
+        };
+        let diff = diff_runs(&a, &b, "baseline", "optimized");
+        assert!(
+            diff.contains("baseline"),
+            "should use label_a as column header. Got:\n{diff}"
+        );
+        assert!(
+            diff.contains("optimized"),
+            "should use label_b as column header. Got:\n{diff}"
+        );
+        assert!(
+            !diff.contains("Before"),
+            "should not contain hardcoded 'Before'. Got:\n{diff}"
+        );
+        assert!(
+            !diff.contains("After"),
+            "should not contain hardcoded 'After'. Got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn diff_custom_labels_in_cpu_headers() {
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 1,
+                total_ms: 10.0,
+                self_ms: 10.0,
+                cpu_self_ms: Some(8.0),
+                ..Default::default()
+            }],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 1,
+                total_ms: 12.0,
+                self_ms: 12.0,
+                cpu_self_ms: Some(10.0),
+                ..Default::default()
+            }],
+        };
+        let diff = diff_runs(&a, &b, "v1", "v2");
+        assert!(
+            diff.contains("CPU.v1"),
+            "should use CPU.label_a as CPU column header. Got:\n{diff}"
+        );
+        assert!(
+            diff.contains("CPU.v2"),
+            "should use CPU.label_b as CPU column header. Got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn diff_truncates_long_labels() {
+        let entry = || FnEntry {
+            name: "work".into(),
+            calls: 1,
+            total_ms: 10.0,
+            self_ms: 10.0,
+            ..Default::default()
+        };
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![entry()],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![entry()],
+        };
+        let long_label = "my-really-long-tag-name-that-goes-on";
+        let diff = diff_runs(&a, &b, long_label, "short");
+        // Should be truncated to 20 chars with ellipsis.
+        assert!(
+            diff.contains("my-really-long-tag-n\u{2026}"),
+            "should truncate label > 20 chars with ellipsis. Got:\n{diff}"
+        );
+        assert!(
+            !diff.contains(long_label),
+            "should not contain the full long label. Got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn diff_label_column_width_expands_for_label() {
+        let entry = || FnEntry {
+            name: "work".into(),
+            calls: 1,
+            total_ms: 10.0,
+            self_ms: 10.0,
+            ..Default::default()
+        };
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![entry()],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![entry()],
+        };
+        // "after-refactor" is 14 chars, wider than default 10.
+        let diff = diff_runs(&a, &b, "before", "after-refactor");
+        // The "after-refactor" header should appear untruncated.
+        assert!(
+            diff.contains("after-refactor"),
+            "should expand column to fit label. Got:\n{diff}"
+        );
     }
 }
