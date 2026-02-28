@@ -573,10 +573,22 @@ pub fn diff_runs(a: &Run, b: &Run, label_a: &str, label_b: &str) -> String {
     let a_map: HashMap<&str, &FnEntry> = a.functions.iter().map(|f| (f.name.as_str(), f)).collect();
     let b_map: HashMap<&str, &FnEntry> = b.functions.iter().map(|f| (f.name.as_str(), f)).collect();
 
-    // Collect all function names, sorted for deterministic output.
+    // Collect unique function names, sorted by absolute self-time delta descending
+    // so the biggest changes appear first.
     let mut names: Vec<&str> = a_map.keys().chain(b_map.keys()).copied().collect();
     names.sort_unstable();
     names.dedup();
+    names.sort_by(|na, nb| {
+        let delta_a = (b_map.get(na).map_or(0.0, |e| e.self_ms)
+            - a_map.get(na).map_or(0.0, |e| e.self_ms))
+        .abs();
+        let delta_b = (b_map.get(nb).map_or(0.0, |e| e.self_ms)
+            - a_map.get(nb).map_or(0.0, |e| e.self_ms))
+        .abs();
+        delta_b
+            .partial_cmp(&delta_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Check if either run has alloc data or CPU data.
     let has_allocs = a.functions.iter().any(|f| f.alloc_count > 0)
