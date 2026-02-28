@@ -404,7 +404,11 @@ fn cmd_build(
         runtime_path,
         cpu_time,
     )?;
-    eprintln!("built: {}", binary.display());
+    let display_name = binary
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| binary.display().to_string());
+    eprintln!("built: {display_name}");
     if !std::io::stdout().is_terminal() {
         println!("{}", binary.display());
     }
@@ -476,7 +480,11 @@ fn cmd_profile(
         runtime_path,
         cpu_time,
     )?;
-    eprintln!("built: {}", binary.display());
+    let display_name = binary
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| binary.display().to_string());
+    eprintln!("built: {display_name}");
 
     let status = std::process::Command::new(&binary)
         .args(&args)
