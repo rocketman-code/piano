@@ -133,10 +133,10 @@ enum Commands {
         /// Second run file.
         b: PathBuf,
     },
-    /// Tag the latest run for easy reference.
+    /// Tag the latest run, or list existing tags (no args).
     Tag {
-        /// Tag name.
-        name: String,
+        /// Tag name. If omitted, lists all saved tags.
+        name: Option<String>,
     },
 }
 
@@ -595,7 +595,30 @@ fn cmd_diff(a: PathBuf, b: PathBuf) -> Result<(), Error> {
     Ok(())
 }
 
-fn cmd_tag(name: String) -> Result<(), Error> {
+fn cmd_tag(name: Option<String>) -> Result<(), Error> {
+    let Some(name) = name else {
+        let tags_dir = default_tags_dir()?;
+        let mut entries: Vec<String> = std::fs::read_dir(&tags_dir)
+            .map_err(|source| Error::RunReadError {
+                path: tags_dir.clone(),
+                source,
+            })?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if entry.file_type().ok()?.is_file() {
+                    Some(entry.file_name().to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        entries.sort();
+        for tag in &entries {
+            println!("{tag}");
+        }
+        return Ok(());
+    };
+
     let runs_dir = default_runs_dir()?;
     let tags_dir = default_tags_dir()?;
     let latest = load_latest_run(&runs_dir)?;
