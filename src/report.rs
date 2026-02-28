@@ -807,6 +807,25 @@ pub fn load_tagged_run(tags_dir: &Path, runs_dir: &Path, tag: &str) -> Result<Ru
     })
 }
 
+/// Find a tag name that points to the given run_id, if any.
+///
+/// Scans all tag files in tags_dir. Returns the first match.
+pub fn reverse_resolve_tag(tags_dir: &Path, run_id: &str) -> Option<String> {
+    let entries = std::fs::read_dir(tags_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if contents.trim() == run_id {
+                return path.file_name()?.to_str().map(String::from);
+            }
+        }
+    }
+    None
+}
+
 /// Find the NDJSON file for a given run_id, if one exists.
 pub fn find_ndjson_by_run_id(runs_dir: &Path, run_id: &str) -> Result<Option<PathBuf>, Error> {
     use std::io::BufRead;
@@ -897,6 +916,53 @@ pub fn load_latest_run(runs_dir: &Path) -> Result<Run, Error> {
     Ok(merge_runs(&to_merge))
 }
 
+/// Load the two most recent runs, grouped by run_id.
+///
+/// Returns `(previous, latest)` where latest has the highest timestamp.
+/// Files sharing a run_id are merged (multi-threaded runs).
+pub fn load_two_latest_runs(runs_dir: &Path) -> Result<(Run, Run), Error> {
+    let all_files = collect_run_files(runs_dir)?;
+    if all_files.is_empty() {
+        return Err(Error::NotEnoughRuns);
+    }
+
+    let mut runs: Vec<Run> = Vec::new();
+    for path in &all_files {
+        match load_run(path) {
+            Ok(run) => runs.push(run),
+            Err(_) => continue,
+        }
+    }
+
+    if runs.is_empty() {
+        return Err(Error::NoRuns);
+    }
+
+    // Group by run_id, track max timestamp per group.
+    let mut groups: HashMap<String, Vec<&Run>> = HashMap::new();
+    for run in &runs {
+        let key = run
+            .run_id
+            .clone()
+            .unwrap_or_else(|| format!("_legacy_{}", run.timestamp_ms));
+        groups.entry(key).or_default().push(run);
+    }
+
+    if groups.len() < 2 {
+        return Err(Error::NotEnoughRuns);
+    }
+
+    // Sort groups by their max timestamp (ascending).
+    let mut group_list: Vec<(String, Vec<&Run>)> = groups.into_iter().collect();
+    group_list.sort_by_key(|(_, runs)| runs.iter().map(|r| r.timestamp_ms).max().unwrap_or(0));
+
+    let len = group_list.len();
+    let (_, prev_runs) = &group_list[len - 2];
+    let (_, latest_runs) = &group_list[len - 1];
+
+    Ok((merge_runs(prev_runs), merge_runs(latest_runs)))
+}
+
 /// Find the path to the latest run file without loading it.
 ///
 /// Returns `Some(path)` to the latest file (preferring .ndjson over .json
@@ -905,6 +971,25 @@ pub fn find_latest_run_file(runs_dir: &Path) -> Result<Option<PathBuf>, Error> {
     let all_files = collect_run_files(runs_dir)?;
     // Files are sorted by name (timestamp ascending); last is latest.
     Ok(all_files.into_iter().next_back())
+}
+
+/// Format a SystemTime as a relative duration string ("N sec/min/hours/days ago").
+pub fn relative_time(t: std::time::SystemTime) -> String {
+    let elapsed = t.elapsed().unwrap_or_default();
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs} sec ago")
+    } else if secs < 3600 {
+        format!("{} min ago", secs / 60)
+    } else if secs < 86400 {
+        let h = secs / 3600;
+        let unit = if h == 1 { "hour" } else { "hours" };
+        format!("{h} {unit} ago")
+    } else {
+        let d = secs / 86400;
+        let unit = if d == 1 { "day" } else { "days" };
+        format!("{d} {unit} ago")
+    }
 }
 
 #[cfg(test)]
@@ -2728,6 +2813,179 @@ mod tests {
         assert!(
             diff.contains("after-refactor"),
             "should expand column to fit label. Got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn relative_time_seconds() {
+        use std::time::{Duration, SystemTime};
+        let t = SystemTime::now() - Duration::from_secs(30);
+        assert_eq!(relative_time(t), "30 sec ago");
+    }
+
+    #[test]
+    fn relative_time_minutes() {
+        use std::time::{Duration, SystemTime};
+        let t = SystemTime::now() - Duration::from_secs(150);
+        assert_eq!(relative_time(t), "2 min ago");
+    }
+
+    #[test]
+    fn relative_time_hours() {
+        use std::time::{Duration, SystemTime};
+        let t = SystemTime::now() - Duration::from_secs(7200);
+        assert_eq!(relative_time(t), "2 hours ago");
+    }
+
+    #[test]
+    fn relative_time_days() {
+        use std::time::{Duration, SystemTime};
+        let t = SystemTime::now() - Duration::from_secs(172800);
+        assert_eq!(relative_time(t), "2 days ago");
+    }
+
+    #[test]
+    fn relative_time_singular_hour() {
+        use std::time::{Duration, SystemTime};
+        let t = SystemTime::now() - Duration::from_secs(3600);
+        assert_eq!(relative_time(t), "1 hour ago");
+    }
+
+    #[test]
+    fn relative_time_singular_day() {
+        use std::time::{Duration, SystemTime};
+        let t = SystemTime::now() - Duration::from_secs(86400);
+        assert_eq!(relative_time(t), "1 day ago");
+    }
+
+    #[test]
+    fn load_two_latest_runs_returns_previous_and_latest() {
+        let dir = TempDir::new().unwrap();
+        let old = r#"{"run_id":"1_500","timestamp_ms":500,"functions":[
+            {"name":"old_fn","calls":1,"total_ms":5.0,"self_ms":5.0}
+        ]}"#;
+        let newer = r#"{"run_id":"2_1000","timestamp_ms":1000,"functions":[
+            {"name":"new_fn","calls":2,"total_ms":10.0,"self_ms":8.0}
+        ]}"#;
+        fs::write(dir.path().join("500.json"), old).unwrap();
+        fs::write(dir.path().join("1000.json"), newer).unwrap();
+
+        let (previous, latest) = load_two_latest_runs(dir.path()).unwrap();
+        assert_eq!(previous.run_id.as_deref(), Some("1_500"));
+        assert_eq!(latest.run_id.as_deref(), Some("2_1000"));
+    }
+
+    #[test]
+    fn load_two_latest_runs_errors_with_one_run() {
+        let dir = TempDir::new().unwrap();
+        let only = r#"{"run_id":"1_500","timestamp_ms":500,"functions":[]}"#;
+        fs::write(dir.path().join("500.json"), only).unwrap();
+
+        let result = load_two_latest_runs(dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_two_latest_runs_errors_on_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let result = load_two_latest_runs(dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_two_latest_runs_merges_multi_thread_files() {
+        let dir = TempDir::new().unwrap();
+        // Two files from the same run (multi-threaded)
+        let run1_a = r#"{"run_id":"1_500","timestamp_ms":500,"functions":[
+            {"name":"parse","calls":50,"total_ms":100.0,"self_ms":100.0}
+        ]}"#;
+        let run1_b = r#"{"run_id":"1_500","timestamp_ms":501,"functions":[
+            {"name":"resolve","calls":30,"total_ms":60.0,"self_ms":60.0}
+        ]}"#;
+        // One file from a different run
+        let run2 = r#"{"run_id":"2_1000","timestamp_ms":1000,"functions":[
+            {"name":"new_fn","calls":2,"total_ms":10.0,"self_ms":8.0}
+        ]}"#;
+        fs::write(dir.path().join("500.json"), run1_a).unwrap();
+        fs::write(dir.path().join("501.json"), run1_b).unwrap();
+        fs::write(dir.path().join("1000.json"), run2).unwrap();
+
+        let (previous, latest) = load_two_latest_runs(dir.path()).unwrap();
+        // Previous should have both parse and resolve merged
+        assert_eq!(previous.functions.len(), 2);
+        assert_eq!(latest.run_id.as_deref(), Some("2_1000"));
+    }
+
+    #[test]
+    fn reverse_resolve_tag_finds_matching_tag() {
+        let dir = TempDir::new().unwrap();
+        let tags_dir = dir.path().join("tags");
+        fs::create_dir_all(&tags_dir).unwrap();
+        fs::write(tags_dir.join("baseline"), "42_9000").unwrap();
+        fs::write(tags_dir.join("other"), "99_1000").unwrap();
+
+        let result = reverse_resolve_tag(&tags_dir, "42_9000");
+        assert_eq!(result, Some("baseline".to_string()));
+    }
+
+    #[test]
+    fn reverse_resolve_tag_returns_none_when_no_match() {
+        let dir = TempDir::new().unwrap();
+        let tags_dir = dir.path().join("tags");
+        fs::create_dir_all(&tags_dir).unwrap();
+        fs::write(tags_dir.join("baseline"), "42_9000").unwrap();
+
+        let result = reverse_resolve_tag(&tags_dir, "nonexistent");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn reverse_resolve_tag_returns_none_for_missing_dir() {
+        let dir = TempDir::new().unwrap();
+        let tags_dir = dir.path().join("no_such_dir");
+
+        let result = reverse_resolve_tag(&tags_dir, "42_9000");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn two_latest_runs_with_tags_and_relative_time() {
+        let dir = TempDir::new().unwrap();
+        let runs_dir = dir.path().join("runs");
+        let tags_dir = dir.path().join("tags");
+        fs::create_dir_all(&runs_dir).unwrap();
+        fs::create_dir_all(&tags_dir).unwrap();
+
+        let run_old = r#"{"run_id":"1_500","timestamp_ms":500,"functions":[
+            {"name":"old_fn","calls":1,"total_ms":5.0,"self_ms":5.0}
+        ]}"#;
+        let run_new = r#"{"run_id":"2_1000","timestamp_ms":1000,"functions":[
+            {"name":"new_fn","calls":2,"total_ms":10.0,"self_ms":8.0}
+        ]}"#;
+        fs::write(runs_dir.join("500.json"), run_old).unwrap();
+        fs::write(runs_dir.join("1000.json"), run_new).unwrap();
+
+        // Tag the old run
+        fs::write(tags_dir.join("baseline"), "1_500").unwrap();
+
+        let (prev, latest) = load_two_latest_runs(&runs_dir).unwrap();
+        assert_eq!(prev.run_id.as_deref(), Some("1_500"));
+        assert_eq!(latest.run_id.as_deref(), Some("2_1000"));
+
+        // Reverse resolve: tagged run returns tag name
+        let label_prev = reverse_resolve_tag(&tags_dir, "1_500");
+        assert_eq!(label_prev, Some("baseline".to_string()));
+
+        // Reverse resolve: untagged run returns None
+        let label_latest = reverse_resolve_tag(&tags_dir, "2_1000");
+        assert_eq!(label_latest, None);
+
+        // relative_time works on file modified time
+        let meta = fs::metadata(runs_dir.join("1000.json")).unwrap();
+        let label = relative_time(meta.modified().unwrap());
+        assert!(
+            label.contains("ago"),
+            "expected relative time, got: {label}"
         );
     }
 }
