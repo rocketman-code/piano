@@ -216,6 +216,68 @@ fn profile_suppresses_no_runs_error_on_nonzero_exit() {
     );
 }
 
+#[test]
+fn profile_propagates_child_exit_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("exit-one");
+    create_exit_one_project(&project_dir);
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Create runs_dir so cmd_report hits NoRuns (empty dir), not an IO error.
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let output = Command::new(piano_bin)
+        .args(["profile", "--fn", "work", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run piano profile");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "piano profile should propagate child's exit code 1, got: {:?}\nstderr: {stderr}",
+        output.status.code()
+    );
+}
+
+#[test]
+fn profile_ignore_exit_code_returns_success() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("exit-one");
+    create_exit_one_project(&project_dir);
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let output = Command::new(piano_bin)
+        .args(["profile", "--fn", "work", "--ignore-exit-code", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run piano profile with --ignore-exit-code");
+
+    assert!(
+        output.status.success(),
+        "piano profile with --ignore-exit-code should exit 0, got: {:?}",
+        output.status.code()
+    );
+}
+
 fn create_echo_args_project(dir: &Path) {
     fs::create_dir_all(dir.join("src")).unwrap();
 
