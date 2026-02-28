@@ -906,6 +906,11 @@ pub fn collect_invocations() -> Vec<InvocationRecord> {
 }
 
 /// Return completed per-frame summaries.
+///
+/// No `flush_records_buf()` call is needed here: FRAMES is populated at
+/// depth-0 boundaries -- the same point where RECORDS_BUF is flushed into
+/// RECORDS. By the time a frame appears in FRAMES, its records have already
+/// been flushed.
 pub fn collect_frames() -> Vec<Vec<FrameFnSummary>> {
     FRAMES.with(|frames| frames.borrow().clone())
 }
@@ -970,6 +975,10 @@ fn aggregate_frame_into_frames(records: &[InvocationRecord]) {
 pub fn collect_all() -> Vec<FunctionRecord> {
     // Flush the calling thread's local buffer so its records are visible.
     // Other threads' buffers are flushed at their own depth-0 boundaries.
+    // Records still buffered on other threads (not yet at a depth-0 boundary)
+    // will be missed. In practice this only affects detached spawns
+    // (std::thread::spawn, rayon::spawn) which have no completion guarantee;
+    // scoped concurrency always completes before the caller returns.
     flush_records_buf();
     let arcs: Vec<ThreadRecordArc> = {
         let registry = thread_records().lock().unwrap_or_else(|e| e.into_inner());
