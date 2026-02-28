@@ -322,3 +322,51 @@ fn list_skipped_shows_message_when_none_skipped() {
         "stderr should say 'no functions skipped': {stderr}"
     );
 }
+
+#[test]
+fn no_targets_found_error_prints_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("special");
+    create_project_with_special_fns(&project_dir);
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // --fn dangerous matches only the unsafe fn, which gets skipped.
+    // The error should appear exactly once (no duplicate warning).
+    let output = Command::new(piano_bin)
+        .args(["build", "--fn", "dangerous", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    assert!(
+        !output.status.success(),
+        "should fail when all matches are skipped"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The error message should appear exactly once.
+    assert!(
+        stderr.contains("no functions matched"),
+        "should contain the error message: {stderr}"
+    );
+
+    // The skipped-functions warning should NOT appear separately -- the error
+    // message already includes skip information.
+    assert!(
+        !stderr.contains("function(s) skipped"),
+        "should not print a separate skipped warning when the error already includes skip info: {stderr}"
+    );
+
+    // Count occurrences of "error:" to verify single error output.
+    let error_count = stderr.matches("error:").count();
+    assert_eq!(
+        error_count, 1,
+        "error should appear exactly once, got {error_count}: {stderr}"
+    );
+}
