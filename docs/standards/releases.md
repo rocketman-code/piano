@@ -35,15 +35,16 @@ Batch related changes, release when there's a meaningful set of user-facing chan
 2. `cargo test --workspace` passes
 3. `cargo clippy --workspace --all-targets -- -D warnings` clean
 4. `cargo doc --workspace --no-deps` builds without warnings
-5. Update `CHANGELOG.md`
-6. Bump version in both `Cargo.toml` and `piano-runtime/Cargo.toml`
-7. Run `cargo generate-lockfile --ignore-rust-version` (without this flag, cargo constrains all workspace deps to the lowest member MSRV, downgrading shared dependencies like clap)
-8. Commit: `chore(cargo): bump version to 0.x.y`
-9. Tag: `git tag v0.x.y`
-10. Push: `git push && git push --tags`
-11. Publish `piano-runtime` first: `cargo publish -p piano-runtime`
-12. Wait for crates.io to index, then publish `piano`: `cargo publish -p piano`
-13. Close the milestone on GitHub (if applicable)
+5. Verify README and `docs/standards/` reflect current CLI behavior
+6. Update `CHANGELOG.md`
+7. Bump version in both `Cargo.toml` and `piano-runtime/Cargo.toml`
+8. Run `cargo generate-lockfile --ignore-rust-version` (without this flag, cargo constrains all workspace deps to the lowest member MSRV, downgrading shared dependencies like clap)
+9. Commit: `chore(cargo): bump version to 0.x.y`
+10. Open a PR (`release/0.x.y` branch) -- main has branch protection, even version bumps go through a PR
+11. After merge, tag the merge commit: `git tag v0.x.y` and `git push --tags`
+12. Publish `piano-runtime` first: `cargo publish -p piano-runtime`
+13. Wait for crates.io to index, then publish `piano`: `cargo publish -p piano`
+14. Close the milestone on GitHub (if applicable)
 
 Publishing order matters: `piano build` injects `piano-runtime` as a dependency into user projects, so the runtime crate must be available on crates.io before the CLI crate references it.
 
