@@ -818,7 +818,12 @@ pub fn resolve_tag(tags_dir: &Path, tag: &str) -> Result<String, Error> {
 /// Load a run by resolving a tag name to a run_id, then consolidating.
 pub fn load_tagged_run(tags_dir: &Path, runs_dir: &Path, tag: &str) -> Result<Run, Error> {
     let run_id = resolve_tag(tags_dir, tag)?;
-    load_run_by_id(runs_dir, &run_id)
+    load_run_by_id(runs_dir, &run_id).map_err(|e| match e {
+        Error::NoRuns => Error::RunNotFound {
+            tag: tag.to_owned(),
+        },
+        other => other,
+    })
 }
 
 /// Find the NDJSON file for a given run_id, if one exists.
@@ -1106,7 +1111,7 @@ mod tests {
         fs::write(runs_dir.join("1000.json"), run_json).unwrap();
 
         let result = load_run_by_id(&runs_dir, "nonexistent");
-        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::NoRuns));
     }
 
     #[test]
@@ -1119,6 +1124,29 @@ mod tests {
 
         let result = load_tagged_run(&tags_dir, &runs_dir, "nonexistent");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_tagged_run_returns_run_not_found_for_stale_tag() {
+        let dir = TempDir::new().unwrap();
+        let tags_dir = dir.path().join("tags");
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&tags_dir).unwrap();
+        std::fs::create_dir_all(&runs_dir).unwrap();
+
+        // Tag points to a run_id that doesn't exist in runs_dir.
+        save_tag(&tags_dir, "baseline", "deleted_1000").unwrap();
+
+        let err = load_tagged_run(&tags_dir, &runs_dir, "baseline").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("baseline"),
+            "error should mention tag name: {msg}"
+        );
+        assert!(
+            msg.contains("piano tag"),
+            "error should suggest listing tags: {msg}"
+        );
     }
 
     #[test]
