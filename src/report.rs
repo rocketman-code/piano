@@ -776,19 +776,20 @@ fn validate_tag_name(tag: &str) -> Result<(), Error> {
             "provide a tag name (e.g., `baseline`, `v1`)".into(),
         ));
     }
+    let safe: String = tag.chars().flat_map(char::escape_default).collect();
     if tag == "." || tag == ".." {
         return Err(Error::InvalidTagName(format!(
-            "valid tags are plain names (e.g., `baseline`), got '{tag}'"
+            "valid tags are plain names (e.g., `baseline`), got '{safe}'"
         )));
     }
     if tag.contains('/') || tag.contains('\\') {
         return Err(Error::InvalidTagName(format!(
-            "valid tags cannot include slashes, got '{tag}'"
+            "valid tags cannot include slashes, got '{safe}'"
         )));
     }
     if tag.contains('\0') {
         return Err(Error::InvalidTagName(format!(
-            "valid tags are printable text (e.g., `baseline`, `v1`), got '{tag}'"
+            "valid tags are printable text (e.g., `baseline`, `v1`), got '{safe}'"
         )));
     }
     Ok(())

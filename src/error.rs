@@ -34,7 +34,7 @@ pub enum Error {
     #[error("invalid run data in {}: {reason}", path.display())]
     InvalidRunData { path: PathBuf, reason: String },
 
-    #[error("invalid tag name: {0}")]
+    #[error("{0}")]
     InvalidTagName(String),
 
     #[error("profiling data was not written -- check disk space and permissions for {}", .0.display())]
