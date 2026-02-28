@@ -190,7 +190,7 @@ pub fn resolve_targets(
             }
         }
 
-        if results.is_empty() && skipped.is_empty() {
+        if results.is_empty() {
             let desc = specs
                 .iter()
                 .map(|s| match s {
@@ -201,7 +201,22 @@ pub fn resolve_targets(
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            let hint = build_suggestion_hint(specs, &rs_files);
+            let hint = if skipped.is_empty() {
+                build_suggestion_hint(specs, &rs_files)
+            } else {
+                let reasons = skipped
+                    .iter()
+                    .map(|s| s.reason.to_string())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    ". All {} matched function(s) were skipped ({}) -- piano cannot instrument these",
+                    skipped.len(),
+                    reasons
+                )
+            };
             return Err(Error::NoTargetsFound { specs: desc, hint });
         }
     }
@@ -1010,21 +1025,21 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         create_test_project(tmp.path());
 
-        // "dangerous" matches the unsafe fn "dangerous" but not "fixed_size" or "ffi_callback"
+        // "dangerous" matches the unsafe fn "dangerous" but not "fixed_size" or "ffi_callback".
+        // Since all matched functions are skipped (none instrumentable), resolve_targets
+        // returns an error with skip information in the hint.
         let specs = [TargetSpec::Fn("dangerous".into())];
-        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false);
 
-        assert_eq!(
-            result.skipped.len(),
-            1,
-            "only one skipped fn matches 'dangerous'"
+        assert!(result.is_err(), "should error when all matches are skipped");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no functions matched"),
+            "error should say no functions matched: {err}"
         );
-        assert_eq!(result.skipped[0].name, "dangerous");
-        assert_eq!(result.skipped[0].reason, SkipReason::Unsafe);
-        assert_eq!(
-            result.skipped[0].path,
-            Path::new("src/special_fns.rs"),
-            "skipped function should have relative file path"
+        assert!(
+            err.contains("1 matched function(s) were skipped (unsafe)"),
+            "error should mention skipped unsafe function: {err}"
         );
     }
 

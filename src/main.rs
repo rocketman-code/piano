@@ -294,28 +294,6 @@ fn build_project(
         );
     }
 
-    if targets.is_empty() && !specs.is_empty() {
-        let desc = specs
-            .iter()
-            .map(|s| match s {
-                TargetSpec::Fn(p) => format!("--fn {p}"),
-                TargetSpec::File(p) => format!("--file {}", p.display()),
-                TargetSpec::Mod(m) => format!("--mod {m}"),
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let hint = if !skipped.is_empty() {
-            format!(
-                ". All {} matched function(s) were skipped ({}) -- piano cannot instrument these",
-                skipped.len(),
-                unique_skip_reasons(&skipped)
-            )
-        } else {
-            String::new()
-        };
-        return Err(Error::NoTargetsFound { specs: desc, hint });
-    }
-
     let total_fns: usize = targets.iter().map(|t| t.functions.len()).sum();
     eprintln!(
         "found {} function(s) across {} file(s)",
