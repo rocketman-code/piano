@@ -13,7 +13,8 @@ use piano::error::Error;
 use piano::report::{
     diff_runs, find_latest_run_file, find_ndjson_by_run_id, format_frames_table, format_table,
     format_table_with_frames, load_latest_run, load_ndjson, load_run, load_run_by_id,
-    load_tagged_run, resolve_tag, save_tag,
+    load_tagged_run, load_two_latest_runs, relative_time, resolve_tag, reverse_resolve_tag,
+    save_tag,
 };
 use piano::resolve::{TargetSpec, resolve_targets};
 use piano::rewrite::{
@@ -136,10 +137,10 @@ enum Commands {
     },
     /// Compare two profiling runs.
     Diff {
-        /// First run (path or tag).
-        a: PathBuf,
+        /// First run (path or tag; omit both to compare two most recent runs).
+        a: Option<PathBuf>,
         /// Second run (path or tag).
-        b: PathBuf,
+        b: Option<PathBuf>,
     },
     /// Tag the latest run, or list existing tags (no args).
     Tag {
@@ -627,13 +628,64 @@ fn diff_label(arg: &Path) -> String {
     }
 }
 
-fn cmd_diff(a: PathBuf, b: PathBuf) -> Result<(), Error> {
-    let label_a = diff_label(&a);
-    let label_b = diff_label(&b);
-    let run_a = resolve_run_arg(&a)?;
-    let run_b = resolve_run_arg(&b)?;
-    anstream::print!("{}", diff_runs(&run_a, &run_b, &label_a, &label_b));
+fn cmd_diff(a: Option<PathBuf>, b: Option<PathBuf>) -> Result<(), Error> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let label_a = diff_label(&a);
+            let label_b = diff_label(&b);
+            let run_a = resolve_run_arg(&a)?;
+            let run_b = resolve_run_arg(&b)?;
+            anstream::print!("{}", diff_runs(&run_a, &run_b, &label_a, &label_b));
+        }
+        (None, None) => {
+            let runs_dir = default_runs_dir()?;
+            let tags_dir = default_tags_dir().ok();
+            let (previous, latest) = load_two_latest_runs(&runs_dir)?;
+
+            let label_a = resolve_diff_label(&tags_dir, &previous, &runs_dir, "previous");
+            let label_b = resolve_diff_label(&tags_dir, &latest, &runs_dir, "latest");
+            eprintln!("comparing: {label_a} vs {label_b}");
+
+            anstream::print!("{}", diff_runs(&previous, &latest, &label_a, &label_b));
+        }
+        _ => {
+            return Err(Error::DiffArgCount);
+        }
+    }
     Ok(())
+}
+
+/// Determine a display label for an auto-selected diff run.
+///
+/// Uses the tag name if a tag points to this run, otherwise falls back
+/// to a relative timestamp with a role prefix ("previous (2 min ago)").
+fn resolve_diff_label(
+    tags_dir: &Option<PathBuf>,
+    run: &piano::report::Run,
+    runs_dir: &Path,
+    role: &str,
+) -> String {
+    // Try reverse-resolving a tag.
+    if let (Some(tags), Some(run_id)) = (tags_dir, &run.run_id) {
+        if let Some(tag) = reverse_resolve_tag(tags, run_id) {
+            return tag;
+        }
+    }
+
+    // Fall back to relative timestamp from file modified time.
+    let stem = run.timestamp_ms.to_string();
+    for ext in &["ndjson", "json"] {
+        let path = runs_dir.join(format!("{stem}.{ext}"));
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if let Ok(modified) = meta.modified() {
+                let rel = relative_time(modified);
+                return format!("{role} ({rel})");
+            }
+        }
+    }
+
+    // Last resort: use the raw timestamp with role prefix.
+    format!("{role} ({stem})")
 }
 
 fn cmd_tag(name: Option<String>) -> Result<(), Error> {
