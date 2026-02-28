@@ -42,6 +42,10 @@ enum Commands {
         #[arg(long = "fn", value_name = "PATTERN")]
         fn_patterns: Vec<String>,
 
+        /// Match --fn patterns exactly instead of by substring.
+        #[arg(long, requires = "fn_patterns")]
+        exact: bool,
+
         /// Instrument all functions in a file (repeatable).
         #[arg(long = "file", value_name = "PATH")]
         file_patterns: Vec<PathBuf>,
@@ -76,6 +80,10 @@ enum Commands {
         /// e.g. --fn parse matches parse, parse_line, MyStruct::try_parse.
         #[arg(long = "fn", value_name = "PATTERN")]
         fn_patterns: Vec<String>,
+
+        /// Match --fn patterns exactly instead of by substring.
+        #[arg(long, requires = "fn_patterns")]
+        exact: bool,
 
         /// Instrument all functions in a file (repeatable).
         #[arg(long = "file", value_name = "PATH")]
@@ -152,6 +160,7 @@ fn run(cli: Cli) -> Result<(), Error> {
     match cli.command {
         Commands::Build {
             fn_patterns,
+            exact,
             file_patterns,
             mod_patterns,
             project,
@@ -159,6 +168,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             cpu_time,
         } => cmd_build(
             fn_patterns,
+            exact,
             file_patterns,
             mod_patterns,
             project,
@@ -168,6 +178,7 @@ fn run(cli: Cli) -> Result<(), Error> {
         Commands::Run { args } => cmd_run(args),
         Commands::Profile {
             fn_patterns,
+            exact,
             file_patterns,
             mod_patterns,
             project,
@@ -179,6 +190,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             args,
         } => cmd_profile(
             fn_patterns,
+            exact,
             file_patterns,
             mod_patterns,
             project,
@@ -198,6 +210,7 @@ fn run(cli: Cli) -> Result<(), Error> {
 /// Build an instrumented binary and return (binary_path, runs_dir).
 fn build_project(
     fn_patterns: Vec<String>,
+    exact: bool,
     file_patterns: Vec<PathBuf>,
     mod_patterns: Vec<String>,
     project: PathBuf,
@@ -232,7 +245,7 @@ fn build_project(
             project.display()
         )));
     }
-    let targets = resolve_targets(&src_dir, &specs)?;
+    let targets = resolve_targets(&src_dir, &specs, exact)?;
 
     let total_fns: usize = targets.iter().map(|t| t.functions.len()).sum();
     eprintln!(
@@ -390,6 +403,7 @@ fn build_project(
 
 fn cmd_build(
     fn_patterns: Vec<String>,
+    exact: bool,
     file_patterns: Vec<PathBuf>,
     mod_patterns: Vec<String>,
     project: Option<PathBuf>,
@@ -402,6 +416,7 @@ fn cmd_build(
     };
     let (binary, _runs_dir) = build_project(
         fn_patterns,
+        exact,
         file_patterns,
         mod_patterns,
         project,
@@ -467,6 +482,7 @@ fn cmd_run(args: Vec<String>) -> Result<(), Error> {
 #[allow(clippy::too_many_arguments)]
 fn cmd_profile(
     fn_patterns: Vec<String>,
+    exact: bool,
     file_patterns: Vec<PathBuf>,
     mod_patterns: Vec<String>,
     project: Option<PathBuf>,
@@ -483,6 +499,7 @@ fn cmd_profile(
     };
     let (binary, runs_dir) = build_project(
         fn_patterns,
+        exact,
         file_patterns,
         mod_patterns,
         project,
