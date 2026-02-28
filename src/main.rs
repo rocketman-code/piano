@@ -545,7 +545,12 @@ fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result
                 Some(ndjson_path) => Some(ndjson_path),
                 None => {
                     // No NDJSON — fall back to basic JSON table.
-                    let run = load_run_by_id(&runs_dir, &run_id)?;
+                    let run = load_run_by_id(&runs_dir, &run_id).map_err(|e| match e {
+                        Error::NoRuns => Error::RunNotFound {
+                            tag: tag.to_string(),
+                        },
+                        other => other,
+                    })?;
                     anstream::print!("{}", format_table(&run, show_all));
                     return Ok(());
                 }
