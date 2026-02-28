@@ -24,6 +24,9 @@ pub enum Error {
     #[error("no piano runs found -- run `piano profile` to generate one")]
     NoRuns,
 
+    #[error("no run found for tag '{tag}' -- run piano tag to see available tags")]
+    RunNotFound { tag: String },
+
     #[error("failed to read run file {}: {source}", path.display())]
     RunReadError {
         path: PathBuf,
