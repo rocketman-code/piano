@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  version-bump-scope:
+    if: startsWith(github.head_ref, 'release/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version bump commits only touch allowed files
+        run: |
+          base=${{ github.event.pull_request.base.sha }}
+          head=${{ github.event.pull_request.head.sha }}
+
+          allowed="Cargo.lock Cargo.toml piano-runtime/Cargo.toml"
+          failed=0
+
+          for sha in $(git log --format=%H "$base".."$head"); do
+            msg=$(git log -1 --format=%s "$sha")
+
+            case "$msg" in
+              "chore(cargo): bump version"*)
+                files=$(git diff-tree --no-commit-id --name-only -r "$sha" | sort)
+                allowed_sorted=$(echo "$allowed" | tr ' ' '\n' | sort)
+
+                extra=$(comm -23 <(echo "$files") <(echo "$allowed_sorted"))
+                if [ -n "$extra" ]; then
+                  echo "::error::Commit $sha ($msg) touches files outside the version bump scope:"
+                  echo "$extra" | while read -r f; do echo "  - $f"; done
+                  failed=1
+                fi
+                ;;
+            esac
+          done
+
+          if [ "$failed" -eq 1 ]; then
+            echo ""
+            echo "Version bump commits may only change: $allowed"
+            echo "Move other changes (CHANGELOG, docs, etc.) to separate commits."
+            exit 1
+          fi
