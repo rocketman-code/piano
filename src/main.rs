@@ -537,7 +537,7 @@ fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result
                 None => {
                     // No NDJSON — fall back to basic JSON table.
                     let run = load_run_by_id(&runs_dir, &run_id)?;
-                    print!("{}", format_table(&run, show_all));
+                    anstream::print!("{}", format_table(&run, show_all));
                     return Ok(());
                 }
             }
@@ -555,9 +555,9 @@ fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result
     {
         let (_run, frame_data) = load_ndjson(path)?;
         if frames {
-            print!("{}", format_frames_table(&frame_data));
+            anstream::print!("{}", format_frames_table(&frame_data));
         } else {
-            print!("{}", format_table_with_frames(&frame_data, show_all));
+            anstream::print!("{}", format_table_with_frames(&frame_data, show_all));
         }
         return Ok(());
     }
@@ -570,14 +570,14 @@ fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result
             load_latest_run(&dir)?
         }
     };
-    print!("{}", format_table(&run, show_all));
+    anstream::print!("{}", format_table(&run, show_all));
     Ok(())
 }
 
 fn cmd_diff(a: PathBuf, b: PathBuf) -> Result<(), Error> {
     let run_a = resolve_run_arg(&a)?;
     let run_b = resolve_run_arg(&b)?;
-    print!("{}", diff_runs(&run_a, &run_b));
+    anstream::print!("{}", diff_runs(&run_a, &run_b));
     Ok(())
 }
 
