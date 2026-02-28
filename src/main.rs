@@ -16,7 +16,7 @@ use piano::report::{
     load_tagged_run, load_two_latest_runs, relative_time, resolve_tag, reverse_resolve_tag,
     save_tag,
 };
-use piano::resolve::{TargetSpec, resolve_targets};
+use piano::resolve::{ResolveResult, SkippedFunction, TargetSpec, resolve_targets};
 use piano::rewrite::{
     inject_global_allocator, inject_registrations, inject_shutdown, instrument_source,
 };
@@ -66,6 +66,10 @@ enum Commands {
         /// Capture per-thread CPU time alongside wall time (Unix only).
         #[arg(long)]
         cpu_time: bool,
+
+        /// Show functions excluded from instrumentation and exit.
+        #[arg(long)]
+        list_skipped: bool,
     },
     /// Execute the last-built instrumented binary.
     /// Pass arguments to the binary after --.
@@ -105,6 +109,10 @@ enum Commands {
         /// Capture per-thread CPU time alongside wall time (Unix only).
         #[arg(long)]
         cpu_time: bool,
+
+        /// Show functions excluded from instrumentation and exit.
+        #[arg(long)]
+        list_skipped: bool,
 
         /// Show all functions, including those with zero calls.
         #[arg(long)]
@@ -167,6 +175,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             project,
             runtime_path,
             cpu_time,
+            list_skipped,
         } => cmd_build(
             fn_patterns,
             exact,
@@ -175,6 +184,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             project,
             runtime_path,
             cpu_time,
+            list_skipped,
         ),
         Commands::Run { args } => cmd_run(args),
         Commands::Profile {
@@ -185,6 +195,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             project,
             runtime_path,
             cpu_time,
+            list_skipped,
             all,
             frames,
             ignore_exit_code,
@@ -197,6 +208,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             project,
             runtime_path,
             cpu_time,
+            list_skipped,
             all,
             frames,
             ignore_exit_code,
@@ -208,7 +220,20 @@ fn run(cli: Cli) -> Result<(), Error> {
     }
 }
 
+/// Deduplicate and sort skip reasons into a comma-separated string.
+fn unique_skip_reasons(skipped: &[SkippedFunction]) -> String {
+    skipped
+        .iter()
+        .map(|s| s.reason.to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Build an instrumented binary and return (binary_path, runs_dir).
+///
+/// Returns `Ok(None)` when `--list-skipped` is used (early exit after printing).
 fn build_project(
     fn_patterns: Vec<String>,
     exact: bool,
@@ -217,7 +242,8 @@ fn build_project(
     project: PathBuf,
     runtime_path: Option<PathBuf>,
     cpu_time: bool,
-) -> Result<(PathBuf, PathBuf), Error> {
+    list_skipped: bool,
+) -> Result<Option<(PathBuf, PathBuf)>, Error> {
     if !project.exists() {
         return Err(Error::BuildFailed(format!(
             "project directory does not exist: {}",
@@ -246,7 +272,44 @@ fn build_project(
             project.display()
         )));
     }
-    let targets = resolve_targets(&src_dir, &specs, exact)?;
+    let ResolveResult { targets, skipped } = resolve_targets(&src_dir, &specs, exact)?;
+
+    if list_skipped {
+        for s in &skipped {
+            println!("{} ({})", s.name, s.reason);
+        }
+        return Ok(None);
+    }
+
+    if !specs.is_empty() && !skipped.is_empty() {
+        eprintln!(
+            "warning: {} function(s) skipped ({}) -- run piano build --list-skipped to see which",
+            skipped.len(),
+            unique_skip_reasons(&skipped)
+        );
+    }
+
+    if targets.is_empty() && !specs.is_empty() {
+        let desc = specs
+            .iter()
+            .map(|s| match s {
+                TargetSpec::Fn(p) => format!("--fn {p}"),
+                TargetSpec::File(p) => format!("--file {}", p.display()),
+                TargetSpec::Mod(m) => format!("--mod {m}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let hint = if !skipped.is_empty() {
+            format!(
+                ". All {} matched function(s) were skipped ({}) -- piano cannot instrument these",
+                skipped.len(),
+                unique_skip_reasons(&skipped)
+            )
+        } else {
+            String::new()
+        };
+        return Err(Error::NoTargetsFound { specs: desc, hint });
+    }
 
     let total_fns: usize = targets.iter().map(|t| t.functions.len()).sum();
     eprintln!(
@@ -399,7 +462,7 @@ fn build_project(
     // Build the instrumented binary.
     let binary = build_instrumented(staging.path(), &target_dir, package_name.as_deref())?;
 
-    Ok((binary, runs_dir))
+    Ok(Some((binary, runs_dir)))
 }
 
 fn cmd_build(
@@ -410,12 +473,13 @@ fn cmd_build(
     project: Option<PathBuf>,
     runtime_path: Option<PathBuf>,
     cpu_time: bool,
+    list_skipped: bool,
 ) -> Result<(), Error> {
     let project = match project {
         Some(p) => p,
         None => find_project_root(&std::env::current_dir()?)?,
     };
-    let (binary, _runs_dir) = build_project(
+    let Some((binary, _runs_dir)) = build_project(
         fn_patterns,
         exact,
         file_patterns,
@@ -423,7 +487,11 @@ fn cmd_build(
         project,
         runtime_path,
         cpu_time,
-    )?;
+        list_skipped,
+    )?
+    else {
+        return Ok(());
+    };
     let display_name = binary
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -489,6 +557,7 @@ fn cmd_profile(
     project: Option<PathBuf>,
     runtime_path: Option<PathBuf>,
     cpu_time: bool,
+    list_skipped: bool,
     show_all: bool,
     frames: bool,
     ignore_exit_code: bool,
@@ -498,7 +567,7 @@ fn cmd_profile(
         Some(p) => p,
         None => find_project_root(&std::env::current_dir()?)?,
     };
-    let (binary, runs_dir) = build_project(
+    let Some((binary, runs_dir)) = build_project(
         fn_patterns,
         exact,
         file_patterns,
@@ -506,7 +575,11 @@ fn cmd_profile(
         project,
         runtime_path,
         cpu_time,
-    )?;
+        list_skipped,
+    )?
+    else {
+        return Ok(());
+    };
     let display_name = binary
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
