@@ -31,7 +31,7 @@ Batch related changes, release when there's a meaningful set of user-facing chan
 
 ## Release Checklist
 
-1. All milestone issues closed (if using milestones)
+1. All milestone issues closed
 2. `cargo test --workspace` passes
 3. `cargo clippy --workspace --all-targets -- -D warnings` clean
 4. `cargo doc --workspace --no-deps` builds without warnings
@@ -43,7 +43,7 @@ Batch related changes, release when there's a meaningful set of user-facing chan
 10. After merge, tag the merge commit: `git tag v0.x.y` and `git push --tags`
 11. Publish `piano-runtime` first: `cargo publish -p piano-runtime`
 12. Wait for crates.io to index, then publish `piano`: `cargo publish -p piano`
-13. Close the milestone on GitHub (if applicable)
+13. Close the milestone on GitHub
 
 Publishing order matters: `piano build` injects `piano-runtime` as a dependency into user projects, so the runtime crate must be available on crates.io before the CLI crate references it.
 
@@ -54,5 +54,5 @@ Format: `v0.x.y` (e.g., `v0.1.0`, `v0.2.0`). Tag the version bump commit.
 ## Changelog
 
 `CHANGELOG.md` in the repo root, following [Keep a Changelog](https://keepachangelog.com/) format.
-Each release maps to a closed GitHub milestone (when milestones are used).
+Each release maps to a closed GitHub milestone.
 Update the changelog as part of the release commit, before tagging.

@@ -1,6 +1,6 @@
 # piano
 
-Automated instrumentation-based profiling for Rust. Point it at your project, get back timing, percentiles, and allocation counts per frame.
+Automated instrumentation-based profiling for Rust. Point it at your project, get back self-time, call counts, and allocation data per function.
 
 ```
 $ piano profile
@@ -8,13 +8,11 @@ found 5 function(s) across 3 file(s)
 built: target/piano/debug/my-project
 ... normal program output ...
 
-Function                                    Calls       Self        p50        p99   Allocs      Bytes
-----------------------------------------------------------------------------------------------------
-parse                                          12   341.21ms    28.11ms    32.44ms      840     62.5KB
-resolve                                        47   141.13ms     2.98ms     3.22ms      329     24.1KB
-parse_item                                    108    94.58ms     0.87ms     1.14ms     1620    126.3KB
-
-3000 frames
+Function                                       Self    Calls   Allocs  Alloc Bytes
+----------------------------------------------------------------------------------
+parse                                       341.21ms       12      840       62.5KB
+resolve                                     141.13ms       47      329       24.1KB
+parse_item                                   94.58ms      108     1620      126.3KB
 ```
 
 Or step by step:
@@ -57,9 +55,16 @@ Narrow scope by name, file, or module:
 ```
 $ piano build --fn parse                    # functions containing "parse"
 $ piano build --fn "Parser::parse"          # specific impl method
+$ piano build --fn parse --exact            # exact match only
 $ piano build --file src/lexer.rs           # all functions in a file
 $ piano build --mod resolver                # all functions in a module
 $ piano build --fn parse --fn resolve       # multiple patterns
+```
+
+See which functions Piano cannot instrument (const, unsafe, extern):
+
+```
+$ piano build --list-skipped
 ```
 
 The instrumented binary is written to `target/piano/debug/<name>`.
@@ -85,7 +90,7 @@ $ piano profile --fn parse -- --input data.csv
 
 ### Per-frame profiling
 
-Each instrumented run records per-frame timing and allocation data. The default `piano report` shows aggregate percentiles (above). Use `--frames` for a per-frame breakdown with spike detection:
+Each instrumented run records per-frame timing and allocation data. The default `piano report` shows aggregates (above). Use `--frames` for a per-frame breakdown with spike detection:
 
 ```
 $ piano report --frames
@@ -114,14 +119,14 @@ $ piano tag current
 tagged 'current'
 
 $ piano diff baseline current
-Function                                     Before      After      Delta     Allocs    A.Delta
+Function                                   baseline    current      Delta     Allocs    A.Delta
 ----------------------------------------------------------------------------------------------
-parse                                       341.21ms    198.44ms   -142.77ms        640       -200
-resolve                                     141.13ms    141.09ms     -0.04ms        329         +0
-parse_item                                   94.58ms     88.12ms     -6.46ms       1240       -380
+parse                                      341.21ms    198.44ms   -142.77ms        640       -200
+parse_item                                  94.58ms     88.12ms     -6.46ms       1240       -380
+resolve                                    141.13ms    141.09ms     -0.04ms        329         +0
 ```
 
-`piano report` and `piano diff` accept file paths or tag names.
+`piano tag` with no arguments lists all saved tags. `piano diff` with no arguments compares the two most recent runs. Both `piano report` and `piano diff` accept file paths or tag names.
 
 ### CPU time
 
