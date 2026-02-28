@@ -132,3 +132,120 @@ fn special_fns_are_skipped_during_instrumentation() {
         "output should NOT contain extern fn ffi_callback"
     );
 }
+
+#[test]
+fn list_skipped_shows_excluded_functions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("special");
+    create_project_with_special_fns(&project_dir);
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["build", "--list-skipped", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build --list-skipped");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "piano build --list-skipped failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    // Should list all skipped functions with reasons.
+    assert!(
+        stdout.contains("dangerous (unsafe)"),
+        "should list unsafe fn: {stdout}"
+    );
+    assert!(
+        stdout.contains("fixed_size (const)"),
+        "should list const fn: {stdout}"
+    );
+    assert!(
+        stdout.contains("ffi_callback (extern)"),
+        "should list extern fn: {stdout}"
+    );
+
+    // Should NOT list normal functions.
+    assert!(
+        !stdout.contains("normal_work"),
+        "should not list normal fn: {stdout}"
+    );
+    assert!(!stdout.contains("main"), "should not list main: {stdout}");
+}
+
+#[test]
+fn build_warns_about_skipped_functions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("special");
+    create_project_with_special_fns(&project_dir);
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Use a broad --fn pattern that matches both normal and skipped functions.
+    // The warning should only fire when specs are explicit, not in instrument-everything mode.
+    let output = Command::new(piano_bin)
+        .args(["build", "--fn", "o", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "piano build failed:\nstderr: {stderr}"
+    );
+
+    assert!(
+        stderr.contains("function(s) skipped"),
+        "should warn about skipped functions: {stderr}"
+    );
+    assert!(
+        stderr.contains("--list-skipped"),
+        "warning should mention --list-skipped: {stderr}"
+    );
+}
+
+#[test]
+fn build_no_warning_in_instrument_everything_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("special");
+    create_project_with_special_fns(&project_dir);
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // No --fn/--file/--mod: instrument-everything mode should NOT warn about skipped functions.
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "piano build failed:\nstderr: {stderr}"
+    );
+
+    assert!(
+        !stderr.contains("function(s) skipped"),
+        "should NOT warn about skipped functions in instrument-everything mode: {stderr}"
+    );
+}
