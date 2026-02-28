@@ -597,9 +597,9 @@ fn cmd_profile(
     }
 
     eprintln!();
-    match cmd_report(None, show_all, frames) {
+    let report_result = match cmd_report(None, show_all, frames) {
         Ok(()) => Ok(()),
-        Err(Error::NoRuns) if !status.success() && !ignore_exit_code => {
+        Err(Error::NoRuns) if !status.success() => {
             // Program failed and produced no data. The program's own error
             // output is the primary affordance (UX principle 6). Suppress
             // Piano's NoRuns to avoid cascading errors.
@@ -612,7 +612,15 @@ fn cmd_profile(
             Err(Error::NoDataWritten(runs_dir))
         }
         Err(e) => Err(e),
+    };
+
+    report_result?;
+
+    if !status.success() && !ignore_exit_code {
+        std::process::exit(status.code().unwrap_or(1));
     }
+
+    Ok(())
 }
 
 fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result<(), Error> {
