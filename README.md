@@ -106,12 +106,12 @@ Frames exceeding 2x the median total time are marked with `<<`.
 
 ```
 $ piano tag baseline
-tagged 'baseline' -> 98321_1740000000000
+tagged 'baseline'
 
 # ... make changes, rebuild, re-run ...
 
 $ piano tag current
-tagged 'current' -> 98321_1740000060000
+tagged 'current'
 
 $ piano diff baseline current
 Function                                     Before      After      Delta     Allocs    A.Delta

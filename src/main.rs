@@ -588,7 +588,7 @@ fn cmd_tag(name: String) -> Result<(), Error> {
     let latest = load_latest_run(&runs_dir)?;
     let run_id = latest.run_id.ok_or(Error::NoRuns)?;
     save_tag(&tags_dir, &name, &run_id)?;
-    eprintln!("tagged '{name}' -> {run_id}");
+    eprintln!("tagged '{name}'");
     Ok(())
 }
 
