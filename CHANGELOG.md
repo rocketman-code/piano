@@ -7,6 +7,14 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-02-28
+
+### Changed
+
+- README updated to match 0.8.0 report output format (#204)
+- CI workflow added to enforce version bump commit scope on release PRs (#201)
+- Milestones now required for every release in release checklist (#204)
+
 ## [0.8.0] - 2026-02-28
 
 ### Added
