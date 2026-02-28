@@ -277,7 +277,7 @@ fn build_project(
 
     if list_skipped {
         for s in &skipped {
-            println!("{} ({})", s.name, s.reason);
+            println!("{}: {} ({})", s.path.display(), s.name, s.reason);
         }
         return Ok(None);
     }
