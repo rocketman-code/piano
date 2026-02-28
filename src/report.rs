@@ -801,9 +801,17 @@ pub fn save_tag(tags_dir: &Path, tag: &str, run_id: &str) -> Result<(), Error> {
 pub fn resolve_tag(tags_dir: &Path, tag: &str) -> Result<String, Error> {
     validate_tag_name(tag)?;
     let tag_path = tags_dir.join(tag);
-    let run_id = std::fs::read_to_string(&tag_path).map_err(|source| Error::RunReadError {
-        path: tag_path,
-        source,
+    let run_id = std::fs::read_to_string(&tag_path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            Error::RunNotFound {
+                tag: tag.to_owned(),
+            }
+        } else {
+            Error::RunReadError {
+                path: tag_path,
+                source,
+            }
+        }
     })?;
     Ok(run_id.trim().to_owned())
 }
@@ -2289,8 +2297,11 @@ mod tests {
         let tags_dir = dir.path().join("tags");
         fs::create_dir_all(&tags_dir).unwrap();
 
-        let result = resolve_tag(&tags_dir, "nonexistent");
-        assert!(result.is_err());
+        let err = resolve_tag(&tags_dir, "nonexistent").unwrap_err();
+        assert!(
+            matches!(err, Error::RunNotFound { ref tag } if tag == "nonexistent"),
+            "expected RunNotFound, got: {err:?}"
+        );
     }
 
     #[test]
