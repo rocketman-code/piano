@@ -7,6 +7,43 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-02-28
+
+### Added
+
+- `--exact` flag for `piano build` and `piano profile`: exact-match mode for `--fn`, mirroring `cargo test -- --exact` convention (#120)
+- `--list-skipped` flag for `piano build` and `piano profile`: list functions that Piano cannot instrument (const, unsafe, extern) with file paths and reasons; prints "no functions skipped" when all functions are instrumentable (#137, #186, #192)
+- `piano tag` with no arguments lists all saved tags; `piano tag <name>` saves (#175)
+- `piano diff` with no arguments compares the two most recent runs, showing "comparing: X vs Y" with tag names or relative timestamps (#125)
+- User labels as diff column headers: tag names, filename stems, or relative timestamps instead of generic "Before"/"After" (#124)
+- Auto-detect project root by walking up from cwd to find Cargo.toml, removing the need for `--project` in most cases (#135)
+- Structural color in report tables: bold headers, dim separators, full NO_COLOR/CLICOLOR/CLICOLOR_FORCE/TERM=dumb support via anstream (#122)
+- Recovery guidance in NoTargetsFound errors: shows similar function names via edit distance, or lists all available functions (#127)
+- UX design principles documented in docs/standards/ux.md
+
+### Fixed
+
+- Diff table sorted by absolute self-time delta descending instead of alphabetically (#193)
+- Duplicate error message on NoTargetsFound when all matched functions were skipped (#191)
+- Missing tag produces "no run found for tag '...'" instead of leaking internal file paths (#198)
+- Internal staging/tempdir paths removed from all user-facing error messages (#129)
+- Cascading NoRuns error suppressed when profiled program exits non-zero (#139)
+- `--fn` substring matching now checks qualified names (Type::method), not just bare names (#185)
+- Stale tags produce RunNotFound with recovery guidance instead of generic NoRuns (#160)
+- Non-printable characters in tag names displayed safely in error messages (#166)
+- Redundant "invalid tag:" prefix removed from tag validation errors (#165)
+- Run ID removed from tag confirmation message (#126)
+- Concurrency warning simplified to one line per function (#138)
+- Invalid tag error defines the valid character set instead of listing what's invalid (#128)
+- App name shown in build output instead of internal binary path (#121)
+- `--fn` help text harmonized between build and profile commands (#123)
+
+### Changed
+
+- Report columns reordered: Function | Self | Calls | Allocs | Alloc Bytes (self-time leads, Total removed from default view) (#180, #136)
+- Runtime exits non-zero on profiling data write failure instead of silently discarding
+- Runs directory pre-created before instrumented build to prevent write failures
+
 ## [0.7.0] - 2026-02-27
 
 ### Added
