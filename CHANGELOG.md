@@ -7,6 +7,14 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-02-28
+
+### Changed
+
+- Per-call instrumentation overhead reduced from 129ns to 59ns on Apple Silicon (#206):
+  - Frame aggregation uses Vec linear scan with pointer comparison instead of HashMap
+  - RECORDS pushes batched in thread-local buffer, flushed at frame boundaries instead of locking Mutex on every function return
+
 ## [0.8.1] - 2026-02-28
 
 ### Changed
