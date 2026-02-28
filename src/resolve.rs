@@ -7,7 +7,7 @@ use crate::error::Error;
 /// What the user asked to instrument.
 #[derive(Debug, Clone)]
 pub enum TargetSpec {
-    /// Substring match against function names (--fn).
+    /// Match against function names (--fn). Substring by default, exact with --exact.
     Fn(String),
     /// All functions in a specific file (--file).
     File(PathBuf),
@@ -27,7 +27,13 @@ pub struct ResolvedTarget {
 /// Returns one `ResolvedTarget` per file that contains at least one matching function.
 /// When `specs` is empty, collects all functions from all files (instrument-everything mode).
 /// When `specs` is non-empty, errors if no functions match any spec.
-pub fn resolve_targets(src_dir: &Path, specs: &[TargetSpec]) -> Result<Vec<ResolvedTarget>, Error> {
+/// When `exact` is true, `Fn` patterns match bare or qualified names exactly
+/// instead of by substring.
+pub fn resolve_targets(
+    src_dir: &Path,
+    specs: &[TargetSpec],
+    exact: bool,
+) -> Result<Vec<ResolvedTarget>, Error> {
     let rs_files = walk_rs_files(src_dir)?;
 
     let mut results: Vec<ResolvedTarget> = Vec::new();
@@ -61,7 +67,11 @@ pub fn resolve_targets(src_dir: &Path, specs: &[TargetSpec]) -> Result<Vec<Resol
                             .filter(|name| {
                                 // Match against the bare function name (after any Type:: prefix).
                                 let bare = name.rsplit("::").next().unwrap_or(name);
-                                bare.contains(pattern.as_str())
+                                if exact {
+                                    bare == pattern.as_str() || name == pattern.as_str()
+                                } else {
+                                    bare.contains(pattern.as_str())
+                                }
                             })
                             .collect();
                         if !matched.is_empty() {
@@ -465,7 +475,7 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::Fn("walk".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs).unwrap();
+        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
         let all_fns: Vec<&str> = results
             .iter()
@@ -487,7 +497,7 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::Fn("resolve".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs).unwrap();
+        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
         let all_fns: Vec<&str> = results
             .iter()
@@ -510,7 +520,7 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::File("resolver.rs".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs).unwrap();
+        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
         assert_eq!(results.len(), 1);
         let fns = &results[0].functions;
@@ -525,7 +535,7 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::Mod("walker".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs).unwrap();
+        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
         assert_eq!(results.len(), 1);
         let fns = &results[0].functions;
@@ -539,7 +549,7 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::Fn("nonexistent_xyz".into())];
-        let result = resolve_targets(&tmp.path().join("src"), &specs);
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false);
 
         assert!(result.is_err(), "should error when no functions match");
         let err = result.unwrap_err().to_string();
@@ -563,7 +573,7 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::File("with_tests.rs".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs).unwrap();
+        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
         let all_fns: Vec<&str> = results
             .iter()
@@ -603,7 +613,7 @@ mod tests {
 
         // Should succeed despite the unparseable file.
         let specs = [TargetSpec::Fn("walk".into())];
-        let results = resolve_targets(&src, &specs).unwrap();
+        let results = resolve_targets(&src, &specs, false).unwrap();
 
         let all_fns: Vec<&str> = results
             .iter()
@@ -626,7 +636,7 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs: Vec<TargetSpec> = vec![];
-        let results = resolve_targets(&tmp.path().join("src"), &specs).unwrap();
+        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
         let all_fns: Vec<&str> = results
             .iter()
@@ -671,7 +681,7 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::File("special_fns.rs".into())];
-        let results = resolve_targets(&tmp.path().join("src"), &specs).unwrap();
+        let results = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
         let all_fns: Vec<&str> = results
             .iter()
@@ -706,7 +716,7 @@ mod tests {
 
         // "heper" is close to "helper" (distance 1, threshold = 5/3 = 1, so distance <= 1 passes).
         let specs = [TargetSpec::Fn("heper".into())];
-        let result = resolve_targets(&tmp.path().join("src"), &specs);
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false);
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -746,7 +756,7 @@ mod tests {
         fs::write(src.join("many.rs"), &code).unwrap();
 
         let specs = [TargetSpec::Fn("nonexistent".into())];
-        let result = resolve_targets(&src, &specs);
+        let result = resolve_targets(&src, &specs, false);
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -766,7 +776,7 @@ mod tests {
         create_test_project(tmp.path());
 
         let specs = [TargetSpec::Fn("zzz_nonexistent".into())];
-        let result = resolve_targets(&tmp.path().join("src"), &specs);
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false);
         let err = result.unwrap_err().to_string();
         assert!(
             err.starts_with("no functions matched"),
@@ -775,6 +785,68 @@ mod tests {
         assert!(
             err.contains("--fn zzz_nonexistent"),
             "error should include the spec: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_fn_exact_match() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        // "walk" with exact=true should match only "walk", not "walk_dir".
+        let specs = [TargetSpec::Fn("walk".into())];
+        let results = resolve_targets(&tmp.path().join("src"), &specs, true).unwrap();
+
+        let all_fns: Vec<&str> = results
+            .iter()
+            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .collect();
+
+        assert!(all_fns.contains(&"walk"), "should match exact 'walk'");
+        assert!(
+            !all_fns.contains(&"walk_dir"),
+            "should NOT match 'walk_dir' in exact mode"
+        );
+    }
+
+    #[test]
+    fn resolve_fn_exact_match_qualified() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        // Exact match should also work with qualified names like "Resolver::resolve".
+        let specs = [TargetSpec::Fn("Resolver::resolve".into())];
+        let results = resolve_targets(&tmp.path().join("src"), &specs, true).unwrap();
+
+        let all_fns: Vec<&str> = results
+            .iter()
+            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .collect();
+
+        assert!(
+            all_fns.contains(&"Resolver::resolve"),
+            "should match qualified 'Resolver::resolve'"
+        );
+        assert!(
+            !all_fns.contains(&"Resolver::internal_resolve"),
+            "should NOT match 'Resolver::internal_resolve' in exact mode"
+        );
+    }
+
+    #[test]
+    fn resolve_fn_exact_no_match_shows_error() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        // "wal" is a substring of "walk" but not an exact match.
+        let specs = [TargetSpec::Fn("wal".into())];
+        let result = resolve_targets(&tmp.path().join("src"), &specs, true);
+
+        assert!(result.is_err(), "partial match should fail in exact mode");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no functions matched"),
+            "error should say no functions matched: {err}"
         );
     }
 }
