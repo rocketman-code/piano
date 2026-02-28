@@ -105,6 +105,7 @@ pub fn resolve_targets(
                                     bare == pattern.as_str() || name == pattern.as_str()
                                 } else {
                                     bare.contains(pattern.as_str())
+                                        || name.contains(pattern.as_str())
                                 }
                             })
                             .collect();
@@ -119,6 +120,7 @@ pub fn resolve_targets(
                                     bare == pattern.as_str() || s.name == pattern.as_str()
                                 } else {
                                     bare.contains(pattern.as_str())
+                                        || s.name.contains(pattern.as_str())
                                 }
                             })
                             .collect();
@@ -878,6 +880,36 @@ mod tests {
         assert!(
             err.contains("--fn zzz_nonexistent"),
             "error should include the spec: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_fn_substring_matches_qualified_name() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        // "Resolver" appears in the qualified name "Resolver::resolve" but not in the bare
+        // name "resolve". Substring matching should check both.
+        let specs = [TargetSpec::Fn("Resolver".into())];
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
+
+        let all_fns: Vec<&str> = result
+            .targets
+            .iter()
+            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .collect();
+
+        assert!(
+            all_fns.contains(&"Resolver::resolve"),
+            "should match 'Resolver::resolve' via qualified name substring"
+        );
+        assert!(
+            all_fns.contains(&"Resolver::internal_resolve"),
+            "should match 'Resolver::internal_resolve' via qualified name substring"
+        );
+        assert!(
+            !all_fns.contains(&"helper"),
+            "should not match unrelated 'helper'"
         );
     }
 
