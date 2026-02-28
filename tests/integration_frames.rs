@@ -172,8 +172,8 @@ fn frame_pipeline_build_run_report() {
         "report should show 'update'"
     );
     assert!(
-        report_stdout.contains("p50"),
-        "report should show percentile columns"
+        !report_stdout.contains("p50"),
+        "default report should not show percentile columns"
     );
 
     // Verify `piano report --frames` shows per-frame breakdown.
