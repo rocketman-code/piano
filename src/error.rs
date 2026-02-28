@@ -27,6 +27,9 @@ pub enum Error {
     #[error("no run found for tag '{tag}' -- run piano tag to see available tags")]
     RunNotFound { tag: String },
 
+    #[error("no Cargo.toml found in {0} or any parent directory")]
+    NoProjectFound(PathBuf),
+
     #[error("failed to read run file {}: {source}", path.display())]
     RunReadError {
         path: PathBuf,
