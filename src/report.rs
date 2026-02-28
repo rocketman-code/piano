@@ -2461,4 +2461,95 @@ mod tests {
             "Column order should be Self | CPU | Calls. Got:\n{table}"
         );
     }
+
+    #[test]
+    fn companion_merged_functions_aggregate_across_frames() {
+        // Worker-thread functions merged from companion JSON only have data in
+        // frame 0. They should still appear in the summary with their totals.
+        let mut companion_fn_ids = HashSet::new();
+        companion_fn_ids.insert(2); // "worker_fn" is companion-merged
+
+        let frame_data = FrameData {
+            fn_names: vec!["main_fn".into(), "update".into(), "worker_fn".into()],
+            frames: vec![
+                vec![
+                    FrameFnEntry {
+                        fn_id: 0,
+                        calls: 1,
+                        self_ns: 5_000_000,
+                        cpu_self_ns: None,
+                        alloc_count: 0,
+                        alloc_bytes: 0,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                    FrameFnEntry {
+                        fn_id: 1,
+                        calls: 1,
+                        self_ns: 2_000_000,
+                        cpu_self_ns: None,
+                        alloc_count: 0,
+                        alloc_bytes: 0,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                    // worker_fn only appears in frame 0
+                    FrameFnEntry {
+                        fn_id: 2,
+                        calls: 50,
+                        self_ns: 3_000_000,
+                        cpu_self_ns: None,
+                        alloc_count: 100,
+                        alloc_bytes: 5000,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                ],
+                vec![
+                    FrameFnEntry {
+                        fn_id: 0,
+                        calls: 1,
+                        self_ns: 4_000_000,
+                        cpu_self_ns: None,
+                        alloc_count: 0,
+                        alloc_bytes: 0,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                    FrameFnEntry {
+                        fn_id: 1,
+                        calls: 1,
+                        self_ns: 2_500_000,
+                        cpu_self_ns: None,
+                        alloc_count: 0,
+                        alloc_bytes: 0,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                    // worker_fn absent from frame 1
+                ],
+            ],
+            companion_fn_ids,
+        };
+
+        let table = format_table_with_frames(&frame_data, false);
+
+        // worker_fn should appear with its aggregated totals (50 calls, 100 allocs)
+        let worker_line = table
+            .lines()
+            .find(|l| l.contains("worker_fn"))
+            .expect("worker_fn should appear in table");
+        assert!(
+            worker_line.contains("50"),
+            "worker_fn should show 50 calls, got: {worker_line}"
+        );
+        assert!(
+            worker_line.contains("100"),
+            "worker_fn should show 100 allocs, got: {worker_line}"
+        );
+
+        // All three functions should appear
+        assert!(table.contains("main_fn"), "main_fn should appear in table");
+        assert!(table.contains("update"), "update should appear in table");
+    }
 }
