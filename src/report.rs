@@ -2981,6 +2981,78 @@ mod tests {
     }
 
     #[test]
+    fn diff_tagged_ndjson_runs_uses_frame_data() {
+        let dir = TempDir::new().unwrap();
+        let runs_dir = dir.path().join("runs");
+        let tags_dir = dir.path().join("tags");
+        fs::create_dir_all(&runs_dir).unwrap();
+        fs::create_dir_all(&tags_dir).unwrap();
+
+        // Run A: NDJSON only (no .json). "compute" has 2 frames, self_ns sums to 5ms.
+        let ndjson_a = r#"{"format_version":2,"run_id":"aaa_1000","timestamp_ms":1000,"functions":["compute"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":2000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+{"frame":1,"fns":[{"id":0,"calls":1,"self_ns":3000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        // Run B: NDJSON only. "compute" has 2 frames, self_ns sums to 8ms.
+        let ndjson_b = r#"{"format_version":2,"run_id":"bbb_2000","timestamp_ms":2000,"functions":["compute"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":4000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+{"frame":1,"fns":[{"id":0,"calls":1,"self_ns":4000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        fs::write(runs_dir.join("1000.ndjson"), ndjson_a).unwrap();
+        fs::write(runs_dir.join("2000.ndjson"), ndjson_b).unwrap();
+
+        // Tag both runs.
+        fs::write(tags_dir.join("before"), "aaa_1000").unwrap();
+        fs::write(tags_dir.join("after"), "bbb_2000").unwrap();
+
+        // Load via tag path — same path as cmd_diff uses.
+        let run_a = load_tagged_run(&tags_dir, &runs_dir, "before").unwrap();
+        let run_b = load_tagged_run(&tags_dir, &runs_dir, "after").unwrap();
+
+        // Verify NDJSON data was loaded (not empty/zero).
+        let compute_a = run_a
+            .functions
+            .iter()
+            .find(|f| f.name == "compute")
+            .unwrap();
+        assert_eq!(
+            compute_a.calls, 2,
+            "run A should have 2 calls from 2 frames"
+        );
+        assert!(
+            (compute_a.self_ms - 5.0).abs() < 0.01,
+            "run A self_ms should be ~5.0ms (from NDJSON), got {}",
+            compute_a.self_ms
+        );
+
+        let compute_b = run_b
+            .functions
+            .iter()
+            .find(|f| f.name == "compute")
+            .unwrap();
+        assert_eq!(
+            compute_b.calls, 2,
+            "run B should have 2 calls from 2 frames"
+        );
+        assert!(
+            (compute_b.self_ms - 8.0).abs() < 0.01,
+            "run B self_ms should be ~8.0ms (from NDJSON), got {}",
+            compute_b.self_ms
+        );
+
+        // Diff output should show the NDJSON-derived values.
+        let diff = diff_runs(&run_a, &run_b, "before", "after");
+        assert!(
+            diff.contains("compute"),
+            "diff should contain function name: {diff}"
+        );
+        assert!(
+            diff.contains("+3.00"),
+            "diff should show +3.00ms delta (8.0 - 5.0): {diff}"
+        );
+    }
+
+    #[test]
     fn two_latest_runs_with_tags_and_relative_time() {
         let dir = TempDir::new().unwrap();
         let runs_dir = dir.path().join("runs");
