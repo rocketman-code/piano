@@ -30,13 +30,17 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
       - run: cargo test --workspace
+      - run: cargo test --workspace --features piano-runtime/cpu-time
 
   msrv:
     runs-on: ubuntu-latest
