@@ -33,43 +33,49 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Parser)]
+struct BuildOpts {
+    /// Instrument functions whose name contains PATTERN (repeatable).
+    /// e.g. --fn parse matches parse, parse_line, MyStruct::try_parse.
+    #[arg(long = "fn", value_name = "PATTERN")]
+    fn_patterns: Vec<String>,
+
+    /// Match --fn patterns exactly instead of by substring.
+    #[arg(long, requires = "fn_patterns")]
+    exact: bool,
+
+    /// Instrument all functions in a file (repeatable).
+    #[arg(long = "file", value_name = "PATH")]
+    file_patterns: Vec<PathBuf>,
+
+    /// Instrument all functions in a module (repeatable).
+    #[arg(long = "mod", value_name = "NAME")]
+    mod_patterns: Vec<String>,
+
+    /// Project root (auto-detected from Cargo.toml).
+    #[arg(long)]
+    project: Option<PathBuf>,
+
+    /// Path to piano-runtime source (for development before publishing).
+    #[arg(long)]
+    runtime_path: Option<PathBuf>,
+
+    /// Capture per-thread CPU time alongside wall time (Unix only).
+    #[arg(long)]
+    cpu_time: bool,
+
+    /// Show functions excluded from instrumentation and exit.
+    #[arg(long)]
+    list_skipped: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Instrument and build the project. Profiles all functions by default;
     /// use --fn, --file, or --mod to narrow scope.
     Build {
-        /// Instrument functions whose name contains PATTERN (repeatable).
-        /// e.g. --fn parse matches parse, parse_line, MyStruct::try_parse.
-        #[arg(long = "fn", value_name = "PATTERN")]
-        fn_patterns: Vec<String>,
-
-        /// Match --fn patterns exactly instead of by substring.
-        #[arg(long, requires = "fn_patterns")]
-        exact: bool,
-
-        /// Instrument all functions in a file (repeatable).
-        #[arg(long = "file", value_name = "PATH")]
-        file_patterns: Vec<PathBuf>,
-
-        /// Instrument all functions in a module (repeatable).
-        #[arg(long = "mod", value_name = "NAME")]
-        mod_patterns: Vec<String>,
-
-        /// Project root (auto-detected from Cargo.toml).
-        #[arg(long)]
-        project: Option<PathBuf>,
-
-        /// Path to piano-runtime source (for development before publishing).
-        #[arg(long)]
-        runtime_path: Option<PathBuf>,
-
-        /// Capture per-thread CPU time alongside wall time (Unix only).
-        #[arg(long)]
-        cpu_time: bool,
-
-        /// Show functions excluded from instrumentation and exit.
-        #[arg(long)]
-        list_skipped: bool,
+        #[command(flatten)]
+        opts: BuildOpts,
     },
     /// Execute the last-built instrumented binary.
     /// Pass arguments to the binary after --.
@@ -81,38 +87,8 @@ enum Commands {
     /// Build, execute, and report in one step.
     /// Pass arguments to the binary after --.
     Profile {
-        /// Instrument functions whose name contains PATTERN (repeatable).
-        /// e.g. --fn parse matches parse, parse_line, MyStruct::try_parse.
-        #[arg(long = "fn", value_name = "PATTERN")]
-        fn_patterns: Vec<String>,
-
-        /// Match --fn patterns exactly instead of by substring.
-        #[arg(long, requires = "fn_patterns")]
-        exact: bool,
-
-        /// Instrument all functions in a file (repeatable).
-        #[arg(long = "file", value_name = "PATH")]
-        file_patterns: Vec<PathBuf>,
-
-        /// Instrument all functions in a module (repeatable).
-        #[arg(long = "mod", value_name = "NAME")]
-        mod_patterns: Vec<String>,
-
-        /// Project root (auto-detected from Cargo.toml).
-        #[arg(long)]
-        project: Option<PathBuf>,
-
-        /// Path to piano-runtime source (for development before publishing).
-        #[arg(long)]
-        runtime_path: Option<PathBuf>,
-
-        /// Capture per-thread CPU time alongside wall time (Unix only).
-        #[arg(long)]
-        cpu_time: bool,
-
-        /// Show functions excluded from instrumentation and exit.
-        #[arg(long)]
-        list_skipped: bool,
+        #[command(flatten)]
+        opts: BuildOpts,
 
         /// Show all functions, including those with zero calls.
         #[arg(long)]
@@ -167,53 +143,15 @@ fn main() {
 
 fn run(cli: Cli) -> Result<(), Error> {
     match cli.command {
-        Commands::Build {
-            fn_patterns,
-            exact,
-            file_patterns,
-            mod_patterns,
-            project,
-            runtime_path,
-            cpu_time,
-            list_skipped,
-        } => cmd_build(
-            fn_patterns,
-            exact,
-            file_patterns,
-            mod_patterns,
-            project,
-            runtime_path,
-            cpu_time,
-            list_skipped,
-        ),
+        Commands::Build { opts } => cmd_build(opts),
         Commands::Run { args } => cmd_run(args),
         Commands::Profile {
-            fn_patterns,
-            exact,
-            file_patterns,
-            mod_patterns,
-            project,
-            runtime_path,
-            cpu_time,
-            list_skipped,
+            opts,
             all,
             frames,
             ignore_exit_code,
             args,
-        } => cmd_profile(
-            fn_patterns,
-            exact,
-            file_patterns,
-            mod_patterns,
-            project,
-            runtime_path,
-            cpu_time,
-            list_skipped,
-            all,
-            frames,
-            ignore_exit_code,
-            args,
-        ),
+        } => cmd_profile(opts, all, frames, ignore_exit_code, args),
         Commands::Report { run, all, frames } => cmd_report(run, all, frames),
         Commands::Diff { a, b } => cmd_diff(a, b),
         Commands::Tag { name } => cmd_tag(name),
@@ -234,17 +172,23 @@ fn unique_skip_reasons(skipped: &[SkippedFunction]) -> String {
 /// Build an instrumented binary and return (binary_path, runs_dir).
 ///
 /// Returns `Ok(None)` when `--list-skipped` is used (early exit after printing).
-#[allow(clippy::too_many_arguments)]
-fn build_project(
-    fn_patterns: Vec<String>,
-    exact: bool,
-    file_patterns: Vec<PathBuf>,
-    mod_patterns: Vec<String>,
-    project: PathBuf,
-    runtime_path: Option<PathBuf>,
-    cpu_time: bool,
-    list_skipped: bool,
-) -> Result<Option<(PathBuf, PathBuf)>, Error> {
+fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
+    let BuildOpts {
+        fn_patterns,
+        exact,
+        file_patterns,
+        mod_patterns,
+        project,
+        runtime_path,
+        cpu_time,
+        list_skipped,
+    } = opts;
+
+    let project = match project {
+        Some(p) => p,
+        None => find_project_root(&std::env::current_dir()?)?,
+    };
+
     if !project.exists() {
         return Err(Error::BuildFailed(format!(
             "project directory does not exist: {}",
@@ -448,32 +392,8 @@ fn build_project(
     Ok(Some((binary, runs_dir)))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_build(
-    fn_patterns: Vec<String>,
-    exact: bool,
-    file_patterns: Vec<PathBuf>,
-    mod_patterns: Vec<String>,
-    project: Option<PathBuf>,
-    runtime_path: Option<PathBuf>,
-    cpu_time: bool,
-    list_skipped: bool,
-) -> Result<(), Error> {
-    let project = match project {
-        Some(p) => p,
-        None => find_project_root(&std::env::current_dir()?)?,
-    };
-    let Some((binary, _runs_dir)) = build_project(
-        fn_patterns,
-        exact,
-        file_patterns,
-        mod_patterns,
-        project,
-        runtime_path,
-        cpu_time,
-        list_skipped,
-    )?
-    else {
+fn cmd_build(opts: BuildOpts) -> Result<(), Error> {
+    let Some((binary, _runs_dir)) = build_project(opts)? else {
         return Ok(());
     };
     let display_name = binary
@@ -532,36 +452,14 @@ fn cmd_run(args: Vec<String>) -> Result<(), Error> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_profile(
-    fn_patterns: Vec<String>,
-    exact: bool,
-    file_patterns: Vec<PathBuf>,
-    mod_patterns: Vec<String>,
-    project: Option<PathBuf>,
-    runtime_path: Option<PathBuf>,
-    cpu_time: bool,
-    list_skipped: bool,
+    opts: BuildOpts,
     show_all: bool,
     frames: bool,
     ignore_exit_code: bool,
     args: Vec<String>,
 ) -> Result<(), Error> {
-    let project = match project {
-        Some(p) => p,
-        None => find_project_root(&std::env::current_dir()?)?,
-    };
-    let Some((binary, runs_dir)) = build_project(
-        fn_patterns,
-        exact,
-        file_patterns,
-        mod_patterns,
-        project,
-        runtime_path,
-        cpu_time,
-        list_skipped,
-    )?
-    else {
+    let Some((binary, runs_dir)) = build_project(opts)? else {
         return Ok(());
     };
     let display_name = binary
