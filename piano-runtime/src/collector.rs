@@ -2576,12 +2576,14 @@ mod tests {
     }
 
     #[test]
-    fn stack_entry_is_64_bytes() {
-        assert_eq!(
-            core::mem::size_of::<StackEntry>(),
-            64,
-            "StackEntry must be exactly 64 bytes to preserve lsl #6 indexing"
-        );
+    fn stack_entry_size() {
+        let size = core::mem::size_of::<StackEntry>();
+        // Without cpu-time: 64 bytes (power-of-two enables lsl #6 indexing on ARM).
+        // With cpu-time: 80 bytes (two extra u64 fields for cpu_children_ns, cpu_start_ns).
+        #[cfg(not(feature = "cpu-time"))]
+        assert_eq!(size, 64, "StackEntry without cpu-time must be 64 bytes");
+        #[cfg(feature = "cpu-time")]
+        assert_eq!(size, 80, "StackEntry with cpu-time must be 80 bytes");
     }
 
     #[test]
