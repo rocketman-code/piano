@@ -187,34 +187,48 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
             .and_then(|c| serde_json::from_str::<Run>(&c).map_err(|e| e.to_string()))
         {
             Ok(json_run) => {
-                let existing: HashSet<String> = fn_names.iter().cloned().collect();
-                let has_new = json_run
-                    .functions
-                    .iter()
-                    .any(|f| !existing.contains(&f.name));
-                if has_new && frames.is_empty() {
-                    frames.push(Vec::new());
-                }
-                for fn_entry in &json_run.functions {
-                    if !existing.contains(&fn_entry.name) {
-                        let new_id = fn_names.len();
-                        fn_names.push(fn_entry.name.clone());
-                        companion_fn_ids.insert(new_id);
-                        // Add aggregate data to first frame. Worker threads lack
-                        // frame boundaries, so we can't assign to specific frames.
-                        if let Some(first_frame) = frames.first_mut() {
-                            first_frame.push(FrameFnEntry {
-                                fn_id: new_id,
-                                calls: fn_entry.calls,
-                                self_ns: (fn_entry.self_ms * 1_000_000.0) as u64,
-                                cpu_self_ns: fn_entry
-                                    .cpu_self_ms
-                                    .map(|ms| (ms * 1_000_000.0) as u64),
-                                alloc_count: fn_entry.alloc_count,
-                                alloc_bytes: fn_entry.alloc_bytes,
-                                free_count: 0,
-                                free_bytes: 0,
-                            });
+                // Verify run_id consistency. When both files carry a run_id,
+                // they must match -- otherwise the companion belongs to a
+                // different logical run that merely shares the timestamp stem.
+                let ids_conflict = match (&header.run_id, &json_run.run_id) {
+                    (Some(ndjson_id), Some(json_id)) => ndjson_id != json_id,
+                    _ => false,
+                };
+                if ids_conflict {
+                    eprintln!(
+                        "warning: companion {} has different run_id, skipping merge",
+                        json_companion.display()
+                    );
+                } else {
+                    let existing: HashSet<String> = fn_names.iter().cloned().collect();
+                    let has_new = json_run
+                        .functions
+                        .iter()
+                        .any(|f| !existing.contains(&f.name));
+                    if has_new && frames.is_empty() {
+                        frames.push(Vec::new());
+                    }
+                    for fn_entry in &json_run.functions {
+                        if !existing.contains(&fn_entry.name) {
+                            let new_id = fn_names.len();
+                            fn_names.push(fn_entry.name.clone());
+                            companion_fn_ids.insert(new_id);
+                            // Add aggregate data to first frame. Worker threads lack
+                            // frame boundaries, so we can't assign to specific frames.
+                            if let Some(first_frame) = frames.first_mut() {
+                                first_frame.push(FrameFnEntry {
+                                    fn_id: new_id,
+                                    calls: fn_entry.calls,
+                                    self_ns: (fn_entry.self_ms * 1_000_000.0) as u64,
+                                    cpu_self_ns: fn_entry
+                                        .cpu_self_ms
+                                        .map(|ms| (ms * 1_000_000.0) as u64),
+                                    alloc_count: fn_entry.alloc_count,
+                                    alloc_bytes: fn_entry.alloc_bytes,
+                                    free_count: 0,
+                                    free_bytes: 0,
+                                });
+                            }
                         }
                     }
                 }
@@ -2482,6 +2496,48 @@ mod tests {
         assert!(
             has_entry,
             "worker_fn should have a frame entry with calls=50"
+        );
+    }
+
+    #[test]
+    fn load_ndjson_skips_companion_with_mismatched_run_id() {
+        // Companion JSON whose run_id differs from the NDJSON header should
+        // NOT be merged, even when the timestamp stems match.
+        let dir = TempDir::new().unwrap();
+
+        let ndjson = r#"{"format_version":2,"run_id":"ndjson_run","timestamp_ms":7000,"functions":["main_fn"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":10000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        fs::write(dir.path().join("7000.ndjson"), ndjson).unwrap();
+
+        // Companion JSON has a DIFFERENT run_id.
+        let json = r#"{
+            "run_id": "different_run",
+            "timestamp_ms": 7000,
+            "functions": [
+                {"name": "main_fn", "calls": 1, "total_ms": 10.0, "self_ms": 10.0},
+                {"name": "worker_fn", "calls": 50, "total_ms": 3.0, "self_ms": 3.0}
+            ]
+        }"#;
+        fs::write(dir.path().join("7000.json"), json).unwrap();
+
+        let ndjson_path = dir.path().join("7000.ndjson");
+        let (run, frame_data) = load_ndjson(&ndjson_path).unwrap();
+
+        // worker_fn should NOT be merged because the run_ids differ.
+        assert_eq!(
+            frame_data.fn_names.len(),
+            1,
+            "should not merge functions from companion with different run_id. Got: {:?}",
+            frame_data.fn_names
+        );
+        assert!(
+            !frame_data.fn_names.contains(&"worker_fn".to_string()),
+            "worker_fn should not appear when companion run_id mismatches"
+        );
+        assert!(
+            run.functions.iter().all(|f| f.name != "worker_fn"),
+            "worker_fn should not appear in Run when companion run_id mismatches"
         );
     }
 
