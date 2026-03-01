@@ -9,6 +9,20 @@ use crate::error::Error;
 /// Copy the user's project into a staging directory, respecting .gitignore
 /// and skipping the `target/` directory.
 pub fn prepare_staging(project_root: &Path, staging_dir: &Path) -> Result<(), Error> {
+    // Wipe existing staging contents so stale files from previous runs
+    // don't leak into the build. The directory itself is preserved.
+    if staging_dir.exists() {
+        for entry in std::fs::read_dir(staging_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+
     let walker = WalkBuilder::new(project_root)
         .hidden(false)
         .follow_links(true)
@@ -573,6 +587,26 @@ version = "0.1.0"
         );
         let content = std::fs::read_to_string(staging.path().join("src/shared.rs")).unwrap();
         assert_eq!(content, "pub fn shared() {}");
+    }
+
+    #[test]
+    fn staging_removes_stale_files() {
+        let project = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        create_file(project.path(), "Cargo.toml", "[package]\nname = \"demo\"");
+        create_file(project.path(), "src/main.rs", "fn main() {}");
+
+        // Pre-populate staging with a stale file that doesn't exist in project
+        create_file(staging.path(), "src/old_module.rs", "pub fn stale() {}");
+
+        prepare_staging(project.path(), staging.path()).unwrap();
+
+        assert!(staging.path().join("src/main.rs").exists());
+        assert!(
+            !staging.path().join("src/old_module.rs").exists(),
+            "stale file should be removed from staging"
+        );
     }
 
     #[test]
