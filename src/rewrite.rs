@@ -583,7 +583,7 @@ fn inject_fn_guards_in_tokens(tokens: &mut [proc_macro2::TokenTree]) {
 }
 
 /// If the token at position `i` starts a non-instrumentable fn definition
-/// (const fn, unsafe fn, extern fn, extern "ABI" fn), return the index just
+/// (const fn, unsafe fn, extern fn with non-Rust ABI), return the index just
 /// past the body brace group so the caller can skip the entire definition.
 /// Returns None if this is not a non-instrumentable fn.
 ///
@@ -606,7 +606,7 @@ fn skip_non_instrumentable_fn(tokens: &[proc_macro2::TokenTree], i: usize) -> Op
         }
     }
 
-    // Must see one of: const, unsafe, extern — then `fn` must follow immediately.
+    // Must see one of: const, unsafe, extern (non-Rust ABI) — then `fn` must follow immediately.
     if is_ident(tokens, pos, "const") {
         pos += 1;
     } else if is_ident(tokens, pos, "unsafe") {
@@ -620,7 +620,7 @@ fn skip_non_instrumentable_fn(tokens: &[proc_macro2::TokenTree], i: usize) -> Op
                 }
             }
         }
-    } else if is_ident(tokens, pos, "extern") {
+    } else if is_non_rust_extern(tokens, pos) {
         pos += 1;
         // extern "ABI" fn
         if pos < len {
@@ -652,19 +652,19 @@ fn skip_non_instrumentable_fn(tokens: &[proc_macro2::TokenTree], i: usize) -> Op
 }
 
 /// Try to match a fn pattern starting at position `start`:
-///   [pub [( ... )]]? [async]? fn NAME ( ... ) [-> ...]? { ... }
+///   [pub [( ... )]]? [extern "Rust"]? [async]? fn NAME ( ... ) [-> ...]? { ... }
 ///
-/// Rejects const fn, unsafe fn, and extern fn (matching is_instrumentable).
+/// Rejects const fn, unsafe fn, and extern fn with non-Rust ABI (matching is_instrumentable).
 /// NAME can be an Ident (literal name) or $metavar (Punct('$') + Ident).
 fn match_fn_pattern(tokens: &[proc_macro2::TokenTree], start: usize) -> Option<FnMatch> {
     let len = tokens.len();
     let mut pos = start;
 
-    // Check for non-instrumentable prefixes: const, unsafe, extern.
+    // Check for non-instrumentable prefixes: const, unsafe, extern (non-Rust ABI).
     // If we see any of these before `fn`, skip this position.
     if is_ident(tokens, pos, "const")
         || is_ident(tokens, pos, "unsafe")
-        || is_ident(tokens, pos, "extern")
+        || is_non_rust_extern(tokens, pos)
     {
         return None;
     }
@@ -688,8 +688,21 @@ fn match_fn_pattern(tokens: &[proc_macro2::TokenTree], start: usize) -> Option<F
         // After pub, check for non-instrumentable prefixes.
         if is_ident(tokens, pos, "const")
             || is_ident(tokens, pos, "unsafe")
-            || is_ident(tokens, pos, "extern")
+            || is_non_rust_extern(tokens, pos)
         {
+            return None;
+        }
+    }
+
+    // Optional: `extern "Rust"` (Rust ABI is instrumentable).
+    if is_ident(tokens, pos, "extern") {
+        pos += 1; // skip `extern`
+        if pos < len {
+            if let proc_macro2::TokenTree::Literal(_) = &tokens[pos] {
+                pos += 1; // skip `"Rust"`
+            }
+        }
+        if pos >= len {
             return None;
         }
     }
@@ -805,6 +818,25 @@ fn is_ident(tokens: &[proc_macro2::TokenTree], i: usize, name: &str) -> bool {
         return false;
     }
     matches!(&tokens[i], proc_macro2::TokenTree::Ident(ident) if *ident == name)
+}
+
+/// Check if `extern` at position `i` has a non-Rust ABI (i.e. should be skipped).
+/// Returns true for `extern fn`, `extern "C" fn`, etc.
+/// Returns false for `extern "Rust" fn` (instrumentable, matching AST-level behavior).
+fn is_non_rust_extern(tokens: &[proc_macro2::TokenTree], i: usize) -> bool {
+    if !is_ident(tokens, i, "extern") {
+        return false;
+    }
+    // Peek at next token: if it's a "Rust" string literal, this is instrumentable.
+    if i + 1 < tokens.len() {
+        if let proc_macro2::TokenTree::Literal(lit) = &tokens[i + 1] {
+            let s = lit.to_string();
+            if s == "\"Rust\"" {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Build the guard statement tokens for a function name.
@@ -1967,6 +1999,35 @@ fn main() {}
         assert_eq!(
             enter_count, 1,
             "only normal fn should be instrumented, not const/unsafe/extern. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn instruments_extern_rust_fn_in_macro_rules() {
+        let source = r#"
+macro_rules! abi_fns {
+    () => {
+        extern "Rust" fn rust_abi() { work(); }
+        extern "C" fn c_abi() {}
+        pub extern "Rust" fn pub_rust_abi() { work(); }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        assert!(
+            result.contains(r#"piano_runtime::enter("rust_abi")"#),
+            "extern \"Rust\" fn should be instrumented. Got:\n{result}"
+        );
+        assert!(
+            result.contains(r#"piano_runtime::enter("pub_rust_abi")"#),
+            "pub extern \"Rust\" fn should be instrumented. Got:\n{result}"
+        );
+        assert!(
+            !result.contains(r#"piano_runtime::enter("c_abi")"#),
+            "extern \"C\" fn should NOT be instrumented. Got:\n{result}"
         );
     }
 
