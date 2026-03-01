@@ -285,13 +285,16 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
     };
 
     // Prepare staging directory.
-    let staging = tempfile::tempdir()?;
-    prepare_staging(&staging_root, staging.path())?;
+    // Use a stable path so cargo can cache incremental builds across runs.
+    // Dependencies compile once; only instrumented source files recompile.
+    let staging = staging_root.join("target/piano/staging");
+    std::fs::create_dir_all(&staging)?;
+    prepare_staging(&staging_root, &staging)?;
 
     // Determine the member directory within staging (workspace root for standalone).
     let member_staging = match &member_subdir {
-        Some(sub) => staging.path().join(sub),
-        None => staging.path().to_path_buf(),
+        Some(sub) => staging.join(sub),
+        None => staging.clone(),
     };
 
     // Inject piano-runtime dependency.
@@ -387,7 +390,7 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
     }
 
     // Build the instrumented binary.
-    let binary = build_instrumented(staging.path(), &target_dir, package_name.as_deref())?;
+    let binary = build_instrumented(&staging, &target_dir, package_name.as_deref())?;
 
     Ok(Some((binary, runs_dir)))
 }
