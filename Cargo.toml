@@ -22,7 +22,6 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ignore = "0.4"
-tempfile = "3"
 proc-macro2 = "1.0.106"
 anstyle = "1"
 anstream = "0.6"
@@ -34,6 +33,9 @@ path = "src/main.rs"
 [lib]
 name = "piano"
 path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = "3"
 
 [build-dependencies]
 toml_edit = "0.22"
