@@ -431,6 +431,123 @@ fn run_passes_args_via_separator() {
     );
 }
 
+fn create_panic_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "panic-test"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "panic-test"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"fn main() {
+    let result = work();
+    println!("result: {result}");
+    panic!("boom");
+}
+
+fn work() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..1000 {
+        sum += i;
+    }
+    sum
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn profile_captures_data_on_panic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("panic-test");
+    create_panic_project(&project_dir);
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let runs_dir = tmp.path().join("runs");
+
+    let output = Command::new(piano_bin)
+        .args(["profile", "--fn", "work", "--ignore-exit-code", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run piano profile");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // The program should have actually panicked -- verify the panic
+    // message appears in stderr (forwarded from the child process).
+    assert!(
+        stderr.contains("panicked"),
+        "child process should have panicked, but stderr shows no panic:\n{stderr}"
+    );
+
+    // The program panicked, so piano profile should still succeed
+    // (--ignore-exit-code suppresses the non-zero exit warning).
+    assert!(
+        output.status.success(),
+        "piano profile with --ignore-exit-code should exit 0 even on panic:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    // NDJSON data files should exist despite the panic.
+    assert!(
+        runs_dir.exists(),
+        "runs directory should exist: {runs_dir:?}"
+    );
+
+    let data_files: Vec<_> = fs::read_dir(&runs_dir)
+        .expect("should be able to read runs dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".ndjson") || name.ends_with(".json")
+        })
+        .collect();
+
+    assert!(
+        !data_files.is_empty(),
+        "profiling data should be written despite panic, runs_dir contents: {:?}",
+        fs::read_dir(&runs_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
+    );
+
+    // The data should contain the instrumented function name.
+    let data_path = data_files[0].path();
+    let data = fs::read_to_string(&data_path)
+        .unwrap_or_else(|e| panic!("should read data file {data_path:?}: {e}"));
+    assert!(
+        data.contains("work"),
+        "profiling data should contain the instrumented function 'work', got: {data}"
+    );
+
+    // The report should include the instrumented function in stdout.
+    assert!(
+        stdout.contains("work"),
+        "report should appear on stdout with 'work' function, got: {stdout}"
+    );
+}
+
 #[test]
 fn run_errors_when_no_binary_exists() {
     let tmp = tempfile::tempdir().unwrap();
