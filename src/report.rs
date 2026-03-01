@@ -53,6 +53,16 @@ pub struct FrameData {
     pub companion_fn_ids: HashSet<usize>,
 }
 
+/// Accumulated per-function counters across all frames (used during NDJSON aggregation).
+#[derive(Default, Clone, Copy)]
+struct FnAgg {
+    calls: u64,
+    self_ns: u64,
+    alloc_count: u64,
+    alloc_bytes: u64,
+    cpu_self_ns: u64,
+}
+
 /// Per-function entry within a single frame.
 pub struct FrameFnEntry {
     pub fn_id: usize,
@@ -220,15 +230,15 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
 
     // Aggregate into Run for backward compatibility.
     let has_cpu = header.has_cpu_time;
-    let mut fn_agg: HashMap<usize, (u64, u64, u64, u64, u64)> = HashMap::new();
+    let mut fn_agg: HashMap<usize, FnAgg> = HashMap::new();
     for frame in &frames {
         for entry in frame {
-            let agg = fn_agg.entry(entry.fn_id).or_insert((0, 0, 0, 0, 0));
-            agg.0 += entry.calls;
-            agg.1 += entry.self_ns;
-            agg.2 += entry.alloc_count;
-            agg.3 += entry.alloc_bytes;
-            agg.4 += entry.cpu_self_ns.unwrap_or(0);
+            let agg = fn_agg.entry(entry.fn_id).or_default();
+            agg.calls += entry.calls;
+            agg.self_ns += entry.self_ns;
+            agg.alloc_count += entry.alloc_count;
+            agg.alloc_bytes += entry.alloc_bytes;
+            agg.cpu_self_ns += entry.cpu_self_ns.unwrap_or(0);
         }
     }
 
@@ -237,21 +247,20 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         .iter()
         .enumerate()
         .map(|(fn_id, name)| {
-            let (calls, self_ns, alloc_count, alloc_bytes, cpu_self_ns) =
-                fn_agg.get(&fn_id).copied().unwrap_or((0, 0, 0, 0, 0));
-            let self_ms = self_ns as f64 / 1_000_000.0;
+            let agg = fn_agg.get(&fn_id).copied().unwrap_or_default();
+            let self_ms = agg.self_ns as f64 / 1_000_000.0;
             FnEntry {
                 name: name.clone(),
-                calls,
+                calls: agg.calls,
                 total_ms: self_ms, // NDJSON format has no total_ms; approximate with self_ms
                 self_ms,
                 cpu_self_ms: if has_cpu {
-                    Some(cpu_self_ns as f64 / 1_000_000.0)
+                    Some(agg.cpu_self_ns as f64 / 1_000_000.0)
                 } else {
                     None
                 },
-                alloc_count,
-                alloc_bytes,
+                alloc_count: agg.alloc_count,
+                alloc_bytes: agg.alloc_bytes,
             }
         })
         .collect();
