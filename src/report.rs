@@ -266,7 +266,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
             FnEntry {
                 name: name.clone(),
                 calls: agg.calls,
-                total_ms: self_ms, // NDJSON format has no total_ms; approximate with self_ms
+                total_ms: 0.0, // NDJSON format has no total_ms (only per-frame self_ns)
                 self_ms,
                 cpu_self_ms: if has_cpu {
                     Some(agg.cpu_self_ns as f64 / 1_000_000.0)
@@ -586,11 +586,9 @@ fn truncate_label(label: &str, max_len: usize) -> String {
 /// `label_a` and `label_b` are used as column headers (e.g. tag names or file stems).
 /// Labels longer than 20 characters are truncated with '…'.
 pub fn diff_runs(a: &Run, b: &Run, label_a: &str, label_b: &str) -> String {
-    // Warn if comparing runs from different formats (total_ms may not be comparable).
+    // Warn if comparing runs from different formats.
     if a.source_format != b.source_format {
-        eprintln!(
-            "warning: comparing runs with different formats; total_ms values may not be directly comparable"
-        );
+        eprintln!("warning: comparing runs with different source formats (JSON vs NDJSON)");
     }
 
     let a_map: HashMap<&str, &FnEntry> = a.functions.iter().map(|f| (f.name.as_str(), f)).collect();
@@ -1426,6 +1424,65 @@ mod tests {
             (update.self_ms - 4.1).abs() < 0.01,
             "expected ~4.1ms, got {}",
             update.self_ms
+        );
+    }
+
+    #[test]
+    fn ndjson_total_ms_is_zero_not_self_ms() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"format_version":2,"run_id":"total_ms_test","timestamp_ms":2000,"functions":["compute","helper"]}
+{"frame":0,"fns":[{"id":0,"calls":5,"self_ns":10000000,"ac":0,"ab":0,"fc":0,"fb":0},{"id":1,"calls":10,"self_ns":3000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        fs::write(dir.path().join("2000.ndjson"), content).unwrap();
+
+        let (run, _frame_data) = load_ndjson(&dir.path().join("2000.ndjson")).unwrap();
+        assert_eq!(run.source_format, RunFormat::Ndjson);
+
+        // NDJSON has no total (elapsed) time, so total_ms must be 0.0 — not
+        // approximated from self_ms.
+        for f in &run.functions {
+            assert!(
+                f.total_ms.abs() < f64::EPSILON,
+                "{}: total_ms should be 0.0 for NDJSON, got {}",
+                f.name,
+                f.total_ms
+            );
+        }
+
+        // self_ms should still be computed correctly.
+        let compute = run.functions.iter().find(|f| f.name == "compute").unwrap();
+        assert!((compute.self_ms - 10.0).abs() < 0.01);
+        let helper = run.functions.iter().find(|f| f.name == "helper").unwrap();
+        assert!((helper.self_ms - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn ndjson_diff_does_not_produce_misleading_total_ms() {
+        // When diffing two NDJSON runs, total_ms is 0.0 on both sides,
+        // so it should not contaminate the diff output.
+        let dir = TempDir::new().unwrap();
+        let ndjson_a = r#"{"format_version":2,"run_id":"diff_a","timestamp_ms":1000,"functions":["work"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":5000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        let ndjson_b = r#"{"format_version":2,"run_id":"diff_b","timestamp_ms":2000,"functions":["work"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":8000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#;
+        fs::write(dir.path().join("1000.ndjson"), ndjson_a).unwrap();
+        fs::write(dir.path().join("2000.ndjson"), ndjson_b).unwrap();
+
+        let (run_a, _) = load_ndjson(&dir.path().join("1000.ndjson")).unwrap();
+        let (run_b, _) = load_ndjson(&dir.path().join("2000.ndjson")).unwrap();
+
+        // Both runs should have total_ms == 0.0
+        assert!(run_a.functions[0].total_ms.abs() < f64::EPSILON);
+        assert!(run_b.functions[0].total_ms.abs() < f64::EPSILON);
+
+        // Diff should show self_ms delta (8ms - 5ms = +3ms), not total_ms.
+        let diff = diff_runs(&run_a, &run_b, "before", "after");
+        assert!(diff.contains("work"), "diff should contain function name");
+        assert!(
+            diff.contains("+3.00ms"),
+            "diff should show +3.00ms self_ms delta"
         );
     }
 
