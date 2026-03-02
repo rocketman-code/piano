@@ -1035,18 +1035,94 @@ impl VisitMut for RegistrationInjector {
     }
 }
 
-/// Inject a `#[global_allocator]` static using `PianoAllocator` wrapping System.
+/// Classification of the user's `#[global_allocator]` declaration.
+pub enum AllocatorKind {
+    /// No `#[global_allocator]` found in the source.
+    Absent,
+    /// `#[global_allocator]` without any `#[cfg(...)]` gate.
+    Unconditional,
+    /// One or more `#[global_allocator]` statics, each behind a `#[cfg(...)]`.
+    /// The `Vec` contains the cfg predicate `Meta` from each `#[cfg(pred)]`.
+    CfgGated(Vec<syn::Meta>),
+}
+
+impl std::fmt::Debug for AllocatorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AllocatorKind::Absent => write!(f, "Absent"),
+            AllocatorKind::Unconditional => write!(f, "Unconditional"),
+            AllocatorKind::CfgGated(preds) => {
+                write!(f, "CfgGated({} predicates)", preds.len())
+            }
+        }
+    }
+}
+
+/// Check whether a static item has a `#[global_allocator]` attribute.
+fn has_global_allocator_attr(static_item: &syn::ItemStatic) -> bool {
+    static_item
+        .attrs
+        .iter()
+        .any(|a| a.path().is_ident("global_allocator"))
+}
+
+/// Wrap a `#[global_allocator]` static's type and initializer with `PianoAllocator`.
+fn wrap_allocator_static(static_item: &mut syn::ItemStatic) {
+    let orig_ty = &static_item.ty;
+    let orig_expr = &static_item.expr;
+    *static_item.ty = syn::parse_quote! {
+        piano_runtime::PianoAllocator<#orig_ty>
+    };
+    *static_item.expr = syn::parse_quote! {
+        piano_runtime::PianoAllocator::new(#orig_expr)
+    };
+}
+
+/// Walk the parsed file and classify any `#[global_allocator]` statics.
+pub fn detect_allocator_kind(source: &str) -> Result<AllocatorKind, syn::Error> {
+    let file: syn::File = syn::parse_str(source)?;
+    let mut cfg_predicates: Vec<syn::Meta> = Vec::new();
+
+    for item in &file.items {
+        if let syn::Item::Static(static_item) = item {
+            if !has_global_allocator_attr(static_item) {
+                continue;
+            }
+
+            let mut cfg_meta = None;
+            for a in &static_item.attrs {
+                if a.path().is_ident("cfg") {
+                    cfg_meta = Some(a.parse_args::<syn::Meta>()?);
+                    break;
+                }
+            }
+
+            match cfg_meta {
+                None => return Ok(AllocatorKind::Unconditional),
+                Some(meta) => cfg_predicates.push(meta),
+            }
+        }
+    }
+
+    if cfg_predicates.is_empty() {
+        Ok(AllocatorKind::Absent)
+    } else {
+        Ok(AllocatorKind::CfgGated(cfg_predicates))
+    }
+}
+
+/// Inject a `#[global_allocator]` static using `PianoAllocator`.
 ///
-/// If `existing_allocator_type` is provided, the source already has a
-/// `#[global_allocator]` that should be wrapped rather than replaced.
-pub fn inject_global_allocator(
-    source: &str,
-    existing_allocator_type: Option<&str>,
-) -> Result<String, syn::Error> {
+/// Behavior depends on `AllocatorKind`:
+/// - `Absent`: inject `PianoAllocator<System>` unconditionally.
+/// - `Unconditional`: wrap the existing allocator with `PianoAllocator`.
+/// - `CfgGated`: wrap each cfg-gated allocator AND inject a cfg-negated
+///   `PianoAllocator<System>` fallback for platforms where none match.
+pub fn inject_global_allocator(source: &str, kind: AllocatorKind) -> Result<String, syn::Error> {
     let mut file: syn::File = syn::parse_str(source)?;
 
-    match existing_allocator_type {
-        None => {
+    match kind {
+        AllocatorKind::Absent => {
             let item: syn::Item = syn::parse_quote! {
                 #[global_allocator]
                 static _PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>
@@ -1054,26 +1130,41 @@ pub fn inject_global_allocator(
             };
             file.items.insert(0, item);
         }
-        Some(_) => {
+        AllocatorKind::Unconditional => {
             for item in &mut file.items {
                 if let syn::Item::Static(static_item) = item {
-                    let has_global_alloc = static_item
-                        .attrs
-                        .iter()
-                        .any(|a| a.path().is_ident("global_allocator"));
-                    if has_global_alloc {
-                        let orig_ty = &static_item.ty;
-                        let orig_expr = &static_item.expr;
-                        *static_item.ty = syn::parse_quote! {
-                            piano_runtime::PianoAllocator<#orig_ty>
-                        };
-                        *static_item.expr = syn::parse_quote! {
-                            piano_runtime::PianoAllocator::new(#orig_expr)
-                        };
+                    if has_global_allocator_attr(static_item) {
+                        wrap_allocator_static(static_item);
                         break;
                     }
                 }
             }
+        }
+        AllocatorKind::CfgGated(ref predicates) => {
+            // Wrap each cfg-gated allocator with PianoAllocator.
+            for item in &mut file.items {
+                if let syn::Item::Static(static_item) = item {
+                    if has_global_allocator_attr(static_item) {
+                        wrap_allocator_static(static_item);
+                    }
+                }
+            }
+
+            // Inject a cfg-negated fallback PianoAllocator<System>.
+            let negated_cfg: syn::Meta = if predicates.len() == 1 {
+                let pred = &predicates[0];
+                syn::parse_quote! { not(#pred) }
+            } else {
+                syn::parse_quote! { not(any(#(#predicates),*)) }
+            };
+
+            let fallback: syn::Item = syn::parse_quote! {
+                #[cfg(#negated_cfg)]
+                #[global_allocator]
+                static _PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>
+                    = piano_runtime::PianoAllocator::new(std::alloc::System);
+            };
+            file.items.insert(0, fallback);
         }
     }
 
@@ -1308,13 +1399,24 @@ fn main() {
     }
 
     #[test]
+    fn detect_no_allocator() {
+        let source = r#"
+fn main() {
+    println!("hello");
+}
+"#;
+        let kind = detect_allocator_kind(source).unwrap();
+        assert!(matches!(kind, AllocatorKind::Absent));
+    }
+
+    #[test]
     fn injects_global_allocator() {
         let source = r#"
 fn main() {
     println!("hello");
 }
 "#;
-        let result = inject_global_allocator(source, None).unwrap();
+        let result = inject_global_allocator(source, AllocatorKind::Absent).unwrap();
         assert!(
             result.contains("#[global_allocator]"),
             "should inject global_allocator attribute. Got:\n{result}"
@@ -1339,10 +1441,94 @@ static ALLOC: System = System;
 
 fn main() {}
 "#;
-        let result = inject_global_allocator(source, Some("System")).unwrap();
+        let result = inject_global_allocator(source, AllocatorKind::Unconditional).unwrap();
         assert!(
             result.contains("PianoAllocator"),
             "should wrap existing allocator. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn cfg_gated_allocator_gets_fallback() {
+        let source = r#"
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: Jemalloc = Jemalloc;
+
+fn main() {}
+"#;
+        let kind = detect_allocator_kind(source).unwrap();
+        let result = inject_global_allocator(source, kind).unwrap();
+        assert!(
+            result.contains("PianoAllocator<Jemalloc>"),
+            "should wrap cfg-gated allocator. Got:\n{result}"
+        );
+        assert!(
+            result.contains("not(target_os = \"linux\")"),
+            "should inject negated cfg fallback. Got:\n{result}"
+        );
+        assert!(
+            result.contains("_PIANO_ALLOC"),
+            "fallback should use _PIANO_ALLOC name. Got:\n{result}"
+        );
+        assert!(
+            result.contains("std::alloc::System"),
+            "fallback should wrap System allocator. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn multiple_cfg_gated_allocators_get_combined_fallback() {
+        let source = r#"
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC_LINUX: Jemalloc = Jemalloc;
+
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static ALLOC_MAC: MiMalloc = MiMalloc;
+
+fn main() {}
+"#;
+        let kind = detect_allocator_kind(source).unwrap();
+        let result = inject_global_allocator(source, kind).unwrap();
+        assert!(
+            result.contains("PianoAllocator<Jemalloc>"),
+            "should wrap linux allocator. Got:\n{result}"
+        );
+        assert!(
+            result.contains("PianoAllocator<MiMalloc>"),
+            "should wrap macos allocator. Got:\n{result}"
+        );
+        assert!(
+            result.contains("not(any("),
+            "fallback should use not(any(...)) for multiple cfgs. Got:\n{result}"
+        );
+        assert!(
+            result.contains("_PIANO_ALLOC"),
+            "fallback should use _PIANO_ALLOC. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn uncfg_allocator_no_fallback() {
+        let source = r#"
+use std::alloc::System;
+
+#[global_allocator]
+static ALLOC: System = System;
+
+fn main() {}
+"#;
+        let kind = detect_allocator_kind(source).unwrap();
+        let result = inject_global_allocator(source, kind).unwrap();
+        assert!(
+            result.contains("PianoAllocator"),
+            "should wrap allocator. Got:\n{result}"
+        );
+        assert!(
+            !result.contains("_PIANO_ALLOC"),
+            "should NOT inject fallback for unconditional allocator. Got:\n{result}"
         );
     }
 
