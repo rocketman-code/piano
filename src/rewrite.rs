@@ -119,6 +119,79 @@ fn stmt_has_direct_await(stmt: &syn::Stmt) -> bool {
     finder.found
 }
 
+/// For if/while/match statements where `.await` is in the condition/scrutinee,
+/// inject `_piano_alloc.resume()` at the start and `_piano_alloc.save()` at
+/// the end of each body block. This ensures allocations inside the body are
+/// tracked rather than being zeroed by the save/resume that wraps the entire
+/// statement.
+///
+/// Without this, `if stream.next().await.is_some() { allocate(); }` would
+/// have `save(); if ... { allocate(); } resume();` -- the body runs between
+/// save and resume, so its allocations are lost when resume() zeroes counters.
+///
+/// With this fix, the pattern becomes:
+///   `save(); if cond.await { resume(); body; save(); } check(); resume();`
+/// The body's resume/save bracket re-enables tracking for the body only.
+fn inject_alloc_body_brackets(stmt: &mut syn::Stmt) {
+    let expr = match stmt {
+        syn::Stmt::Expr(e, _) => e,
+        syn::Stmt::Local(local) => {
+            if let Some(init) = &mut local.init {
+                &mut *init.expr
+            } else {
+                return;
+            }
+        }
+        _ => return,
+    };
+
+    match expr {
+        syn::Expr::If(expr_if) => {
+            inject_alloc_brackets_in_if(expr_if);
+        }
+        syn::Expr::While(expr_while) => {
+            bracket_block(&mut expr_while.body);
+        }
+        syn::Expr::Match(expr_match) => {
+            for arm in &mut expr_match.arms {
+                if let syn::Expr::Block(block_expr) = &mut *arm.body {
+                    bracket_block(&mut block_expr.block);
+                }
+            }
+        }
+        syn::Expr::ForLoop(expr_for) => {
+            bracket_block(&mut expr_for.body);
+        }
+        _ => {}
+    }
+}
+
+/// Inject resume/save brackets into an if-expression and all its else-if/else
+/// branches recursively.
+fn inject_alloc_brackets_in_if(expr_if: &mut syn::ExprIf) {
+    bracket_block(&mut expr_if.then_branch);
+    if let Some((_, else_branch)) = &mut expr_if.else_branch {
+        match &mut **else_branch {
+            syn::Expr::If(nested_if) => {
+                inject_alloc_brackets_in_if(nested_if);
+            }
+            syn::Expr::Block(block_expr) => {
+                bracket_block(&mut block_expr.block);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Insert `_piano_alloc.resume()` as the first statement and
+/// `_piano_alloc.save()` as the last statement of a block.
+fn bracket_block(block: &mut syn::Block) {
+    let resume: syn::Stmt = syn::parse_quote! { _piano_alloc.resume(); };
+    let save: syn::Stmt = syn::parse_quote! { _piano_alloc.save(); };
+    block.stmts.insert(0, resume);
+    block.stmts.push(save);
+}
+
 /// Recursively inject `_piano_guard.check();` after each statement that
 /// directly contains `.await` or a macro invocation, at every nesting depth.
 ///
@@ -140,6 +213,10 @@ fn inject_await_checks(block: &mut syn::Block) {
                 // Recurse into nested blocks within this statement first.
                 self.visit_stmt_mut(&mut stmt);
                 if has_await {
+                    // For if/while/match where .await is in the condition/
+                    // scrutinee, inject resume/save brackets around each body
+                    // block so allocations inside the body are tracked.
+                    inject_alloc_body_brackets(&mut stmt);
                     let save_stmt: syn::Stmt = syn::parse_quote! {
                         _piano_alloc.save();
                     };
@@ -2702,6 +2779,231 @@ async fn example() {
             "_piano_guard.check()",
             "cleanup()",
             "after if with .await in condition",
+        );
+    }
+
+    #[test]
+    fn alloc_body_brackets_for_if_with_await_in_condition() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    if stream.next().await.is_some() {
+        process();
+    }
+    cleanup();
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        let src = &result.source;
+        // The if body must have resume() at start and save() at end so
+        // allocations inside process() are tracked, not zeroed.
+        assert_appears_before(
+            src,
+            "_piano_alloc.save()",
+            "stream.next()",
+            "save before if",
+        );
+        // resume() injected at start of if body, before process()
+        assert!(
+            src.contains("_piano_alloc.resume()"),
+            "should have resume() call. Got:\n{src}",
+        );
+        // The resume inside the body must come before process()
+        // Find resume inside body: after "is_some()" and before "process()"
+        let cond_pos = src.find("is_some()").unwrap();
+        let process_pos = src.find("process()").unwrap();
+        let body_resume_pos = src[cond_pos..].find("_piano_alloc.resume()").unwrap() + cond_pos;
+        assert!(
+            body_resume_pos < process_pos,
+            "resume() should appear in body before process(). Got:\n{src}",
+        );
+        // save() at end of body, after process() but before check()
+        let body_save_pos = src[process_pos..].find("_piano_alloc.save()").unwrap() + process_pos;
+        let check_pos = src.find("_piano_guard.check()").unwrap();
+        assert!(
+            body_save_pos < check_pos,
+            "body save() should appear after process() but before check(). Got:\n{src}",
+        );
+    }
+
+    #[test]
+    fn alloc_body_brackets_for_if_else_with_await_in_condition() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    if stream.next().await.is_some() {
+        process();
+    } else {
+        fallback();
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        let src = &result.source;
+        // Both branches must have resume/save brackets
+        let process_pos = src.find("process()").unwrap();
+        let fallback_pos = src.find("fallback()").unwrap();
+        // resume before process in then-branch
+        let then_resume = src[..process_pos]
+            .rfind("_piano_alloc.resume()")
+            .expect("then-branch should have resume() before process()");
+        assert!(then_resume < process_pos);
+        // resume before fallback in else-branch
+        let else_resume = src[..fallback_pos]
+            .rfind("_piano_alloc.resume()")
+            .expect("else-branch should have resume() before fallback()");
+        assert!(
+            else_resume > process_pos,
+            "else resume should be after then-branch"
+        );
+        // save after process in then-branch
+        let then_save = src[process_pos..fallback_pos]
+            .find("_piano_alloc.save()")
+            .expect("then-branch should have save() after process()");
+        assert!(then_save > 0);
+        // save after fallback in else-branch
+        let after_fallback = src[fallback_pos..].find("_piano_alloc.save()");
+        assert!(
+            after_fallback.is_some(),
+            "else-branch should have save() after fallback(). Got:\n{src}",
+        );
+    }
+
+    #[test]
+    fn alloc_body_brackets_for_while_with_await_in_condition() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    while stream.next().await.is_some() {
+        process();
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        let src = &result.source;
+        let cond_pos = src.find("is_some()").unwrap();
+        let process_pos = src.find("process()").unwrap();
+        // resume at start of while body
+        let body_resume = src[cond_pos..].find("_piano_alloc.resume()").unwrap() + cond_pos;
+        assert!(
+            body_resume < process_pos,
+            "while body should have resume() before process(). Got:\n{src}",
+        );
+        // save at end of while body
+        let body_save = src[process_pos..].find("_piano_alloc.save()");
+        assert!(
+            body_save.is_some(),
+            "while body should have save() after process(). Got:\n{src}",
+        );
+    }
+
+    #[test]
+    fn alloc_body_brackets_for_match_with_await_in_scrutinee() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    match stream.next().await {
+        Some(v) => { process(v); }
+        None => { fallback(); }
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        let src = &result.source;
+        let process_pos = src.find("process(v)").unwrap();
+        let fallback_pos = src.find("fallback()").unwrap();
+        // resume before process in Some arm
+        let some_resume = src[..process_pos]
+            .rfind("_piano_alloc.resume()")
+            .expect("Some arm should have resume() before process(v)");
+        assert!(some_resume < process_pos);
+        // resume before fallback in None arm
+        let none_resume = src[..fallback_pos]
+            .rfind("_piano_alloc.resume()")
+            .expect("None arm should have resume() before fallback()");
+        assert!(
+            none_resume > process_pos,
+            "None arm resume should be after Some arm"
+        );
+    }
+
+    #[test]
+    fn alloc_body_brackets_for_for_loop_with_await_in_iterator() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    for item in get_items().await {
+        process(item);
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        let src = &result.source;
+        let await_pos = src.find("get_items()").unwrap();
+        let process_pos = src.find("process(item)").unwrap();
+        // resume at start of for body
+        let body_resume = src[await_pos..].find("_piano_alloc.resume()").unwrap() + await_pos;
+        assert!(
+            body_resume < process_pos,
+            "for body should have resume() before process(item). Got:\n{src}",
+        );
+        // save at end of for body
+        let body_save = src[process_pos..].find("_piano_alloc.save()");
+        assert!(
+            body_save.is_some(),
+            "for body should have save() after process(item). Got:\n{src}",
+        );
+    }
+
+    #[test]
+    fn alloc_body_brackets_for_if_let_with_await_in_condition() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    if let Some(v) = stream.next().await {
+        process(v);
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        let src = &result.source;
+        let process_pos = src.find("process(v)").unwrap();
+        // resume before process in body
+        let body_resume = src[..process_pos]
+            .rfind("_piano_alloc.resume()")
+            .expect("if-let body should have resume() before process(v)");
+        assert!(body_resume < process_pos);
+        // save after process in body
+        let body_save = src[process_pos..].find("_piano_alloc.save()");
+        assert!(
+            body_save.is_some(),
+            "if-let body should have save() after process(v). Got:\n{src}",
+        );
+    }
+
+    #[test]
+    fn no_alloc_body_brackets_for_bare_await_statement() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    fetch().await;
+    process();
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        let src = &result.source;
+        // A bare .await statement should have save/check/resume around it
+        // but NOT inject extra resume/save brackets (no body to bracket).
+        // Count resume() calls: should be exactly 1 (after check)
+        let resume_count = src.matches("_piano_alloc.resume()").count();
+        assert_eq!(
+            resume_count, 1,
+            "bare .await should have exactly 1 resume(), got {resume_count}:\n{src}",
+        );
+        let save_count = src.matches("_piano_alloc.save()").count();
+        assert_eq!(
+            save_count, 1,
+            "bare .await should have exactly 1 save(), got {save_count}:\n{src}",
         );
     }
 
