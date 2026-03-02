@@ -1465,7 +1465,7 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
 /// Uses wrapping arithmetic to prevent optimization while staying deterministic.
 #[cfg(test)]
 pub(crate) fn burn_cpu(iterations: u64) {
-    let mut buf = [0x42u8; 4096];
+    let mut buf = [0x42u8; 256];
     for i in 0..iterations {
         for b in &mut buf {
             *b = b.wrapping_add(i as u8).wrapping_mul(31);
