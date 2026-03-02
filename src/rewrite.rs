@@ -72,18 +72,36 @@ const SCOPE_FUNCTIONS: &[&str] = &["scope", "scope_fifo"];
 /// SpanContext stays on the parent thread.
 const FORK_TRIGGER_FUNCTIONS: &[&str] = &["scope", "scope_fifo", "join"];
 
-/// Check whether a statement contains `.await` at its own expression level,
-/// excluding awaits inside sub-blocks of control-flow expressions (if, match,
-/// loop, while, for). Those sub-blocks are handled by the recursive visitor.
+/// Check whether a statement contains `.await` or a macro invocation at its
+/// own expression level, excluding awaits inside sub-blocks of control-flow
+/// expressions (if, match, loop, while, for). Those sub-blocks are handled
+/// by the recursive visitor.
 ///
 /// Also excludes closures, async blocks, and nested fn items since those are
 /// separate async contexts.
+///
+/// Macro invocations (e.g. `tokio::select!`, `tokio::join!`) are treated as
+/// potential `.await` points because syn cannot see inside macro token streams.
+/// The injected `check()` is a fast no-op (~2ns) when no thread migration
+/// occurred, so false positives are negligible.
 fn stmt_has_direct_await(stmt: &syn::Stmt) -> bool {
+    // Statement-level macros with curly braces (e.g. `tokio::select! { ... }`)
+    // are parsed by syn as Stmt::Macro, not as expressions containing ExprMacro.
+    // These may contain .await points invisible to the AST.
+    if matches!(stmt, syn::Stmt::Macro(_)) {
+        return true;
+    }
+
     struct AwaitFinder {
         found: bool,
     }
     impl<'ast> syn::visit::Visit<'ast> for AwaitFinder {
         fn visit_expr_await(&mut self, _: &'ast syn::ExprAwait) {
+            self.found = true;
+        }
+        // Expression-position macros (e.g. `let x = some_macro!(...)`) may
+        // also contain .await points invisible to the AST.
+        fn visit_expr_macro(&mut self, _: &'ast syn::ExprMacro) {
             self.found = true;
         }
         // Don't descend into closures -- separate async context.
@@ -102,18 +120,19 @@ fn stmt_has_direct_await(stmt: &syn::Stmt) -> bool {
 }
 
 /// Recursively inject `_piano_guard.check();` after each statement that
-/// directly contains `.await`, at every nesting depth.
+/// directly contains `.await` or a macro invocation, at every nesting depth.
 ///
 /// Uses `VisitMut` to walk into if/match/loop/while/for/block bodies so
-/// that `check()` is placed immediately after the `.await`, not after the
-/// enclosing top-level statement.
+/// that `check()` is placed immediately after the `.await` or macro, not
+/// after the enclosing top-level statement.
 fn inject_await_checks(block: &mut syn::Block) {
     struct AwaitCheckInjector;
 
     impl AwaitCheckInjector {
         /// Process a block's statements: for each statement that directly
-        /// contains `.await`, insert a `check()` call after it. Then recurse
-        /// into nested blocks within each statement.
+        /// contains `.await` or a macro invocation (potential hidden `.await`),
+        /// insert a `check()` call after it. Then recurse into nested blocks
+        /// within each statement.
         fn process_block(&mut self, block: &mut syn::Block) {
             let mut new_stmts = Vec::with_capacity(block.stmts.len() * 2);
             for mut stmt in block.stmts.drain(..) {
@@ -2704,6 +2723,94 @@ async fn example() {
             check_count, 1,
             "expected 1 check() (after send().await only), got {check_count}:\n{}",
             result.source,
+        );
+    }
+
+    #[test]
+    fn injects_check_after_macro_invocation_in_async_fn() {
+        let targets: HashSet<String> = ["handler".to_string()].into_iter().collect();
+        let source = r#"
+async fn handler() {
+    setup();
+    tokio::select! {
+        val = rx.recv() => { process(val); }
+        _ = sleep(timeout) => { handle_timeout(); }
+    }
+    cleanup();
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        // The select! macro may contain .await points invisible to syn.
+        // save/check/resume should be injected around it.
+        assert!(
+            result.source.contains("_piano_alloc.save()"),
+            "should inject save() before macro invocation. Got:\n{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("_piano_guard.check()"),
+            "should inject check() after macro invocation. Got:\n{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("_piano_alloc.resume()"),
+            "should inject resume() after macro invocation. Got:\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn no_check_after_macro_in_sync_fn() {
+        let targets: HashSet<String> = ["handler".to_string()].into_iter().collect();
+        let source = r#"
+fn handler() {
+    setup();
+    println!("hello {}", name);
+    cleanup();
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        // Sync functions should not get check()/save()/resume() even with macros.
+        assert_eq!(
+            result.source.matches("_piano_guard.check()").count(),
+            0,
+            "sync fn should not get check() calls. Got:\n{}",
+            result.source
+        );
+        assert_eq!(
+            result.source.matches("_piano_alloc.save()").count(),
+            0,
+            "sync fn should not get save() calls. Got:\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn injects_check_after_expr_macro_in_async_fn() {
+        let targets: HashSet<String> = ["handler".to_string()].into_iter().collect();
+        let source = r#"
+async fn handler() {
+    let result = tokio::join!(future_a(), future_b());
+    process(result);
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        // Expression-position macros (with parens) are ExprMacro in syn.
+        // They should also get save/check/resume.
+        assert!(
+            result.source.contains("_piano_guard.check()"),
+            "should inject check() after expression-position macro. Got:\n{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("_piano_alloc.save()"),
+            "should inject save() before expression-position macro. Got:\n{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("_piano_alloc.resume()"),
+            "should inject resume() after expression-position macro. Got:\n{}",
+            result.source
         );
     }
 
