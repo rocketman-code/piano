@@ -47,6 +47,11 @@ pub(crate) fn elapsed_ns(start: u64, end: u64) -> u64 {
     let ticks = end.wrapping_sub(start);
     let n = NUMER.load(Ordering::Relaxed);
     let d = DENOM.load(Ordering::Relaxed);
+    // Guard: if denominator is zero (should not happen after calibrate(),
+    // but defend against it), return 0 instead of panicking.
+    if d == 0 {
+        return 0;
+    }
     // Use u128 to avoid overflow on large tick counts
     (ticks as u128 * n as u128 / d as u128) as u64
 }
@@ -83,6 +88,14 @@ pub(crate) fn calibrate() {
         let wall_ns = wall_start.elapsed().as_nanos() as u64;
         let tsc_ticks = tsc_end.wrapping_sub(tsc_start);
 
+        // Guard: if the counter did not advance (frozen TSC, broken VM,
+        // or both reads returned the same value), fall back to 1:1 ratio.
+        if tsc_ticks == 0 {
+            NUMER.store(1, Ordering::Release);
+            DENOM.store(1, Ordering::Release);
+            return;
+        }
+
         // ns = ticks * wall_ns / tsc_ticks
         // Simplify the fraction to avoid overflow in elapsed_ns
         let g = gcd(wall_ns, tsc_ticks);
@@ -97,7 +110,13 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
         b = a % b;
         a = t;
     }
-    a
+    // gcd(0, 0) is mathematically undefined but we use the result as a
+    // divisor, so return 1 instead of 0 to avoid division by zero.
+    if a == 0 {
+        1
+    } else {
+        a
+    }
 }
 
 /// The TSC value captured at epoch. Stored alongside the Instant epoch.
@@ -109,4 +128,52 @@ pub(crate) fn set_epoch_tsc(val: u64) {
 
 pub(crate) fn epoch_tsc() -> u64 {
     EPOCH_TSC.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gcd_normal_cases() {
+        assert_eq!(gcd(12, 8), 4);
+        assert_eq!(gcd(8, 12), 4);
+        assert_eq!(gcd(7, 13), 1);
+        assert_eq!(gcd(100, 100), 100);
+        assert_eq!(gcd(1, 1), 1);
+    }
+
+    #[test]
+    fn gcd_with_one_zero_returns_nonzero() {
+        // gcd(n, 0) = n by mathematical convention
+        assert_eq!(gcd(5, 0), 5);
+        assert_eq!(gcd(0, 5), 5);
+    }
+
+    #[test]
+    fn gcd_both_zero_returns_one() {
+        // gcd(0, 0) is mathematically undefined; we need a nonzero result
+        // because we divide by the return value.
+        let g = gcd(0, 0);
+        assert_ne!(g, 0, "gcd(0,0) must not return 0 (used as divisor)");
+        assert_eq!(g, 1);
+    }
+
+    #[test]
+    fn elapsed_ns_with_zero_denom_does_not_panic() {
+        // If DENOM were zero (e.g., broken TSC), elapsed_ns must not panic.
+        // Temporarily store 0 in DENOM, call elapsed_ns, then restore.
+        let saved_n = NUMER.load(Ordering::Relaxed);
+        let saved_d = DENOM.load(Ordering::Relaxed);
+
+        NUMER.store(1, Ordering::Release);
+        DENOM.store(0, Ordering::Release);
+
+        // Must not panic -- should return 0 for zero denominator
+        let result = elapsed_ns(0, 1000);
+        assert_eq!(result, 0);
+
+        NUMER.store(saved_n, Ordering::Release);
+        DENOM.store(saved_d, Ordering::Release);
+    }
 }
