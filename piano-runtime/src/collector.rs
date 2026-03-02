@@ -24,7 +24,7 @@ use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{compiler_fence, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -87,6 +87,108 @@ static RUNS_DIR: SyncOnceCell<Mutex<Option<PathBuf>>> = SyncOnceCell::new();
 
 fn runs_dir_lock() -> &'static Mutex<Option<PathBuf>> {
     RUNS_DIR.get_or_init(|| Mutex::new(None))
+}
+
+/// Guards against double-shutdown (e.g. signal handler + normal exit).
+///
+/// `shutdown_impl_inner` is a no-op once this flag is set.
+static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Signal handling for graceful data recovery on SIGTERM / SIGINT.
+///
+/// On Unix, `init()` registers signal handlers so that profiling data is
+/// flushed before the process exits. This prevents data loss when the
+/// profiled program is killed (e.g. Ctrl-C, `kill`).
+///
+/// Calling `shutdown_impl_inner` from a signal handler is technically not
+/// async-signal-safe (it acquires mutexes, allocates, does file I/O).
+/// This is a pragmatic choice: for a profiling tool the worst case is a
+/// corrupted output file, which is strictly better than losing all data
+/// (the current behavior without signal handling). Many profilers take
+/// the same approach.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod signal {
+    use super::*;
+
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    const SA_RESETDFL: i32 = {
+        #[cfg(target_os = "linux")]
+        {
+            // SA_RESETDFL == SA_ONESHOT == 0x80000000 on Linux
+            0x80000000u32 as i32
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // SA_RESETDFL == 4 on macOS
+            4
+        }
+    };
+
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    struct Sigaction {
+        sa_handler: extern "C" fn(i32),
+        sa_mask: [u8; 128], // sigset_t is 128 bytes on Linux
+        sa_flags: i32,
+        sa_restorer: usize,
+    }
+
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct Sigaction {
+        sa_handler: extern "C" fn(i32),
+        sa_mask: u32, // sigset_t is 4 bytes on macOS
+        sa_flags: i32,
+    }
+
+    extern "C" {
+        fn sigaction(sig: i32, act: *const Sigaction, oldact: *mut Sigaction) -> i32;
+        fn raise(sig: i32) -> i32;
+    }
+
+    extern "C" fn handler(sig: i32) {
+        // Guard: if shutdown already ran (normal exit path), just re-raise.
+        if SHUTDOWN_DONE.swap(true, Ordering::SeqCst) {
+            // Data already written. Re-raise with default handler
+            // (SA_RESETDFL restored the default before we were called).
+            unsafe { raise(sig) };
+            return;
+        }
+
+        // Best-effort flush. Not async-signal-safe, but losing data is worse.
+        // Uses runs_dir_nonblocking() to avoid deadlocking when the signal
+        // fires while set_runs_dir() holds the RUNS_DIR mutex.
+        if let Some(dir) = runs_dir_nonblocking() {
+            let _ = shutdown_impl_inner(&dir);
+        }
+
+        // Re-raise so the process exits with the correct signal status.
+        // SA_RESETDFL already restored the default disposition, so this
+        // will terminate the process normally.
+        unsafe { raise(sig) };
+    }
+
+    pub(super) fn install_handlers() {
+        unsafe {
+            for &sig in &[SIGINT, SIGTERM] {
+                #[cfg(target_os = "linux")]
+                let act = Sigaction {
+                    sa_handler: handler,
+                    sa_mask: [0u8; 128],
+                    sa_flags: SA_RESETDFL,
+                    sa_restorer: 0,
+                };
+                #[cfg(target_os = "macos")]
+                let act = Sigaction {
+                    sa_handler: handler,
+                    sa_mask: 0,
+                    sa_flags: SA_RESETDFL,
+                };
+                sigaction(sig, &act, std::ptr::null_mut());
+            }
+        }
+    }
 }
 
 fn epoch() -> Instant {
@@ -1161,6 +1263,21 @@ fn runs_dir() -> Option<PathBuf> {
     dirs_fallback().map(|home| home.join(".piano").join("runs"))
 }
 
+/// Non-blocking variant of `runs_dir()` for use in signal handlers.
+///
+/// Uses `try_lock()` instead of `lock()` to avoid deadlocking when the
+/// signal fires while `set_runs_dir()` holds the mutex. Falls back to
+/// the env var and home directory if the lock is contended.
+fn runs_dir_nonblocking() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("PIANO_RUNS_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    if let Some(dir) = runs_dir_lock().try_lock().ok().and_then(|g| g.clone()) {
+        return Some(dir);
+    }
+    dirs_fallback().map(|home| home.join(".piano").join("runs"))
+}
+
 /// Best-effort home directory detection (no deps).
 fn dirs_fallback() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
@@ -1306,11 +1423,14 @@ pub fn flush() {
     reset();
 }
 
-/// No-op retained for API compatibility.
+/// Initialize the runtime: install signal handlers for data recovery.
 ///
-/// Flushing now happens via `shutdown()` at the end of main.
-/// Instrumented code may still call `init()` — it's harmless.
-pub fn init() {}
+/// Called at the start of instrumented main(). Registers SIGTERM/SIGINT
+/// handlers (Unix only) so profiling data is saved if the process is killed.
+pub fn init() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    signal::install_handlers();
+}
 
 /// Flush all collected timing data from ALL threads and write to disk.
 ///
@@ -1319,12 +1439,18 @@ pub fn init() {}
 ///
 /// Writes NDJSON if frame data is present (from the calling thread), and
 /// always writes JSON with cross-thread aggregation from all registered Arcs.
+///
+/// Guarded by `SHUTDOWN_DONE` to prevent double-writes (e.g. if a signal
+/// handler already flushed data before normal exit).
 pub fn shutdown() {
+    if SHUTDOWN_DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let dir = match runs_dir() {
         Some(d) => d,
         None => return,
     };
-    if shutdown_impl(&dir) {
+    if shutdown_impl_inner(&dir) {
         std::process::exit(70);
     }
 }
@@ -1339,8 +1465,11 @@ pub fn shutdown_to(dir: &str) {
     shutdown();
 }
 
-/// Returns `true` if any write failed.
-fn shutdown_impl(dir: &std::path::Path) -> bool {
+/// Core write logic shared by `shutdown()` and the signal handler.
+///
+/// Returns `true` if any write failed. Does NOT check `SHUTDOWN_DONE` --
+/// callers are responsible for the guard.
+fn shutdown_impl_inner(dir: &std::path::Path) -> bool {
     let mut write_failed = false;
     let ts = timestamp_ms();
 
@@ -1654,7 +1783,7 @@ mod tests {
 
     #[test]
     fn init_can_be_called_multiple_times() {
-        // init() is a no-op retained for API compatibility.
+        // Calling init() multiple times is safe (handler overwrites are idempotent).
         init();
         init();
         init();
@@ -2194,11 +2323,11 @@ mod tests {
             burn_cpu(5_000);
         }
 
+        // Use shutdown_impl_inner directly to avoid the SHUTDOWN_DONE
+        // guard, which is process-global and unreliable in parallel tests.
         let tmp = std::env::temp_dir().join(format!("piano_shutdown_{}", timestamp_ms()));
         std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var("PIANO_RUNS_DIR", &tmp) };
-        shutdown();
-        unsafe { std::env::remove_var("PIANO_RUNS_DIR") };
+        let _ = shutdown_impl_inner(&tmp);
 
         let files: Vec<_> = std::fs::read_dir(&tmp)
             .unwrap()
@@ -2582,19 +2711,16 @@ mod tests {
 
     #[test]
     fn shutdown_to_sets_runs_dir_for_flush() {
-        // shutdown_to() should set the global runs dir so that any
-        // earlier flush() calls (e.g. from panic hooks) would have
-        // used the same directory. After shutdown_to(), the dir should
-        // be set so future flushes also use it.
+        // Verify that set_runs_dir + flush + shutdown_impl_inner all
+        // write to the same directory. Uses shutdown_impl_inner directly
+        // to avoid the process-global SHUTDOWN_DONE guard, which is
+        // unreliable in parallel tests.
         reset();
 
-        // Produce data, then call set_runs_dir + flush to simulate
-        // the scenario where the CLI injects set_runs_dir at start
-        // of main, and flush() is called mid-program.
         let tmp = std::env::temp_dir().join(format!("piano_shutdown_to_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // First: set_runs_dir early (like CLI injection at start of main)
+        // set_runs_dir early (like CLI injection at start of main)
         set_runs_dir(tmp.to_str().unwrap());
 
         // Generate some data and flush mid-program.
@@ -2610,8 +2736,8 @@ mod tests {
             burn_cpu(5_000);
         }
 
-        // shutdown_to uses the same dir.
-        shutdown_to(tmp.to_str().unwrap());
+        // Write remaining data to the same dir.
+        let _ = shutdown_impl_inner(&tmp);
         clear_runs_dir();
 
         let files: Vec<_> = std::fs::read_dir(&tmp)
@@ -3258,20 +3384,20 @@ mod tests {
     #[test]
     fn shutdown_impl_reports_write_errors_to_stderr() {
         reset();
-        // Produce some data so shutdown_impl has something to write.
+        // Produce some data so shutdown_impl_inner has something to write.
         {
             let _g = enter("write_err_test");
         }
 
         // Point at a path that cannot be a directory (a file, not a dir).
         let tmp = std::env::temp_dir().join(format!("piano_write_err_{}", std::process::id()));
-        // Create a file where shutdown_impl expects a directory.
+        // Create a file where shutdown_impl_inner expects a directory.
         std::fs::write(&tmp, b"not a directory").unwrap();
 
-        // shutdown_impl should try to write and fail, printing to stderr.
+        // shutdown_impl_inner should try to write and fail, printing to stderr.
         // We can't easily capture stderr in a unit test, so instead verify
         // that the function does not panic and returns normally.
-        shutdown_impl(&tmp);
+        shutdown_impl_inner(&tmp);
 
         // Clean up.
         let _ = std::fs::remove_file(&tmp);

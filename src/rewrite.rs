@@ -1340,6 +1340,12 @@ struct ShutdownInjector {
 }
 
 impl ShutdownInjector {
+    fn init_stmt(&self) -> syn::Stmt {
+        syn::parse_quote! {
+            piano_runtime::init();
+        }
+    }
+
     fn shutdown_stmt(&self) -> syn::Stmt {
         match &self.runs_dir {
             Some(dir) => syn::parse_quote! {
@@ -1374,6 +1380,7 @@ impl VisitMut for ShutdownInjector {
                 // Async main: can't use catch_unwind (sync closure can't contain .await).
                 // Insert shutdown before the tail expression if there is one.
                 let mut stmts: Vec<syn::Stmt> = Vec::new();
+                stmts.push(self.init_stmt());
                 stmts.extend(set_dir_stmt);
                 if has_return_type && !existing_stmts.is_empty() {
                     let (body, tail) = existing_stmts.split_at(existing_stmts.len() - 1);
@@ -1394,6 +1401,7 @@ impl VisitMut for ShutdownInjector {
                     );
                 };
                 let mut stmts: Vec<syn::Stmt> = Vec::new();
+                stmts.push(self.init_stmt());
                 stmts.extend(set_dir_stmt);
                 stmts.push(catch_stmt);
                 stmts.push(shutdown_stmt);
@@ -1683,18 +1691,25 @@ fn main() {}
     }
 
     #[test]
-    fn does_not_inject_init() {
+    fn injects_init_at_start_of_main() {
         let source = r#"
 fn main() {
-    println!("hello");
+    do_stuff();
 }
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = inject_shutdown(source, Some("/project/target/piano/runs")).unwrap();
 
         assert!(
-            !result.contains("piano_runtime::init()"),
-            "should NOT inject init (init is a no-op)"
+            result.contains("piano_runtime::init()"),
+            "should inject init(). Got:\n{result}"
+        );
+
+        // init() should appear before set_runs_dir and catch_unwind
+        let init_pos = result.find("piano_runtime::init()").unwrap();
+        let set_dir_pos = result.find("piano_runtime::set_runs_dir").unwrap();
+        assert!(
+            init_pos < set_dir_pos,
+            "init() should come before set_runs_dir(). Got:\n{result}"
         );
     }
 
