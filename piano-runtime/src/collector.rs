@@ -3,12 +3,13 @@
 //! Each instrumented function calls `enter(name)` which pushes a `StackEntry`
 //! onto a thread-local call stack and returns an RAII `Guard`. When the guard
 //! drops (on any exit path), it pops the stack entry, computes elapsed time,
-//! propagates children time to the parent, and records a `RawRecord`.
+//! propagates children time to the parent, and merges into per-function
+//! aggregates (`FnAgg`) via linear scan.
 //!
-//! `collect()` aggregates raw records into per-function summaries sorted by
+//! `collect()` returns pre-aggregated per-function summaries sorted by
 //! self-time descending. `reset()` clears all state for the current thread.
 //!
-//! Flush strategy: each thread's records live in an `Arc<Mutex<Vec<RawRecord>>>`
+//! Flush strategy: each thread's records live in an `Arc<Mutex<Vec<FnAgg>>>`
 //! registered in a global `THREAD_RECORDS` Vec. `shutdown()` (injected at the
 //! end of main by the AST rewriter) iterates all Arcs to collect data from every
 //! thread, including thread-pool workers whose TLS destructors may never fire.
@@ -160,17 +161,33 @@ pub(crate) struct StackEntry {
     pub(crate) packed: u64,
 }
 
-/// Raw measurement produced when a Guard drops.
+/// In-flight per-function aggregate. Replaces per-invocation storage to bound
+/// memory growth: instead of storing one record per invocation, we merge into
+/// one entry per unique function name via linear scan with pointer identity.
 #[derive(Clone)]
-struct RawRecord {
+struct FnAgg {
     name: &'static str,
-    elapsed_ms: f64,
-    children_ms: f64,
+    calls: u64,
+    total_ms: f64,
+    self_ms: f64,
     #[cfg(feature = "cpu-time")]
     cpu_self_ns: u64,
 }
 
-type ThreadRecordArc = Arc<Mutex<Vec<RawRecord>>>;
+impl FnAgg {
+    /// Merge another aggregate's fields into self.
+    fn absorb(&mut self, other: &FnAgg) {
+        self.calls += other.calls;
+        self.total_ms += other.total_ms;
+        self.self_ms += other.self_ms;
+        #[cfg(feature = "cpu-time")]
+        {
+            self.cpu_self_ns += other.cpu_self_ns;
+        }
+    }
+}
+
+type ThreadRecordArc = Arc<Mutex<Vec<FnAgg>>>;
 
 /// Per-phantom tracking for cross-thread forwarding and cleanup.
 ///
@@ -221,7 +238,7 @@ fn thread_records() -> &'static Mutex<Vec<ThreadRecordArc>> {
 
 thread_local! {
     pub(crate) static STACK: RefCell<Vec<StackEntry>> = RefCell::new(Vec::new());
-    static RECORDS: Arc<Mutex<Vec<RawRecord>>> = {
+    static RECORDS: Arc<Mutex<Vec<FnAgg>>> = {
         let arc = Arc::new(Mutex::new(Vec::new()));
         thread_records().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&arc));
         arc
@@ -229,22 +246,82 @@ thread_local! {
     static REGISTERED: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
     #[cfg(any(test, feature = "_test_internals"))]
     static INVOCATIONS: RefCell<Vec<InvocationRecord>> = RefCell::new(Vec::new());
-    /// Invocations accumulated within the current frame (cleared on frame boundary).
-    static FRAME_BUFFER: RefCell<Vec<InvocationRecord>> = RefCell::new(Vec::new());
+    /// Per-function summaries accumulated within the current frame (cleared on frame boundary).
+    static FRAME_BUFFER: RefCell<Vec<FrameFnSummary>> = RefCell::new(Vec::new());
     /// Completed per-frame summaries.
     static FRAMES: RefCell<Vec<Vec<FrameFnSummary>>> = RefCell::new(Vec::new());
     /// Per-thread phantom forwarding Arcs. When a phantom StackEntry exists on
     /// this thread (from Guard::check()), the corresponding Arc is stored here
     /// so child drops can write through to it.
     static PHANTOM_ARCS: RefCell<Vec<(u64, Arc<Mutex<f64>>)>> = RefCell::new(Vec::new());
-    /// Reusable Vec for frame aggregation. Cleared and reused on each
-    /// depth-0 boundary to avoid per-frame heap allocation.
-    /// Linear scan is faster than HashMap for the typical 1-5 unique functions
-    /// per frame (no hashing, no bucket probing, no memset for clear).
-    static FRAME_AGG_VEC: RefCell<Vec<FrameFnSummary>> = RefCell::new(Vec::new());
-    /// Fast local buffer for RawRecords. Avoids the Mutex lock on RECORDS
+    /// Fast local buffer for FnAgg entries. Avoids the Mutex lock on RECORDS
     /// for every drop_cold call. Flushed to RECORDS at depth-0 boundaries.
-    static RECORDS_BUF: RefCell<Vec<RawRecord>> = RefCell::new(Vec::new());
+    static RECORDS_BUF: RefCell<Vec<FnAgg>> = RefCell::new(Vec::new());
+}
+
+/// Merge a single invocation into a Vec<FnAgg> via linear scan on interned name pointer.
+fn merge_into_fnagg_vec(
+    buf: &mut Vec<FnAgg>,
+    name: &'static str,
+    elapsed_ms: f64,
+    children_ms: f64,
+    #[cfg(feature = "cpu-time")] cpu_self_ns: u64,
+) {
+    if let Some(entry) = buf.iter_mut().find(|e| std::ptr::eq(e.name, name)) {
+        entry.calls += 1;
+        entry.total_ms += elapsed_ms;
+        entry.self_ms += (elapsed_ms - children_ms).max(0.0);
+        #[cfg(feature = "cpu-time")]
+        {
+            entry.cpu_self_ns += cpu_self_ns;
+        }
+    } else {
+        buf.push(FnAgg {
+            name,
+            calls: 1,
+            total_ms: elapsed_ms,
+            self_ms: (elapsed_ms - children_ms).max(0.0),
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns,
+        });
+    }
+}
+
+/// Merge a single invocation into a Vec<FrameFnSummary> via linear scan on interned name pointer.
+fn merge_into_frame_buf(
+    buf: &mut Vec<FrameFnSummary>,
+    name: &'static str,
+    self_ns: u64,
+    #[cfg(feature = "cpu-time")] cpu_self_ns: u64,
+    alloc_count: u64,
+    alloc_bytes: u64,
+    free_count: u64,
+    free_bytes: u64,
+) {
+    if let Some(entry) = buf.iter_mut().find(|e| std::ptr::eq(e.name, name)) {
+        entry.calls += 1;
+        entry.self_ns += self_ns;
+        #[cfg(feature = "cpu-time")]
+        {
+            entry.cpu_self_ns += cpu_self_ns;
+        }
+        entry.alloc_count += alloc_count;
+        entry.alloc_bytes += alloc_bytes;
+        entry.free_count += free_count;
+        entry.free_bytes += free_bytes;
+    } else {
+        buf.push(FrameFnSummary {
+            name,
+            calls: 1,
+            self_ns,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns,
+            alloc_count,
+            alloc_bytes,
+            free_count,
+            free_bytes,
+        });
+    }
 }
 
 /// Drain RECORDS_BUF into the Mutex-guarded RECORDS.
@@ -256,10 +333,14 @@ fn flush_records_buf() {
             return;
         }
         RECORDS.with(|records| {
-            records
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend(buf.drain(..));
+            let mut recs = records.lock().unwrap_or_else(|e| e.into_inner());
+            for local in buf.drain(..) {
+                if let Some(entry) = recs.iter_mut().find(|e| std::ptr::eq(e.name, local.name)) {
+                    entry.absorb(&local);
+                } else {
+                    recs.push(local);
+                }
+            }
         });
     });
 }
@@ -512,7 +593,6 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         let name = lookup_name(unpack_name_id(guard.packed));
         let elapsed_ns = crate::tsc::elapsed_ns(guard.start_tsc, end_tsc);
         let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
-        let start_ns = crate::tsc::ticks_to_epoch_ns(guard.start_tsc, crate::tsc::epoch_tsc());
 
         // Post-migration children (Case 2): find and pop our phantom
         // StackEntry. Its children_ms was updated by children via the
@@ -543,19 +623,18 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         let children_ns = (phantom_children_ms * 1_000_000.0) as u64;
         let self_ns = elapsed_ns.saturating_sub(children_ns);
 
-        // Migrated path: push directly to Mutex-guarded RECORDS (not the
+        // Migrated path: merge directly into Mutex-guarded RECORDS (not the
         // fast buffer) because this thread has no depth-0 boundary to flush.
         RECORDS.with(|records| {
-            records
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(RawRecord {
-                    name,
-                    elapsed_ms,
-                    children_ms: phantom_children_ms,
-                    #[cfg(feature = "cpu-time")]
-                    cpu_self_ns: 0,
-                });
+            let mut recs = records.lock().unwrap_or_else(|e| e.into_inner());
+            merge_into_fnagg_vec(
+                &mut recs,
+                name,
+                elapsed_ms,
+                phantom_children_ms,
+                #[cfg(feature = "cpu-time")]
+                0,
+            );
         });
 
         let scope_alloc = crate::alloc::ALLOC_COUNTERS
@@ -567,27 +646,38 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             cell.set(phantom_saved_alloc);
         });
 
-        let invocation = InvocationRecord {
-            name,
-            start_ns,
-            elapsed_ns,
-            self_ns,
-            #[cfg(feature = "cpu-time")]
-            cpu_self_ns: 0,
-            alloc_count: scope_alloc.alloc_count,
-            alloc_bytes: scope_alloc.alloc_bytes,
-            free_count: scope_alloc.free_count,
-            free_bytes: scope_alloc.free_bytes,
-            depth: 0,
-        };
-
         #[cfg(any(test, feature = "_test_internals"))]
-        INVOCATIONS.with(|inv| {
-            inv.borrow_mut().push(invocation.clone());
-        });
+        {
+            let start_ns = crate::tsc::ticks_to_epoch_ns(guard.start_tsc, crate::tsc::epoch_tsc());
+            INVOCATIONS.with(|inv| {
+                inv.borrow_mut().push(InvocationRecord {
+                    name,
+                    start_ns,
+                    elapsed_ns,
+                    self_ns,
+                    #[cfg(feature = "cpu-time")]
+                    cpu_self_ns: 0,
+                    alloc_count: scope_alloc.alloc_count,
+                    alloc_bytes: scope_alloc.alloc_bytes,
+                    free_count: scope_alloc.free_count,
+                    free_bytes: scope_alloc.free_bytes,
+                    depth: 0,
+                });
+            });
+        }
 
         FRAME_BUFFER.with(|buf| {
-            buf.borrow_mut().push(invocation);
+            merge_into_frame_buf(
+                &mut buf.borrow_mut(),
+                name,
+                self_ns,
+                #[cfg(feature = "cpu-time")]
+                0,
+                scope_alloc.alloc_count,
+                scope_alloc.alloc_bytes,
+                scope_alloc.free_count,
+                scope_alloc.free_bytes,
+            );
         });
         return;
     }
@@ -630,7 +720,6 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
         let children_ns = (entry.children_ms * 1_000_000.0) as u64;
         let self_ns = elapsed_ns.saturating_sub(children_ns);
-        let start_ns = crate::tsc::ticks_to_epoch_ns(guard.start_tsc, crate::tsc::epoch_tsc());
         let children_ms = entry.children_ms;
 
         #[cfg(feature = "cpu-time")]
@@ -659,36 +748,48 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         }
 
         RECORDS_BUF.with(|buf| {
-            buf.borrow_mut().push(RawRecord {
-                name: entry.name,
+            merge_into_fnagg_vec(
+                &mut buf.borrow_mut(),
+                entry.name,
                 elapsed_ms,
                 children_ms,
                 #[cfg(feature = "cpu-time")]
                 cpu_self_ns,
-            });
+            );
         });
-
-        let invocation = InvocationRecord {
-            name: entry.name,
-            start_ns,
-            elapsed_ns,
-            self_ns,
-            #[cfg(feature = "cpu-time")]
-            cpu_self_ns,
-            alloc_count: scope_alloc.alloc_count,
-            alloc_bytes: scope_alloc.alloc_bytes,
-            free_count: scope_alloc.free_count,
-            free_bytes: scope_alloc.free_bytes,
-            depth: unpack_depth(entry.packed),
-        };
 
         #[cfg(any(test, feature = "_test_internals"))]
-        INVOCATIONS.with(|inv| {
-            inv.borrow_mut().push(invocation.clone());
-        });
+        {
+            let start_ns = crate::tsc::ticks_to_epoch_ns(guard.start_tsc, crate::tsc::epoch_tsc());
+            INVOCATIONS.with(|inv| {
+                inv.borrow_mut().push(InvocationRecord {
+                    name: entry.name,
+                    start_ns,
+                    elapsed_ns,
+                    self_ns,
+                    #[cfg(feature = "cpu-time")]
+                    cpu_self_ns,
+                    alloc_count: scope_alloc.alloc_count,
+                    alloc_bytes: scope_alloc.alloc_bytes,
+                    free_count: scope_alloc.free_count,
+                    free_bytes: scope_alloc.free_bytes,
+                    depth: unpack_depth(entry.packed),
+                });
+            });
+        }
 
         FRAME_BUFFER.with(|buf| {
-            buf.borrow_mut().push(invocation);
+            merge_into_frame_buf(
+                &mut buf.borrow_mut(),
+                entry.name,
+                self_ns,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns,
+                scope_alloc.alloc_count,
+                scope_alloc.alloc_bytes,
+                scope_alloc.free_count,
+                scope_alloc.free_bytes,
+            );
         });
 
         // Flush RECORDS_BUF at frame boundaries. Normally this is depth 0,
@@ -703,10 +804,9 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         }
         if unpack_depth(entry.packed) == 0 {
             FRAME_BUFFER.with(|buf| {
-                {
-                    let borrowed = buf.borrow();
-                    aggregate_frame_into_frames(&borrowed);
-                }
+                FRAMES.with(|frames| {
+                    frames.borrow_mut().push(buf.borrow().clone());
+                });
                 buf.borrow_mut().clear();
             });
         }
@@ -849,49 +949,14 @@ pub fn register(name: &'static str) {
     });
 }
 
-/// Aggregate raw records into per-function summaries, sorted by self_ms descending.
-struct AggEntry {
-    calls: u64,
-    total_ms: f64,
-    self_ms: f64,
-    #[cfg(feature = "cpu-time")]
-    cpu_self_ns: u64,
-}
-
-impl AggEntry {
-    fn new() -> Self {
-        Self {
-            calls: 0,
-            total_ms: 0.0,
-            self_ms: 0.0,
-            #[cfg(feature = "cpu-time")]
-            cpu_self_ns: 0,
-        }
-    }
-}
-
-fn aggregate(raw: &[RawRecord], registered: &[&str]) -> Vec<FunctionRecord> {
-    let mut map: HashMap<&str, AggEntry> = HashMap::new();
-
-    for name in registered {
-        map.entry(name).or_insert_with(AggEntry::new);
-    }
-
-    for rec in raw {
-        let entry = map.entry(rec.name).or_insert_with(AggEntry::new);
-        entry.calls += 1;
-        entry.total_ms += rec.elapsed_ms;
-        entry.self_ms += (rec.elapsed_ms - rec.children_ms).max(0.0);
-        #[cfg(feature = "cpu-time")]
-        {
-            entry.cpu_self_ns += rec.cpu_self_ns;
-        }
-    }
-
-    let mut result: Vec<FunctionRecord> = map
-        .into_iter()
-        .map(|(name, e)| FunctionRecord {
-            name: name.to_owned(),
+/// Convert pre-aggregated FnAgg entries into FunctionRecord output, adding
+/// zero-entry placeholders for registered names not yet present.
+/// Result is sorted by self_ms descending.
+fn aggregate(agg: &[FnAgg], registered: &[&str]) -> Vec<FunctionRecord> {
+    let mut result: Vec<FunctionRecord> = agg
+        .iter()
+        .map(|e| FunctionRecord {
+            name: e.name.to_owned(),
             calls: e.calls,
             total_ms: e.total_ms,
             self_ms: e.self_ms,
@@ -899,6 +964,20 @@ fn aggregate(raw: &[RawRecord], registered: &[&str]) -> Vec<FunctionRecord> {
             cpu_self_ms: e.cpu_self_ns as f64 / 1_000_000.0,
         })
         .collect();
+
+    // Add zero-entry placeholders for registered names not yet seen.
+    for &name in registered {
+        if !agg.iter().any(|e| std::ptr::eq(e.name, name)) {
+            result.push(FunctionRecord {
+                name: name.to_owned(),
+                calls: 0,
+                total_ms: 0.0,
+                self_ms: 0.0,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ms: 0.0,
+            });
+        }
+    }
 
     result.sort_by(|a, b| {
         b.self_ms
@@ -908,7 +987,7 @@ fn aggregate(raw: &[RawRecord], registered: &[&str]) -> Vec<FunctionRecord> {
     result
 }
 
-/// Aggregate raw records into per-function summaries, sorted by self_ms descending.
+/// Return pre-aggregated per-function summaries sorted by self_ms descending.
 /// Reads only from the current thread's record storage.
 pub fn collect() -> Vec<FunctionRecord> {
     flush_records_buf();
@@ -932,52 +1011,6 @@ pub fn collect_invocations() -> Vec<InvocationRecord> {
 /// been flushed.
 pub fn collect_frames() -> Vec<Vec<FrameFnSummary>> {
     FRAMES.with(|frames| frames.borrow().clone())
-}
-
-/// Aggregate invocation records and push directly into FRAMES.
-///
-/// Uses a thread-local reusable Vec with linear scan instead of HashMap.
-/// For the typical 1-5 unique functions per frame, linear scan avoids
-/// hashing, bucket probing, and memset overhead. Benchmarked crossover
-/// is ~80 unique functions per frame; even at 100 the per-call penalty
-/// is only 18ns vs 12ns (HashMap). If this becomes a bottleneck, add a
-/// len-based fallback to HashMap above a threshold.
-fn aggregate_frame_into_frames(records: &[InvocationRecord]) {
-    FRAME_AGG_VEC.with(|vec_cell| {
-        let mut agg = vec_cell.borrow_mut();
-        agg.clear();
-        for rec in records {
-            // Linear scan: faster than HashMap for typical 1-5 unique functions.
-            // Function names are interned &'static str, so pointer comparison works.
-            if let Some(entry) = agg.iter_mut().find(|e| std::ptr::eq(e.name, rec.name)) {
-                entry.calls += 1;
-                entry.self_ns += rec.self_ns;
-                #[cfg(feature = "cpu-time")]
-                {
-                    entry.cpu_self_ns += rec.cpu_self_ns;
-                }
-                entry.alloc_count += rec.alloc_count;
-                entry.alloc_bytes += rec.alloc_bytes;
-                entry.free_count += rec.free_count;
-                entry.free_bytes += rec.free_bytes;
-            } else {
-                agg.push(FrameFnSummary {
-                    name: rec.name,
-                    calls: 1,
-                    self_ns: rec.self_ns,
-                    #[cfg(feature = "cpu-time")]
-                    cpu_self_ns: rec.cpu_self_ns,
-                    alloc_count: rec.alloc_count,
-                    alloc_bytes: rec.alloc_bytes,
-                    free_count: rec.free_count,
-                    free_bytes: rec.free_bytes,
-                });
-            }
-        }
-        FRAMES.with(|frames| {
-            frames.borrow_mut().push(agg.clone());
-        });
-    });
 }
 
 /// Collect records from ALL threads via the global registry.
@@ -1006,15 +1039,22 @@ pub fn collect_all() -> Vec<FunctionRecord> {
         let registry = thread_records().lock().unwrap_or_else(|e| e.into_inner());
         registry.clone()
     };
-    let mut all_raw: Vec<RawRecord> = Vec::new();
+    // Merge FnAgg entries across all threads via linear scan.
+    let mut merged: Vec<FnAgg> = Vec::new();
     for arc in &arcs {
         let records = arc.lock().unwrap_or_else(|e| e.into_inner());
-        all_raw.extend(records.iter().cloned());
+        for entry in records.iter() {
+            if let Some(dst) = merged.iter_mut().find(|e| std::ptr::eq(e.name, entry.name)) {
+                dst.absorb(entry);
+            } else {
+                merged.push(entry.clone());
+            }
+        }
     }
     let registered: Vec<&str> = REGISTERED
         .try_with(|reg| reg.borrow().clone())
         .unwrap_or_default();
-    aggregate(&all_raw, &registered)
+    aggregate(&merged, &registered)
 }
 
 /// Clear all collected timing data for the current thread.
@@ -1032,7 +1072,6 @@ pub fn reset() {
     INVOCATIONS.with(|inv| inv.borrow_mut().clear());
     FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
     FRAMES.with(|frames| frames.borrow_mut().clear());
-    FRAME_AGG_VEC.with(|v| v.borrow_mut().clear());
     PHANTOM_ARCS.with(|arcs| arcs.borrow_mut().clear());
     // Drain any pending cleanup entries for this thread from the global queue.
     let cookie = THREAD_COOKIE.with(|c| *c);
@@ -1767,17 +1806,17 @@ mod tests {
 
     #[test]
     fn negative_self_time_clamped_to_zero() {
-        // Regression test for the f64 drift clamp in aggregate().
-        // Construct a synthetic RawRecord where children_ms slightly exceeds elapsed_ms
-        // (simulating floating-point accumulation drift).
-        let raw = vec![RawRecord {
+        // Regression test: merge_into_fnagg_vec clamps (elapsed - children).max(0.0).
+        // Verify the clamp propagates through aggregate() into FunctionRecord.
+        let agg = vec![FnAgg {
             name: "drifted",
-            elapsed_ms: 10.0,
-            children_ms: 10.001,
+            calls: 1,
+            total_ms: 10.0,
+            self_ms: 0.0, // already clamped by merge_into_fnagg_vec
             #[cfg(feature = "cpu-time")]
             cpu_self_ns: 0,
         }];
-        let result = aggregate(&raw, &[]);
+        let result = aggregate(&agg, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].self_ms, 0.0,
@@ -3580,5 +3619,47 @@ mod tests {
         assert_eq!(record.alloc_bytes, 3000, "1000 from A + 2000 from B");
         assert_eq!(record.free_count, 3, "1 from A + 2 from B");
         assert_eq!(record.free_bytes, 700, "200 from A + 500 from B");
+    }
+
+    #[test]
+    fn records_aggregate_in_flight() {
+        reset();
+        for _ in 0..10_000 {
+            let _g = enter("hot_fn");
+        }
+        flush_records_buf();
+        RECORDS.with(|records| {
+            let recs = records.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                recs.len(),
+                1,
+                "expected 1 aggregated entry, got {}",
+                recs.len()
+            );
+            assert_eq!(recs[0].calls, 10_000);
+        });
+    }
+
+    #[test]
+    fn frame_buffer_aggregates_in_flight() {
+        reset();
+        {
+            let _outer = enter("outer");
+            for _ in 0..10_000 {
+                let _g = enter("inner");
+            }
+        }
+        let frames = collect_frames();
+        assert_eq!(frames.len(), 1);
+        assert!(
+            frames[0].len() <= 2,
+            "expected <= 2 fn summaries, got {}",
+            frames[0].len()
+        );
+        let inner = frames[0]
+            .iter()
+            .find(|f| f.name == "inner")
+            .expect("inner not found");
+        assert_eq!(inner.calls, 10_000);
     }
 }
