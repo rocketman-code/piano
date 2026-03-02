@@ -120,12 +120,22 @@ fn inject_await_checks(block: &mut syn::Block) {
                 let has_await = stmt_has_direct_await(&stmt);
                 // Recurse into nested blocks within this statement first.
                 self.visit_stmt_mut(&mut stmt);
+                if has_await {
+                    let save_stmt: syn::Stmt = syn::parse_quote! {
+                        _piano_alloc.save();
+                    };
+                    new_stmts.push(save_stmt);
+                }
                 new_stmts.push(stmt);
                 if has_await {
                     let check_stmt: syn::Stmt = syn::parse_quote! {
                         _piano_guard.check();
                     };
+                    let resume_stmt: syn::Stmt = syn::parse_quote! {
+                        _piano_alloc.resume();
+                    };
                     new_stmts.push(check_stmt);
+                    new_stmts.push(resume_stmt);
                 }
             }
             block.stmts = new_stmts;
@@ -173,6 +183,13 @@ impl Instrumenter {
             let guard_stmt = block.stmts.remove(0);
             inject_await_checks(block);
             block.stmts.insert(0, guard_stmt);
+
+            // Inject AllocAccumulator as second statement. Drops first due to
+            // reverse declaration order, writing alloc total before Guard reads it.
+            let alloc_stmt: syn::Stmt = syn::parse_quote! {
+                let mut _piano_alloc = piano_runtime::AllocAccumulator::new();
+            };
+            block.stmts.insert(1, alloc_stmt);
         }
 
         // If the function body contains concurrency calls, inject fork
@@ -2447,6 +2464,116 @@ async fn example() {
             check_count, 1,
             "expected 1 check() (after send().await only), got {check_count}:\n{}",
             result.source,
+        );
+    }
+
+    #[test]
+    fn injects_alloc_accumulator_in_async_fn() {
+        let source = r#"
+async fn fetch() {
+    work().await;
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+
+        assert!(
+            result.source.contains("AllocAccumulator::new()"),
+            "async fn should get AllocAccumulator. Got:\n{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("_piano_alloc"),
+            "accumulator variable should be named _piano_alloc. Got:\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn does_not_inject_alloc_accumulator_in_sync_fn() {
+        let source = r#"
+fn compute(x: u64) -> u64 {
+    x * 2
+}
+"#;
+        let targets: HashSet<String> = ["compute".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+
+        assert!(
+            !result.source.contains("AllocAccumulator"),
+            "sync fn should NOT get AllocAccumulator. Got:\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn injects_save_and_resume_around_await() {
+        let source = r#"
+async fn fetch() {
+    setup();
+    data().await;
+    process();
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+
+        let save_pos = result
+            .source
+            .find("_piano_alloc.save()")
+            .expect("should have save()");
+        let await_pos = result
+            .source
+            .find("data().await")
+            .expect("should have .await");
+        let check_pos = result
+            .source
+            .find("_piano_guard.check()")
+            .expect("should have check()");
+        let resume_pos = result
+            .source
+            .find("_piano_alloc.resume()")
+            .expect("should have resume()");
+
+        assert!(
+            save_pos < await_pos,
+            "save() should come before .await. Got:\n{}",
+            result.source
+        );
+        assert!(await_pos < check_pos, "check() should come after .await");
+        assert!(check_pos < resume_pos, "resume() should come after check()");
+    }
+
+    #[test]
+    fn injects_save_resume_for_multiple_awaits() {
+        let source = r#"
+async fn multi() {
+    a().await;
+    b().await;
+    c().await;
+}
+"#;
+        let targets: HashSet<String> = ["multi".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+
+        let save_count = result.source.matches("_piano_alloc.save()").count();
+        let resume_count = result.source.matches("_piano_alloc.resume()").count();
+        let check_count = result.source.matches("_piano_guard.check()").count();
+
+        assert_eq!(
+            save_count, 3,
+            "should have 3 save() calls. Got:\n{}",
+            result.source
+        );
+        assert_eq!(
+            resume_count, 3,
+            "should have 3 resume() calls. Got:\n{}",
+            result.source
+        );
+        assert_eq!(
+            check_count, 3,
+            "should have 3 check() calls. Got:\n{}",
+            result.source
         );
     }
 }
