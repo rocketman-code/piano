@@ -1,6 +1,6 @@
 # piano
 
-Automated instrumentation-based profiling for Rust. Point it at your project, get back self-time, call counts, and allocation data per function.
+Automated instrumentation-based profiling for Rust. Point it at your project, get back self-time, call counts, and allocation data per function -- sync, threaded, and async.
 
 ```
 $ piano profile
@@ -140,26 +140,54 @@ The report adds CPU columns so you can distinguish computation from I/O or sleep
 
 ### Multi-threaded programs
 
-Programs using rayon or `std::thread::spawn` work out of the box. Each thread writes its own timing data with a shared `run_id`. `piano report` consolidates all files from the same run automatically.
+Programs using rayon or `std::thread::spawn` work out of the box. Piano detects concurrency patterns (rayon `par_iter`, `scope`, `join`, `std::thread::scope`) and tracks timing across threads. Each thread writes its own timing data with a shared `run_id`. `piano report` consolidates all files from the same run automatically.
+
+### Async programs
+
+Async functions instrumented with Piano track self-time and allocations correctly across `.await` points, even when tasks migrate between threads:
+
+```
+$ piano profile --fn handle_request
+Function                                       Self    Calls   Allocs  Alloc Bytes
+----------------------------------------------------------------------------------
+handle_request                               12.44ms      100      450       34.2KB
+fetch_data                                    8.91ms      100      200       15.8KB
+process_response                              3.12ms      100      150       11.4KB
+```
+
+When a tokio task migrates mid-function, Piano's guard detects the thread change and preserves wall-time measurement. Allocation tracking uses a save/resume pattern around `.await` to carry data across thread hops.
+
+### Platform-gated allocators
+
+Projects that gate their global allocator behind `#[cfg(...)]` -- common with `tikv-jemallocator` or `mimalloc` -- work correctly. Piano detects the cfg gate and injects a fallback allocator for platforms where the user's allocator is compiled out:
+
+```rust
+// Your code -- Piano handles this automatically
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+```
 
 ## How it works
 
 1. `piano build` copies your project to a staging directory
 2. Adds `piano-runtime` as a dependency in the staged `Cargo.toml`
 3. Parses Rust source with `syn`, finds functions matching your patterns, and injects `let _guard = piano_runtime::enter("name")` at the top of each
-4. Sets `PianoAllocator` as the global allocator to track per-frame heap activity
+4. Detects existing `#[global_allocator]` declarations (including cfg-gated ones) and wraps them with `PianoAllocator` for heap tracking
 5. Builds with `cargo build`
 
-Each guard records wall-clock time on construction and drop. Self-time is computed by subtracting children's time from total time. The allocator attributes heap operations to the currently executing instrumented function, and frame summaries are computed when top-level guards complete.
+Each guard records wall-clock time on construction and drop. Self-time is computed by subtracting children's time from total time. The allocator attributes heap operations to the currently executing instrumented function, and frame summaries are computed when top-level guards complete. For async functions, guards detect thread migration on drop and allocation accumulators carry data across `.await` points via save/resume.
 
-Two crates: `piano` (CLI, AST rewriting, build orchestration) and `piano-runtime` (zero-dependency timing and allocation runtime injected into user projects). The runtime has zero external dependencies to avoid version conflicts.
+Two crates: `piano` (CLI, AST rewriting, build orchestration, requires Rust 1.88) and `piano-runtime` (zero-dependency timing and allocation runtime injected into user projects, MSRV 1.59). The runtime has zero external dependencies to avoid version conflicts with user projects.
 
 ## Limitations
 
-- Wall-clock timing by default. Use `--cpu-time` to add per-thread CPU time (Linux + macOS only).
-- Functions shorter than the guard overhead (~12ns on x86-64, sub-nanosecond on Apple Silicon) will have noisy measurements.
-- Async functions record wall time only when futures migrate across threads (self-time may overcount).
+- Wall-clock timing by default. Use `--cpu-time` to add per-thread CPU time (Linux + macOS, 64-bit only).
+- Functions shorter than the guard overhead (~12ns on x86-64, ~59ns on Apple Silicon) will have noisy measurements.
+- Async functions that migrate threads record wall time accurately but self-time uses wall-time-only accounting on the migrated path.
 - Allocation tracking counts heap operations only (`alloc`/`dealloc`). Stack allocations and memory-mapped regions are not tracked.
+- `const fn`, `unsafe fn`, and `extern fn` are skipped during instrumentation (use `--list-skipped` to see them).
+- Profiling data is captured even when the instrumented program panics.
 
 ## License
 
