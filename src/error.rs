@@ -54,6 +54,29 @@ pub enum Error {
     #[error("profiling data was not written -- check disk space and permissions for {}", .0.display())]
     NoDataWritten(PathBuf),
 
+    #[error("failed to {operation} {}: {source}", path.display())]
+    IoWithContext {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Create a closure that wraps a `std::io::Error` with file path context.
+///
+/// Usage: `.map_err(io_context("read", &path))?`
+pub fn io_context(
+    operation: &'static str,
+    path: impl Into<PathBuf>,
+) -> impl FnOnce(std::io::Error) -> Error {
+    let path = path.into();
+    move |source| Error::IoWithContext {
+        operation,
+        path,
+        source,
+    }
 }
