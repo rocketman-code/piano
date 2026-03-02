@@ -7,6 +7,40 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-03-02
+
+Piano is feature-complete. Every metric (wall time, self time, CPU time, allocations) is accurate across every execution model (sync, threaded, async).
+
+### Added
+
+- Async-aware allocation tracking: `AllocAccumulator` carries allocation data across async thread migrations via `save()`/`resume()`/`Drop` pattern (#226, PR #225)
+  - Rewriter injects `AllocAccumulator` and `save()`/`resume()` around `.await` points in async functions
+  - Per-await overhead: ~1.3ns on Apple Silicon, ~57ns on x86_64 (~3% of baseline enter/drop)
+  - Sync functions: zero overhead, no changes
+- Integration test for async allocation tracking pipeline
+- Integration test for panic data capture (#86)
+- Tagged NDJSON diff path test coverage
+- cpu-time feature added to CI test matrix (#117)
+
+### Fixed
+
+- Allocation data no longer silently lost when async tasks migrate threads
+- Phantom stack entry saves and zeroes host thread alloc counters on migration
+- Migrated guard drop path reads accumulated allocs instead of reporting zeros
+- Companion JSON merge validates run_id consistency, skips mismatched files (#58)
+- Child exit code propagated from `piano profile` (#93)
+- `extern "Rust" fn` inside `macro_rules!` templates now instrumented (#144)
+- Stale files removed from staging directory on rebuild
+- stack_entry_size test made feature-aware for cpu-time builds
+- tempfile moved to dev-dependencies (smaller dependency footprint for users)
+
+### Changed
+
+- Staging directory uses stable path (`target/piano/staging/`) for incremental compilation instead of fresh tempdir per build
+- `BuildOpts` struct extracted from shared build/profile CLI fields
+- `fn_agg` tuple replaced with named `FnAgg` struct in report module
+- `shutdown_to()` delegates through `runs_dir()` instead of duplicating logic
+
 ## [0.8.2] - 2026-02-28
 
 ### Changed
