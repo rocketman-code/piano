@@ -3479,6 +3479,9 @@ mod tests {
             // save() captures {1, 100} into cumulative, zeros counters.
             acc.save();
 
+            // resume() after .await -- sets active = true, zeros counters.
+            acc.resume();
+
             // Segment 2: allocate 200 bytes.
             crate::alloc::ALLOC_COUNTERS.with(|cell| {
                 cell.set(crate::alloc::AllocSnapshot {
