@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anstyle::{Effects, Style};
 
-use crate::error::Error;
+use crate::error::{Error, io_context};
 
 const HEADER: Style = Style::new().bold();
 const DIM: Style = Style::new().effects(Effects::DIMMED);
@@ -812,9 +812,9 @@ fn validate_tag_name(tag: &str) -> Result<(), Error> {
 /// Save a tag pointing to a run_id.
 pub fn save_tag(tags_dir: &Path, tag: &str, run_id: &str) -> Result<(), Error> {
     validate_tag_name(tag)?;
-    std::fs::create_dir_all(tags_dir)?;
+    std::fs::create_dir_all(tags_dir).map_err(io_context("create directory", tags_dir))?;
     let path = tags_dir.join(tag);
-    std::fs::write(&path, run_id)?;
+    std::fs::write(&path, run_id).map_err(io_context("write", &path))?;
     Ok(())
 }
 

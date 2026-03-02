@@ -4,7 +4,7 @@ use std::process::Command;
 use ignore::WalkBuilder;
 use toml_edit::DocumentMut;
 
-use crate::error::Error;
+use crate::error::{Error, io_context};
 
 /// Copy the user's project into a staging directory, respecting .gitignore
 /// and skipping the `target/` directory.
@@ -12,13 +12,15 @@ pub fn prepare_staging(project_root: &Path, staging_dir: &Path) -> Result<(), Er
     // Wipe existing staging contents so stale files from previous runs
     // don't leak into the build. The directory itself is preserved.
     if staging_dir.exists() {
-        for entry in std::fs::read_dir(staging_dir)? {
-            let entry = entry?;
+        for entry in
+            std::fs::read_dir(staging_dir).map_err(io_context("read directory", staging_dir))?
+        {
+            let entry = entry.map_err(io_context("read directory entry", staging_dir))?;
             let path = entry.path();
             if path.is_dir() {
-                std::fs::remove_dir_all(&path)?;
+                std::fs::remove_dir_all(&path).map_err(io_context("remove directory", &path))?;
             } else {
-                std::fs::remove_file(&path)?;
+                std::fs::remove_file(&path).map_err(io_context("remove file", &path))?;
             }
         }
     }
@@ -42,12 +44,12 @@ pub fn prepare_staging(project_root: &Path, staging_dir: &Path) -> Result<(), Er
         let dest = staging_dir.join(relative);
 
         if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-            std::fs::create_dir_all(&dest)?;
+            std::fs::create_dir_all(&dest).map_err(io_context("create directory", &dest))?;
         } else if entry.file_type().is_some_and(|ft| ft.is_file()) {
             if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
+                std::fs::create_dir_all(parent).map_err(io_context("create directory", parent))?;
             }
-            std::fs::copy(source, &dest)?;
+            std::fs::copy(source, &dest).map_err(io_context("copy file to", &dest))?;
         }
     }
 
@@ -91,11 +93,15 @@ fn inject_runtime(
     features: &[&str],
 ) -> Result<(), Error> {
     let cargo_toml_path = staging_dir.join("Cargo.toml");
-    let content = std::fs::read_to_string(&cargo_toml_path)?;
+    let content =
+        std::fs::read_to_string(&cargo_toml_path).map_err(io_context("read", &cargo_toml_path))?;
 
-    let mut doc: DocumentMut = content
-        .parse::<DocumentMut>()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut doc: DocumentMut = content.parse::<DocumentMut>().map_err(|e| {
+        Error::BuildFailed(format!(
+            "failed to parse {}: {e}",
+            cargo_toml_path.display()
+        ))
+    })?;
 
     // Ensure [dependencies] table exists.
     if !doc.contains_table("dependencies") {
@@ -133,7 +139,8 @@ fn inject_runtime(
             toml_edit::Item::Value(toml_edit::Value::InlineTable(table));
     }
 
-    std::fs::write(&cargo_toml_path, doc.to_string())?;
+    std::fs::write(&cargo_toml_path, doc.to_string())
+        .map_err(io_context("write", &cargo_toml_path))?;
 
     Ok(())
 }
@@ -210,7 +217,8 @@ pub fn find_project_root(start_dir: &Path) -> Result<PathBuf, Error> {
 /// is used. Returns an error if no entry point can be found.
 pub fn find_bin_entry_point(project_dir: &Path) -> Result<PathBuf, Error> {
     let cargo_toml_path = project_dir.join("Cargo.toml");
-    let content = std::fs::read_to_string(&cargo_toml_path)?;
+    let content =
+        std::fs::read_to_string(&cargo_toml_path).map_err(io_context("read", &cargo_toml_path))?;
     let doc: DocumentMut = content
         .parse::<DocumentMut>()
         .map_err(|e| Error::BuildFailed(format!("failed to parse Cargo.toml: {e}")))?;

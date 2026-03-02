@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use syn::visit::Visit;
 
-use crate::error::Error;
+use crate::error::{Error, io_context};
 
 /// What the user asked to instrument.
 #[derive(Debug, Clone)]
@@ -258,9 +258,9 @@ fn walk_rs_files(dir: &Path) -> Result<Vec<PathBuf>, Error> {
 }
 
 fn walk_rs_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> {
-    let entries = std::fs::read_dir(dir)?;
+    let entries = std::fs::read_dir(dir).map_err(io_context("read directory", dir))?;
     for entry in entries {
-        let entry = entry?;
+        let entry = entry.map_err(io_context("read directory entry", dir))?;
         let path = entry.path();
         if path.is_dir() {
             walk_rs_files_inner(&path, out)?;
