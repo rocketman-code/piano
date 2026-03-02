@@ -104,7 +104,7 @@ fn measure_tls_cell_get_set() -> f64 {
 fn measure_refcell_vec_push_pop() -> f64 {
     struct Entry {
         _name: &'static str,
-        _children_ms: f64,
+        _children_ns: u64,
         _saved: [u64; 4],
         _packed: u64,
     }
@@ -120,7 +120,7 @@ fn measure_refcell_vec_push_pop() -> f64 {
             let depth = stack.borrow().len();
             stack.borrow_mut().push(Entry {
                 _name: "test",
-                _children_ms: 0.0,
+                _children_ns: 0,
                 _saved: [0; 4],
                 _packed: i | ((depth as u64) << 48),
             });
@@ -130,7 +130,7 @@ fn measure_refcell_vec_push_pop() -> f64 {
             let entry = stack.borrow_mut().pop();
             black_box(entry);
             if let Some(parent) = stack.borrow_mut().last_mut() {
-                parent._children_ms += 0.001;
+                parent._children_ns += 1000;
             }
         });
     }
@@ -164,7 +164,7 @@ fn measure_mutex_vec_push() -> f64 {
     struct RawRecord {
         _name: &'static str,
         _elapsed_ms: f64,
-        _children_ms: f64,
+        _children_ns: u64,
     }
 
     thread_local! {
@@ -177,7 +177,7 @@ fn measure_mutex_vec_push() -> f64 {
             records.lock().unwrap().push(RawRecord {
                 _name: "test",
                 _elapsed_ms: 0.001,
-                _children_ms: 0.0,
+                _children_ns: 0,
             });
         });
     }
