@@ -367,6 +367,120 @@ fn measure_frame_aggregation() -> f64 {
     ns_per_call(start.elapsed())
 }
 
+/// AllocAccumulator save(): TLS Cell get+set + 4 integer adds.
+/// This is the per-.await cost on the departing thread.
+fn measure_alloc_acc_save() -> f64 {
+    #[derive(Clone, Copy, Default)]
+    struct Snap {
+        a: u64,
+        b: u64,
+        c: u64,
+        d: u64,
+    }
+
+    thread_local! {
+        static COUNTERS: Cell<Snap> = Cell::new(Snap::default());
+    }
+
+    let mut cumulative = Snap::default();
+
+    // Seed counters like a real scope would have.
+    COUNTERS.with(|cell| {
+        cell.set(Snap {
+            a: 5,
+            b: 1000,
+            c: 1,
+            d: 200,
+        });
+    });
+
+    let start = Instant::now();
+    for _ in 0..N {
+        // save(): read current, zero, accumulate
+        let current = COUNTERS.with(|cell| {
+            let snap = cell.get();
+            cell.set(Snap::default());
+            snap
+        });
+        cumulative.a += current.a;
+        cumulative.b += current.b;
+        cumulative.c += current.c;
+        cumulative.d += current.d;
+    }
+    black_box(cumulative);
+    ns_per_call(start.elapsed())
+}
+
+/// AllocAccumulator resume(): TLS Cell set (zero counters on new thread).
+/// This is the per-.await cost on the arriving thread.
+fn measure_alloc_acc_resume() -> f64 {
+    #[derive(Clone, Copy, Default)]
+    struct Snap {
+        a: u64,
+        b: u64,
+        c: u64,
+        d: u64,
+    }
+
+    thread_local! {
+        static COUNTERS: Cell<Snap> = Cell::new(Snap::default());
+    }
+
+    let start = Instant::now();
+    for _ in 0..N {
+        COUNTERS.with(|cell| {
+            cell.set(Snap::default());
+        });
+    }
+    ns_per_call(start.elapsed())
+}
+
+/// AllocAccumulator save()+resume() pair: the full per-.await overhead.
+fn measure_alloc_acc_save_resume() -> f64 {
+    #[derive(Clone, Copy, Default)]
+    struct Snap {
+        a: u64,
+        b: u64,
+        c: u64,
+        d: u64,
+    }
+
+    thread_local! {
+        static COUNTERS: Cell<Snap> = Cell::new(Snap::default());
+    }
+
+    let mut cumulative = Snap::default();
+
+    COUNTERS.with(|cell| {
+        cell.set(Snap {
+            a: 5,
+            b: 1000,
+            c: 1,
+            d: 200,
+        });
+    });
+
+    let start = Instant::now();
+    for _ in 0..N {
+        // save()
+        let current = COUNTERS.with(|cell| {
+            let snap = cell.get();
+            cell.set(Snap::default());
+            snap
+        });
+        cumulative.a += current.a;
+        cumulative.b += current.b;
+        cumulative.c += current.c;
+        cumulative.d += current.d;
+        // resume() (same thread for measurement — TLS cost is identical)
+        COUNTERS.with(|cell| {
+            cell.set(Snap::default());
+        });
+    }
+    black_box(cumulative);
+    ns_per_call(start.elapsed())
+}
+
 /// drain().collect() on a 1-element Vec: replicates FRAME_BUFFER drain on depth-0 drop.
 fn measure_drain_collect() -> f64 {
     struct InvRecord {
@@ -461,6 +575,9 @@ fn overhead_breakdown() {
     let frame_agg = measure_frame_aggregation();
     let drain = measure_drain_collect();
     let multi_tls = measure_multi_tls();
+    let acc_save = measure_alloc_acc_save();
+    let acc_resume = measure_alloc_acc_resume();
+    let acc_pair = measure_alloc_acc_save_resume();
 
     eprintln!();
     eprintln!("--- Component Costs ({N} iterations, release build) ---");
@@ -546,6 +663,23 @@ fn overhead_breakdown() {
         "  {:<45} {:>8.1}ns",
         "depth-0 penalty (frame agg cost)",
         depth0 - depth1
+    );
+    eprintln!();
+    eprintln!("--- Async Alloc Accumulator (per-.await overhead) ---");
+    eprintln!();
+    eprintln!(
+        "  {:<45} {:>8.1}ns",
+        "save() (TLS read+zero + 4 adds)", acc_save
+    );
+    eprintln!("  {:<45} {:>8.1}ns", "resume() (TLS zero)", acc_resume);
+    eprintln!(
+        "  {:<45} {:>8.1}ns",
+        "save()+resume() pair (full per-await)", acc_pair
+    );
+    eprintln!(
+        "  {:<45} {:>8.1}ns",
+        "as % of depth-1 enter/drop",
+        acc_pair / depth1 * 100.0
     );
     eprintln!();
 }

@@ -7,7 +7,7 @@ mod collector;
 mod cpu_clock;
 mod tsc;
 
-pub use alloc::PianoAllocator;
+pub use alloc::{AllocAccumulator, PianoAllocator};
 #[cfg(test)]
 pub use collector::clear_runs_dir;
 #[cfg(any(test, feature = "_test_internals"))]

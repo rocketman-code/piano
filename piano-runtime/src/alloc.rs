@@ -29,6 +29,68 @@ impl AllocSnapshot {
     }
 }
 
+/// Accumulates allocation data across async thread migrations.
+///
+/// Declared after the Guard in instrumented async functions so that Rust's
+/// reverse declaration drop order ensures this drops first, writing the
+/// accumulated total to ALLOC_COUNTERS before the Guard reads it.
+pub struct AllocAccumulator {
+    cumulative: AllocSnapshot,
+}
+
+impl Default for AllocAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AllocAccumulator {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            cumulative: AllocSnapshot::new(),
+        }
+    }
+
+    /// Called BEFORE .await: captures this thread segment's allocs into
+    /// cumulative and zeros counters for the next segment.
+    #[inline]
+    pub fn save(&mut self) {
+        let current = ALLOC_COUNTERS.with(|cell| {
+            let snap = cell.get();
+            cell.set(AllocSnapshot::new());
+            snap
+        });
+        self.cumulative.alloc_count += current.alloc_count;
+        self.cumulative.alloc_bytes += current.alloc_bytes;
+        self.cumulative.free_count += current.free_count;
+        self.cumulative.free_bytes += current.free_bytes;
+    }
+
+    /// Called AFTER .await + check(): zeros counters on the (possibly new)
+    /// thread so allocations from this point go into a fresh segment.
+    #[inline]
+    pub fn resume(&mut self) {
+        ALLOC_COUNTERS.with(|cell| {
+            cell.set(AllocSnapshot::new());
+        });
+    }
+}
+
+impl Drop for AllocAccumulator {
+    fn drop(&mut self) {
+        let _ = ALLOC_COUNTERS.try_with(|cell| {
+            let final_seg = cell.get();
+            cell.set(AllocSnapshot {
+                alloc_count: self.cumulative.alloc_count + final_seg.alloc_count,
+                alloc_bytes: self.cumulative.alloc_bytes + final_seg.alloc_bytes,
+                free_count: self.cumulative.free_count + final_seg.free_count,
+                free_bytes: self.cumulative.free_bytes + final_seg.free_bytes,
+            });
+        });
+    }
+}
+
 /// A global allocator wrapper that tracks allocation counts and bytes
 /// per instrumented function scope, with zero timing distortion.
 ///
@@ -157,6 +219,51 @@ mod tests {
         assert_eq!(outer.alloc_bytes, 400, "outer alloc_bytes");
         assert_eq!(outer.free_count, 1, "outer free_count");
         assert_eq!(outer.free_bytes, 75, "outer free_bytes");
+    }
+
+    #[test]
+    fn alloc_accumulator_save_resume_drop_cycle() {
+        ALLOC_COUNTERS.with(|cell| {
+            cell.set(AllocSnapshot::new());
+        });
+
+        let total = {
+            let mut acc = AllocAccumulator::new();
+
+            // Segment 1: 5 allocs, 1000 bytes.
+            ALLOC_COUNTERS.with(|cell| {
+                cell.set(AllocSnapshot {
+                    alloc_count: 5,
+                    alloc_bytes: 1000,
+                    free_count: 1,
+                    free_bytes: 200,
+                });
+            });
+            acc.save();
+
+            let after = ALLOC_COUNTERS.with(|cell| cell.get());
+            assert_eq!(after.alloc_count, 0);
+
+            acc.resume();
+
+            // Segment 2: 3 allocs, 2000 bytes.
+            ALLOC_COUNTERS.with(|cell| {
+                cell.set(AllocSnapshot {
+                    alloc_count: 3,
+                    alloc_bytes: 2000,
+                    free_count: 2,
+                    free_bytes: 500,
+                });
+            });
+
+            drop(acc);
+            ALLOC_COUNTERS.with(|cell| cell.get())
+        };
+
+        assert_eq!(total.alloc_count, 8, "5 + 3");
+        assert_eq!(total.alloc_bytes, 3000, "1000 + 2000");
+        assert_eq!(total.free_count, 3, "1 + 2");
+        assert_eq!(total.free_bytes, 700, "200 + 500");
     }
 
     #[test]

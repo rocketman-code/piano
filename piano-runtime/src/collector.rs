@@ -3115,4 +3115,461 @@ mod tests {
         // Clean up.
         let _ = std::fs::remove_file(&tmp);
     }
+
+    #[test]
+    fn alloc_accumulator_carries_data_across_thread_hop() {
+        // Simulates: async fn foo() {
+        //     alloc 1000 bytes         // segment 1 on thread A
+        //     _acc.save();
+        //     something.await;          // migrates to thread B
+        //     _guard.check();
+        //     _acc.resume();
+        //     alloc 2000 bytes         // segment 2 on thread B
+        // }                            // acc drops -> writes total to ALLOC_COUNTERS
+        reset();
+
+        let _guard = enter("acc_test");
+        let mut acc = crate::alloc::AllocAccumulator::new();
+
+        // Segment 1: allocations on thread A.
+        crate::alloc::ALLOC_COUNTERS.with(|cell| {
+            cell.set(crate::alloc::AllocSnapshot {
+                alloc_count: 5,
+                alloc_bytes: 1000,
+                free_count: 1,
+                free_bytes: 200,
+            });
+        });
+
+        // Pre-await: save alloc state while still on A.
+        acc.save();
+
+        // At this point, A's ALLOC_COUNTERS should be zeroed.
+        let after_save = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
+        assert_eq!(after_save.alloc_count, 0, "save() should zero counters");
+
+        // --- Simulate thread migration ---
+        // Move acc to thread B (simulating future state machine migration).
+        // Guard stays on A for this test since we're testing the accumulator,
+        // not the guard's migration path.
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                // Post-migration: resume on new thread.
+                // First, B might have garbage in its counters from other work.
+                crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                    cell.set(crate::alloc::AllocSnapshot {
+                        alloc_count: 999,
+                        alloc_bytes: 99999,
+                        free_count: 0,
+                        free_bytes: 0,
+                    });
+                });
+
+                // resume() zeros B's counters, isolating our scope.
+                acc.resume();
+
+                let after_resume = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
+                assert_eq!(
+                    after_resume.alloc_count, 0,
+                    "resume() should zero B's counters"
+                );
+
+                // Segment 2: allocations on thread B.
+                crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                    cell.set(crate::alloc::AllocSnapshot {
+                        alloc_count: 3,
+                        alloc_bytes: 2000,
+                        free_count: 2,
+                        free_bytes: 500,
+                    });
+                });
+
+                // Drop writes cumulative + final segment to ALLOC_COUNTERS.
+                drop(acc);
+
+                let total = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
+                assert_eq!(total.alloc_count, 8, "5 from A + 3 from B");
+                assert_eq!(total.alloc_bytes, 3000, "1000 from A + 2000 from B");
+                assert_eq!(total.free_count, 3, "1 from A + 2 from B");
+                assert_eq!(total.free_bytes, 700, "200 from A + 500 from B");
+            });
+        });
+    }
+
+    #[test]
+    fn alloc_accumulator_multi_hop() {
+        // Simulates A -> B -> C migration (two awaits, three segments).
+        reset();
+
+        let _guard = enter("multi_hop_test");
+        let mut acc = crate::alloc::AllocAccumulator::new();
+
+        // Segment 1 on A: 100 bytes.
+        crate::alloc::ALLOC_COUNTERS.with(|cell| {
+            cell.set(crate::alloc::AllocSnapshot {
+                alloc_count: 1,
+                alloc_bytes: 100,
+                free_count: 0,
+                free_bytes: 0,
+            });
+        });
+        acc.save();
+
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                // Now on B.
+                acc.resume();
+
+                // Segment 2 on B: 200 bytes.
+                crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                    cell.set(crate::alloc::AllocSnapshot {
+                        alloc_count: 2,
+                        alloc_bytes: 200,
+                        free_count: 0,
+                        free_bytes: 0,
+                    });
+                });
+                acc.save(); // pre-await on B
+
+                std::thread::scope(|s2| {
+                    s2.spawn(move || {
+                        // Now on C.
+                        acc.resume();
+
+                        // Segment 3 on C: 300 bytes.
+                        crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                            cell.set(crate::alloc::AllocSnapshot {
+                                alloc_count: 3,
+                                alloc_bytes: 300,
+                                free_count: 0,
+                                free_bytes: 0,
+                            });
+                        });
+
+                        // Drop writes cumulative + final segment to ALLOC_COUNTERS.
+                        drop(acc);
+
+                        let total = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
+                        assert_eq!(total.alloc_count, 6, "1 + 2 + 3 from three segments");
+                        assert_eq!(total.alloc_bytes, 600, "100 + 200 + 300");
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn alloc_accumulator_with_nested_children() {
+        // Simulates an async parent that calls child functions which allocate.
+        // Children's allocs should be excluded (by enter/drop save/restore),
+        // and the accumulator should only capture the parent's self-allocs.
+        //
+        // async fn parent() {
+        //     alloc 100            // parent on A
+        //     child()              // child allocs 500
+        //     alloc 200            // parent on A
+        //     _acc.save();
+        //     something.await;     // migrate to B
+        //     _guard.check();
+        //     _acc.resume();
+        //     alloc 300            // parent on B
+        //     child2()             // child2 allocs 700
+        //     alloc 400            // parent on B
+        // }
+        // Expected parent self-allocs: 100 + 200 + 300 + 400 = 1000
+        reset();
+
+        let _parent_guard = enter("parent_with_children");
+        let mut acc = crate::alloc::AllocAccumulator::new();
+
+        // --- Segment 1 on thread A ---
+
+        // Parent allocs 100 bytes.
+        crate::alloc::ALLOC_COUNTERS.with(|cell| {
+            cell.set(crate::alloc::AllocSnapshot {
+                alloc_count: 1,
+                alloc_bytes: 100,
+                free_count: 0,
+                free_bytes: 0,
+            });
+        });
+
+        // Child enters: saves parent's {1, 100}, zeros counters.
+        {
+            let _child = enter("child1");
+
+            // Child allocs 500 bytes.
+            crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                cell.set(crate::alloc::AllocSnapshot {
+                    alloc_count: 10,
+                    alloc_bytes: 500,
+                    free_count: 0,
+                    free_bytes: 0,
+                });
+            });
+        }
+        // Child drops: records child's {10, 500}, restores parent's {1, 100}.
+
+        // Verify: ALLOC_COUNTERS should be back to parent's {1, 100}.
+        let after_child1 = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
+        assert_eq!(
+            after_child1.alloc_count, 1,
+            "parent's counters restored after child1"
+        );
+        assert_eq!(after_child1.alloc_bytes, 100);
+
+        // Parent allocs 200 more bytes (total on A: 100 + 200 = 300).
+        crate::alloc::ALLOC_COUNTERS.with(|cell| {
+            let mut snap = cell.get();
+            snap.alloc_count += 2;
+            snap.alloc_bytes += 200;
+            cell.set(snap);
+        });
+
+        // Pre-await: save. Should capture {3, 300} (parent's self-allocs on A).
+        acc.save();
+
+        // After save, counters should be zeroed.
+        let after_save = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
+        assert_eq!(after_save.alloc_count, 0, "save() should zero counters");
+
+        // --- Simulate migration to thread B ---
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                // B might have garbage counters from other work.
+                crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                    cell.set(crate::alloc::AllocSnapshot {
+                        alloc_count: 777,
+                        alloc_bytes: 77777,
+                        free_count: 0,
+                        free_bytes: 0,
+                    });
+                });
+
+                // Post-migration: resume zeros B's counters.
+                acc.resume();
+
+                // --- Segment 2 on thread B ---
+
+                // Parent allocs 300 bytes.
+                crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                    cell.set(crate::alloc::AllocSnapshot {
+                        alloc_count: 3,
+                        alloc_bytes: 300,
+                        free_count: 0,
+                        free_bytes: 0,
+                    });
+                });
+
+                // Child2 enters: saves parent's {3, 300}, zeros counters.
+                {
+                    let _child2 = enter("child2");
+
+                    // Child2 allocs 700 bytes.
+                    crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                        cell.set(crate::alloc::AllocSnapshot {
+                            alloc_count: 20,
+                            alloc_bytes: 700,
+                            free_count: 0,
+                            free_bytes: 0,
+                        });
+                    });
+                }
+                // Child2 drops: records child2's {20, 700}, restores parent's {3, 300}.
+
+                // Verify: counters back to parent's {3, 300} on B.
+                let after_child2 = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
+                assert_eq!(
+                    after_child2.alloc_count, 3,
+                    "parent's counters restored after child2"
+                );
+                assert_eq!(after_child2.alloc_bytes, 300);
+
+                // Parent allocs 400 more bytes (total on B: 300 + 400 = 700).
+                crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                    let mut snap = cell.get();
+                    snap.alloc_count += 4;
+                    snap.alloc_bytes += 400;
+                    cell.set(snap);
+                });
+
+                // Drop writes cumulative + final segment to ALLOC_COUNTERS.
+                drop(acc);
+
+                let total = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
+
+                // Parent self-allocs only: (100 + 200) from A + (300 + 400) from B = 1000
+                assert_eq!(total.alloc_count, 10, "3 from A + 7 from B");
+                assert_eq!(total.alloc_bytes, 1000, "300 from A + 700 from B");
+                assert_eq!(total.free_count, 0);
+                assert_eq!(total.free_bytes, 0);
+            });
+        });
+    }
+
+    #[test]
+    fn drop_order_accumulator_before_guard() {
+        // Prove that Rust drops in reverse declaration order:
+        // _piano_guard (declared first) drops AFTER _piano_alloc (declared second).
+        //
+        // This means AllocAccumulator::drop() can write to ALLOC_COUNTERS
+        // and Guard::drop() (via drop_cold) will read those values.
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        static DROP_ORDER: AtomicU8 = AtomicU8::new(0);
+
+        struct First; // simulates Guard (declared first, should drop second)
+        struct Second; // simulates AllocAccumulator (declared second, should drop first)
+
+        impl Drop for First {
+            fn drop(&mut self) {
+                let prev = DROP_ORDER.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    prev, 1,
+                    "First (Guard) should drop SECOND (after Second/Accumulator)"
+                );
+            }
+        }
+
+        impl Drop for Second {
+            fn drop(&mut self) {
+                let prev = DROP_ORDER.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    prev, 0,
+                    "Second (Accumulator) should drop FIRST (before First/Guard)"
+                );
+            }
+        }
+
+        DROP_ORDER.store(0, Ordering::SeqCst);
+        {
+            let _first = First; // like: let _piano_guard = enter(...)
+            let _second = Second; // like: let _piano_alloc = AllocAccumulator::new()
+        }
+        assert_eq!(
+            DROP_ORDER.load(Ordering::SeqCst),
+            2,
+            "both should have dropped"
+        );
+    }
+
+    #[test]
+    fn accumulator_drop_writes_to_counters_before_guard_reads() {
+        // End-to-end proof: AllocAccumulator::drop() writes cumulative allocs
+        // to ALLOC_COUNTERS, and Guard::drop() (drop_cold) reads them.
+        //
+        // Reverse declaration order ensures acc drops first (writes to
+        // ALLOC_COUNTERS), then _guard drops (reads ALLOC_COUNTERS).
+        reset();
+
+        {
+            let _guard = enter("drop_order_test");
+            let mut acc = crate::alloc::AllocAccumulator::new();
+
+            // Segment 1: allocate 100 bytes.
+            crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                cell.set(crate::alloc::AllocSnapshot {
+                    alloc_count: 1,
+                    alloc_bytes: 100,
+                    free_count: 0,
+                    free_bytes: 0,
+                });
+            });
+
+            // save() captures {1, 100} into cumulative, zeros counters.
+            acc.save();
+
+            // Segment 2: allocate 200 bytes.
+            crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                cell.set(crate::alloc::AllocSnapshot {
+                    alloc_count: 2,
+                    alloc_bytes: 200,
+                    free_count: 0,
+                    free_bytes: 0,
+                });
+            });
+
+            // When this scope ends:
+            //   1. acc drops first (reverse declaration order):
+            //      writes {1+2=3, 100+200=300} to ALLOC_COUNTERS.
+            //   2. _guard drops second: drop_cold reads ALLOC_COUNTERS.
+        }
+
+        // Guard's drop_cold should have recorded alloc_count=3, alloc_bytes=300.
+        let invocations = collect_invocations();
+        let rec = invocations
+            .iter()
+            .find(|r| r.name == "drop_order_test")
+            .unwrap();
+        assert_eq!(
+            rec.alloc_count, 3,
+            "should see 1+2 allocs from both segments"
+        );
+        assert_eq!(
+            rec.alloc_bytes, 300,
+            "should see 100+200 bytes from both segments"
+        );
+    }
+
+    #[test]
+    fn migrated_drop_cold_reads_alloc_counters() {
+        // End-to-end: an async fn migrates A -> B.
+        // AllocAccumulator::Drop writes total to ALLOC_COUNTERS on B.
+        // Guard::drop_cold on B should read those values into InvocationRecord.
+        reset();
+
+        let record = std::thread::scope(|s| {
+            // Thread A: enter and allocate.
+            let guard = enter("migrated_alloc");
+            let mut acc = crate::AllocAccumulator::new();
+
+            crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                cell.set(crate::alloc::AllocSnapshot {
+                    alloc_count: 5,
+                    alloc_bytes: 1000,
+                    free_count: 1,
+                    free_bytes: 200,
+                });
+            });
+            acc.save();
+
+            // Migrate to thread B.
+            s.spawn(move || {
+                // check() pushes phantom on B.
+                guard.check();
+                acc.resume();
+
+                // Segment 2 on B.
+                crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                    cell.set(crate::alloc::AllocSnapshot {
+                        alloc_count: 3,
+                        alloc_bytes: 2000,
+                        free_count: 2,
+                        free_bytes: 500,
+                    });
+                });
+
+                // acc drops first (reverse declaration order):
+                //   writes {5+3=8, 1000+2000=3000, ...} to ALLOC_COUNTERS.
+                // guard drops second (drop_cold migrated path):
+                //   should read {8, 3000, ...} from ALLOC_COUNTERS.
+                drop(acc);
+                drop(guard);
+
+                // Collect on thread B where the invocation was recorded.
+                let invocations = collect_invocations();
+                invocations
+                    .into_iter()
+                    .find(|r| r.name == "migrated_alloc")
+                    .expect("should have recorded migrated_alloc")
+            })
+            .join()
+            .unwrap()
+        });
+
+        assert_eq!(record.alloc_count, 8, "5 from A + 3 from B");
+        assert_eq!(record.alloc_bytes, 3000, "1000 from A + 2000 from B");
+        assert_eq!(record.free_count, 3, "1 from A + 2 from B");
+        assert_eq!(record.free_bytes, 700, "200 from A + 500 from B");
+    }
 }
