@@ -1274,14 +1274,24 @@ pub fn flush() {
             }
         }
         let path = dir.join(format!("{}.ndjson", timestamp_ms()));
-        let _ = write_ndjson(&frames, &fn_names, &path);
+        if let Err(e) = write_ndjson(&frames, &fn_names, &path) {
+            eprintln!(
+                "piano: failed to write profiling data to {}: {e}",
+                path.display()
+            );
+        }
     } else {
         let records = collect();
         if records.is_empty() {
             return;
         }
         let path = dir.join(format!("{}.json", timestamp_ms()));
-        let _ = write_json(&records, &path);
+        if let Err(e) = write_json(&records, &path) {
+            eprintln!(
+                "piano: failed to write profiling data to {}: {e}",
+                path.display()
+            );
+        }
     }
     reset();
 }
