@@ -7,6 +7,15 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-03-02
+
+### Fixed
+
+- Allocation tracking no longer reports zero when user's `#[global_allocator]` is behind a `#[cfg(...)]` gate (#231)
+  - Detection moved from string matching to syn AST walk (`detect_allocator_kind`)
+  - Cfg-gated allocators get a `#[cfg(not(...))]` fallback `PianoAllocator<System>` so every platform tracks allocations
+  - Common pattern: `#[cfg(target_os = "linux")] #[global_allocator]` with tikv-jemallocator or mimalloc
+
 ## [0.9.0] - 2026-03-02
 
 Piano is feature-complete. Every metric (wall time, self time, CPU time, allocations) is accurate across every execution model (sync, threaded, async).
