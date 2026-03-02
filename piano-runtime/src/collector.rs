@@ -146,7 +146,7 @@ pub struct InvocationRecord {
 /// Entry on the thread-local timing stack.
 pub(crate) struct StackEntry {
     pub(crate) name: &'static str,
-    pub(crate) children_ms: f64,
+    pub(crate) children_ns: u64,
     #[cfg(feature = "cpu-time")]
     pub(crate) cpu_children_ns: u64,
     #[cfg(feature = "cpu-time")]
@@ -193,15 +193,15 @@ type ThreadRecordArc = Arc<Mutex<Vec<FnAgg>>>;
 ///
 /// When `check()` pushes a phantom on thread B, it registers a `PhantomInfo`
 /// in the global `PHANTOM_REGISTRY`. This enables:
-/// - Forwarding: children_ms accumulated on B is readable by C via the Arc.
+/// - Forwarding: children_ns accumulated on B is readable by C via the Arc.
 /// - Cleanup: `host_cookie` identifies B so the cleanup queue can target it.
 struct PhantomInfo {
     /// Thread cookie of the thread hosting this phantom StackEntry.
     host_cookie: u64,
-    /// Shared children_ms accumulator. The host thread writes to this Arc
+    /// Shared children_ns accumulator. The host thread writes to this Arc
     /// (via PHANTOM_ARCS) when children update the phantom; the next thread
     /// reads from it to seed its own phantom.
-    children_arc: Arc<Mutex<f64>>,
+    children_arc: Arc<Mutex<u64>>,
 }
 
 /// Global registry mapping guard packed identity -> phantom info.
@@ -253,7 +253,7 @@ thread_local! {
     /// Per-thread phantom forwarding Arcs. When a phantom StackEntry exists on
     /// this thread (from Guard::check()), the corresponding Arc is stored here
     /// so child drops can write through to it.
-    static PHANTOM_ARCS: RefCell<Vec<(u64, Arc<Mutex<f64>>)>> = RefCell::new(Vec::new());
+    static PHANTOM_ARCS: RefCell<Vec<(u64, Arc<Mutex<u64>>)>> = RefCell::new(Vec::new());
     /// Fast local buffer for FnAgg entries. Avoids the Mutex lock on RECORDS
     /// for every drop_cold call. Flushed to RECORDS at depth-0 boundaries.
     static RECORDS_BUF: RefCell<Vec<FnAgg>> = RefCell::new(Vec::new());
@@ -263,14 +263,16 @@ thread_local! {
 fn merge_into_fnagg_vec(
     buf: &mut Vec<FnAgg>,
     name: &'static str,
-    elapsed_ms: f64,
-    children_ms: f64,
+    elapsed_ns: u64,
+    children_ns: u64,
     #[cfg(feature = "cpu-time")] cpu_self_ns: u64,
 ) {
+    let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
+    let self_ms = elapsed_ns.saturating_sub(children_ns) as f64 / 1_000_000.0;
     if let Some(entry) = buf.iter_mut().find(|e| std::ptr::eq(e.name, name)) {
         entry.calls += 1;
         entry.total_ms += elapsed_ms;
-        entry.self_ms += (elapsed_ms - children_ms).max(0.0);
+        entry.self_ms += self_ms;
         #[cfg(feature = "cpu-time")]
         {
             entry.cpu_self_ns += cpu_self_ns;
@@ -280,7 +282,7 @@ fn merge_into_fnagg_vec(
             name,
             calls: 1,
             total_ms: elapsed_ms,
-            self_ms: (elapsed_ms - children_ms).max(0.0),
+            self_ms,
             #[cfg(feature = "cpu-time")]
             cpu_self_ns,
         });
@@ -519,12 +521,12 @@ impl Guard {
                 return;
             }
 
-            // Read forwarded children_ms from a previous thread's phantom and
+            // Read forwarded children_ns from a previous thread's phantom and
             // schedule cleanup of the old host thread's phantom (multi-hop
             // migration: A -> B -> C).
-            let (forwarded_children_ms, fwd_arc) = {
+            let (forwarded_children_ns, fwd_arc) = {
                 // Lock registry: remove old entry (if any) and insert new one.
-                let arc = Arc::new(Mutex::new(0.0));
+                let arc = Arc::new(Mutex::new(0u64));
                 let old_info = {
                     let mut reg = phantom_registry().lock().unwrap_or_else(|e| e.into_inner());
                     let old = reg.remove(&self.packed);
@@ -550,7 +552,7 @@ impl Guard {
                     *arc.lock().unwrap_or_else(|e| e.into_inner()) = val;
                     val
                 } else {
-                    0.0
+                    0
                 };
 
                 (forwarded, arc)
@@ -563,7 +565,7 @@ impl Guard {
 
             s.push(StackEntry {
                 name: "<phantom>",
-                children_ms: forwarded_children_ms,
+                children_ns: forwarded_children_ns,
                 #[cfg(feature = "cpu-time")]
                 cpu_children_ns: 0,
                 #[cfg(feature = "cpu-time")]
@@ -592,22 +594,21 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
     if migrated {
         let name = lookup_name(unpack_name_id(guard.packed));
         let elapsed_ns = crate::tsc::elapsed_ns(guard.start_tsc, end_tsc);
-        let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
 
         // Post-migration children (Case 2): find and pop our phantom
-        // StackEntry. Its children_ms was updated by children via the
+        // StackEntry. Its children_ns was updated by children via the
         // normal parent fast path, and seeded with forwarded children
         // from previous thread hops (multi-hop migration).
-        let (phantom_children_ms, phantom_saved_alloc) = STACK.with(|stack| {
+        let (phantom_children_ns, phantom_saved_alloc) = STACK.with(|stack| {
             let mut s = stack.borrow_mut();
             if let Some(pos) = s
                 .iter()
                 .rposition(|e| e.packed == guard.packed && e.name == "<phantom>")
             {
                 let phantom = s.remove(pos);
-                (phantom.children_ms, phantom.saved_alloc)
+                (phantom.children_ns, phantom.saved_alloc)
             } else {
-                (0.0, crate::alloc::AllocSnapshot::new())
+                (0, crate::alloc::AllocSnapshot::new())
             }
         });
 
@@ -620,8 +621,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             arcs.borrow_mut().retain(|(pk, _)| *pk != guard.packed);
         });
 
-        let children_ns = (phantom_children_ms * 1_000_000.0) as u64;
-        let self_ns = elapsed_ns.saturating_sub(children_ns);
+        let self_ns = elapsed_ns.saturating_sub(phantom_children_ns);
 
         // Migrated path: merge directly into Mutex-guarded RECORDS (not the
         // fast buffer) because this thread has no depth-0 boundary to flush.
@@ -630,8 +630,8 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             merge_into_fnagg_vec(
                 &mut recs,
                 name,
-                elapsed_ms,
-                phantom_children_ms,
+                elapsed_ns,
+                phantom_children_ns,
                 #[cfg(feature = "cpu-time")]
                 0,
             );
@@ -717,10 +717,8 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         });
 
         let elapsed_ns = crate::tsc::elapsed_ns(guard.start_tsc, end_tsc);
-        let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
-        let children_ns = (entry.children_ms * 1_000_000.0) as u64;
+        let children_ns = entry.children_ns;
         let self_ns = elapsed_ns.saturating_sub(children_ns);
-        let children_ms = entry.children_ms;
 
         #[cfg(feature = "cpu-time")]
         let cpu_elapsed_ns = cpu_end_ns.saturating_sub(entry.cpu_start_ns);
@@ -728,12 +726,12 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
 
         if let Some(parent) = stack.borrow_mut().last_mut() {
-            parent.children_ms += elapsed_ms;
+            parent.children_ns += elapsed_ns;
             // If parent is a phantom (cookie differs from this thread),
             // write through to its forwarding Arc so subsequent thread
-            // hops can read the accumulated children_ms.
+            // hops can read the accumulated children_ns.
             if unpack_cookie(parent.packed) != drop_cookie {
-                let children = parent.children_ms;
+                let children = parent.children_ns;
                 let pk = parent.packed;
                 PHANTOM_ARCS.with(|arcs| {
                     if let Some((_, arc)) = arcs.borrow().iter().find(|(k, _)| *k == pk) {
@@ -751,8 +749,8 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             merge_into_fnagg_vec(
                 &mut buf.borrow_mut(),
                 entry.name,
-                elapsed_ms,
-                children_ms,
+                elapsed_ns,
+                children_ns,
                 #[cfg(feature = "cpu-time")]
                 cpu_self_ns,
             );
@@ -905,7 +903,7 @@ fn enter_cold(name: &'static str) -> u64 {
         let packed = pack_cookie_name_depth(cookie, name_id, depth);
         stack.borrow_mut().push(StackEntry {
             name,
-            children_ms: 0.0,
+            children_ns: 0,
             #[cfg(feature = "cpu-time")]
             cpu_children_ns: 0,
             #[cfg(feature = "cpu-time")]
@@ -1498,7 +1496,7 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
         let depth = stack.borrow().len() as u16;
         stack.borrow_mut().push(StackEntry {
             name: ctx.parent_name,
-            children_ms: 0.0,
+            children_ns: 0,
             #[cfg(feature = "cpu-time")]
             cpu_children_ns: 0,
             #[cfg(feature = "cpu-time")]
@@ -2932,8 +2930,8 @@ mod tests {
                     let s = stack.borrow();
                     assert_eq!(s.len(), 1, "only one phantom on stack");
                     assert!(
-                        s[0].children_ms > 0.0,
-                        "phantom should have accumulated children_ms"
+                        s[0].children_ns > 0,
+                        "phantom should have accumulated children_ns"
                     );
                 });
                 drop(guard);
