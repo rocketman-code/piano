@@ -483,7 +483,13 @@ impl Guard {
                 cpu_children_ns: 0,
                 #[cfg(feature = "cpu-time")]
                 cpu_start_ns: 0,
-                saved_alloc: crate::alloc::AllocSnapshot::new(),
+                saved_alloc: crate::alloc::ALLOC_COUNTERS
+                    .try_with(|cell| {
+                        let snap = cell.get();
+                        cell.set(crate::alloc::AllocSnapshot::new());
+                        snap
+                    })
+                    .unwrap_or_default(),
                 packed: self.packed,
             });
         });
@@ -2628,6 +2634,50 @@ mod tests {
                     let s = stack.borrow();
                     assert_eq!(s.len(), 1, "only one phantom after two checks");
                 });
+                drop(guard);
+            });
+        });
+    }
+
+    #[test]
+    fn phantom_saves_host_thread_alloc_counters() {
+        // When check() creates a phantom on thread B, it should save B's
+        // current ALLOC_COUNTERS (from a parent scope) and zero them,
+        // just like enter() does. This protects parent scopes from having
+        // their alloc data destroyed when the phantom is later popped.
+        reset();
+
+        // Thread A: enter creates the guard.
+        let guard = enter("phantom_alloc_test");
+
+        // Move guard to thread B where there's a parent scope with alloc data.
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                // B has a parent scope with alloc data.
+                crate::alloc::ALLOC_COUNTERS.with(|cell| {
+                    cell.set(crate::alloc::AllocSnapshot {
+                        alloc_count: 42,
+                        alloc_bytes: 9999,
+                        free_count: 10,
+                        free_bytes: 500,
+                    });
+                });
+
+                // check() detects migration A->B, creates phantom on B.
+                // It should save B's {42, 9999, 10, 500} into phantom.saved_alloc
+                // and zero B's counters.
+                guard.check();
+
+                let after_check = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
+                assert_eq!(
+                    after_check.alloc_count, 0,
+                    "check() should zero ALLOC_COUNTERS after saving to phantom"
+                );
+                assert_eq!(
+                    after_check.alloc_bytes, 0,
+                    "check() should zero alloc_bytes"
+                );
+
                 drop(guard);
             });
         });
