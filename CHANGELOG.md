@@ -7,6 +7,32 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-03-02
+
+Round 2 audit: 4 P1 bugs, 10 P2 bugs, and 2 follow-up bugs resolved across 17 PRs.
+
+### Added
+
+- MIT LICENSE file (#248)
+- Signal handlers for SIGTERM and SIGINT recover profiling data on Unix instead of losing it (#257)
+- `#[non_exhaustive]` on all public runtime structs for forward-compatible field additions (#258)
+- `#[doc(hidden)]` on injection-only API to keep docs.rs clean (#259)
+
+### Fixed
+
+- `AllocAccumulator` no longer corrupts alloc counters when async futures are cancelled mid-await (#250)
+- `select!`/`join!` and other macro invocations in async functions now treated as potential `.await` points for migration detection (#249)
+- Unbounded memory growth for high-call-count programs: per-invocation records replaced with in-flight aggregation, bounding memory to O(unique functions) instead of O(total calls) (#251)
+- Children time accumulation uses integer nanoseconds instead of f64 milliseconds, eliminating floating-point precision loss in self-time computation (#253)
+- NDJSON runs no longer approximate `total_ms` from `self_ms`; the field is set to 0.0 to honestly represent absent data (#254)
+- IO errors now include file path and operation context instead of bare OS messages (#255)
+- `flush()` reports write errors to stderr instead of silently discarding them (#256)
+- `find_latest_binary` accepts `.exe` extension on Windows (#252)
+- Migrated async guards capture post-migration CPU time instead of reporting zero (#269)
+- Alloc save/resume correctly scoped to condition expressions for `if`/`while`/`match` with `.await` in condition, so body allocations are tracked (#270)
+- Non-block match arms (`Some(v) => process(v)`) now get alloc body brackets when scrutinee contains `.await` (#292)
+- `FrameFnSummary.calls` widened from `u32` to `u64` to prevent overflow for high-call-count frames (#286)
+
 ## [0.9.2] - 2026-03-02
 
 ### Fixed
