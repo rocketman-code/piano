@@ -1058,12 +1058,58 @@ impl std::fmt::Debug for AllocatorKind {
     }
 }
 
-/// Check whether a static item has a `#[global_allocator]` attribute.
+/// Check whether a static item has a `#[global_allocator]` attribute,
+/// either directly or inside a `#[cfg_attr(condition, global_allocator)]`.
 fn has_global_allocator_attr(static_item: &syn::ItemStatic) -> bool {
-    static_item
-        .attrs
+    static_item.attrs.iter().any(|a| {
+        if a.path().is_ident("global_allocator") {
+            return true;
+        }
+        if a.path().is_ident("cfg_attr") {
+            return cfg_attr_contains_global_allocator(a);
+        }
+        false
+    })
+}
+
+/// Check whether a `#[cfg_attr(...)]` attribute contains `global_allocator`
+/// among its conditional attributes.
+///
+/// `cfg_attr` has the form `cfg_attr(condition, attr1, attr2, ...)`.
+/// We parse the token stream and check if any attr after the condition
+/// is the path `global_allocator`.
+fn cfg_attr_contains_global_allocator(attr: &syn::Attribute) -> bool {
+    let Ok(nested) = attr.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return false;
+    };
+    // First element is the condition; remaining elements are the conditional attributes.
+    nested
         .iter()
-        .any(|a| a.path().is_ident("global_allocator"))
+        .skip(1)
+        .any(|meta| meta.path().is_ident("global_allocator"))
+}
+
+/// Extract the condition `Meta` from a `#[cfg_attr(condition, ...)]` that
+/// contains `global_allocator`. Returns `None` if the attribute is not a
+/// matching `cfg_attr`.
+fn cfg_attr_global_allocator_condition(attr: &syn::Attribute) -> Option<syn::Meta> {
+    if !attr.path().is_ident("cfg_attr") {
+        return None;
+    }
+    let nested = attr
+        .parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+        .ok()?;
+    let has_global_alloc = nested
+        .iter()
+        .skip(1)
+        .any(|meta| meta.path().is_ident("global_allocator"));
+    if has_global_alloc {
+        nested.into_iter().next()
+    } else {
+        None
+    }
 }
 
 /// Wrap a `#[global_allocator]` static's type and initializer with `PianoAllocator`.
@@ -1089,18 +1135,26 @@ pub fn detect_allocator_kind(source: &str) -> Result<AllocatorKind, syn::Error> 
                 continue;
             }
 
-            let mut cfg_meta = None;
+            let mut item_cfgs: Vec<syn::Meta> = Vec::new();
             for a in &static_item.attrs {
                 if a.path().is_ident("cfg") {
-                    cfg_meta = Some(a.parse_args::<syn::Meta>()?);
-                    break;
+                    item_cfgs.push(a.parse_args::<syn::Meta>()?);
+                } else if let Some(condition) = cfg_attr_global_allocator_condition(a) {
+                    item_cfgs.push(condition);
                 }
             }
 
-            match cfg_meta {
-                None => return Ok(AllocatorKind::Unconditional),
-                Some(meta) => cfg_predicates.push(meta),
+            if item_cfgs.is_empty() {
+                return Ok(AllocatorKind::Unconditional);
             }
+
+            // Multiple #[cfg] on the same item is semantically #[cfg(all(...))].
+            let combined: syn::Meta = if item_cfgs.len() == 1 {
+                item_cfgs.remove(0)
+            } else {
+                syn::parse_quote! { all(#(#item_cfgs),*) }
+            };
+            cfg_predicates.push(combined);
         }
     }
 
@@ -2760,6 +2814,114 @@ async fn multi() {
             check_count, 3,
             "should have 3 check() calls. Got:\n{}",
             result.source
+        );
+    }
+
+    #[test]
+    fn detect_cfg_attr_global_allocator() {
+        let src = r#"
+            #[cfg_attr(target_os = "linux", global_allocator)]
+            static ALLOC: Jemalloc = Jemalloc;
+            fn main() {}
+        "#;
+        let kind = detect_allocator_kind(src).unwrap();
+        match kind {
+            AllocatorKind::CfgGated(preds) => {
+                assert_eq!(preds.len(), 1);
+                let pred_str = quote::quote!(#(#preds)*).to_string();
+                assert!(
+                    pred_str.contains("target_os"),
+                    "predicate should contain target_os, got: {pred_str}"
+                );
+            }
+            other => panic!("expected CfgGated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cfg_attr_without_global_allocator_is_absent() {
+        let src = r#"
+            #[cfg_attr(unix, derive(Debug))]
+            static ALLOC: Jemalloc = Jemalloc;
+            fn main() {}
+        "#;
+        let kind = detect_allocator_kind(src).unwrap();
+        assert!(matches!(kind, AllocatorKind::Absent));
+    }
+
+    #[test]
+    fn cfg_attr_with_multiple_attrs_detects_global_allocator() {
+        let src = r#"
+            #[cfg_attr(unix, global_allocator, allow(unused))]
+            static ALLOC: Jemalloc = Jemalloc;
+            fn main() {}
+        "#;
+        let kind = detect_allocator_kind(src).unwrap();
+        assert!(matches!(kind, AllocatorKind::CfgGated(_)));
+    }
+
+    #[test]
+    fn multiple_cfg_attrs_on_same_static() {
+        let src = r#"
+            #[cfg(target_os = "linux")]
+            #[cfg(target_arch = "x86_64")]
+            #[global_allocator]
+            static ALLOC: Jemalloc = Jemalloc;
+            fn main() {}
+        "#;
+        let kind = detect_allocator_kind(src).unwrap();
+        match kind {
+            AllocatorKind::CfgGated(preds) => {
+                assert_eq!(
+                    preds.len(),
+                    1,
+                    "multiple cfgs on same item should be combined into one predicate"
+                );
+                let pred_str = quote::quote!(#(#preds)*).to_string();
+                assert!(
+                    pred_str.contains("all"),
+                    "combined predicate should use all(...), got: {pred_str}"
+                );
+                assert!(pred_str.contains("target_os"), "should contain target_os");
+                assert!(
+                    pred_str.contains("target_arch"),
+                    "should contain target_arch"
+                );
+            }
+            other => panic!("expected CfgGated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cfg_attr_allocator_gets_fallback_injection() {
+        let src = r#"
+            #[cfg_attr(target_os = "linux", global_allocator)]
+            static ALLOC: Jemalloc = Jemalloc;
+            fn main() {}
+        "#;
+        let kind = detect_allocator_kind(src).unwrap();
+        let result = inject_global_allocator(src, kind).unwrap();
+        assert!(result.contains("PianoAllocator"), "should wrap allocator");
+        assert!(result.contains("_PIANO_ALLOC"), "should inject fallback");
+        assert!(result.contains("not"), "fallback should have negated cfg");
+    }
+
+    #[test]
+    fn multiple_cfg_fallback_negates_all_predicates() {
+        let src = r#"
+            #[cfg(target_os = "linux")]
+            #[cfg(target_arch = "x86_64")]
+            #[global_allocator]
+            static ALLOC: Jemalloc = Jemalloc;
+            fn main() {}
+        "#;
+        let kind = detect_allocator_kind(src).unwrap();
+        let result = inject_global_allocator(src, kind).unwrap();
+        assert!(result.contains("PianoAllocator"), "should wrap allocator");
+        assert!(result.contains("_PIANO_ALLOC"), "should inject fallback");
+        assert!(
+            result.contains("target_os") && result.contains("target_arch"),
+            "fallback negation should reference both predicates"
         );
     }
 }
