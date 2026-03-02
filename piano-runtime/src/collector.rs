@@ -514,16 +514,16 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         // StackEntry. Its children_ms was updated by children via the
         // normal parent fast path, and seeded with forwarded children
         // from previous thread hops (multi-hop migration).
-        let phantom_children_ms = STACK.with(|stack| {
+        let (phantom_children_ms, phantom_saved_alloc) = STACK.with(|stack| {
             let mut s = stack.borrow_mut();
             if let Some(pos) = s
                 .iter()
                 .rposition(|e| e.packed == guard.packed && e.name == "<phantom>")
             {
                 let phantom = s.remove(pos);
-                phantom.children_ms
+                (phantom.children_ms, phantom.saved_alloc)
             } else {
-                0.0
+                (0.0, crate::alloc::AllocSnapshot::new())
             }
         });
 
@@ -554,6 +554,15 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                 });
         });
 
+        let scope_alloc = crate::alloc::ALLOC_COUNTERS
+            .try_with(|cell| cell.get())
+            .unwrap_or_default();
+
+        // Restore the phantom's saved alloc counters (parent scope's data on this thread).
+        let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
+            cell.set(phantom_saved_alloc);
+        });
+
         let invocation = InvocationRecord {
             name,
             start_ns,
@@ -561,10 +570,10 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             self_ns,
             #[cfg(feature = "cpu-time")]
             cpu_self_ns: 0,
-            alloc_count: 0,
-            alloc_bytes: 0,
-            free_count: 0,
-            free_bytes: 0,
+            alloc_count: scope_alloc.alloc_count,
+            alloc_bytes: scope_alloc.alloc_bytes,
+            free_count: scope_alloc.free_count,
+            free_bytes: scope_alloc.free_bytes,
             depth: 0,
         };
 
