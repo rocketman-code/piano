@@ -18,7 +18,8 @@ use piano::report::{
 };
 use piano::resolve::{ResolveResult, SkippedFunction, TargetSpec, resolve_targets};
 use piano::rewrite::{
-    inject_global_allocator, inject_registrations, inject_shutdown, instrument_source,
+    detect_allocator_kind, inject_global_allocator, inject_registrations, inject_shutdown,
+    instrument_source,
 };
 
 #[derive(Parser)]
@@ -368,16 +369,16 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
         })?;
 
         // Inject global allocator for allocation tracking.
-        let existing = if rewritten.contains("#[global_allocator]") {
-            Some("existing")
-        } else {
-            None
-        };
-        let rewritten =
-            inject_global_allocator(&rewritten, existing).map_err(|source| Error::ParseError {
+        let alloc_kind = detect_allocator_kind(&rewritten).map_err(|source| Error::ParseError {
+            path: bin_entry.clone(),
+            source,
+        })?;
+        let rewritten = inject_global_allocator(&rewritten, alloc_kind).map_err(|source| {
+            Error::ParseError {
                 path: bin_entry.clone(),
                 source,
-            })?;
+            }
+        })?;
 
         let runs_dir_str = runs_dir.to_string_lossy().to_string();
         let rewritten = inject_shutdown(&rewritten, Some(&runs_dir_str)).map_err(|source| {
