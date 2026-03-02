@@ -114,7 +114,9 @@ impl<A> PianoAllocator<A> {
 unsafe impl<A: GlobalAlloc> GlobalAlloc for PianoAllocator<A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { self.inner.alloc(layout) };
-        track_alloc(layout.size() as u64);
+        if !ptr.is_null() {
+            track_alloc(layout.size() as u64);
+        }
         ptr
     }
 
@@ -135,7 +137,9 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for PianoAllocator<A> {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { self.inner.alloc_zeroed(layout) };
-        track_alloc(layout.size() as u64);
+        if !ptr.is_null() {
+            track_alloc(layout.size() as u64);
+        }
         ptr
     }
 }
@@ -264,6 +268,70 @@ mod tests {
         assert_eq!(total.alloc_bytes, 3000, "1000 + 2000");
         assert_eq!(total.free_count, 3, "1 + 2");
         assert_eq!(total.free_bytes, 700, "200 + 500");
+    }
+
+    /// An allocator that always returns null, simulating allocation failure.
+    struct FailingAlloc;
+
+    unsafe impl GlobalAlloc for FailingAlloc {
+        unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+            std::ptr::null_mut()
+        }
+
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+
+        unsafe fn realloc(&self, _ptr: *mut u8, _layout: Layout, _new_size: usize) -> *mut u8 {
+            std::ptr::null_mut()
+        }
+
+        unsafe fn alloc_zeroed(&self, _layout: Layout) -> *mut u8 {
+            std::ptr::null_mut()
+        }
+    }
+
+    #[test]
+    fn failed_alloc_not_counted() {
+        ALLOC_COUNTERS.with(|cell| cell.set(AllocSnapshot::new()));
+        let allocator = PianoAllocator::new(FailingAlloc);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let ptr = unsafe { allocator.alloc(layout) };
+        assert!(ptr.is_null());
+        let snap = ALLOC_COUNTERS.with(|cell| cell.get());
+        assert_eq!(snap.alloc_count, 0, "failed alloc should not be counted");
+        assert_eq!(snap.alloc_bytes, 0, "failed alloc bytes should be zero");
+    }
+
+    #[test]
+    fn failed_alloc_zeroed_not_counted() {
+        ALLOC_COUNTERS.with(|cell| cell.set(AllocSnapshot::new()));
+        let allocator = PianoAllocator::new(FailingAlloc);
+        let layout = Layout::from_size_align(128, 8).unwrap();
+        let ptr = unsafe { allocator.alloc_zeroed(layout) };
+        assert!(ptr.is_null());
+        let snap = ALLOC_COUNTERS.with(|cell| cell.get());
+        assert_eq!(
+            snap.alloc_count, 0,
+            "failed alloc_zeroed should not be counted"
+        );
+        assert_eq!(
+            snap.alloc_bytes, 0,
+            "failed alloc_zeroed bytes should be zero"
+        );
+    }
+
+    #[test]
+    fn failed_realloc_not_counted() {
+        ALLOC_COUNTERS.with(|cell| cell.set(AllocSnapshot::new()));
+        let allocator = PianoAllocator::new(FailingAlloc);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let ptr = unsafe { allocator.realloc(std::ptr::null_mut(), layout, 128) };
+        assert!(ptr.is_null());
+        let snap = ALLOC_COUNTERS.with(|cell| cell.get());
+        assert_eq!(snap.alloc_count, 0, "failed realloc should not be counted");
+        assert_eq!(
+            snap.free_count, 0,
+            "failed realloc should not count dealloc"
+        );
     }
 
     #[test]
