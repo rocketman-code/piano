@@ -218,7 +218,7 @@ pub struct FunctionRecord {
 #[non_exhaustive]
 pub struct FrameFnSummary {
     pub name: &'static str,
-    pub calls: u32,
+    pub calls: u64,
     pub self_ns: u64,
     #[cfg(feature = "cpu-time")]
     pub cpu_self_ns: u64,
@@ -3903,5 +3903,25 @@ mod tests {
             .find(|f| f.name == "inner")
             .expect("inner not found");
         assert_eq!(inner.calls, 10_000);
+    }
+
+    #[test]
+    fn frame_fn_summary_calls_holds_above_u32_max() {
+        let above_u32_max: u64 = u32::MAX as u64 + 1;
+        let summary = FrameFnSummary {
+            name: "hot_fn",
+            calls: above_u32_max,
+            self_ns: 0,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 0,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
+        };
+        assert_eq!(
+            summary.calls, above_u32_max,
+            "FrameFnSummary.calls must hold values above u32::MAX"
+        );
     }
 }
