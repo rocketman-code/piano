@@ -57,6 +57,7 @@ pub(crate) fn elapsed_ns(start: u64, end: u64) -> u64 {
 }
 
 /// Convert a tick value to nanoseconds-since-epoch for absolute timestamps.
+#[cfg(any(test, feature = "_test_internals"))]
 #[inline]
 pub(crate) fn ticks_to_epoch_ns(ticks: u64, epoch_tsc: u64) -> u64 {
     elapsed_ns(epoch_tsc, ticks)
@@ -126,6 +127,7 @@ pub(crate) fn set_epoch_tsc(val: u64) {
     EPOCH_TSC.store(val, Ordering::Release);
 }
 
+#[cfg(any(test, feature = "_test_internals"))]
 pub(crate) fn epoch_tsc() -> u64 {
     EPOCH_TSC.load(Ordering::Relaxed)
 }
