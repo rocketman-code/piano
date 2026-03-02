@@ -100,6 +100,7 @@ fn epoch() -> Instant {
 
 /// Aggregated timing data for a single function.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FunctionRecord {
     pub name: String,
     pub calls: u64,
@@ -111,6 +112,7 @@ pub struct FunctionRecord {
 
 /// Per-function summary within a single frame.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FrameFnSummary {
     pub name: &'static str,
     pub calls: u32,
@@ -125,6 +127,7 @@ pub struct FrameFnSummary {
 
 /// Per-invocation measurement record with nanosecond precision.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct InvocationRecord {
     pub name: &'static str,
     pub start_ns: u64,
@@ -383,6 +386,7 @@ fn unpack_depth(packed: u64) -> u16 {
 /// `Instant::now()` to minimize clock-read cost. The tsc-to-nanosecond
 /// conversion happens in `drop_cold`, outside the measurement window.
 #[must_use = "dropping the guard immediately records ~0ms; bind it with `let _guard = ...`"]
+#[non_exhaustive]
 pub struct Guard {
     start_tsc: u64,
     /// Bit layout: `[cookie:32][name_id:16][depth:16]`
@@ -1324,6 +1328,7 @@ fn shutdown_impl(dir: &std::path::Path) -> bool {
 /// `adopt()`. When the child completes, its CPU time is accumulated
 /// in `children_cpu_ns` which the parent reads back via Drop (or explicit `finalize()`).
 /// Wall time is NOT propagated cross-thread (it's not additive for parallel work).
+#[non_exhaustive]
 pub struct SpanContext {
     parent_name: &'static str,
     #[cfg(feature = "cpu-time")]
@@ -1366,6 +1371,7 @@ impl Drop for SpanContext {
 /// RAII guard for cross-thread adoption. Pops the synthetic parent on drop
 /// and propagates CPU time back to the parent's `SpanContext`.
 #[must_use = "dropping AdoptGuard immediately records ~0ms; bind it with `let _guard = ...`"]
+#[non_exhaustive]
 pub struct AdoptGuard {
     #[cfg(feature = "cpu-time")]
     cpu_start_ns: u64,

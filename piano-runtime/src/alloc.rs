@@ -34,6 +34,7 @@ impl AllocSnapshot {
 /// Declared after the Guard in instrumented async functions so that Rust's
 /// reverse declaration drop order ensures this drops first, writing the
 /// accumulated total to ALLOC_COUNTERS before the Guard reads it.
+#[non_exhaustive]
 pub struct AllocAccumulator {
     cumulative: AllocSnapshot,
     /// Whether the accumulator is in an active segment (counters belong to us).
@@ -117,6 +118,7 @@ impl Drop for AllocAccumulator {
 /// The struct bound is on `GlobalAlloc` impls only (not the struct itself)
 /// so that `const fn new` compiles on Rust < 1.61 where trait bounds on
 /// const fn parameters are unstable.
+#[non_exhaustive]
 pub struct PianoAllocator<A> {
     inner: A,
 }
