@@ -10,7 +10,7 @@
 
 ## Testing
 
-Integration tests in `tests/`. No unit tests in source files currently.
+Integration tests in `tests/`. Unit tests in source files (`#[cfg(test)]` modules) for parsing, formatting, and internal logic.
 
 ### When to Test
 
@@ -32,6 +32,13 @@ Integration tests in `tests/`. No unit tests in source files currently.
 - `cpu_time.rs` -- CPU time feature pipeline
 - `integration_frames.rs` -- per-frame NDJSON output
 - `alloc_threaded.rs` -- allocation tracking across threads
+- `async_alloc.rs` -- async-aware allocation tracking across .await points
+- `async_self_time.rs` -- async self-time measurement
+- `async_tokio.rs` -- async instrumentation with tokio runtime
+- `macro_rules.rs` -- macro_rules! template instrumentation
+- `project_root.rs` -- project root detection
+- `run_cmd.rs` -- `piano run` command pipeline
+- `special_fns.rs` -- special function handling (const fn, unsafe fn, extern fn)
 - `msrv_compat.rs` -- runtime compiles on Rust 1.59
 - `strict_lints.rs` -- runtime compiles with strict warnings
 - `workspace_member.rs` -- workspace member instrumentation
@@ -41,13 +48,13 @@ Integration tests in `tests/`. No unit tests in source files currently.
 
 ### ci.yml (all PRs + push to main)
 
-Five jobs, all on ubuntu-latest:
+Five jobs:
 
-1. `fmt` -- `cargo fmt --check`
-2. `clippy` -- `cargo clippy --workspace --all-targets -- -D warnings`
-3. `test` -- `cargo test --workspace`
-4. `msrv` -- tests on Rust 1.88 (CLI MSRV) + installs 1.59 for runtime MSRV test
-5. `doc` -- `cargo doc --workspace --no-deps` with `-D warnings`
+1. `fmt` (ubuntu-latest) -- `cargo fmt --check`
+2. `clippy` (ubuntu-latest) -- `cargo clippy --workspace --all-targets -- -D warnings`
+3. `test` (matrix: ubuntu-latest + macos-latest) -- `cargo test --workspace` then `cargo test --workspace --features piano-runtime/cpu-time`
+4. `msrv` (ubuntu-latest) -- tests on Rust 1.88 (CLI MSRV) + installs 1.59 for runtime MSRV test
+5. `doc` (ubuntu-latest) -- `cargo doc --workspace --no-deps` with `-D warnings`
 
 ### release.yml (release/* PRs only)
 

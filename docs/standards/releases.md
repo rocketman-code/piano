@@ -15,7 +15,7 @@ Both `piano` and `piano-runtime` share the same version number. Bump them togeth
 - CLI flags and subcommands (renaming/removing breaks scripts)
 - NDJSON format version and field names (tooling may parse these)
 - JSON run file schema (tags reference saved runs by path)
-- `piano-runtime` public API (`enter`, `init`, `flush`, `register`, `reset`, `fork`, `adopt`, `PianoAllocator`, `Guard`, `AdoptGuard`, `SpanContext`)
+- `piano-runtime` public API (`enter`, `init`, `flush`, `register`, `reset`, `fork`, `adopt`, `collect`, `collect_all`, `collect_frames`, `shutdown`, `shutdown_to`, `set_runs_dir`, `PianoAllocator`, `AllocAccumulator`, `Guard`, `AdoptGuard`, `SpanContext`, `FrameFnSummary`, `FunctionRecord`, `InvocationRecord`)
 - Environment variables (`PIANO_RUNS_DIR`, `PIANO_TAGS_DIR`) -- scripts and CI may rely on these
 
 ## NOT Compatibility Concerns
