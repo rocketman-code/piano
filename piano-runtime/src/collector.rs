@@ -569,7 +569,7 @@ impl Guard {
                 #[cfg(feature = "cpu-time")]
                 cpu_children_ns: 0,
                 #[cfg(feature = "cpu-time")]
-                cpu_start_ns: 0,
+                cpu_start_ns: crate::cpu_clock::cpu_now_ns(),
                 saved_alloc: crate::alloc::ALLOC_COUNTERS
                     .try_with(|cell| {
                         let snap = cell.get();
@@ -599,18 +599,30 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         // StackEntry. Its children_ns was updated by children via the
         // normal parent fast path, and seeded with forwarded children
         // from previous thread hops (multi-hop migration).
-        let (phantom_children_ns, phantom_saved_alloc) = STACK.with(|stack| {
+        let phantom_entry = STACK.with(|stack| {
             let mut s = stack.borrow_mut();
-            if let Some(pos) = s
-                .iter()
+            s.iter()
                 .rposition(|e| e.packed == guard.packed && e.name == "<phantom>")
-            {
-                let phantom = s.remove(pos);
-                (phantom.children_ns, phantom.saved_alloc)
-            } else {
-                (0, crate::alloc::AllocSnapshot::new())
-            }
+                .map(|pos| s.remove(pos))
         });
+        let (phantom_children_ns, phantom_saved_alloc) = if let Some(ref p) = phantom_entry {
+            (p.children_ns, p.saved_alloc)
+        } else {
+            (0, crate::alloc::AllocSnapshot::new())
+        };
+
+        // CPU time for the post-migration segment: measure from when check()
+        // created the phantom on this thread to the Guard's drop. Pre-migration
+        // CPU time (on the original thread) is lost -- acceptable since that
+        // segment ran on a different thread's CPU clock.
+        // When no phantom exists (check() never called), report 0.
+        #[cfg(feature = "cpu-time")]
+        let cpu_self_ns = if let Some(ref p) = phantom_entry {
+            let cpu_elapsed = cpu_end_ns.saturating_sub(p.cpu_start_ns);
+            cpu_elapsed.saturating_sub(p.cpu_children_ns)
+        } else {
+            0
+        };
 
         // Clean up the phantom registry and PHANTOM_ARCS for this guard.
         {
@@ -633,7 +645,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                 elapsed_ns,
                 phantom_children_ns,
                 #[cfg(feature = "cpu-time")]
-                0,
+                cpu_self_ns,
             );
         });
 
@@ -656,7 +668,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                     elapsed_ns,
                     self_ns,
                     #[cfg(feature = "cpu-time")]
-                    cpu_self_ns: 0,
+                    cpu_self_ns,
                     alloc_count: scope_alloc.alloc_count,
                     alloc_bytes: scope_alloc.alloc_bytes,
                     free_count: scope_alloc.free_count,
@@ -672,7 +684,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                 name,
                 self_ns,
                 #[cfg(feature = "cpu-time")]
-                0,
+                cpu_self_ns,
                 scope_alloc.alloc_count,
                 scope_alloc.alloc_bytes,
                 scope_alloc.free_count,
@@ -2640,6 +2652,102 @@ mod tests {
             rec.cpu_self_ms == 0.0,
             "cpu_self_ms should be exactly 0 for migrated guard, got {:.3}",
             rec.cpu_self_ms
+        );
+    }
+
+    #[cfg(feature = "cpu-time")]
+    #[test]
+    fn migrated_guard_with_check_captures_cpu_time() {
+        // When check() is called after migration, the phantom records
+        // cpu_start_ns on the new thread. CPU time from that point to
+        // Guard::drop should be captured (post-migration segment).
+        reset();
+        let guard = enter("cpu_mig_check");
+
+        // Collect invocations from the spawned thread (INVOCATIONS is TLS).
+        let child_invocations = std::thread::scope(|s| {
+            s.spawn(move || {
+                guard.check();
+                // Burn CPU after check() so the post-migration segment
+                // has measurable CPU time on this thread.
+                burn_cpu(100_000);
+                drop(guard);
+                collect_invocations()
+            })
+            .join()
+            .unwrap()
+        });
+
+        let inv = child_invocations
+            .iter()
+            .find(|r| r.name == "cpu_mig_check")
+            .expect("migrated guard should preserve name 'cpu_mig_check'");
+        assert!(
+            inv.cpu_self_ns > 0,
+            "cpu_self_ns should be non-zero for migrated guard with check(), got {}",
+            inv.cpu_self_ns
+        );
+
+        let records = collect_all();
+        let rec = records
+            .iter()
+            .find(|r| r.name == "cpu_mig_check")
+            .expect("migrated guard should preserve name 'cpu_mig_check'");
+        assert!(
+            rec.cpu_self_ms > 0.0,
+            "cpu_self_ms should be non-zero for migrated guard with check(), got {:.6}",
+            rec.cpu_self_ms
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cpu-time")]
+    fn migrated_guard_cpu_self_excludes_children() {
+        // After migration + check(), a child function called on the new thread
+        // should have its CPU time subtracted from the parent's cpu_self_ns.
+        reset();
+        let parent_guard = enter("mig_cpu_parent");
+
+        let child_invocations = std::thread::scope(|s| {
+            s.spawn(move || {
+                parent_guard.check();
+
+                // Child function burns CPU after the parent migrated.
+                let child_guard = enter("mig_cpu_child");
+                burn_cpu(200_000);
+                drop(child_guard);
+
+                // Parent also burns a small amount so its self time is non-zero.
+                burn_cpu(50_000);
+                drop(parent_guard);
+                collect_invocations()
+            })
+            .join()
+            .unwrap()
+        });
+
+        let parent = child_invocations
+            .iter()
+            .find(|r| r.name == "mig_cpu_parent")
+            .expect("parent invocation should exist");
+        let child = child_invocations
+            .iter()
+            .find(|r| r.name == "mig_cpu_child")
+            .expect("child invocation should exist");
+
+        assert!(
+            child.cpu_self_ns > 0,
+            "child cpu_self_ns should be non-zero, got {}",
+            child.cpu_self_ns
+        );
+        // The parent's cpu_self_ns must exclude the child's CPU time.
+        // Without the fix, parent.cpu_self_ns >= child.cpu_self_ns (double-counted).
+        assert!(
+            parent.cpu_self_ns < child.cpu_self_ns,
+            "parent cpu_self_ns ({}) should be less than child cpu_self_ns ({}) \
+             because child CPU time must be subtracted",
+            parent.cpu_self_ns,
+            child.cpu_self_ns
         );
     }
 
