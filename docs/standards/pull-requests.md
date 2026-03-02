@@ -67,6 +67,17 @@ Force pushing to feature branches is only allowed during this cleanup step, neve
 - No force pushes to main
 - Linear history required
 
+## Author Responsibilities
+
+Never make the reviewer run tests you could have run yourself. Before requesting review:
+
+- Run the full test suite and confirm it passes
+- If the PR affects CI, wait for CI to pass and include the results
+- If the PR claims performance improvements, include before/after measurements
+- If the PR changes user-facing behavior, verify it manually
+
+The reviewer's job is to evaluate the change, not to discover whether it works.
+
 ## PR Content
 
 Summary + test plan. Checklist items:
