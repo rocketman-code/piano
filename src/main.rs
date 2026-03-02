@@ -412,6 +412,13 @@ fn cmd_build(opts: BuildOpts) -> Result<(), Error> {
     Ok(())
 }
 
+/// Returns true if the given file extension belongs to a binary executable.
+/// On Windows, `.exe` is a binary extension. On Unix, binaries have no extension
+/// so this always returns false.
+fn is_binary_extension(ext: &std::ffi::OsStr) -> bool {
+    cfg!(windows) && ext == "exe"
+}
+
 fn find_latest_binary() -> Result<PathBuf, Error> {
     let project = find_project_root(&std::env::current_dir()?).map_err(|_| Error::NoBinary)?;
     let dir = project.join("target/piano/debug");
@@ -425,9 +432,12 @@ fn find_latest_binary() -> Result<PathBuf, Error> {
         if !path.is_file() {
             continue;
         }
-        // Skip files with extensions (e.g. .d, .fingerprint) -- binaries have no extension on unix
-        if path.extension().is_some() {
-            continue;
+        // Skip non-binary files by extension. On Unix, binaries have no extension.
+        // On Windows, binaries have .exe extension -- allow those through.
+        if let Some(ext) = path.extension() {
+            if !is_binary_extension(ext) {
+                continue;
+            }
         }
         #[cfg(unix)]
         {
@@ -737,4 +747,29 @@ fn default_tags_dir() -> Result<PathBuf, Error> {
         return Ok(local);
     }
     Err(Error::NoRuns)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_binary_extension_exe() {
+        let ext = std::ffi::OsStr::new("exe");
+        // On the current platform, the result depends on cfg!(windows).
+        // On Windows: .exe is a binary extension -> true.
+        // On Unix: no extension counts as binary, .exe is not -> false.
+        assert_eq!(is_binary_extension(ext), cfg!(windows));
+    }
+
+    #[test]
+    fn is_binary_extension_rejects_non_binary() {
+        for name in &["d", "fingerprint", "rmeta", "rlib", "o", "so", "dylib"] {
+            let ext = std::ffi::OsStr::new(name);
+            assert!(
+                !is_binary_extension(ext),
+                "extension .{name} should not be treated as binary"
+            );
+        }
+    }
 }
