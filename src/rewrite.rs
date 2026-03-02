@@ -156,6 +156,21 @@ fn inject_alloc_body_brackets(stmt: &mut syn::Stmt) {
             for arm in &mut expr_match.arms {
                 if let syn::Expr::Block(block_expr) = &mut *arm.body {
                     bracket_block(&mut block_expr.block);
+                } else {
+                    // Wrap the bare expression in a block so we can inject
+                    // resume/save around it (e.g. `Some(v) => process(v)`
+                    // becomes `Some(v) => { resume(); process(v); save(); }`).
+                    let bare_expr = std::mem::replace(&mut *arm.body, syn::Expr::PLACEHOLDER);
+                    let mut block = syn::Block {
+                        brace_token: syn::token::Brace::default(),
+                        stmts: vec![syn::Stmt::Expr(bare_expr, None)],
+                    };
+                    bracket_block(&mut block);
+                    *arm.body = syn::Expr::Block(syn::ExprBlock {
+                        attrs: Vec::new(),
+                        label: None,
+                        block,
+                    });
                 }
             }
         }
@@ -3328,6 +3343,41 @@ async fn multi() {
         assert!(result.contains("PianoAllocator"), "should wrap allocator");
         assert!(result.contains("_PIANO_ALLOC"), "should inject fallback");
         assert!(result.contains("not"), "fallback should have negated cfg");
+    }
+
+    #[test]
+    fn alloc_body_brackets_for_non_block_match_arms() {
+        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
+        let source = r#"
+async fn example() {
+    match stream.next().await {
+        Some(v) => process(v),
+        None => fallback(),
+    }
+}
+"#;
+        let result = instrument_source(source, &targets, false).unwrap();
+        let src = &result.source;
+        let process_pos = src.find("process(v)").unwrap();
+        let fallback_pos = src.find("fallback()").unwrap();
+        // resume before process in Some arm (non-block)
+        let some_resume = src[..process_pos]
+            .rfind("_piano_alloc.resume()")
+            .expect("Some arm should have resume() before process(v)");
+        assert!(some_resume < process_pos);
+        // save after process in Some arm
+        let some_save = src[process_pos..fallback_pos]
+            .find("_piano_alloc.save()")
+            .expect("Some arm should have save() after process(v)");
+        assert!(some_save > 0);
+        // resume before fallback in None arm (non-block)
+        let none_resume = src[..fallback_pos]
+            .rfind("_piano_alloc.resume()")
+            .expect("None arm should have resume() before fallback()");
+        assert!(
+            none_resume > process_pos,
+            "None arm resume should be after Some arm"
+        );
     }
 
     #[test]
