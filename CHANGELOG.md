@@ -7,6 +7,15 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-03-02
+
+### Fixed
+
+- `#[cfg_attr(..., global_allocator)]` now detected by allocator analysis (#237)
+- Multiple `#[cfg(...)]` attributes on the same allocator static now all captured and combined for correct fallback negation (#238)
+- Failed allocations (null pointer) no longer counted by `alloc()` and `alloc_zeroed()`, matching `realloc()` behavior (#239)
+- TSC calibration no longer panics when hardware counter does not advance (#240)
+
 ## [0.9.1] - 2026-03-02
 
 ### Fixed
