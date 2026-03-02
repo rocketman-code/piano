@@ -9,7 +9,7 @@ use piano::build::{
     build_instrumented, find_bin_entry_point, find_project_root, find_workspace_root,
     inject_runtime_dependency, inject_runtime_path_dependency, prepare_staging,
 };
-use piano::error::Error;
+use piano::error::{Error, io_context};
 use piano::report::{
     diff_runs, find_latest_run_file, find_ndjson_by_run_id, format_frames_table, format_table,
     format_table_with_frames, load_latest_run, load_ndjson, load_run, load_run_by_id,
@@ -196,7 +196,7 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
             project.display()
         )));
     }
-    let project = std::fs::canonicalize(&project)?;
+    let project = std::fs::canonicalize(&project).map_err(io_context("canonicalize", &project))?;
 
     // Build target specs from CLI args.
     let mut specs: Vec<TargetSpec> = Vec::new();
@@ -270,7 +270,9 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .to_path_buf();
         // Read package name from the member's Cargo.toml.
-        let member_toml = std::fs::read_to_string(project.join("Cargo.toml"))?;
+        let member_cargo_toml = project.join("Cargo.toml");
+        let member_toml = std::fs::read_to_string(&member_cargo_toml)
+            .map_err(io_context("read", &member_cargo_toml))?;
         let doc: toml_edit::DocumentMut = member_toml
             .parse()
             .map_err(|e| Error::BuildFailed(format!("failed to parse member Cargo.toml: {e}")))?;
@@ -289,7 +291,7 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
     // Use a stable path so cargo can cache incremental builds across runs.
     // Dependencies compile once; only instrumented source files recompile.
     let staging = staging_root.join("target/piano/staging");
-    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&staging).map_err(io_context("create directory", &staging))?;
     prepare_staging(&staging_root, &staging)?;
 
     // Determine the member directory within staging (workspace root for standalone).
@@ -302,7 +304,7 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
     let features: Vec<&str> = if cpu_time { vec!["cpu-time"] } else { vec![] };
     match runtime_path {
         Some(ref path) => {
-            let abs_path = std::fs::canonicalize(path)?;
+            let abs_path = std::fs::canonicalize(path).map_err(io_context("canonicalize", path))?;
             inject_runtime_path_dependency(&member_staging, &abs_path, &features)?;
         }
         None => {
@@ -333,7 +335,7 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
             })?;
 
         all_concurrency.extend(result.concurrency);
-        std::fs::write(&staged_file, result.source)?;
+        std::fs::write(&staged_file, result.source).map_err(io_context("write", &staged_file))?;
     }
 
     // Warn if parallel code was detected without --cpu-time.
@@ -350,7 +352,7 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
     let main_file = member_staging.join(&bin_entry);
     let target_dir = project.join("target").join("piano");
     let runs_dir = target_dir.join("runs");
-    std::fs::create_dir_all(&runs_dir)?;
+    std::fs::create_dir_all(&runs_dir).map_err(io_context("create directory", &runs_dir))?;
     {
         let all_fn_names: Vec<String> = targets
             .iter()
@@ -387,7 +389,7 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
                 source,
             }
         })?;
-        std::fs::write(&main_file, rewritten)?;
+        std::fs::write(&main_file, rewritten).map_err(io_context("write", &main_file))?;
     }
 
     // Build the instrumented binary.
@@ -426,8 +428,8 @@ fn find_latest_binary() -> Result<PathBuf, Error> {
         return Err(Error::NoBinary);
     }
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
+    for entry in std::fs::read_dir(&dir).map_err(io_context("read directory", &dir))? {
+        let entry = entry.map_err(io_context("read directory entry", &dir))?;
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -442,11 +444,19 @@ fn find_latest_binary() -> Result<PathBuf, Error> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if entry.metadata()?.permissions().mode() & 0o111 == 0 {
+            let meta = entry
+                .metadata()
+                .map_err(io_context("read metadata", &path))?;
+            if meta.permissions().mode() & 0o111 == 0 {
                 continue; // not executable
             }
         }
-        let mtime = entry.metadata()?.modified()?;
+        let meta = entry
+            .metadata()
+            .map_err(io_context("read metadata", &path))?;
+        let mtime = meta
+            .modified()
+            .map_err(io_context("read modified time", &path))?;
         if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
             best = Some((path, mtime));
         }
@@ -743,7 +753,7 @@ fn default_tags_dir() -> Result<PathBuf, Error> {
     // Auto-create tags dir if runs exist (tags live alongside runs)
     let runs_local = project.join("target/piano/runs");
     if runs_local.is_dir() {
-        std::fs::create_dir_all(&local)?;
+        std::fs::create_dir_all(&local).map_err(io_context("create directory", &local))?;
         return Ok(local);
     }
     Err(Error::NoRuns)
