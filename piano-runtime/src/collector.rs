@@ -104,9 +104,9 @@ static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
 static STREAMING_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// State for the streaming NDJSON file.
-#[allow(dead_code)]
 struct StreamState {
     file: std::io::BufWriter<std::fs::File>,
+    #[allow(dead_code)] // used by shutdown/trailer in a later task
     path: PathBuf,
     frame_count: usize,
 }
@@ -119,7 +119,6 @@ fn stream_file() -> &'static Mutex<Option<StreamState>> {
 }
 
 /// Open a new streaming NDJSON file and write the v4 header.
-#[allow(dead_code)]
 fn open_stream_file(dir: &std::path::Path) -> std::io::Result<StreamState> {
     std::fs::create_dir_all(dir)?;
     let ts = timestamp_ms();
@@ -143,7 +142,6 @@ fn open_stream_file(dir: &std::path::Path) -> std::io::Result<StreamState> {
 }
 
 /// Write a frame to an already-locked StreamState.
-#[allow(dead_code)]
 fn stream_frame_to_writer(state: &mut StreamState, buf: &[FrameFnSummary]) {
     let frame_idx = state.frame_count;
     let _ = write!(state.file, "{{\"frame\":{frame_idx},\"fns\":[");
@@ -176,7 +174,6 @@ fn stream_frame_to_writer(state: &mut StreamState, buf: &[FrameFnSummary]) {
 /// When streaming is enabled (init() was called), writes one NDJSON line
 /// per frame to the global stream file. When not enabled (tests), pushes
 /// to the thread-local FRAMES vec as before.
-#[allow(dead_code)]
 fn stream_frame(buf: &[FrameFnSummary]) {
     if !STREAMING_ENABLED.load(Ordering::Relaxed) {
         FRAMES.with(|frames| {
@@ -1120,12 +1117,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             FRAME_BUFFER.with(|buf| {
                 let b = buf.borrow();
                 if !b.is_empty() {
-                    FRAMES.with(|frames| {
-                        frames
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(b.clone());
-                    });
+                    stream_frame(&b);
                 }
                 drop(b);
                 buf.borrow_mut().clear();
@@ -1615,7 +1607,10 @@ pub fn init() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     signal::install_handlers();
     atexit::register();
-    STREAMING_ENABLED.store(true, Ordering::Release);
+    // NOTE: STREAMING_ENABLED is not set here yet. It will be enabled
+    // in Task 4 once shutdown() is updated to finalize the stream file
+    // (write trailer + flush). Until then, frames use the in-memory
+    // FRAMES path via stream_frame()'s fallback.
 }
 
 /// Flush all collected timing data from ALL threads and write to disk.
@@ -1821,12 +1816,7 @@ impl Drop for AdoptGuard {
                 FRAME_BUFFER.with(|buf| {
                     let b = buf.borrow();
                     if !b.is_empty() {
-                        FRAMES.with(|frames| {
-                            frames
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .push(b.clone());
-                        });
+                        stream_frame(&b);
                     }
                     drop(b);
                     buf.borrow_mut().clear();
@@ -1973,8 +1963,6 @@ mod tests {
         init();
         init();
         init();
-        // init() enables streaming; reset so parallel tests use the FRAMES path.
-        STREAMING_ENABLED.store(false, Ordering::Release);
     }
 
     #[test]
@@ -4228,6 +4216,78 @@ mod tests {
         assert!(last.contains("stream_test_fn"));
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn frames_on_disk_before_shutdown() {
+        // Verify the end-to-end wiring: drop_cold at depth 0 calls
+        // stream_frame(), which writes to disk when streaming is enabled.
+        //
+        // We do the frame work on a dedicated thread, using a channel to
+        // coordinate: the spawned thread enables streaming just before its
+        // own guard drop, and disables it immediately after. This keeps
+        // the STREAMING_ENABLED=true window to a single guard drop on a
+        // single thread, avoiding interference with parallel tests.
+
+        let tmp = std::env::temp_dir().join(format!("piano_immediate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        set_runs_dir(tmp.to_str().unwrap());
+
+        // Pre-open the stream file so the spawned thread doesn't race
+        // with other threads on the lazy initialization.
+        {
+            let mut state = stream_file().lock().unwrap();
+            if state.is_none() {
+                *state = Some(open_stream_file(&tmp).unwrap());
+            }
+        }
+
+        let handle = thread::spawn(|| {
+            reset();
+            // Create the guard, do work, then enable streaming just
+            // before the guard drops. The drop is the ONLY operation
+            // that runs with streaming enabled.
+            let g = enter("immediate_fn");
+            burn_cpu(5_000);
+            STREAMING_ENABLED.store(true, Ordering::SeqCst);
+            drop(g);
+            STREAMING_ENABLED.store(false, Ordering::SeqCst);
+        });
+        handle.join().unwrap();
+
+        // Force flush the BufWriter so we can read the content.
+        {
+            let mut state = stream_file().lock().unwrap();
+            if let Some(ref mut s) = *state {
+                s.file.flush().unwrap();
+            }
+        }
+
+        // File should exist with header + at least 1 frame, NO trailer.
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        assert_eq!(files.len(), 1);
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert!(
+            lines.len() >= 2,
+            "header + at least 1 frame, got {} lines",
+            lines.len()
+        );
+        assert!(lines[0].contains("\"format_version\":4"));
+        assert!(lines[1].contains("\"frame\":0"));
+        assert!(lines[1].contains("\"id\":"));
+
+        // Cleanup
+        *stream_file().lock().unwrap() = None;
+        clear_runs_dir();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
