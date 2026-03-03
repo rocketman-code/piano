@@ -51,6 +51,11 @@ pub enum Error {
     #[error("{0}")]
     InvalidTagName(String),
 
+    #[error(
+        "no profiling data written -- no functions were instrumented (all functions may be const, unsafe, or extern)\n\n  run `piano build --list-skipped` for details"
+    )]
+    NoFunctionsInstrumented,
+
     #[error("profiling data was not written -- check disk space and permissions for {}", .0.display())]
     NoDataWritten(PathBuf),
 
@@ -78,5 +83,39 @@ pub fn io_context(
         operation,
         path,
         source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_functions_instrumented_message() {
+        let err = Error::NoFunctionsInstrumented;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no functions were instrumented"),
+            "should mention no functions instrumented: {msg}"
+        );
+        assert!(
+            msg.contains("--list-skipped"),
+            "should include --list-skipped hint: {msg}"
+        );
+        assert!(
+            !msg.contains("disk space"),
+            "should not mention disk space: {msg}"
+        );
+    }
+
+    #[test]
+    fn no_data_written_message() {
+        let err = Error::NoDataWritten(PathBuf::from("/tmp/runs"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("disk space"),
+            "should mention disk space: {msg}"
+        );
+        assert!(msg.contains("/tmp/runs"), "should include path: {msg}");
     }
 }
