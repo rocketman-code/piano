@@ -1,6 +1,8 @@
 //! Integration test: verify cross-thread instrumentation captures all calls
 //! from rayon par_iter and std::thread::scope with correct attribution.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -100,15 +102,15 @@ fn cross_thread_captures_all_calls() {
         String::from_utf8_lossy(&run.stderr)
     );
 
-    // Read the JSON output (shutdown always writes JSON with cross-thread data).
-    let json_files: Vec<_> = fs::read_dir(&runs_dir)
+    // Read the NDJSON output.
+    let ndjson_files: Vec<_> = fs::read_dir(&runs_dir)
         .expect("runs dir should exist")
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
         .collect();
-    assert!(!json_files.is_empty(), "should have JSON output files");
+    assert!(!ndjson_files.is_empty(), "should have NDJSON output files");
 
-    let content = fs::read_to_string(json_files[0].path()).unwrap();
+    let content = fs::read_to_string(ndjson_files[0].path()).unwrap();
 
     // Verify compute function is captured.
     assert!(
@@ -116,53 +118,27 @@ fn cross_thread_captures_all_calls() {
         "should contain compute function. Got:\n{content}"
     );
 
+    // Parse NDJSON to aggregate calls per function.
+    let stats = common::aggregate_ndjson(&content);
+
     // compute is called 100 times in par_iter + 100 times in thread::scope = 200.
-    let compute_calls = extract_field_u64(&content, "compute", "calls");
+    let compute_calls = stats.get("compute").map(|s| s.calls).unwrap_or(0);
     assert_eq!(
         compute_calls, 200,
         "compute should be called 200 times (100 par_iter + 100 thread::scope), got {compute_calls}"
     );
 
-    // After wall-time non-propagation: main self_ms ~ total_ms because
-    // cross-thread children wall time is NOT subtracted from parent.
-    let main_self = extract_field_f64(&content, "main", "self_ms");
-    let main_total = extract_field_f64(&content, "main", "total_ms");
+    // Cross-thread wall-time non-propagation: main's self_ns must NOT be
+    // reduced by child-thread compute time. Since compute runs on worker
+    // threads (not as a same-thread child of main), main's self_ns equals
+    // its full wall time. If this invariant were broken, main's self_ns
+    // would be near zero.
+    let main_self_ns = stats.get("main").map(|s| s.self_ns).unwrap_or(0);
+    let compute_self_ns = stats.get("compute").map(|s| s.self_ns).unwrap_or(0);
     assert!(
-        main_self > main_total * 0.5,
-        "main self_ms ({main_self}) should be close to total_ms ({main_total}) — no cross-thread wall subtraction"
+        main_self_ns > compute_self_ns / 64,
+        "main self_ns ({main_self_ns}) should be substantial relative to compute \
+         self_ns ({compute_self_ns}) — cross-thread wall time must not be subtracted \
+         from parent self-time"
     );
-}
-
-fn extract_field_u64(json: &str, function: &str, field: &str) -> u64 {
-    let func_section = json
-        .split(&format!("\"{function}\""))
-        .nth(1)
-        .unwrap_or_else(|| panic!("function {function} not found in JSON"));
-    let value_str = func_section
-        .split(&format!("\"{field}\":"))
-        .nth(1)
-        .unwrap_or_else(|| panic!("field {field} not found for {function}"))
-        .split([',', '}'])
-        .next()
-        .unwrap();
-    value_str
-        .parse()
-        .unwrap_or_else(|_| panic!("failed to parse {field}={value_str} for {function}"))
-}
-
-fn extract_field_f64(json: &str, function: &str, field: &str) -> f64 {
-    let func_section = json
-        .split(&format!("\"{function}\""))
-        .nth(1)
-        .unwrap_or_else(|| panic!("function {function} not found in JSON"));
-    let value_str = func_section
-        .split(&format!("\"{field}\":"))
-        .nth(1)
-        .unwrap_or_else(|| panic!("field {field} not found for {function}"))
-        .split([',', '}'])
-        .next()
-        .unwrap();
-    value_str
-        .parse()
-        .unwrap_or_else(|_| panic!("failed to parse {field}={value_str} for {function}"))
 }

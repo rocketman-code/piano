@@ -113,11 +113,7 @@ fn macro_generated_fns_appear_in_output() {
     let run_files: Vec<_> = fs::read_dir(&runs_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "json" || ext == "ndjson")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
         .collect();
 
     assert!(!run_files.is_empty(), "expected at least one run file");
