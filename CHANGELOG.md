@@ -7,6 +7,24 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-03-03
+
+Piano is now a true multi-threaded profiler -- worker thread data that was previously lost is captured correctly, profiling data survives process::exit() and crashes, and instrumented builds use release mode by default.
+
+### Added
+
+- Profiling data streams to disk as frames complete, so data collected before a crash or forced exit is not lost (#310)
+- Profiling data recovered on `process::exit()` instead of being silently dropped (#303)
+
+### Fixed
+
+- Worker thread profiling data now collected from all threads instead of only the main thread (#309, #315)
+- Instrumented builds use release mode by default, matching the performance characteristics of the program being profiled (#302)
+
+### Removed
+
+- Legacy JSON output format removed; NDJSON is now the only output format (#309)
+
 ## [0.9.3] - 2026-03-02
 
 Fixes correctness bugs in async profiling, allocation tracking, and self-time precision -- upgrading is recommended for anyone profiling async or high-call-count programs.
@@ -252,7 +270,8 @@ Per-frame allocation tracking, cross-thread instrumentation, NDJSON output, and 
 
 Initial tagged release.
 
-[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/rocketman-code/piano/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/rocketman-code/piano/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/rocketman-code/piano/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/rocketman-code/piano/compare/v0.9.0...v0.9.1
