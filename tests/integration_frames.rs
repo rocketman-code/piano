@@ -4,6 +4,8 @@
 //! runs it, verifies NDJSON output, and checks that `piano report` and
 //! `piano report --frames` produce expected output.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -109,47 +111,34 @@ fn frame_pipeline_build_run_report() {
     );
 
     // Verify an NDJSON file was written (frame boundaries produce NDJSON output).
-    let ndjson_files: Vec<_> = fs::read_dir(&runs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
-
-    assert!(
-        !ndjson_files.is_empty(),
-        "expected at least one .ndjson run file in {runs_dir:?}. Files: {:?}",
-        fs::read_dir(&runs_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .collect::<Vec<_>>()
-    );
-
-    let content = fs::read_to_string(ndjson_files[0].path()).unwrap();
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
     let lines: Vec<&str> = content.lines().collect();
 
-    // Header should have format_version 3 and function names.
+    // Header should have format_version 4 and NO functions (v4 = trailer).
     assert!(
-        lines[0].contains("\"format_version\":3"),
-        "header should have format_version 3"
+        lines[0].contains("\"format_version\":4"),
+        "header should have format_version 4"
+    );
+    // v4: functions are in the trailer (last line), not the header.
+    let last_line = lines.last().unwrap();
+    assert!(
+        last_line.contains("\"functions\""),
+        "trailer should have functions array"
     );
     assert!(
-        lines[0].contains("\"functions\""),
-        "header should have functions array"
-    );
-    assert!(
-        lines[0].contains("update"),
+        last_line.contains("update"),
         "functions should include 'update'"
     );
     assert!(
-        lines[0].contains("physics"),
+        last_line.contains("physics"),
         "functions should include 'physics'"
     );
 
-    // Should have frame lines (header + at least 5 frames).
+    // Should have frame lines (header + at least 5 frames + trailer).
     assert!(
-        lines.len() >= 6,
-        "expected header + 5 frames, got {} lines",
+        lines.len() >= 7,
+        "expected header + 5 frames + trailer, got {} lines",
         lines.len()
     );
 

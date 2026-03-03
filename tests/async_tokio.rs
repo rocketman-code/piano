@@ -3,6 +3,8 @@
 //! instrumented binary should run without panicking, and the profiling output
 //! should contain the async function names.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -127,20 +129,9 @@ fn async_tokio_pipeline() {
         "program should produce correct output, got: {program_stdout}"
     );
 
-    // Verify run files were produced.
-    let run_files: Vec<_> = fs::read_dir(&runs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
-
-    assert!(
-        !run_files.is_empty(),
-        "expected at least one run file in {runs_dir:?}"
-    );
-
     // Read the output and verify async function names appear.
-    let content = fs::read_to_string(run_files[0].path()).unwrap();
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
     assert!(
         content.contains("compute"),
         "output should contain instrumented async function 'compute'. Got:\n{content}"

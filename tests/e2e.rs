@@ -1,5 +1,7 @@
 //! End-to-end test: create a project, instrument it, build it, run it, verify output.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -101,18 +103,9 @@ fn full_pipeline_instrument_build_run_verify() {
     );
 
     // Verify a run file was written.
-    let run_files: Vec<_> = fs::read_dir(&runs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
+    let run_file = common::largest_ndjson_file(&runs_dir);
 
-    assert!(
-        !run_files.is_empty(),
-        "expected at least one run file in {runs_dir:?}"
-    );
-
-    let content = fs::read_to_string(run_files[0].path()).unwrap();
+    let content = fs::read_to_string(&run_file).unwrap();
     assert!(
         content.contains("\"work\"") || content.contains("work"),
         "output should contain instrumented function name 'work'"
@@ -148,7 +141,7 @@ fn full_pipeline_instrument_build_run_verify() {
     // Verify `piano report` can also read a specific file.
     let specific_report = Command::new(piano_bin)
         .args(["report"])
-        .arg(run_files[0].path())
+        .arg(&run_file)
         .output()
         .expect("failed to run piano report (specific)");
 
@@ -215,15 +208,8 @@ fn build_with_no_targets_instruments_all_functions() {
     );
 
     // Verify run file contains both functions.
-    let run_files: Vec<_> = fs::read_dir(&runs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
-
-    assert!(!run_files.is_empty(), "expected at least one run file");
-
-    let content = fs::read_to_string(run_files[0].path()).unwrap();
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
     assert!(content.contains("\"main\""), "output should contain 'main'");
     assert!(content.contains("\"work\""), "output should contain 'work'");
 }
