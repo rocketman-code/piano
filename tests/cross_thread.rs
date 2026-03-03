@@ -103,14 +103,8 @@ fn cross_thread_captures_all_calls() {
     );
 
     // Read the NDJSON output.
-    let ndjson_files: Vec<_> = fs::read_dir(&runs_dir)
-        .expect("runs dir should exist")
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
-    assert!(!ndjson_files.is_empty(), "should have NDJSON output files");
-
-    let content = fs::read_to_string(ndjson_files[0].path()).unwrap();
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
 
     // Verify compute function is captured.
     assert!(

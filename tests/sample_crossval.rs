@@ -187,14 +187,7 @@ fn sample_cross_validation() {
     assert!(piano_run.status.success());
 
     // Read piano results (NDJSON format).
-    let output_files: Vec<_> = fs::read_dir(&runs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
-    assert!(!output_files.is_empty(), "no piano output files");
-
-    let output_path = output_files[0].path();
+    let output_path = common::largest_ndjson_file(&runs_dir);
     let content = fs::read_to_string(&output_path).unwrap();
     eprintln!("Piano output ({}):\n{content}", output_path.display());
 

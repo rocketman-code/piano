@@ -9,6 +9,8 @@
 //! It also uses rayon (common real-world pattern) to exercise thread pool
 //! allocation paths.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -148,18 +150,8 @@ fn rayon_program_with_alloc_tracking_does_not_crash_on_older_rust() {
     );
 
     // Verify output file was produced with worker data.
-    let ndjson_files: Vec<_> = fs::read_dir(&runs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
-
-    assert!(
-        !ndjson_files.is_empty(),
-        "expected at least one .ndjson run file"
-    );
-
-    let content = fs::read_to_string(ndjson_files[0].path()).unwrap();
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
     assert!(
         content.contains("worker"),
         "output should contain worker function data"

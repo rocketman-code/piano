@@ -1,5 +1,7 @@
 //! Integration tests for `piano profile` and `piano run`.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -466,28 +468,8 @@ fn process_exit_preserves_profiling_data() {
         "runs directory should exist: {runs_dir:?}"
     );
 
-    let data_files: Vec<_> = fs::read_dir(&runs_dir)
-        .expect("should be able to read runs dir")
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name.ends_with(".ndjson")
-        })
-        .collect();
-
-    assert!(
-        !data_files.is_empty(),
-        "profiling data should be written despite process::exit(), runs_dir contents: {:?}",
-        fs::read_dir(&runs_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name())
-            .collect::<Vec<_>>()
-    );
-
     // The data should contain the instrumented function name.
-    let data_path = data_files[0].path();
+    let data_path = common::largest_ndjson_file(&runs_dir);
     let data = fs::read_to_string(&data_path)
         .unwrap_or_else(|e| panic!("should read data file {data_path:?}: {e}"));
     assert!(
@@ -583,28 +565,8 @@ fn profile_captures_data_on_panic() {
         "runs directory should exist: {runs_dir:?}"
     );
 
-    let data_files: Vec<_> = fs::read_dir(&runs_dir)
-        .expect("should be able to read runs dir")
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name.ends_with(".ndjson")
-        })
-        .collect();
-
-    assert!(
-        !data_files.is_empty(),
-        "profiling data should be written despite panic, runs_dir contents: {:?}",
-        fs::read_dir(&runs_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name())
-            .collect::<Vec<_>>()
-    );
-
     // The data should contain the instrumented function name.
-    let data_path = data_files[0].path();
+    let data_path = common::largest_ndjson_file(&runs_dir);
     let data = fs::read_to_string(&data_path)
         .unwrap_or_else(|e| panic!("should read data file {data_path:?}: {e}"));
     assert!(

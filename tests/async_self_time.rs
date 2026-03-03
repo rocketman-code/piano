@@ -139,17 +139,8 @@ fn async_self_time_accuracy() {
     );
 
     // Parse NDJSON output (always written by shutdown).
-    let ndjson_files: Vec<_> = fs::read_dir(&runs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
-    assert!(
-        !ndjson_files.is_empty(),
-        "expected NDJSON output in {runs_dir:?}"
-    );
-
-    let content = fs::read_to_string(ndjson_files[0].path()).unwrap();
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
     let stats = common::aggregate_ndjson(&content);
 
     // Verify functions appear in the output.

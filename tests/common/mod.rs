@@ -1,9 +1,13 @@
 //! Shared NDJSON parsing utilities for integration tests.
 //!
-//! Parses the NDJSON format written by piano-runtime: a header line with
-//! function names, followed by frame lines with per-function summaries.
+//! Parses the NDJSON v4 format written by piano-runtime: a header line,
+//! frame lines with per-function summaries, and a trailer line with
+//! the function names array.
+
+#![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Per-function aggregated data from NDJSON frames.
 #[derive(Debug, Default)]
@@ -18,15 +22,21 @@ pub struct FnStats {
 ///
 /// Returns a map from function name to aggregated `FnStats`.
 pub fn aggregate_ndjson(content: &str) -> HashMap<String, FnStats> {
-    let mut lines = content.lines();
-    let header = lines.next().expect("NDJSON should have header line");
+    let all_lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        all_lines.len() >= 2,
+        "NDJSON should have at least header + trailer"
+    );
 
-    let fn_names = parse_header_functions(header);
+    // v4: function names are in the trailer (last line), not the header.
+    let trailer = *all_lines.last().unwrap();
+    let fn_names = parse_trailer_functions(trailer);
 
     let mut calls = vec![0u64; fn_names.len()];
     let mut self_ns = vec![0u64; fn_names.len()];
 
-    for line in lines {
+    // Frame lines are between header and trailer.
+    for &line in &all_lines[1..all_lines.len() - 1] {
         if !line.contains("\"fns\"") {
             continue;
         }
@@ -63,20 +73,41 @@ pub fn aggregate_ndjson(content: &str) -> HashMap<String, FnStats> {
         .collect()
 }
 
-/// Parse the "functions" array from an NDJSON header line.
-fn parse_header_functions(header: &str) -> Vec<String> {
-    let fns_start = header
+/// Parse the "functions" array from an NDJSON v4 trailer line.
+fn parse_trailer_functions(trailer: &str) -> Vec<String> {
+    let fns_start = trailer
         .find("\"functions\":[")
-        .expect("header should have functions array")
+        .expect("trailer should have functions array")
         + "\"functions\":[".len();
-    let fns_end = header[fns_start..]
+    let fns_end = trailer[fns_start..]
         .find(']')
         .expect("functions array should close");
-    let fns_str = &header[fns_start..fns_start + fns_end];
+    let fns_str = &trailer[fns_start..fns_start + fns_end];
     fns_str
         .split(',')
         .map(|s| s.trim().trim_matches('"').to_string())
         .collect()
+}
+
+/// Find the largest NDJSON file in a directory.
+///
+/// When streaming mode produces multiple files (e.g. streaming + fallback),
+/// the complete v4 file (header + frames + trailer) is the largest.
+pub fn largest_ndjson_file(dir: &std::path::Path) -> PathBuf {
+    let entries: Vec<_> = std::fs::read_dir(dir)
+        .expect("runs dir should exist")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "expected at least one .ndjson file in {dir:?}"
+    );
+    entries
+        .iter()
+        .max_by_key(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+        .unwrap()
+        .path()
 }
 
 /// Extract an integer value for a given key from a JSON-like string fragment.

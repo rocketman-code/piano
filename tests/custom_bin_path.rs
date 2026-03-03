@@ -1,5 +1,7 @@
 //! Test: piano build works when [[bin]] specifies a custom path.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -91,18 +93,8 @@ fn custom_bin_path_produces_profiling_data() {
     );
 
     // Verify profiling data was actually written.
-    let run_files: Vec<_> = fs::read_dir(&runs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
-
-    assert!(
-        !run_files.is_empty(),
-        "expected profiling data in {runs_dir:?} — piano silently produced nothing"
-    );
-
-    let content = fs::read_to_string(run_files[0].path()).unwrap();
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
     assert!(
         content.contains("compute"),
         "output should contain instrumented function name 'compute'"

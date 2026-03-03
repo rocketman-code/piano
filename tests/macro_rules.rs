@@ -2,6 +2,8 @@
 //! Covers the full pipeline (build + run + verify NDJSON output) and a
 //! unit-level syntax validation test.
 
+mod common;
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -110,15 +112,8 @@ fn macro_generated_fns_appear_in_output() {
     );
 
     // Verify run file contains the macro-generated function names.
-    let run_files: Vec<_> = fs::read_dir(&runs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
-
-    assert!(!run_files.is_empty(), "expected at least one run file");
-
-    let content = fs::read_to_string(run_files[0].path()).unwrap();
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
 
     // Metavar-generated functions should appear by their expanded names.
     assert!(
