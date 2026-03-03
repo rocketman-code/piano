@@ -9,12 +9,18 @@
 //! `collect()` returns pre-aggregated per-function summaries sorted by
 //! self-time descending. `reset()` clears all state for the current thread.
 //!
-//! Flush strategy: each thread's records live in an `Arc<Mutex<Vec<FnAgg>>>`
-//! registered in a global `THREAD_RECORDS` Vec, and per-frame data lives in
-//! `Arc<Mutex<Vec<Vec<FrameFnSummary>>>>` registered in `THREAD_FRAMES`.
-//! `shutdown()` (injected at the end of main by the AST rewriter) iterates
-//! all Arcs to collect data from every thread, including thread-pool workers
-//! whose TLS destructors may never fire. Always writes NDJSON.
+//! Flush strategy: when streaming is enabled (init() called), each completed
+//! frame (depth-0 guard drop) is written directly to disk as one NDJSON line.
+//! The function name table is written as a trailer at shutdown.
+//!
+//! When streaming is not enabled (tests, no init()), frames buffer in
+//! `Arc<Mutex<Vec<Vec<FrameFnSummary>>>>` registered in `THREAD_FRAMES`,
+//! and `shutdown()` writes them in bulk (legacy path).
+//!
+//! Per-function aggregates live in `Arc<Mutex<Vec<FnAgg>>>` registered in
+//! a global `THREAD_RECORDS` Vec. `shutdown()` iterates all Arcs to collect
+//! data from every thread, including thread-pool workers whose TLS
+//! destructors may never fire. Always writes NDJSON.
 //!
 //! Thread-locality: stack and records are thread-local. Each thread produces an
 //! independent call tree by default. For cross-thread attribution (e.g. rayon
@@ -241,16 +247,6 @@ fn write_stream_trailer(state: &mut StreamState) -> std::io::Result<()> {
     writeln!(state.file, "]}}")?;
     state.file.flush()?;
     Ok(())
-}
-
-/// Write trailer and close the stream file.
-#[allow(dead_code)]
-fn write_stream_trailer_and_close() {
-    let mut state = stream_file().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(ref mut s) = *state {
-        let _ = write_stream_trailer(s);
-    }
-    *state = None;
 }
 
 /// Signal handling for graceful data recovery on SIGTERM / SIGINT.
