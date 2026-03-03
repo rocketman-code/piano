@@ -7,6 +7,8 @@
 //! internal types or mechanisms. It goes through piano build -> run ->
 //! parse JSON output -> assert self-time relationship.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -136,26 +138,27 @@ fn async_self_time_accuracy() {
         String::from_utf8_lossy(&run.stdout),
     );
 
-    // Parse JSON output (always written by shutdown).
-    let json_files: Vec<_> = fs::read_dir(&runs_dir)
+    // Parse NDJSON output (always written by shutdown).
+    let ndjson_files: Vec<_> = fs::read_dir(&runs_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
         .collect();
     assert!(
-        !json_files.is_empty(),
-        "expected JSON output in {runs_dir:?}"
+        !ndjson_files.is_empty(),
+        "expected NDJSON output in {runs_dir:?}"
     );
 
-    let content = fs::read_to_string(json_files[0].path()).unwrap();
+    let content = fs::read_to_string(ndjson_files[0].path()).unwrap();
+    let stats = common::aggregate_ndjson(&content);
 
     // Verify functions appear in the output.
     assert!(
-        content.contains("\"parent_fn\""),
+        stats.contains_key("parent_fn"),
         "output should contain parent_fn. Got:\n{content}"
     );
     assert!(
-        content.contains("\"expensive_child\""),
+        stats.contains_key("expensive_child"),
         "output should contain expensive_child. Got:\n{content}"
     );
 
@@ -166,7 +169,7 @@ fn async_self_time_accuracy() {
     //   expensive_child does 4M wrapping_add iterations
     //
     // Therefore: parent_fn.self ≈ 0  and  expensive_child.self >> 0
-    // So: parent_fn.self_ms < expensive_child.self_ms  (always true if accounting works)
+    // So: parent_fn.self_ns < expensive_child.self_ns  (always true if accounting works)
     //
     // With the bug (migrated guard sets self = elapsed):
     //   parent_fn.self ≈ parent_fn.total ≈ 2 * expensive_child.total
@@ -175,39 +178,27 @@ fn async_self_time_accuracy() {
     // This assertion holds regardless of whether migration occurred:
     // - No migration: normal parent-child subtraction makes parent self ≈ 0
     // - Migration + fix: phantom subtraction makes parent self ≈ 0
-    let child_self = extract_field(&content, "expensive_child", "self_ms")
-        .expect("expensive_child should appear in output");
+    let child_self = stats.get("expensive_child").unwrap().self_ns;
     assert!(
-        child_self > 0.0,
-        "expensive_child should have non-zero self_ms (it does real work)"
+        child_self > 0,
+        "expensive_child should have non-zero self_ns (it does real work)"
     );
 
     // Migrated guards now preserve the real function name, so parent_fn
     // always appears under its own name.
-    if let Some(parent_self) = extract_field(&content, "parent_fn", "self_ms") {
+    if let Some(parent_stats) = stats.get("parent_fn") {
         assert!(
-            parent_self < child_self,
-            "parent_fn.self_ms ({parent_self:.3}) must be < expensive_child.self_ms \
-             ({child_self:.3}) -- parent does no computation, child does all of it"
+            parent_stats.self_ns < child_self,
+            "parent_fn.self_ns ({}) must be < expensive_child.self_ns \
+             ({child_self}) -- parent does no computation, child does all of it",
+            parent_stats.self_ns,
         );
     }
 
     // Migrated guards now preserve their real function names, so there
     // should be no "<migrated>" bucket in the output.
     assert!(
-        extract_field(&content, "<migrated>", "self_ms").is_none(),
+        !stats.contains_key("<migrated>"),
         "should not have a <migrated> bucket -- migrated guards preserve real names"
     );
-}
-
-/// Extract a float field from the JSON output for a given function name.
-/// Returns None if the function or field is not found.
-fn extract_field(json: &str, function: &str, field: &str) -> Option<f64> {
-    let func_section = json.split(&format!("\"{function}\"")).nth(1)?;
-    let value_str = func_section
-        .split(&format!("\"{field}\":"))
-        .nth(1)?
-        .split([',', '}'])
-        .next()?;
-    value_str.parse().ok()
 }

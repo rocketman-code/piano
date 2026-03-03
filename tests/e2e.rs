@@ -100,15 +100,11 @@ fn full_pipeline_instrument_build_run_verify() {
         "program should produce correct output, got: {program_stdout}"
     );
 
-    // Verify a run file was written (JSON or NDJSON depending on frame boundaries).
+    // Verify a run file was written.
     let run_files: Vec<_> = fs::read_dir(&runs_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "json" || ext == "ndjson")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
         .collect();
 
     assert!(
@@ -222,11 +218,7 @@ fn build_with_no_targets_instruments_all_functions() {
     let run_files: Vec<_> = fs::read_dir(&runs_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "json" || ext == "ndjson")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
         .collect();
 
     assert!(!run_files.is_empty(), "expected at least one run file");

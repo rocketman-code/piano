@@ -4,6 +4,8 @@
 //!
 //! Skips gracefully if `sample` is not available or cannot capture the process.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -144,17 +146,6 @@ fn parse_sample_output(output: &str, functions: &[&str]) -> Vec<(String, u64)> {
     counts
 }
 
-/// Extract an integer value for a given key from a JSON-like string fragment.
-///
-/// Looks for `key` followed by digits, returns the parsed u64.
-fn extract_json_u64(s: &str, key: &str) -> Option<u64> {
-    let start = s.find(key)? + key.len();
-    let end = s[start..]
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(s.len() - start);
-    s[start..start + end].parse().ok()
-}
-
 #[test]
 #[ignore]
 fn sample_cross_validation() {
@@ -195,92 +186,27 @@ fn sample_cross_validation() {
         .expect("piano run failed");
     assert!(piano_run.status.success());
 
-    // Read piano results (may be .json or .ndjson depending on workload type)
+    // Read piano results (NDJSON format).
     let output_files: Vec<_> = fs::read_dir(&runs_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "json" || ext == "ndjson")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
         .collect();
     assert!(!output_files.is_empty(), "no piano output files");
 
     let output_path = output_files[0].path();
     let content = fs::read_to_string(&output_path).unwrap();
-    let is_ndjson = output_path.extension().is_some_and(|ext| ext == "ndjson");
     eprintln!("Piano output ({}):\n{content}", output_path.display());
 
-    // Parse piano self-time percentages
+    // Parse piano self-time percentages from NDJSON.
     let piano_funcs = ["heavy", "medium", "light"];
+    let stats = common::aggregate_ndjson(&content);
+
     let mut piano_self_ms: Vec<(String, f64)> = Vec::new();
-
-    if is_ndjson {
-        // NDJSON format: header line has function name table, subsequent lines have frame data.
-        let mut lines = content.lines();
-        let header = lines.next().expect("ndjson should have header line");
-
-        // Parse function names from header: "functions":["heavy","medium","light","main"]
-        let fn_names: Vec<String> = {
-            let fns_start = header
-                .find("\"functions\":[")
-                .expect("header should have functions array")
-                + "\"functions\":[".len();
-            let fns_end = header[fns_start..]
-                .find(']')
-                .expect("functions array should close");
-            let fns_str = &header[fns_start..fns_start + fns_end];
-            fns_str
-                .split(',')
-                .map(|s| s.trim().trim_matches('"').to_string())
-                .collect()
-        };
-
-        // Accumulate self_ns per function across all frames.
-        let mut self_ns_totals: Vec<u64> = vec![0u64; fn_names.len()];
-        for line in lines {
-            if !line.contains("\"fns\"") {
-                continue;
-            }
-            // Parse each fn entry: {"id":N,...,"self_ns":M,...}
-            let fns_start = line.find("\"fns\":[").unwrap() + "\"fns\":[".len();
-            let fns_end = line[fns_start..].rfind(']').unwrap();
-            let fns_str = &line[fns_start..fns_start + fns_end];
-
-            // Split on "},{" to get individual fn entries
-            for entry in fns_str.split("},{") {
-                let entry = entry.trim_start_matches('{').trim_end_matches('}');
-                let id = extract_json_u64(entry, "\"id\":");
-                let self_ns = extract_json_u64(entry, "\"self_ns\":");
-                if let (Some(id), Some(self_ns)) = (id, self_ns)
-                    && (id as usize) < self_ns_totals.len()
-                {
-                    self_ns_totals[id as usize] += self_ns;
-                }
-            }
-        }
-
-        for func in &piano_funcs {
-            if let Some(idx) = fn_names.iter().position(|n| n == func) {
-                let ms = self_ns_totals[idx] as f64 / 1_000_000.0;
-                piano_self_ms.push((func.to_string(), ms));
-            }
-        }
-    } else {
-        // Legacy JSON format: {"functions":[{"name":"heavy","self_ms":123.4},...]
-        for func in &piano_funcs {
-            if let Some(pos) = content.find(&format!("\"name\":\"{func}\"")) {
-                let rest = &content[pos..];
-                if let Some(sm_pos) = rest.find("\"self_ms\":") {
-                    let num_start = sm_pos + "\"self_ms\":".len();
-                    let num_end = rest[num_start..]
-                        .find(|c: char| c != '.' && !c.is_ascii_digit())
-                        .unwrap_or(rest.len() - num_start);
-                    let val: f64 = rest[num_start..num_start + num_end].parse().unwrap_or(0.0);
-                    piano_self_ms.push((func.to_string(), val));
-                }
-            }
+    for func in &piano_funcs {
+        if let Some(s) = stats.get(*func) {
+            let ms = s.self_ns as f64 / 1_000_000.0;
+            piano_self_ms.push((func.to_string(), ms));
         }
     }
 

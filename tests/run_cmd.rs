@@ -518,7 +518,7 @@ fn profile_captures_data_on_panic() {
         .filter(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            name.ends_with(".ndjson") || name.ends_with(".json")
+            name.ends_with(".ndjson")
         })
         .collect();
 
