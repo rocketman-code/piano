@@ -9,151 +9,146 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [0.9.3] - 2026-03-02
 
-Round 2 audit: 4 P1 bugs, 10 P2 bugs, and 2 follow-up bugs resolved across 17 PRs.
+Fixes correctness bugs in async profiling, allocation tracking, and self-time precision -- upgrading is recommended for anyone profiling async or high-call-count programs.
 
 ### Added
 
-- MIT LICENSE file (#248)
 - Signal handlers for SIGTERM and SIGINT recover profiling data on Unix instead of losing it (#257)
-- `#[non_exhaustive]` on all public runtime structs for forward-compatible field additions (#258)
-- `#[doc(hidden)]` on injection-only API to keep docs.rs clean (#259)
+- `#[non_exhaustive]` on all public runtime structs for forward-compatible API evolution (#258)
+- Internal injection API hidden from docs.rs to keep published documentation clean (#259)
+- MIT LICENSE file (#248)
 
 ### Fixed
 
-- `AllocAccumulator` no longer corrupts alloc counters when async futures are cancelled mid-await (#250)
-- `select!`/`join!` and other macro invocations in async functions now treated as potential `.await` points for migration detection (#249)
+- Allocation counters no longer corrupted when async futures are cancelled mid-await (#250)
 - Unbounded memory growth for high-call-count programs: per-invocation records replaced with in-flight aggregation, bounding memory to O(unique functions) instead of O(total calls) (#251)
-- Children time accumulation uses integer nanoseconds instead of f64 milliseconds, eliminating floating-point precision loss in self-time computation (#253)
+- Floating-point precision loss in self-time computation eliminated by using integer nanoseconds for children time accumulation (#253)
+- `select!`/`join!` and other macro invocations in async functions now treated as potential `.await` points for thread migration detection (#249)
+- Migrated async guards capture post-migration CPU time instead of reporting zero (#269)
+- Allocation tracking correctly scoped to condition expressions for `if`/`while`/`match` with `.await` in condition, so body allocations are not lost (#270)
+- Non-block match arms (`Some(v) => process(v)`) now get allocation tracking when scrutinee contains `.await` (#292)
 - NDJSON runs no longer approximate `total_ms` from `self_ms`; the field is set to 0.0 to honestly represent absent data (#254)
+- `FrameFnSummary.calls` widened from `u32` to `u64` to prevent overflow for high-call-count frames (#286)
 - IO errors now include file path and operation context instead of bare OS messages (#255)
 - `flush()` reports write errors to stderr instead of silently discarding them (#256)
 - `find_latest_binary` accepts `.exe` extension on Windows (#252)
-- Migrated async guards capture post-migration CPU time instead of reporting zero (#269)
-- Alloc save/resume correctly scoped to condition expressions for `if`/`while`/`match` with `.await` in condition, so body allocations are tracked (#270)
-- Non-block match arms (`Some(v) => process(v)`) now get alloc body brackets when scrutinee contains `.await` (#292)
-- `FrameFnSummary.calls` widened from `u32` to `u64` to prevent overflow for high-call-count frames (#286)
 
 ## [0.9.2] - 2026-03-02
 
+Fixes edge cases in allocator detection and TSC calibration that caused panics or silent zero-byte reports on certain hardware and project configurations.
+
 ### Fixed
 
-- `#[cfg_attr(..., global_allocator)]` now detected by allocator analysis (#237)
-- Multiple `#[cfg(...)]` attributes on the same allocator static now all captured and combined for correct fallback negation (#238)
-- Failed allocations (null pointer) no longer counted by `alloc()` and `alloc_zeroed()`, matching `realloc()` behavior (#239)
-- TSC calibration no longer panics when hardware counter does not advance (#240)
+- `#[cfg_attr(..., global_allocator)]` now detected by allocator analysis, fixing zero-byte reports for projects using conditional allocator attributes (#237)
+- Multiple `#[cfg(...)]` attributes on the same allocator static correctly combined, so fallback negation works on all platforms (#238)
+- Failed allocations (null pointer) no longer counted, matching the behavior of `realloc()` (#239)
+- TSC calibration no longer panics when the hardware counter does not advance (#240)
 
 ## [0.9.1] - 2026-03-02
 
+Fixes allocation tracking reporting zero bytes when the user's global allocator is behind a `#[cfg(...)]` gate -- a common pattern with tikv-jemallocator and mimalloc.
+
 ### Fixed
 
-- Allocation tracking no longer reports zero when user's `#[global_allocator]` is behind a `#[cfg(...)]` gate (#231)
-  - Detection moved from string matching to syn AST walk (`detect_allocator_kind`)
-  - Cfg-gated allocators get a `#[cfg(not(...))]` fallback `PianoAllocator<System>` so every platform tracks allocations
+- Allocation tracking no longer reports zero when the user's `#[global_allocator]` is behind a `#[cfg(...)]` gate (#231)
+  - Detection moved from string matching to syn AST walk
+  - Cfg-gated allocators get a `#[cfg(not(...))]` fallback so every platform tracks allocations
   - Common pattern: `#[cfg(target_os = "linux")] #[global_allocator]` with tikv-jemallocator or mimalloc
 
 ## [0.9.0] - 2026-03-02
 
-Piano is feature-complete. Every metric (wall time, self time, CPU time, allocations) is accurate across every execution model (sync, threaded, async).
+Piano is feature-complete. Every metric -- wall time, self time, CPU time, allocations -- is accurate across sync, threaded, and async execution models.
 
 ### Added
 
-- Async-aware allocation tracking: `AllocAccumulator` carries allocation data across async thread migrations via `save()`/`resume()`/`Drop` pattern (#226, PR #225)
-  - Rewriter injects `AllocAccumulator` and `save()`/`resume()` around `.await` points in async functions
-  - Per-await overhead: ~1.3ns on Apple Silicon, ~57ns on x86_64 (~3% of baseline enter/drop)
-  - Sync functions: zero overhead, no changes
-- Integration test for async allocation tracking pipeline
-- Integration test for panic data capture (#86)
-- Tagged NDJSON diff path test coverage
-- cpu-time feature added to CI test matrix (#117)
+- Async-aware allocation tracking: allocation data survives thread migrations in async programs, so `tokio::spawn` and `select!` no longer silently drop alloc counts (#226, PR #225)
 
 ### Fixed
 
 - Allocation data no longer silently lost when async tasks migrate threads
-- Phantom stack entry saves and zeroes host thread alloc counters on migration
-- Migrated guard drop path reads accumulated allocs instead of reporting zeros
-- Companion JSON merge validates run_id consistency, skips mismatched files (#58)
-- Child exit code propagated from `piano profile` (#93)
+- Migrated async guards report real allocations instead of zeros
+- Companion JSON merge validates run_id consistency, skipping mismatched files (#58)
+- Child exit code propagated from `piano profile` -- non-zero exits no longer swallowed (#93)
 - `extern "Rust" fn` inside `macro_rules!` templates now instrumented (#144)
 - Stale files removed from staging directory on rebuild
-- stack_entry_size test made feature-aware for cpu-time builds
-- tempfile moved to dev-dependencies (smaller dependency footprint for users)
+- `tempfile` moved to dev-dependencies, shrinking the dependency tree for users
 
 ### Changed
 
-- Staging directory uses stable path (`target/piano/staging/`) for incremental compilation instead of fresh tempdir per build
-- `BuildOpts` struct extracted from shared build/profile CLI fields
-- `fn_agg` tuple replaced with named `FnAgg` struct in report module
-- `shutdown_to()` delegates through `runs_dir()` instead of duplicating logic
+- Staging directory uses a stable path (`target/piano/staging/`) for incremental compilation instead of a fresh tempdir per build
 
 ## [0.8.2] - 2026-02-28
 
+Per-call instrumentation overhead cut from 129ns to 59ns on Apple Silicon -- profiling results are more representative of real performance.
+
 ### Changed
 
-- Per-call instrumentation overhead reduced from 129ns to 59ns on Apple Silicon (#206):
-  - Frame aggregation uses Vec linear scan with pointer comparison instead of HashMap
-  - RECORDS pushes batched in thread-local buffer, flushed at frame boundaries instead of locking Mutex on every function return
+- Per-call instrumentation overhead reduced from 129ns to 59ns on Apple Silicon (#206)
 
 ## [0.8.1] - 2026-02-28
+
+Documentation update. No runtime or CLI changes.
 
 ### Changed
 
 - README updated to match 0.8.0 report output format (#204)
-- CI workflow added to enforce version bump commit scope on release PRs (#201)
-- Milestones now required for every release in release checklist (#204)
 
 ## [0.8.0] - 2026-02-28
 
+Major UX overhaul: smarter defaults, better error messages, and less typing for common workflows.
+
 ### Added
 
-- `--exact` flag for `piano build` and `piano profile`: exact-match mode for `--fn`, mirroring `cargo test -- --exact` convention (#120)
-- `--list-skipped` flag for `piano build` and `piano profile`: list functions that Piano cannot instrument (const, unsafe, extern) with file paths and reasons; prints "no functions skipped" when all functions are instrumentable (#137, #186, #192)
+- `--exact` flag for `piano build` and `piano profile`: exact-match mode for `--fn`, mirroring `cargo test -- --exact` (#120)
+- `--list-skipped` flag: shows functions Piano cannot instrument (const, unsafe, extern) with file paths and reasons (#137, #186, #192)
 - `piano tag` with no arguments lists all saved tags; `piano tag <name>` saves (#175)
-- `piano diff` with no arguments compares the two most recent runs, showing "comparing: X vs Y" with tag names or relative timestamps (#125)
+- `piano diff` with no arguments compares the two most recent runs, showing tag names or relative timestamps (#125)
 - User labels as diff column headers: tag names, filename stems, or relative timestamps instead of generic "Before"/"After" (#124)
 - Auto-detect project root by walking up from cwd to find Cargo.toml, removing the need for `--project` in most cases (#135)
-- Structural color in report tables: bold headers, dim separators, full NO_COLOR/CLICOLOR/CLICOLOR_FORCE/TERM=dumb support via anstream (#122)
-- Recovery guidance in NoTargetsFound errors: shows similar function names via edit distance, or lists all available functions (#127)
-- UX design principles documented in docs/standards/ux.md
+- Colored report tables with bold headers and dim separators; full NO_COLOR/CLICOLOR/CLICOLOR_FORCE/TERM=dumb support (#122)
+- Recovery guidance on NoTargetsFound: shows similar function names via edit distance, or lists all available functions (#127)
 
 ### Fixed
 
 - Diff table sorted by absolute self-time delta descending instead of alphabetically (#193)
-- Duplicate error message on NoTargetsFound when all matched functions were skipped (#191)
+- `--fn` substring matching now checks qualified names (`Type::method`), not just bare names (#185)
 - Missing tag produces "no run found for tag '...'" instead of leaking internal file paths (#198)
-- Internal staging/tempdir paths removed from all user-facing error messages (#129)
+- Duplicate error message when all matched functions were skipped (#191)
+- Internal staging paths removed from all user-facing error messages (#129)
 - Cascading NoRuns error suppressed when profiled program exits non-zero (#139)
-- `--fn` substring matching now checks qualified names (Type::method), not just bare names (#185)
-- Stale tags produce RunNotFound with recovery guidance instead of generic NoRuns (#160)
+- Stale tags produce a helpful error with recovery guidance instead of generic NoRuns (#160)
 - Non-printable characters in tag names displayed safely in error messages (#166)
+- Invalid tag error defines the valid character set instead of listing what is invalid (#128)
+- App name shown in build output instead of internal binary path (#121)
+- `--fn` help text harmonized between build and profile commands (#123)
 - Redundant "invalid tag:" prefix removed from tag validation errors (#165)
 - Run ID removed from tag confirmation message (#126)
 - Concurrency warning simplified to one line per function (#138)
-- Invalid tag error defines the valid character set instead of listing what's invalid (#128)
-- App name shown in build output instead of internal binary path (#121)
-- `--fn` help text harmonized between build and profile commands (#123)
 
 ### Changed
 
-- Report columns reordered: Function | Self | Calls | Allocs | Alloc Bytes (self-time leads, Total removed from default view) (#180, #136)
+- Report columns reordered: Function | Self | Calls | Allocs | Alloc Bytes -- self-time leads, Total removed from default view (#180, #136)
 - Runtime exits non-zero on profiling data write failure instead of silently discarding
-- Runs directory pre-created before instrumented build to prevent write failures
 
 ## [0.7.0] - 2026-02-27
 
+Async profiling arrives. Piano now instruments async functions and tracks self-time accurately across thread migrations, so `tokio::spawn`, `select!`, and work-stealing runtimes produce correct results.
+
 ### Added
 
-- Accurate async self-time: migration-safe Guard with phantom StackEntry tracks self-time correctly when async tasks migrate across threads (#94)
-- Guard::check() injected after `.await` at any nesting depth (if, match, loop, etc.), not just top-level statements (#142)
-- Function names preserved for migrated async guards; no more `<migrated>` bucket in reports (#116)
-- Phantom StackEntry cleanup on intermediate threads during multi-hop async migration via deferred cleanup queue (#141)
+- Async self-time tracking: migration-safe Guard tracks self-time correctly when async tasks migrate across threads (#94)
+- Guard checks injected after `.await` at any nesting depth (if, match, loop), not just top-level statements (#142)
+- Function names preserved for migrated async guards -- no more `<migrated>` bucket in reports (#116)
+- Phantom stack entry cleanup on intermediate threads during multi-hop migration (#141)
 - Instrument `fn` items inside `macro_rules!` definitions when profiling all functions (#143)
 
 ### Changed
 
-- StackEntry uses packed `u64` identity field (cookie + name_id + depth) instead of separate `depth` and `cookie_low` fields
-- Guard::check() uses recursive VisitMut-based injection instead of flat top-level iteration
+- Guard check injection uses recursive visitor instead of flat top-level iteration, catching `.await` inside nested expressions
 
 ## [0.6.0] - 2026-02-25
+
+New `profile` and `run` commands, async function instrumentation, and hardware timestamp counters for lower overhead.
 
 ### Added
 
@@ -165,8 +160,8 @@ Piano is feature-complete. Every metric (wall time, self time, CPU time, allocat
 ### Fixed
 
 - Allocation counter widened from u32 to u64, preventing silent truncation on high-allocation programs (#55)
-- Synthetic frames created for companion-merged worker threads, preventing silent data loss (#57)
 - Worker-thread percentiles show "-" instead of misleading aggregated values (#56)
+- Synthetic frames created for companion-merged worker threads, preventing silent data loss (#57)
 - `flush()` writes to project-local `target/piano/runs/` instead of global directory (#84)
 - `diff_runs` uses i128 for alloc_count delta, preventing wrap on extreme values (#101)
 - `const`, `unsafe`, and `extern` functions skipped during instrumentation instead of causing compile errors (#102)
@@ -174,10 +169,12 @@ Piano is feature-complete. Every metric (wall time, self time, CPU time, allocat
 
 ### Changed
 
-- Runtime timing uses hardware TSC counters (Apple Silicon CNTVCT, x86 RDTSC) instead of `Instant::now()`, reducing per-call overhead
+- Timing uses hardware TSC counters (Apple Silicon CNTVCT, x86 RDTSC) instead of `Instant::now()`, reducing per-call overhead
 - Timestamp capture reordered to minimize bias in self-time measurement
 
 ## [0.5.1] - 2026-02-24
+
+Removes global `~/.piano/` fallback -- all profiling data is now project-local under `target/piano/`.
 
 ### Fixed
 
@@ -189,26 +186,25 @@ Piano is feature-complete. Every metric (wall time, self time, CPU time, allocat
 
 ## [0.5.0] - 2026-02-24
 
+CPU time profiling, instrument-everything default, panic-safe data capture, and project-local storage.
+
 ### Added
 
 - CPU time profiling via `--cpu-time` flag (Linux + macOS, 64-bit)
 - Instrument all functions by default when no `--fn`/`--file`/`--mod` specified
-- Hidden-function footer in summary and frames reports
 - Project-local run data: output written to `target/piano/runs/` instead of global `~/.piano/runs/`
-- `shutdown_to(dir)` runtime API for directing output to a specific directory
 - Panic-safe data capture: profiling data is collected even when the instrumented program panics
-- Workflow note in `piano --help` output
+- Hidden-function footer in summary and frames reports
 
 ### Fixed
 
 - Unparseable source files are skipped with a warning instead of aborting
-- Async functions skipped with a warning
+- Async functions skipped with a warning instead of silently producing wrong data
 - Cross-thread functions correctly merged into NDJSON report
 - Symlinks followed when staging project files for instrumentation
-- Bare stdout path suppressed in interactive terminals (no more duplicate path output)
+- Bare stdout path suppressed in interactive terminals
 - `--fn` help text clarified with substring matching example including qualified names
 - Actionable error messages when project directory or `src/` is missing
-- `piano report` and `piano tag` check project-local `target/piano/runs/` before falling back to global
 
 ### Changed
 
@@ -217,31 +213,27 @@ Piano is feature-complete. Every metric (wall time, self time, CPU time, allocat
 
 ## [0.4.1] - 2026-02-23
 
+Fixes silent data loss for zero-call functions, truncated function names in frames view, and broadens runtime compatibility down to Rust 1.56.
+
 ### Fixed
 
-- Zero-call registered functions now appear in NDJSON output (previously silently dropped)
+- Zero-call registered functions now appear in NDJSON output instead of being silently dropped
 - Dynamic column width in `--frames` table prevents long function names from being truncated
-- piano-runtime MSRV lowered from 1.70 to 1.56 (supports older Rust projects)
-- Flaky cross-thread timing test stabilized for CI (sleep margin increased from 50ms to 200ms)
-
-### Changed
-
-- MSRV for piano-runtime: 1.56 (was 1.70)
+- piano-runtime MSRV lowered from 1.70 to 1.56, supporting older Rust projects
 
 ## [0.4.0] - 2026-02-23
+
+Per-frame allocation tracking, cross-thread instrumentation, NDJSON output, and workspace support.
 
 ### Added
 
 - Per-frame allocation tracking with zero-distortion timing
 - NDJSON output format with per-frame views and allocation diffs
-- PianoAllocator AST injection for automatic allocation tracking
-- Cross-thread instrumentation: per-thread Arc registry, fork/adopt/shutdown
-- AST rewriter detects concurrency patterns (rayon par_iter, thread::spawn, rayon::scope) and injects fork/adopt/shutdown
+- Automatic allocator injection: PianoAllocator wraps the user's global allocator via AST rewriting
+- Cross-thread instrumentation with per-thread collection and fork/adopt for scoped concurrency
+- Concurrency pattern detection (rayon par_iter, thread::spawn, rayon::scope) with automatic fork/adopt injection
 - Workspace member support with inherited Cargo.toml fields
 - Custom `[[bin]]` entry point resolution from Cargo.toml
-- MSRV integration test verifying piano-runtime compiles on Rust 1.70
-- GitHub Actions CI workflow (fmt, clippy, test, doc, msrv)
-- Release checklist and versioning policy
 
 ### Fixed
 
