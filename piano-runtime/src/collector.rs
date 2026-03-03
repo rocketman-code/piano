@@ -193,6 +193,36 @@ mod signal {
     }
 }
 
+/// Register a C-level atexit handler so profiling data is flushed when user
+/// code calls `std::process::exit()`.
+///
+/// `std::process::exit()` calls libc `exit()`, which runs atexit handlers
+/// but does NOT trigger Rust stack unwinding. Without this, all profiling
+/// data is silently lost on `process::exit()`. The `SHUTDOWN_DONE` atomic
+/// prevents double-writes when the normal shutdown path also runs.
+mod atexit {
+    use super::*;
+
+    extern "C" {
+        fn atexit(f: extern "C" fn()) -> i32;
+    }
+
+    extern "C" fn on_exit() {
+        if SHUTDOWN_DONE.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(dir) = runs_dir_nonblocking() {
+            let _ = shutdown_impl_inner(&dir);
+        }
+    }
+
+    pub(super) fn register() {
+        unsafe {
+            atexit(on_exit);
+        }
+    }
+}
+
 fn epoch() -> Instant {
     *EPOCH.get_or_init(|| {
         crate::tsc::calibrate();
@@ -1420,13 +1450,15 @@ pub fn flush() {
     reset();
 }
 
-/// Initialize the runtime: install signal handlers for data recovery.
+/// Initialize the runtime: install handlers for data recovery.
 ///
-/// Called at the start of instrumented main(). Registers SIGTERM/SIGINT
-/// handlers (Unix only) so profiling data is saved if the process is killed.
+/// Called at the start of instrumented main(). Registers:
+/// - SIGTERM/SIGINT signal handlers (Unix only) for kill/Ctrl-C
+/// - C-level atexit handler for `std::process::exit()` calls
 pub fn init() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     signal::install_handlers();
+    atexit::register();
 }
 
 /// Flush all collected timing data from ALL threads and write to disk.
