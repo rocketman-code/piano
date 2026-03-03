@@ -35,7 +35,7 @@ Batch related changes, release when there's a meaningful set of user-facing chan
 2. `cargo test --workspace` passes
 3. `cargo clippy --workspace --all-targets -- -D warnings` clean
 4. `cargo doc --workspace --no-deps` builds without warnings
-5. Update `CHANGELOG.md`
+5. Update `CHANGELOG.md` (invoke the `changelog` skill -- entries must be user-facing, no internal jargon)
 6. Bump version in both `Cargo.toml` and `piano-runtime/Cargo.toml`
 7. Run `cargo generate-lockfile --ignore-rust-version` (without this flag, cargo constrains all workspace deps to the lowest member MSRV, downgrading shared dependencies like clap)
 8. Commit: `chore(cargo): bump version to 0.x.y` -- this commit may only touch `Cargo.toml`, `piano-runtime/Cargo.toml`, and `Cargo.lock` (CI enforces this on `release/*` PRs)
@@ -53,6 +53,13 @@ Format: `v0.x.y` (e.g., `v0.1.0`, `v0.2.0`). Tag the version bump commit.
 
 ## Changelog
 
-`CHANGELOG.md` in the repo root, following [Keep a Changelog](https://keepachangelog.com/) format.
+`CHANGELOG.md` in the repo root, following [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/) format.
 Each release maps to a closed GitHub milestone.
 Update the changelog as part of the release commit, before tagging.
+
+Standards (enforced by the `changelog` skill):
+- Every entry written for users, not the team -- no audit rounds, internal struct names, or milestone labels
+- One-sentence version summary explaining why to upgrade
+- Bullets ordered by impact (data loss > correctness > UX > cosmetic)
+- No CI/test/refactoring entries unless user-visible
+- Comparison links at bottom for every version
