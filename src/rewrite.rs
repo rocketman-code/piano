@@ -891,7 +891,20 @@ fn match_fn_pattern(tokens: &[proc_macro2::TokenTree], start: usize) -> Option<F
                 if let proc_macro2::TokenTree::Punct(p) = &tokens[pos] {
                     match p.as_char() {
                         '<' => depth += 1,
-                        '>' => depth -= 1,
+                        '>' => {
+                            // Don't decrement for `->` (return type arrow).
+                            // In proc_macro2, `->` is two separate Punct tokens:
+                            // `-` then `>`. Check the previous token.
+                            let is_arrow = pos > 0
+                                && matches!(
+                                    &tokens[pos - 1],
+                                    proc_macro2::TokenTree::Punct(prev)
+                                        if prev.as_char() == '-' && prev.spacing() == proc_macro2::Spacing::Joint
+                                );
+                            if !is_arrow {
+                                depth -= 1;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -2553,6 +2566,48 @@ fn main() {}
         assert!(
             result.contains("piano_runtime::enter"),
             "generic fn in macro should be instrumented. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn instruments_generic_fn_with_fn_trait_return_in_macro_rules() {
+        let source = r#"
+macro_rules! make {
+    () => {
+        fn process<F: Fn() -> bool>(f: F) {
+            work();
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        assert!(
+            result.contains(r#"piano_runtime::enter("process")"#),
+            "generic fn with Fn() -> T bound in macro should be instrumented. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn instruments_generic_fn_with_nested_return_type_in_macro_rules() {
+        let source = r#"
+macro_rules! make {
+    () => {
+        fn apply<F: Fn(i32) -> Option<bool>>(f: F) {
+            work();
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true).unwrap().source;
+
+        assert!(
+            result.contains(r#"piano_runtime::enter("apply")"#),
+            "generic fn with Fn() -> Option<bool> bound in macro should be instrumented. Got:\n{result}"
         );
     }
 
