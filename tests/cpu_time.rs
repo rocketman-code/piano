@@ -101,11 +101,7 @@ fn cpu_time_flag_produces_cpu_data() {
     let run_files: Vec<_> = fs::read_dir(&runs_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "json" || ext == "ndjson")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
         .collect();
 
     assert!(
@@ -115,32 +111,17 @@ fn cpu_time_flag_produces_cpu_data() {
 
     // Verify the run file contains CPU time data.
     let content = fs::read_to_string(run_files[0].path()).unwrap();
-    let ext = run_files[0]
-        .path()
-        .extension()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
 
-    if ext == "ndjson" {
-        // NDJSON: header should have has_cpu_time, entries should have csn field.
-        assert!(
-            content.contains("\"has_cpu_time\":true"),
-            "NDJSON header should contain has_cpu_time flag. Got:\n{}",
-            content.lines().next().unwrap_or("")
-        );
-        assert!(
-            content.contains("\"csn\":"),
-            "NDJSON entries should contain csn (cpu_self_ns) field"
-        );
-    } else {
-        // JSON: should have cpu_self_ms field.
-        assert!(
-            content.contains("\"cpu_self_ms\":"),
-            "JSON output should contain cpu_self_ms field"
-        );
-    }
+    // NDJSON: header should have has_cpu_time, entries should have csn field.
+    assert!(
+        content.contains("\"has_cpu_time\":true"),
+        "NDJSON header should contain has_cpu_time flag. Got:\n{}",
+        content.lines().next().unwrap_or("")
+    );
+    assert!(
+        content.contains("\"csn\":"),
+        "NDJSON entries should contain csn (cpu_self_ns) field"
+    );
 
     // Verify `piano report` shows CPU column.
     let report_output = Command::new(piano_bin)

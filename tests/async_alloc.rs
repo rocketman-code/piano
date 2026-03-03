@@ -126,24 +126,18 @@ fn async_alloc_tracking_pipeline() {
         "program should produce correct output, got: {program_stdout}"
     );
 
-    // Find run output file (.ndjson or .json).
+    // Find run output file.
     let all_files: Vec<_> = fs::read_dir(&runs_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .collect();
 
-    // Prefer .ndjson (has alloc data) over .json (legacy, no alloc fields).
     let run_file = all_files
         .iter()
         .find(|p| p.extension().is_some_and(|ext| ext == "ndjson"))
-        .or_else(|| {
-            all_files
-                .iter()
-                .find(|p| p.extension().is_some_and(|ext| ext == "json"))
-        })
         .unwrap_or_else(|| {
-            panic!("should have .ndjson or .json output file. Files in runs dir: {all_files:?}")
+            panic!("should have .ndjson output file. Files in runs dir: {all_files:?}")
         });
 
     let content = fs::read_to_string(run_file).unwrap();
@@ -152,11 +146,6 @@ fn async_alloc_tracking_pipeline() {
     //   Line 1 (header): {"format_version":3,...,"functions":["allocating_work","main"]}
     //   Line 2+ (frames): {"frame":0,"fns":[{"id":0,"calls":1,"self_ns":...,"ac":N,"ab":N,...}]}
     // "ac" = alloc_count, "ab" = alloc_bytes. Functions referenced by index into header array.
-    let is_ndjson = run_file.extension().is_some_and(|ext| ext == "ndjson");
-    assert!(
-        is_ndjson,
-        "expected NDJSON output (frame-level data with alloc fields). Got .json. Files: {all_files:?}",
-    );
 
     let mut lines = content.lines();
     let header_line = lines

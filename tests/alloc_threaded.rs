@@ -148,18 +148,18 @@ fn rayon_program_with_alloc_tracking_does_not_crash_on_older_rust() {
     );
 
     // Verify output file was produced with worker data.
-    let json_files: Vec<_> = fs::read_dir(&runs_dir)
+    let ndjson_files: Vec<_> = fs::read_dir(&runs_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
         .collect();
 
     assert!(
-        !json_files.is_empty(),
-        "expected at least one .json run file"
+        !ndjson_files.is_empty(),
+        "expected at least one .ndjson run file"
     );
 
-    let content = fs::read_to_string(json_files[0].path()).unwrap();
+    let content = fs::read_to_string(ndjson_files[0].path()).unwrap();
     assert!(
         content.contains("worker"),
         "output should contain worker function data"
