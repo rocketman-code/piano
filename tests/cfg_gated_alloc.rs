@@ -6,6 +6,8 @@
 //! fallback `PianoAllocator<System>` behind the negated cfg. The NDJSON output
 //! should report non-zero `alloc_count` ("ac" field) for functions that allocate.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -127,20 +129,8 @@ fn cfg_gated_allocator_reports_nonzero() {
     );
 
     // Find run output file.
-    let all_files: Vec<_> = fs::read_dir(&runs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .collect();
-
-    let run_file = all_files
-        .iter()
-        .find(|p| p.extension().is_some_and(|ext| ext == "ndjson"))
-        .unwrap_or_else(|| {
-            panic!("should have .ndjson output file. Files in runs dir: {all_files:?}")
-        });
-
-    let content = fs::read_to_string(run_file).unwrap();
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
 
     // NDJSON v4 format:
     //   Line 1 (header): {"format_version":4,"run_id":"...","timestamp_ms":...}
