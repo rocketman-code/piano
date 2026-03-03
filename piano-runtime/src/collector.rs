@@ -174,6 +174,16 @@ fn stream_frame_to_writer(state: &mut StreamState, buf: &[FrameFnSummary]) {
     state.frame_count += 1;
 }
 
+/// Push a frame into the thread-local in-memory buffer (fallback path).
+fn push_to_frames(buf: &[FrameFnSummary]) {
+    FRAMES.with(|frames| {
+        frames
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(buf.to_vec());
+    });
+}
+
 /// Stream a completed frame to disk, or fall back to in-memory FRAMES.
 ///
 /// When streaming is enabled (init() was called), writes one NDJSON line
@@ -181,24 +191,14 @@ fn stream_frame_to_writer(state: &mut StreamState, buf: &[FrameFnSummary]) {
 /// to the thread-local FRAMES vec as before.
 fn stream_frame(buf: &[FrameFnSummary]) {
     if !STREAMING_ENABLED.load(Ordering::Relaxed) {
-        FRAMES.with(|frames| {
-            frames
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(buf.to_vec());
-        });
+        push_to_frames(buf);
         return;
     }
 
     let dir = match runs_dir() {
         Some(d) => d,
         None => {
-            FRAMES.with(|frames| {
-                frames
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(buf.to_vec());
-            });
+            push_to_frames(buf);
             return;
         }
     };
@@ -217,12 +217,7 @@ fn stream_frame(buf: &[FrameFnSummary]) {
             Err(e) => {
                 eprintln!("piano: failed to open stream file: {e}");
                 drop(state);
-                FRAMES.with(|frames| {
-                    frames
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(buf.to_vec());
-                });
+                push_to_frames(buf);
                 return;
             }
         }
@@ -1624,7 +1619,7 @@ pub fn init() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     signal::install_handlers();
     atexit::register();
-    STREAMING_ENABLED.store(true, Ordering::Release);
+    STREAMING_ENABLED.store(true, Ordering::Relaxed);
 }
 
 /// Flush all collected timing data from ALL threads and write to disk.
@@ -1704,8 +1699,11 @@ fn synthesize_frame_from_agg(agg: &[FnAgg]) -> Vec<FrameFnSummary> {
 
 /// Core write logic shared by `shutdown()` and the signal handler.
 ///
-/// Always writes NDJSON. When no frames exist but aggregate records do,
-/// synthesizes a single frame from aggregate data. Never writes JSON.
+/// When streaming is enabled: writes the trailer line (function name table)
+/// to the existing stream file and closes it. When streaming is not enabled
+/// (or no stream file was opened): collects frames from THREAD_FRAMES and
+/// writes a complete NDJSON file. In either case, when no frames exist but
+/// aggregate records do, synthesizes a single frame from aggregate data.
 ///
 /// Returns `true` if any write failed. Does NOT check `SHUTDOWN_DONE` --
 /// callers are responsible for the guard.
