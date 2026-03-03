@@ -200,6 +200,12 @@ fn stream_frame(buf: &[FrameFnSummary]) {
     let mut state = stream_file().lock().unwrap_or_else(|e| e.into_inner());
 
     if state.is_none() {
+        // After shutdown, the stream file has been closed and the trailer
+        // written. Don't open a new orphan file (it would have no trailer
+        // and the BufWriter might not flush before process exit).
+        if SHUTDOWN_DONE.load(Ordering::Relaxed) {
+            return;
+        }
         match open_stream_file(&dir) {
             Ok(s) => *state = Some(s),
             Err(e) => {
