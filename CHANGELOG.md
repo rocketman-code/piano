@@ -51,7 +51,7 @@ Fixes correctness bugs in async profiling, allocation tracking, and self-time pr
 - `flush()` reports write errors to stderr instead of silently discarding them (#256)
 - `find_latest_binary` accepts `.exe` extension on Windows (#252)
 
-## [0.9.2] - 2026-03-02
+## [0.9.2] - 2026-03-01
 
 Fixes edge cases in allocator detection and TSC calibration that caused panics or silent zero-byte reports on certain hardware and project configurations.
 
@@ -62,7 +62,7 @@ Fixes edge cases in allocator detection and TSC calibration that caused panics o
 - Failed allocations (null pointer) no longer counted, matching the behavior of `realloc()` (#239)
 - TSC calibration no longer panics when the hardware counter does not advance (#240)
 
-## [0.9.1] - 2026-03-02
+## [0.9.1] - 2026-03-01
 
 Fixes allocation tracking reporting zero bytes when the user's global allocator is behind a `#[cfg(...)]` gate -- a common pattern with tikv-jemallocator and mimalloc.
 
@@ -73,7 +73,7 @@ Fixes allocation tracking reporting zero bytes when the user's global allocator 
   - Cfg-gated allocators get a `#[cfg(not(...))]` fallback so every platform tracks allocations
   - Common pattern: `#[cfg(target_os = "linux")] #[global_allocator]` with tikv-jemallocator or mimalloc
 
-## [0.9.0] - 2026-03-02
+## [0.9.0] - 2026-03-01
 
 Piano is feature-complete. Every metric -- wall time, self time, CPU time, allocations -- is accurate across sync, threaded, and async execution models.
 
@@ -103,7 +103,7 @@ Per-call instrumentation overhead cut from 129ns to 59ns on Apple Silicon -- pro
 
 - Per-call instrumentation overhead reduced from 129ns to 59ns on Apple Silicon (#206)
 
-## [0.8.1] - 2026-02-28
+## [0.8.1] - 2026-02-27
 
 Documentation update. No runtime or CLI changes.
 
@@ -111,7 +111,7 @@ Documentation update. No runtime or CLI changes.
 
 - README updated to match 0.8.0 report output format (#204)
 
-## [0.8.0] - 2026-02-28
+## [0.8.0] - 2026-02-27
 
 Major UX overhaul: smarter defaults, better error messages, and less typing for common workflows.
 
@@ -266,7 +266,7 @@ Per-frame allocation tracking, cross-thread instrumentation, NDJSON output, and 
 - MSRV for piano-runtime: 1.70 (was 1.88)
 - MSRV for piano CLI: 1.88 (pinned via rust-toolchain.toml)
 
-## [0.3.0] - 2025-12-01
+## [0.3.0] - 2026-02-22
 
 Initial tagged release.
 
