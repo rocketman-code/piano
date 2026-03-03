@@ -423,7 +423,7 @@ fn is_binary_extension(ext: &std::ffi::OsStr) -> bool {
 
 fn find_latest_binary() -> Result<PathBuf, Error> {
     let project = find_project_root(&std::env::current_dir()?).map_err(|_| Error::NoBinary)?;
-    let dir = project.join("target/piano/debug");
+    let dir = project.join("target/piano/release");
     if !dir.is_dir() {
         return Err(Error::NoBinary);
     }
