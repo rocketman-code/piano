@@ -11,7 +11,6 @@ use std::path::PathBuf;
 
 /// Per-function aggregated data from NDJSON frames.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct FnStats {
     pub calls: u64,
     pub self_ns: u64,
