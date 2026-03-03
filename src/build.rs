@@ -259,7 +259,7 @@ pub fn find_bin_entry_point(project_dir: &Path) -> Result<PathBuf, Error> {
     )))
 }
 
-/// Build the instrumented binary using `cargo build --message-format=json`.
+/// Build the instrumented binary using `cargo build --release --message-format=json`.
 /// Returns the path to the compiled executable.
 ///
 /// When `package` is `Some`, passes `-p <name>` to cargo to build a specific
@@ -274,6 +274,7 @@ pub fn build_instrumented(
     // parent's toolchain, ignoring the project's pinned version.
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
+        .arg("--release")
         .arg("--message-format=json")
         .env("CARGO_TARGET_DIR", target_dir)
         .env_remove("RUSTUP_TOOLCHAIN")
