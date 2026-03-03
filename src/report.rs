@@ -48,9 +48,6 @@ pub struct FnEntry {
 pub struct FrameData {
     pub fn_names: Vec<String>,
     pub frames: Vec<Vec<FrameFnEntry>>,
-    /// Function IDs that were merged from companion JSON (worker-thread data).
-    /// These lack per-frame granularity.
-    pub companion_fn_ids: HashSet<usize>,
 }
 
 /// Accumulated per-function counters across all frames (used during NDJSON aggregation).
@@ -175,74 +172,9 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         frames.push(entries);
     }
 
-    // Merge cross-thread functions from companion JSON if present.
-    // NDJSON only has main-thread frame data (from collect_frames TLS).
-    // The companion JSON has all threads (from collect_all Arc registry).
-    let mut fn_names = header.functions;
-    let mut companion_fn_ids: HashSet<usize> = HashSet::new();
-    let json_companion = path.with_extension("json");
-    if json_companion.exists() {
-        match std::fs::read_to_string(&json_companion)
-            .map_err(|e| e.to_string())
-            .and_then(|c| serde_json::from_str::<Run>(&c).map_err(|e| e.to_string()))
-        {
-            Ok(json_run) => {
-                // Verify run_id consistency. When both files carry a run_id,
-                // they must match -- otherwise the companion belongs to a
-                // different logical run that merely shares the timestamp stem.
-                let ids_conflict = match (&header.run_id, &json_run.run_id) {
-                    (Some(ndjson_id), Some(json_id)) => ndjson_id != json_id,
-                    _ => false,
-                };
-                if ids_conflict {
-                    eprintln!(
-                        "warning: companion {} has different run_id, skipping merge",
-                        json_companion.display()
-                    );
-                } else {
-                    let existing: HashSet<String> = fn_names.iter().cloned().collect();
-                    let has_new = json_run
-                        .functions
-                        .iter()
-                        .any(|f| !existing.contains(&f.name));
-                    if has_new && frames.is_empty() {
-                        frames.push(Vec::new());
-                    }
-                    for fn_entry in &json_run.functions {
-                        if !existing.contains(&fn_entry.name) {
-                            let new_id = fn_names.len();
-                            fn_names.push(fn_entry.name.clone());
-                            companion_fn_ids.insert(new_id);
-                            // Add aggregate data to first frame. Worker threads lack
-                            // frame boundaries, so we can't assign to specific frames.
-                            if let Some(first_frame) = frames.first_mut() {
-                                first_frame.push(FrameFnEntry {
-                                    fn_id: new_id,
-                                    calls: fn_entry.calls,
-                                    self_ns: (fn_entry.self_ms * 1_000_000.0) as u64,
-                                    cpu_self_ns: fn_entry
-                                        .cpu_self_ms
-                                        .map(|ms| (ms * 1_000_000.0) as u64),
-                                    alloc_count: fn_entry.alloc_count,
-                                    alloc_bytes: fn_entry.alloc_bytes,
-                                    free_count: 0,
-                                    free_bytes: 0,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: companion {} unreadable: {e}",
-                    json_companion.display()
-                );
-            }
-        }
-    }
+    let fn_names = header.functions;
 
-    // Aggregate into Run for backward compatibility.
+    // Aggregate into Run.
     let has_cpu = header.has_cpu_time;
     let mut fn_agg: HashMap<usize, FnAgg> = HashMap::new();
     for frame in &frames {
@@ -286,11 +218,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         source_format: RunFormat::Ndjson,
     };
 
-    let frame_data = FrameData {
-        fn_names,
-        frames,
-        companion_fn_ids,
-    };
+    let frame_data = FrameData { fn_names, frames };
 
     Ok((run, frame_data))
 }
@@ -715,8 +643,8 @@ fn collect_run_files(runs_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     });
 
     // Deduplicate by stem: when both <stem>.json and <stem>.ndjson exist,
-    // keep only the .ndjson file. load_ndjson already merges companion JSON
-    // data, so loading both would double-count every function.
+    // keep only the .ndjson file (the richer format). Loading both would
+    // double-count every function.
     let ndjson_stems: HashSet<String> = files
         .iter()
         .filter(|p| p.extension().is_some_and(|e| e == "ndjson"))
@@ -1545,7 +1473,6 @@ mod tests {
                     },
                 ],
             ],
-            companion_fn_ids: HashSet::new(),
         };
         let table = format_table_with_frames(&frame_data, true);
         assert!(!table.contains("p50"), "should not have p50 column");
@@ -1719,7 +1646,6 @@ mod tests {
                     },
                 ],
             ],
-            companion_fn_ids: HashSet::new(),
         };
         let table = format_frames_table(&frame_data);
         assert!(table.contains("Frame"), "should have Frame column header");
@@ -1771,7 +1697,6 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
-            companion_fn_ids: HashSet::new(),
         };
         // Default (show_all=false) should hide "unused"
         let table = format_table_with_frames(&frame_data, false);
@@ -1812,7 +1737,6 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
-            companion_fn_ids: HashSet::new(),
         };
         let table = format_table_with_frames(&frame_data, false);
         assert!(
@@ -1882,7 +1806,6 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
-            companion_fn_ids: HashSet::new(),
         };
         let table = format_table_with_frames(&frame_data, false);
         assert!(
@@ -2127,7 +2050,6 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
-            companion_fn_ids: HashSet::new(),
         };
         // Without --all: hides unused, shows CPU.
         let table = format_table_with_frames(&frame_data, false);
@@ -2166,7 +2088,6 @@ mod tests {
                 free_count: 3,
                 free_bytes: 512,
             }]],
-            companion_fn_ids: HashSet::new(),
         };
         let table = format_table_with_frames(&frame_data, false);
         assert!(
@@ -2174,63 +2095,6 @@ mod tests {
             "should not show CPU column when no CPU data. Got:\n{table}"
         );
         assert!(table.contains("update"), "should still show function");
-    }
-
-    #[test]
-    fn load_ndjson_merges_cross_thread_functions_from_companion_json() {
-        // NDJSON has main-thread functions only (from collect_frames TLS).
-        // Companion JSON has ALL functions (from collect_all Arc registry).
-        // load_ndjson should merge worker-thread-only functions into FrameData.
-        let dir = TempDir::new().unwrap();
-
-        let ndjson = r#"{"format_version":2,"run_id":"test_1","timestamp_ms":5000,"functions":["main","orchestrate"]}
-{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":10000000,"ac":100,"ab":50000,"fc":10,"fb":5000},{"id":1,"calls":1,"self_ns":5000000,"ac":50,"ab":25000,"fc":5,"fb":2500}]}
-"#;
-        fs::write(dir.path().join("5000.ndjson"), ndjson).unwrap();
-
-        let json = r#"{
-            "run_id": "test_1",
-            "timestamp_ms": 5000,
-            "functions": [
-                {"name": "main", "calls": 1, "total_ms": 15.0, "self_ms": 10.0, "cpu_self_ms": 8.0},
-                {"name": "orchestrate", "calls": 1, "total_ms": 5.0, "self_ms": 5.0, "cpu_self_ms": 0.0},
-                {"name": "busy_wait_ms", "calls": 200, "total_ms": 3.0, "self_ms": 3.0, "cpu_self_ms": 2.5},
-                {"name": "expensive_computation", "calls": 50, "total_ms": 1.5, "self_ms": 1.5, "cpu_self_ms": 1.2}
-            ]
-        }"#;
-        fs::write(dir.path().join("5000.json"), json).unwrap();
-
-        let ndjson_path = dir.path().join("5000.ndjson");
-        let (_run, frame_data) = load_ndjson(&ndjson_path).unwrap();
-
-        // Should have all 4 functions, not just the 2 from NDJSON.
-        assert_eq!(
-            frame_data.fn_names.len(),
-            4,
-            "should merge worker-thread functions from companion JSON. Got: {:?}",
-            frame_data.fn_names
-        );
-        assert!(frame_data.fn_names.contains(&"busy_wait_ms".to_string()));
-        assert!(
-            frame_data
-                .fn_names
-                .contains(&"expensive_computation".to_string())
-        );
-
-        // The merged functions should appear in the default table output.
-        let table = format_table_with_frames(&frame_data, false);
-        assert!(
-            table.contains("busy_wait_ms"),
-            "worker-thread function should appear in report. Got:\n{table}"
-        );
-        assert!(
-            table.contains("expensive_computation"),
-            "worker-thread function should appear in report. Got:\n{table}"
-        );
-        assert!(
-            table.contains("200"),
-            "busy_wait_ms should show 200 calls. Got:\n{table}"
-        );
     }
 
     #[test]
@@ -2284,13 +2148,12 @@ mod tests {
     #[test]
     fn load_run_by_id_no_double_count_with_json_and_ndjson() {
         // When both 5000.json and 5000.ndjson exist with the same run_id,
-        // load_run_by_id must NOT double-count metrics.
+        // collect_run_files deduplicates — only the .ndjson is loaded.
         let dir = TempDir::new().unwrap();
 
         let ndjson = r#"{"format_version":2,"run_id":"dup_5000","timestamp_ms":5000,"functions":["main_fn"]}
 {"frame":0,"fns":[{"id":0,"calls":10,"self_ns":5000000,"ac":100,"ab":4096,"fc":0,"fb":0}]}
 "#;
-        // The companion JSON has the same function plus a worker-thread one.
         let json = r#"{
             "run_id": "dup_5000",
             "timestamp_ms": 5000,
@@ -2316,13 +2179,12 @@ mod tests {
             main_fn.calls
         );
 
-        // worker_fn should be merged from companion JSON via load_ndjson.
-        let worker_fn = run
-            .functions
-            .iter()
-            .find(|f| f.name == "worker_fn")
-            .expect("worker_fn should be merged from companion JSON");
-        assert_eq!(worker_fn.calls, 20);
+        // The .json is deduplicated away — only .ndjson data is used.
+        assert_eq!(
+            run.functions.len(),
+            1,
+            "only NDJSON data should be loaded, not companion JSON"
+        );
     }
 
     #[test]
@@ -2431,52 +2293,6 @@ mod tests {
     }
 
     #[test]
-    fn companion_json_merge_preserves_large_alloc_counts() {
-        // Regression test: FrameFnEntry.alloc_count was previously u32, and
-        // the companion JSON merge path used `as u32` which silently truncated
-        // values above u32::MAX. Verify the u64 widening preserves large values.
-        let dir = TempDir::new().unwrap();
-
-        let ndjson = r#"{"format_version":3,"run_id":"alloc_1","timestamp_ms":7000,"functions":["main_fn"]}
-{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":1000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
-"#;
-        fs::write(dir.path().join("7000.ndjson"), ndjson).unwrap();
-
-        let large_alloc_count: u64 = 5_000_000_000; // exceeds u32::MAX (4,294,967,295)
-        let json = format!(
-            r#"{{
-            "run_id": "alloc_1",
-            "timestamp_ms": 7000,
-            "functions": [
-                {{"name": "main_fn", "calls": 1, "total_ms": 1.0, "self_ms": 1.0}},
-                {{"name": "heavy_alloc", "calls": 100, "total_ms": 5.0, "self_ms": 5.0, "alloc_count": {large_alloc_count}, "alloc_bytes": 40000000000}}
-            ]
-        }}"#
-        );
-        fs::write(dir.path().join("7000.json"), json).unwrap();
-
-        let ndjson_path = dir.path().join("7000.ndjson");
-        let (_run, frame_data) = load_ndjson(&ndjson_path).unwrap();
-
-        // Find the merged worker-thread function.
-        let heavy_id = frame_data
-            .fn_names
-            .iter()
-            .position(|n| n == "heavy_alloc")
-            .expect("heavy_alloc should be merged from companion JSON");
-
-        let entry = frame_data.frames[0]
-            .iter()
-            .find(|e| e.fn_id == heavy_id)
-            .expect("heavy_alloc should have a frame entry");
-
-        assert_eq!(
-            entry.alloc_count, large_alloc_count,
-            "alloc_count should preserve values above u32::MAX without truncation"
-        );
-    }
-
-    #[test]
     fn ndjson_deserializes_large_alloc_counts() {
         // NDJSON ac/fc fields should support values above u32::MAX.
         let dir = TempDir::new().unwrap();
@@ -2505,100 +2321,6 @@ mod tests {
     }
 
     #[test]
-    fn load_ndjson_empty_frames_preserves_companion_data() {
-        // NDJSON with header but zero frame lines is valid.
-        // Companion JSON has worker-thread functions.
-        // Bug: fn_names grows but frames stays empty, so metrics are silently dropped.
-        let dir = TempDir::new().unwrap();
-
-        // Header only, no frame lines.
-        let ndjson = r#"{"format_version":2,"run_id":"empty_1","timestamp_ms":9000,"functions":["main_fn"]}
-"#;
-        fs::write(dir.path().join("9000.ndjson"), ndjson).unwrap();
-
-        let json = r#"{
-            "run_id": "empty_1",
-            "timestamp_ms": 9000,
-            "functions": [
-                {"name": "main_fn", "calls": 1, "total_ms": 10.0, "self_ms": 10.0},
-                {"name": "worker_fn", "calls": 50, "total_ms": 3.0, "self_ms": 3.0}
-            ]
-        }"#;
-        fs::write(dir.path().join("9000.json"), json).unwrap();
-
-        let ndjson_path = dir.path().join("9000.ndjson");
-        let (run, frame_data) = load_ndjson(&ndjson_path).unwrap();
-
-        // worker_fn should be merged with its metrics, not zeroed out.
-        let worker = run
-            .functions
-            .iter()
-            .find(|f| f.name == "worker_fn")
-            .expect("worker_fn should be present in run");
-        assert_eq!(
-            worker.calls, 50,
-            "worker_fn should have 50 calls, not 0 (silent data loss)"
-        );
-
-        // FrameData should also contain the worker data.
-        let worker_id = frame_data
-            .fn_names
-            .iter()
-            .position(|n| n == "worker_fn")
-            .expect("worker_fn should be in fn_names");
-        let has_entry = frame_data
-            .frames
-            .iter()
-            .any(|frame| frame.iter().any(|e| e.fn_id == worker_id && e.calls == 50));
-        assert!(
-            has_entry,
-            "worker_fn should have a frame entry with calls=50"
-        );
-    }
-
-    #[test]
-    fn load_ndjson_skips_companion_with_mismatched_run_id() {
-        // Companion JSON whose run_id differs from the NDJSON header should
-        // NOT be merged, even when the timestamp stems match.
-        let dir = TempDir::new().unwrap();
-
-        let ndjson = r#"{"format_version":2,"run_id":"ndjson_run","timestamp_ms":7000,"functions":["main_fn"]}
-{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":10000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
-"#;
-        fs::write(dir.path().join("7000.ndjson"), ndjson).unwrap();
-
-        // Companion JSON has a DIFFERENT run_id.
-        let json = r#"{
-            "run_id": "different_run",
-            "timestamp_ms": 7000,
-            "functions": [
-                {"name": "main_fn", "calls": 1, "total_ms": 10.0, "self_ms": 10.0},
-                {"name": "worker_fn", "calls": 50, "total_ms": 3.0, "self_ms": 3.0}
-            ]
-        }"#;
-        fs::write(dir.path().join("7000.json"), json).unwrap();
-
-        let ndjson_path = dir.path().join("7000.ndjson");
-        let (run, frame_data) = load_ndjson(&ndjson_path).unwrap();
-
-        // worker_fn should NOT be merged because the run_ids differ.
-        assert_eq!(
-            frame_data.fn_names.len(),
-            1,
-            "should not merge functions from companion with different run_id. Got: {:?}",
-            frame_data.fn_names
-        );
-        assert!(
-            !frame_data.fn_names.contains(&"worker_fn".to_string()),
-            "worker_fn should not appear when companion run_id mismatches"
-        );
-        assert!(
-            run.functions.iter().all(|f| f.name != "worker_fn"),
-            "worker_fn should not appear in Run when companion run_id mismatches"
-        );
-    }
-
-    #[test]
     fn format_table_with_frames_self_before_calls() {
         let frame_data = FrameData {
             fn_names: vec!["work".into()],
@@ -2612,7 +2334,6 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
-            companion_fn_ids: HashSet::new(),
         };
         let table = format_table_with_frames(&frame_data, false);
         let self_pos = table.find("Self").expect("Self header missing");
@@ -2637,7 +2358,6 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
-            companion_fn_ids: HashSet::new(),
         };
         let table = format_table_with_frames(&frame_data, false);
         let self_pos = table.find("Self").expect("Self header missing");
@@ -2723,12 +2443,9 @@ mod tests {
     }
 
     #[test]
-    fn companion_merged_functions_aggregate_across_frames() {
-        // Worker-thread functions merged from companion JSON only have data in
-        // frame 0. They should still appear in the summary with their totals.
-        let mut companion_fn_ids = HashSet::new();
-        companion_fn_ids.insert(2); // "worker_fn" is companion-merged
-
+    fn partial_frame_functions_aggregate_correctly() {
+        // A function appearing in only one frame should still aggregate
+        // correctly in the summary table.
         let frame_data = FrameData {
             fn_names: vec!["main_fn".into(), "update".into(), "worker_fn".into()],
             frames: vec![
@@ -2789,7 +2506,6 @@ mod tests {
                     // worker_fn absent from frame 1
                 ],
             ],
-            companion_fn_ids,
         };
 
         let table = format_table_with_frames(&frame_data, false);
