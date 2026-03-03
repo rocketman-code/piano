@@ -1639,6 +1639,7 @@ pub fn shutdown() {
         None => return,
     };
     if shutdown_impl_inner(&dir) {
+        eprintln!("piano: profiling data could not be written (see errors above)");
         std::process::exit(70);
     }
 }
