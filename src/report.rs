@@ -79,6 +79,7 @@ struct NdjsonHeader {
     _format_version: u32,
     run_id: Option<String>,
     timestamp_ms: u128,
+    #[serde(default)]
     functions: Vec<String>,
     #[serde(default)]
     has_cpu_time: bool,
@@ -110,6 +111,12 @@ struct NdjsonFnEntry {
     fb: u64,
 }
 
+/// NDJSON v4 trailer line (written at shutdown with the function name table).
+#[derive(serde::Deserialize)]
+struct NdjsonTrailer {
+    functions: Vec<String>,
+}
+
 /// Read a profiling run from a JSON or NDJSON file on disk.
 pub fn load_run(path: &Path) -> Result<Run, Error> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -133,9 +140,9 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut lines = contents.lines();
+    let all_lines: Vec<&str> = contents.lines().collect();
 
-    let header_line = lines.next().ok_or_else(|| Error::InvalidRunData {
+    let header_line = all_lines.first().ok_or_else(|| Error::InvalidRunData {
         path: path.to_path_buf(),
         reason: "empty NDJSON file".into(),
     })?;
@@ -145,8 +152,33 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
             reason: format!("invalid NDJSON header: {e}"),
         })?;
 
+    // Determine v3 vs v4 format and identify frame lines.
+    // v3: function names in header, all remaining lines are frames.
+    // v4: header.functions is empty; last non-empty line may be a trailer with names.
+    let (fn_names, frame_lines): (Vec<String>, &[&str]) = if !header.functions.is_empty() {
+        // v3: names in header, everything after header is frames.
+        (header.functions, &all_lines[1..])
+    } else {
+        // v4: check the last non-empty line for a trailer.
+        let body = &all_lines[1..];
+        let last_non_empty = body.iter().rposition(|l| !l.trim().is_empty());
+        match last_non_empty {
+            Some(idx) => {
+                let candidate = body[idx].trim();
+                match serde_json::from_str::<NdjsonTrailer>(candidate) {
+                    Ok(trailer) => (trailer.functions, &body[..idx]),
+                    Err(_) => {
+                        // No valid trailer -- generate placeholder names after parsing frames.
+                        (Vec::new(), body)
+                    }
+                }
+            }
+            None => (Vec::new(), body),
+        }
+    };
+
     let mut frames: Vec<Vec<FrameFnEntry>> = Vec::new();
-    for line in lines {
+    for line in frame_lines {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -172,7 +204,18 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         frames.push(entries);
     }
 
-    let fn_names = header.functions;
+    // If no names were resolved (v4 crash recovery), generate placeholders from frame data.
+    let fn_names = if fn_names.is_empty() {
+        let max_id = frames
+            .iter()
+            .flat_map(|f| f.iter())
+            .map(|e| e.fn_id)
+            .max()
+            .unwrap_or(0);
+        (0..=max_id).map(|i| format!("fn_{i}")).collect()
+    } else {
+        fn_names
+    };
 
     // Aggregate into Run.
     let has_cpu = header.has_cpu_time;
@@ -1353,6 +1396,66 @@ mod tests {
             "expected ~4.1ms, got {}",
             update.self_ms
         );
+    }
+
+    #[test]
+    fn load_ndjson_v4_with_trailer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.ndjson");
+        // v4 format: header with no functions, frames, trailer with functions
+        fs::write(
+            &path,
+            r#"{"format_version":4,"run_id":"test","timestamp_ms":1000}
+{"frame":0,"fns":[{"id":0,"calls":3,"self_ns":5000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+{"frame":1,"fns":[{"id":1,"calls":1,"self_ns":2000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+{"functions":["alpha","beta"]}
+"#,
+        )
+        .unwrap();
+        let (run, frame_data) = load_ndjson(&path).unwrap();
+        assert_eq!(run.run_id.as_deref(), Some("test"));
+        assert_eq!(run.functions.len(), 2);
+        assert_eq!(run.functions[0].name, "alpha");
+        assert_eq!(run.functions[0].calls, 3);
+        assert_eq!(run.functions[1].name, "beta");
+        assert_eq!(run.functions[1].calls, 1);
+        assert_eq!(frame_data.fn_names, vec!["alpha", "beta"]);
+        assert_eq!(frame_data.frames.len(), 2);
+    }
+
+    #[test]
+    fn load_ndjson_v4_without_trailer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("crash.ndjson");
+        // v4 format: header with no functions, frames, NO trailer (simulates crash)
+        fs::write(
+            &path,
+            r#"{"format_version":4,"run_id":"crash","timestamp_ms":2000}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":100,"ac":0,"ab":0,"fc":0,"fb":0},{"id":2,"calls":1,"self_ns":200,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#,
+        )
+        .unwrap();
+        let (run, frame_data) = load_ndjson(&path).unwrap();
+        // With no trailer, placeholder names should be generated
+        assert_eq!(run.functions.len(), 3); // fn_0, fn_1, fn_2 (max id is 2)
+        assert_eq!(run.functions[0].name, "fn_0");
+        assert_eq!(run.functions[2].name, "fn_2");
+        assert_eq!(frame_data.frames.len(), 1);
+    }
+
+    #[test]
+    fn load_ndjson_v3_still_works() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v3.ndjson");
+        fs::write(
+            &path,
+            r#"{"format_version":3,"timestamp_ms":1000,"functions":["foo","bar"]}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":100,"ac":0,"ab":0,"fc":0,"fb":0}]}
+"#,
+        )
+        .unwrap();
+        let (run, _) = load_ndjson(&path).unwrap();
+        assert_eq!(run.functions[0].name, "foo");
     }
 
     #[test]
