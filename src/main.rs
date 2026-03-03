@@ -170,10 +170,10 @@ fn unique_skip_reasons(skipped: &[SkippedFunction]) -> String {
         .join(", ")
 }
 
-/// Build an instrumented binary and return (binary_path, runs_dir).
+/// Build an instrumented binary and return (binary_path, runs_dir, instrumented_fn_count).
 ///
 /// Returns `Ok(None)` when `--list-skipped` is used (early exit after printing).
-fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
+fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf, usize)>, Error> {
     let BuildOpts {
         fn_patterns,
         exact,
@@ -395,11 +395,11 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf)>, Error> {
     // Build the instrumented binary.
     let binary = build_instrumented(&staging, &target_dir, package_name.as_deref())?;
 
-    Ok(Some((binary, runs_dir)))
+    Ok(Some((binary, runs_dir, total_fns)))
 }
 
 fn cmd_build(opts: BuildOpts) -> Result<(), Error> {
-    let Some((binary, _runs_dir)) = build_project(opts)? else {
+    let Some((binary, _runs_dir, _total_fns)) = build_project(opts)? else {
         return Ok(());
     };
     let display_name = binary
@@ -483,7 +483,7 @@ fn cmd_profile(
     ignore_exit_code: bool,
     args: Vec<String>,
 ) -> Result<(), Error> {
-    let Some((binary, runs_dir)) = build_project(opts)? else {
+    let Some((binary, runs_dir, total_fns)) = build_project(opts)? else {
         return Ok(());
     };
     let display_name = binary
@@ -527,8 +527,13 @@ fn cmd_profile(
             // Piano's NoRuns to avoid cascading errors.
             Ok(())
         }
+        Err(Error::NoRuns) if total_fns == 0 => {
+            // No functions were instrumented -- the binary ran but had
+            // nothing to record.
+            Err(Error::NoFunctionsInstrumented)
+        }
         Err(Error::NoRuns) => {
-            // Program exited successfully but no data was written.
+            // Functions were instrumented but no data was written.
             // Something went wrong with the runtime's write -- give an
             // actionable message.
             Err(Error::NoDataWritten(runs_dir))
