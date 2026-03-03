@@ -120,7 +120,7 @@ fn stmt_has_direct_await(stmt: &syn::Stmt) -> bool {
 }
 
 /// For if/while/match statements where `.await` is in the condition/scrutinee,
-/// inject `_piano_alloc.resume()` at the start and `_piano_alloc.save()` at
+/// inject `__piano_alloc.resume()` at the start and `__piano_alloc.save()` at
 /// the end of each body block. This ensures allocations inside the body are
 /// tracked rather than being zeroed by the save/resume that wraps the entire
 /// statement.
@@ -198,16 +198,16 @@ fn inject_alloc_brackets_in_if(expr_if: &mut syn::ExprIf) {
     }
 }
 
-/// Insert `_piano_alloc.resume()` as the first statement and
-/// `_piano_alloc.save()` as the last statement of a block.
+/// Insert `__piano_alloc.resume()` as the first statement and
+/// `__piano_alloc.save()` as the last statement of a block.
 fn bracket_block(block: &mut syn::Block) {
-    let resume: syn::Stmt = syn::parse_quote! { _piano_alloc.resume(); };
-    let save: syn::Stmt = syn::parse_quote! { _piano_alloc.save(); };
+    let resume: syn::Stmt = syn::parse_quote! { __piano_alloc.resume(); };
+    let save: syn::Stmt = syn::parse_quote! { __piano_alloc.save(); };
     block.stmts.insert(0, resume);
     block.stmts.push(save);
 }
 
-/// Recursively inject `_piano_guard.check();` after each statement that
+/// Recursively inject `__piano_guard.check();` after each statement that
 /// directly contains `.await` or a macro invocation, at every nesting depth.
 ///
 /// Uses `VisitMut` to walk into if/match/loop/while/for/block bodies so
@@ -233,17 +233,17 @@ fn inject_await_checks(block: &mut syn::Block) {
                     // block so allocations inside the body are tracked.
                     inject_alloc_body_brackets(&mut stmt);
                     let save_stmt: syn::Stmt = syn::parse_quote! {
-                        _piano_alloc.save();
+                        __piano_alloc.save();
                     };
                     new_stmts.push(save_stmt);
                 }
                 new_stmts.push(stmt);
                 if has_await {
                     let check_stmt: syn::Stmt = syn::parse_quote! {
-                        _piano_guard.check();
+                        __piano_guard.check();
                     };
                     let resume_stmt: syn::Stmt = syn::parse_quote! {
-                        _piano_alloc.resume();
+                        __piano_alloc.resume();
                     };
                     new_stmts.push(check_stmt);
                     new_stmts.push(resume_stmt);
@@ -284,7 +284,7 @@ impl Instrumenter {
             return;
         }
         let guard_stmt: syn::Stmt = syn::parse_quote! {
-            let _piano_guard = piano_runtime::enter(#name);
+            let __piano_guard = piano_runtime::enter(#name);
         };
         block.stmts.insert(0, guard_stmt);
 
@@ -298,7 +298,7 @@ impl Instrumenter {
             // Inject AllocAccumulator as second statement. Drops first due to
             // reverse declaration order, writing alloc total before Guard reads it.
             let alloc_stmt: syn::Stmt = syn::parse_quote! {
-                let mut _piano_alloc = piano_runtime::AllocAccumulator::new();
+                let mut __piano_alloc = piano_runtime::AllocAccumulator::new();
             };
             block.stmts.insert(1, alloc_stmt);
         }
@@ -308,10 +308,10 @@ impl Instrumenter {
         if let Some(pattern) = find_concurrency_pattern(block) {
             self.concurrency.push((name.to_string(), pattern));
             let fork_owned_stmt: syn::Stmt = syn::parse_quote! {
-                let _piano_ctx_owned = piano_runtime::fork();
+                let __piano_ctx_owned = piano_runtime::fork();
             };
             let fork_ref_stmt: syn::Stmt = syn::parse_quote! {
-                let _piano_ctx = _piano_ctx_owned.as_ref();
+                let __piano_ctx = __piano_ctx_owned.as_ref();
             };
             // Insert after the guard (position 1, 2)
             block.stmts.insert(1, fork_owned_stmt);
@@ -522,7 +522,7 @@ fn receiver_has_parallel_method(expr: &syn::Expr) -> bool {
 
 fn inject_adopt_at_closure_start(closure: &mut syn::ExprClosure) {
     let adopt_stmt: syn::Stmt = syn::parse_quote! {
-        let _piano_adopt = _piano_ctx.map(|c| piano_runtime::adopt(c));
+        let __piano_adopt = __piano_ctx.map(|c| piano_runtime::adopt(c));
     };
     match &mut *closure.body {
         syn::Expr::Block(block) => {
@@ -550,7 +550,7 @@ fn recurse_closure_body_for_spawns(closure: &mut syn::ExprClosure) {
 }
 
 /// Walk statements, injecting adopt into spawn closures.
-/// `_piano_ctx` is `Option<&SpanContext>` which is `Copy`, so `move` closures
+/// `__piano_ctx` is `Option<&SpanContext>` which is `Copy`, so `move` closures
 /// can capture it without ownership issues.
 fn inject_adopt_in_stmts(stmts: &mut [syn::Stmt]) {
     for stmt in stmts.iter_mut() {
@@ -963,17 +963,17 @@ fn is_non_rust_extern(tokens: &[proc_macro2::TokenTree], i: usize) -> bool {
 /// Build the guard statement tokens for a function name.
 ///
 /// For a literal name like `initialize`:
-///   `let _piano_guard = piano_runtime::enter("initialize");`
+///   `let __piano_guard = piano_runtime::enter("initialize");`
 ///
 /// For a metavar name like `$name`:
-///   `let _piano_guard = piano_runtime::enter(stringify!($name));`
+///   `let __piano_guard = piano_runtime::enter(stringify!($name));`
 fn make_guard_tokens(name_tokens: &[proc_macro2::TokenTree]) -> proc_macro2::TokenStream {
     let is_metavar = name_tokens.len() == 2
         && matches!(&name_tokens[0], proc_macro2::TokenTree::Punct(p) if p.as_char() == '$');
 
     if is_metavar {
         // For metavar names, we need to build:
-        //   let _piano_guard = piano_runtime::enter(stringify!($name));
+        //   let __piano_guard = piano_runtime::enter(stringify!($name));
         // We construct the tokens manually because `quote!` doesn't emit `$`.
         let dollar = proc_macro2::Punct::new('$', proc_macro2::Spacing::Alone);
         let metavar_ident = name_tokens[1].clone();
@@ -1002,14 +1002,14 @@ fn make_guard_tokens(name_tokens: &[proc_macro2::TokenTree]) -> proc_macro2::Tok
             .collect()
         };
 
-        // Build: let _piano_guard = piano_runtime::enter(stringify!($name));
+        // Build: let __piano_guard = piano_runtime::enter(stringify!($name));
         let enter_arg =
             proc_macro2::Group::new(proc_macro2::Delimiter::Parenthesis, stringify_call);
 
         let span = proc_macro2::Span::call_site();
         vec![
             proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("let", span)),
-            proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("_piano_guard", span)),
+            proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("__piano_guard", span)),
             proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
                 '=',
                 proc_macro2::Spacing::Alone,
@@ -1041,7 +1041,7 @@ fn make_guard_tokens(name_tokens: &[proc_macro2::TokenTree]) -> proc_macro2::Tok
             ),
         };
         quote! {
-            let _piano_guard = piano_runtime::enter(#name_str);
+            let __piano_guard = piano_runtime::enter(#name_str);
         }
     }
 }
@@ -2058,7 +2058,7 @@ fn parallel_work() {
     #[test]
     fn rayon_scope_spawn_in_loop_with_move_closures() {
         // Simulates real rayon pattern: s.spawn(move |_| { ... }) in a for loop.
-        // `_piano_ctx` is `Option<&SpanContext>` which is Copy, so move closures work.
+        // `__piano_ctx` is `Option<&SpanContext>` which is Copy, so move closures work.
         let source = r#"
 fn concurrent_discover() {
     rayon::scope(|s| {
@@ -2268,7 +2268,7 @@ async fn do_work() {
 }
 "#;
         let result = instrument_source(source, &targets, false).unwrap();
-        let check_count = result.source.matches("_piano_guard.check()").count();
+        let check_count = result.source.matches("__piano_guard.check()").count();
         assert_eq!(
             check_count, 2,
             "should inject check() after each .await statement. Got:\n{}",
@@ -2287,7 +2287,7 @@ fn do_work() {
 "#;
         let result = instrument_source(source, &targets, false).unwrap();
         assert_eq!(
-            result.source.matches("_piano_guard.check()").count(),
+            result.source.matches("__piano_guard.check()").count(),
             0,
             "sync fn should not get check() calls. Got:\n{}",
             result.source
@@ -2304,7 +2304,7 @@ async fn not_targeted() {
 "#;
         let result = instrument_source(source, &targets, false).unwrap();
         assert_eq!(
-            result.source.matches("_piano_guard.check()").count(),
+            result.source.matches("__piano_guard.check()").count(),
             0,
             "non-target async fn should not get check() calls. Got:\n{}",
             result.source
@@ -2681,7 +2681,7 @@ async fn example() {
         // not after the if statement.
         assert_appears_before(
             &result.source,
-            "_piano_guard.check()",
+            "__piano_guard.check()",
             "process()",
             "inside if block",
         );
@@ -2704,7 +2704,7 @@ async fn example(x: u32) {
         let result = instrument_source(source, &targets, false).unwrap();
         assert_appears_before(
             &result.source,
-            "_piano_guard.check()",
+            "__piano_guard.check()",
             "process()",
             "inside match arm",
         );
@@ -2724,7 +2724,7 @@ async fn example() {
         let result = instrument_source(source, &targets, false).unwrap();
         assert_appears_before(
             &result.source,
-            "_piano_guard.check()",
+            "__piano_guard.check()",
             "process()",
             "inside loop",
         );
@@ -2746,7 +2746,7 @@ async fn example() {
 }
 "#;
         let result = instrument_source(source, &targets, false).unwrap();
-        let check_count = result.source.matches("_piano_guard.check()").count();
+        let check_count = result.source.matches("__piano_guard.check()").count();
         assert_eq!(
             check_count, 3,
             "should inject check() after every .await at any depth. Got:\n{}",
@@ -2755,7 +2755,7 @@ async fn example() {
         // Verify the innermost check() is between save().await and cleanup()
         let save_pos = result.source.find("save()").unwrap();
         let cleanup_pos = result.source.find("cleanup()").unwrap();
-        let check_between = result.source[save_pos..cleanup_pos].contains("_piano_guard.check()");
+        let check_between = result.source[save_pos..cleanup_pos].contains("__piano_guard.check()");
         assert!(
             check_between,
             "check() should appear between save().await and cleanup(). Got:\n{}",
@@ -2779,7 +2779,7 @@ async fn example() {
         let result = instrument_source(source, &targets, false).unwrap();
         assert_appears_before(
             &result.source,
-            "_piano_guard.check()",
+            "__piano_guard.check()",
             "process()",
             "inside else block",
         );
@@ -2799,7 +2799,7 @@ async fn example() {
         let result = instrument_source(source, &targets, false).unwrap();
         assert_appears_before(
             &result.source,
-            "_piano_guard.check()",
+            "__piano_guard.check()",
             "log()",
             "inside while let body",
         );
@@ -2819,7 +2819,7 @@ async fn example() {
         let result = instrument_source(source, &targets, false).unwrap();
         assert_appears_before(
             &result.source,
-            "_piano_guard.check()",
+            "__piano_guard.check()",
             "log()",
             "inside for loop body",
         );
@@ -2839,7 +2839,7 @@ async fn example() {
         let result = instrument_source(source, &targets, false).unwrap();
         assert_appears_before(
             &result.source,
-            "_piano_guard.check()",
+            "__piano_guard.check()",
             "process()",
             "inside bare block",
         );
@@ -2859,19 +2859,19 @@ async fn example() {
         let result = instrument_source(source, &targets, false).unwrap();
         // The .await is in the condition, so check() goes after the whole if statement
         assert_eq!(
-            result.source.matches("_piano_guard.check()").count(),
+            result.source.matches("__piano_guard.check()").count(),
             1,
             "expected exactly 1 check() call",
         );
         assert_appears_before(
             &result.source,
             "process()",
-            "_piano_guard.check()",
+            "__piano_guard.check()",
             "check() should be after the if block containing process()",
         );
         assert_appears_before(
             &result.source,
-            "_piano_guard.check()",
+            "__piano_guard.check()",
             "cleanup()",
             "after if with .await in condition",
         );
@@ -2894,27 +2894,27 @@ async fn example() {
         // allocations inside process() are tracked, not zeroed.
         assert_appears_before(
             src,
-            "_piano_alloc.save()",
+            "__piano_alloc.save()",
             "stream.next()",
             "save before if",
         );
         // resume() injected at start of if body, before process()
         assert!(
-            src.contains("_piano_alloc.resume()"),
+            src.contains("__piano_alloc.resume()"),
             "should have resume() call. Got:\n{src}",
         );
         // The resume inside the body must come before process()
         // Find resume inside body: after "is_some()" and before "process()"
         let cond_pos = src.find("is_some()").unwrap();
         let process_pos = src.find("process()").unwrap();
-        let body_resume_pos = src[cond_pos..].find("_piano_alloc.resume()").unwrap() + cond_pos;
+        let body_resume_pos = src[cond_pos..].find("__piano_alloc.resume()").unwrap() + cond_pos;
         assert!(
             body_resume_pos < process_pos,
             "resume() should appear in body before process(). Got:\n{src}",
         );
         // save() at end of body, after process() but before check()
-        let body_save_pos = src[process_pos..].find("_piano_alloc.save()").unwrap() + process_pos;
-        let check_pos = src.find("_piano_guard.check()").unwrap();
+        let body_save_pos = src[process_pos..].find("__piano_alloc.save()").unwrap() + process_pos;
+        let check_pos = src.find("__piano_guard.check()").unwrap();
         assert!(
             body_save_pos < check_pos,
             "body save() should appear after process() but before check(). Got:\n{src}",
@@ -2940,12 +2940,12 @@ async fn example() {
         let fallback_pos = src.find("fallback()").unwrap();
         // resume before process in then-branch
         let then_resume = src[..process_pos]
-            .rfind("_piano_alloc.resume()")
+            .rfind("__piano_alloc.resume()")
             .expect("then-branch should have resume() before process()");
         assert!(then_resume < process_pos);
         // resume before fallback in else-branch
         let else_resume = src[..fallback_pos]
-            .rfind("_piano_alloc.resume()")
+            .rfind("__piano_alloc.resume()")
             .expect("else-branch should have resume() before fallback()");
         assert!(
             else_resume > process_pos,
@@ -2953,11 +2953,11 @@ async fn example() {
         );
         // save after process in then-branch
         let then_save = src[process_pos..fallback_pos]
-            .find("_piano_alloc.save()")
+            .find("__piano_alloc.save()")
             .expect("then-branch should have save() after process()");
         assert!(then_save > 0);
         // save after fallback in else-branch
-        let after_fallback = src[fallback_pos..].find("_piano_alloc.save()");
+        let after_fallback = src[fallback_pos..].find("__piano_alloc.save()");
         assert!(
             after_fallback.is_some(),
             "else-branch should have save() after fallback(). Got:\n{src}",
@@ -2979,13 +2979,13 @@ async fn example() {
         let cond_pos = src.find("is_some()").unwrap();
         let process_pos = src.find("process()").unwrap();
         // resume at start of while body
-        let body_resume = src[cond_pos..].find("_piano_alloc.resume()").unwrap() + cond_pos;
+        let body_resume = src[cond_pos..].find("__piano_alloc.resume()").unwrap() + cond_pos;
         assert!(
             body_resume < process_pos,
             "while body should have resume() before process(). Got:\n{src}",
         );
         // save at end of while body
-        let body_save = src[process_pos..].find("_piano_alloc.save()");
+        let body_save = src[process_pos..].find("__piano_alloc.save()");
         assert!(
             body_save.is_some(),
             "while body should have save() after process(). Got:\n{src}",
@@ -3009,12 +3009,12 @@ async fn example() {
         let fallback_pos = src.find("fallback()").unwrap();
         // resume before process in Some arm
         let some_resume = src[..process_pos]
-            .rfind("_piano_alloc.resume()")
+            .rfind("__piano_alloc.resume()")
             .expect("Some arm should have resume() before process(v)");
         assert!(some_resume < process_pos);
         // resume before fallback in None arm
         let none_resume = src[..fallback_pos]
-            .rfind("_piano_alloc.resume()")
+            .rfind("__piano_alloc.resume()")
             .expect("None arm should have resume() before fallback()");
         assert!(
             none_resume > process_pos,
@@ -3037,13 +3037,13 @@ async fn example() {
         let await_pos = src.find("get_items()").unwrap();
         let process_pos = src.find("process(item)").unwrap();
         // resume at start of for body
-        let body_resume = src[await_pos..].find("_piano_alloc.resume()").unwrap() + await_pos;
+        let body_resume = src[await_pos..].find("__piano_alloc.resume()").unwrap() + await_pos;
         assert!(
             body_resume < process_pos,
             "for body should have resume() before process(item). Got:\n{src}",
         );
         // save at end of for body
-        let body_save = src[process_pos..].find("_piano_alloc.save()");
+        let body_save = src[process_pos..].find("__piano_alloc.save()");
         assert!(
             body_save.is_some(),
             "for body should have save() after process(item). Got:\n{src}",
@@ -3065,11 +3065,11 @@ async fn example() {
         let process_pos = src.find("process(v)").unwrap();
         // resume before process in body
         let body_resume = src[..process_pos]
-            .rfind("_piano_alloc.resume()")
+            .rfind("__piano_alloc.resume()")
             .expect("if-let body should have resume() before process(v)");
         assert!(body_resume < process_pos);
         // save after process in body
-        let body_save = src[process_pos..].find("_piano_alloc.save()");
+        let body_save = src[process_pos..].find("__piano_alloc.save()");
         assert!(
             body_save.is_some(),
             "if-let body should have save() after process(v). Got:\n{src}",
@@ -3090,12 +3090,12 @@ async fn example() {
         // A bare .await statement should have save/check/resume around it
         // but NOT inject extra resume/save brackets (no body to bracket).
         // Count resume() calls: should be exactly 1 (after check)
-        let resume_count = src.matches("_piano_alloc.resume()").count();
+        let resume_count = src.matches("__piano_alloc.resume()").count();
         assert_eq!(
             resume_count, 1,
             "bare .await should have exactly 1 resume(), got {resume_count}:\n{src}",
         );
-        let save_count = src.matches("_piano_alloc.save()").count();
+        let save_count = src.matches("__piano_alloc.save()").count();
         assert_eq!(
             save_count, 1,
             "bare .await should have exactly 1 save(), got {save_count}:\n{src}",
@@ -3115,7 +3115,7 @@ async fn example() {
         let result = instrument_source(source, &targets, false).unwrap();
         // Only one check() -- after send().await. The closure and async block
         // have separate async contexts with their own guards.
-        let check_count = result.source.matches("_piano_guard.check()").count();
+        let check_count = result.source.matches("__piano_guard.check()").count();
         assert_eq!(
             check_count, 1,
             "expected 1 check() (after send().await only), got {check_count}:\n{}",
@@ -3140,17 +3140,17 @@ async fn handler() {
         // The select! macro may contain .await points invisible to syn.
         // save/check/resume should be injected around it.
         assert!(
-            result.source.contains("_piano_alloc.save()"),
+            result.source.contains("__piano_alloc.save()"),
             "should inject save() before macro invocation. Got:\n{}",
             result.source
         );
         assert!(
-            result.source.contains("_piano_guard.check()"),
+            result.source.contains("__piano_guard.check()"),
             "should inject check() after macro invocation. Got:\n{}",
             result.source
         );
         assert!(
-            result.source.contains("_piano_alloc.resume()"),
+            result.source.contains("__piano_alloc.resume()"),
             "should inject resume() after macro invocation. Got:\n{}",
             result.source
         );
@@ -3169,13 +3169,13 @@ fn handler() {
         let result = instrument_source(source, &targets, false).unwrap();
         // Sync functions should not get check()/save()/resume() even with macros.
         assert_eq!(
-            result.source.matches("_piano_guard.check()").count(),
+            result.source.matches("__piano_guard.check()").count(),
             0,
             "sync fn should not get check() calls. Got:\n{}",
             result.source
         );
         assert_eq!(
-            result.source.matches("_piano_alloc.save()").count(),
+            result.source.matches("__piano_alloc.save()").count(),
             0,
             "sync fn should not get save() calls. Got:\n{}",
             result.source
@@ -3195,17 +3195,17 @@ async fn handler() {
         // Expression-position macros (with parens) are ExprMacro in syn.
         // They should also get save/check/resume.
         assert!(
-            result.source.contains("_piano_guard.check()"),
+            result.source.contains("__piano_guard.check()"),
             "should inject check() after expression-position macro. Got:\n{}",
             result.source
         );
         assert!(
-            result.source.contains("_piano_alloc.save()"),
+            result.source.contains("__piano_alloc.save()"),
             "should inject save() before expression-position macro. Got:\n{}",
             result.source
         );
         assert!(
-            result.source.contains("_piano_alloc.resume()"),
+            result.source.contains("__piano_alloc.resume()"),
             "should inject resume() after expression-position macro. Got:\n{}",
             result.source
         );
@@ -3227,8 +3227,8 @@ async fn fetch() {
             result.source
         );
         assert!(
-            result.source.contains("_piano_alloc"),
-            "accumulator variable should be named _piano_alloc. Got:\n{}",
+            result.source.contains("__piano_alloc"),
+            "accumulator variable should be named __piano_alloc. Got:\n{}",
             result.source
         );
     }
@@ -3264,7 +3264,7 @@ async fn fetch() {
 
         let save_pos = result
             .source
-            .find("_piano_alloc.save()")
+            .find("__piano_alloc.save()")
             .expect("should have save()");
         let await_pos = result
             .source
@@ -3272,11 +3272,11 @@ async fn fetch() {
             .expect("should have .await");
         let check_pos = result
             .source
-            .find("_piano_guard.check()")
+            .find("__piano_guard.check()")
             .expect("should have check()");
         let resume_pos = result
             .source
-            .find("_piano_alloc.resume()")
+            .find("__piano_alloc.resume()")
             .expect("should have resume()");
 
         assert!(
@@ -3300,9 +3300,9 @@ async fn multi() {
         let targets: HashSet<String> = ["multi".to_string()].into();
         let result = instrument_source(source, &targets, false).unwrap();
 
-        let save_count = result.source.matches("_piano_alloc.save()").count();
-        let resume_count = result.source.matches("_piano_alloc.resume()").count();
-        let check_count = result.source.matches("_piano_guard.check()").count();
+        let save_count = result.source.matches("__piano_alloc.save()").count();
+        let resume_count = result.source.matches("__piano_alloc.resume()").count();
+        let check_count = result.source.matches("__piano_guard.check()").count();
 
         assert_eq!(
             save_count, 3,
@@ -3427,17 +3427,17 @@ async fn example() {
         let fallback_pos = src.find("fallback()").unwrap();
         // resume before process in Some arm (non-block)
         let some_resume = src[..process_pos]
-            .rfind("_piano_alloc.resume()")
+            .rfind("__piano_alloc.resume()")
             .expect("Some arm should have resume() before process(v)");
         assert!(some_resume < process_pos);
         // save after process in Some arm
         let some_save = src[process_pos..fallback_pos]
-            .find("_piano_alloc.save()")
+            .find("__piano_alloc.save()")
             .expect("Some arm should have save() after process(v)");
         assert!(some_save > 0);
         // resume before fallback in None arm (non-block)
         let none_resume = src[..fallback_pos]
-            .rfind("_piano_alloc.resume()")
+            .rfind("__piano_alloc.resume()")
             .expect("None arm should have resume() before fallback()");
         assert!(
             none_resume > process_pos,
