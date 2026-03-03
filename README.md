@@ -1,34 +1,34 @@
 # piano
 
-Automated instrumentation-based profiling for Rust. Point it at your project, get back self-time, call counts, and allocation data per function -- sync, threaded, and async.
+[![Crates.io](https://img.shields.io/crates/v/piano.svg)](https://crates.io/crates/piano)
+[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+Automatic instrumentation-based profiler for Rust. Measures self-time, call counts, and heap allocations per function across sync, threaded, and async code.
+
+Given this program:
+
+```rust
+#[tokio::main]
+async fn main() {
+    let config = load_config("settings.toml");
+    let data = fetch_all(&config.urls).await;
+    let report = analyze(data);
+    write_output(report);
+}
+```
+
+`piano` reports:
 
 ```
-$ piano profile
-found 5 function(s) across 3 file(s)
-built: target/piano/release/my-project
-... normal program output ...
-
 Function                                       Self    Calls   Allocs  Alloc Bytes
 ----------------------------------------------------------------------------------
-parse                                       341.21ms       12      840       62.5KB
-resolve                                     141.13ms       47      329       24.1KB
-parse_item                                   94.58ms      108     1620      126.3KB
+fetch_all                                   341.21ms        1      840       62.5KB
+analyze                                     141.13ms        1      329       24.1KB
+load_config                                  12.44ms        1       52        4.1KB
+write_output                                  3.02ms        1       12        1.2KB
 ```
 
-Or step by step:
-
-```
-$ piano build
-found 5 function(s) across 3 file(s)
-built: target/piano/release/my-project
-
-$ piano run
-... normal program output ...
-
-$ piano report
-```
-
-Piano rewrites your source at the AST level to inject RAII timing guards and an allocation-tracking allocator, builds the instrumented binary, and flushes per-frame results to `target/piano/runs/` on process exit. Your original source is never modified.
+Self-time is time spent in the function itself, excluding called functions. `fetch_all` took 341ms of its own work. The `.await` points and thread migrations are tracked automatically. Programs using threads (rayon, std::thread) and async runtimes (tokio, async-std) work automatically.
 
 ## Install
 
@@ -40,57 +40,58 @@ Requires Rust 1.88+.
 
 ## Usage
 
-### Instrument and build
-
-By default, `piano build` instruments all functions in your project:
+Three steps: instrument, run, report.
 
 ```
-$ piano build
-found 5 function(s) across 3 file(s)
-built: target/piano/release/my-project
+$ piano build                                # instrument all functions and compile
+$ piano run                                  # execute the instrumented binary
+$ piano report                               # display results
 ```
 
-Narrow scope by name, file, or module:
+If your program takes arguments, pass them after `--`:
 
 ```
-$ piano build --fn parse                    # functions containing "parse"
-$ piano build --fn "Parser::parse"          # specific impl method
-$ piano build --fn parse --exact            # exact match only
-$ piano build --file src/lexer.rs           # all functions in a file
-$ piano build --mod resolver                # all functions in a module
-$ piano build --fn parse --fn resolve       # multiple patterns
+$ piano run -- --input data.csv --verbose
 ```
 
-See which functions Piano cannot instrument (const, unsafe, extern):
+`piano profile` chains all three steps into one command:
 
 ```
-$ piano build --list-skipped
+$ piano profile                              # build + run + report
+$ piano profile -- --input data.csv          # with args passed to your binary
 ```
 
-The instrumented binary is written to `target/piano/release/<name>`.
-
-### Execute the instrumented binary
-
-`piano run` finds and executes the most recently built instrumented binary:
+Narrow instrumentation to specific functions, files, or modules:
 
 ```
-$ piano run
-$ piano run -- --input data.csv --verbose    # pass arguments after --
+$ piano build --fn parse                     # functions matching "parse"
+$ piano build --fn "Parser::parse"           # specific impl method
+$ piano build --file src/lexer.rs            # all functions in a file
+$ piano build --mod resolver                 # all functions in a module
 ```
 
-It looks in `target/piano/release/` and picks the most recent executable. Piano exits with the binary's exit code.
+These flags work with `piano profile` too: `piano profile --fn parse -- --input data.csv`.
 
-### One-step profiling
+Add `--cpu-time` to measure per-thread CPU time alongside wall time (Linux + macOS, 64-bit only).
 
-`piano profile` combines build, execute, and report into one command:
+### Compare runs
+
+Tag a run, make changes, profile again, diff:
 
 ```
-$ piano profile --fn parse -- --input data.csv
+$ piano tag baseline
+# ... make changes ...
+$ piano profile
+$ piano tag current
+$ piano diff baseline current
+Function                                   baseline    current      Delta     Allocs    A.Delta
+----------------------------------------------------------------------------------------------
+parse                                      341.21ms    198.44ms   -142.77ms        640       -200
+parse_item                                  94.58ms     88.12ms     -6.46ms       1240       -380
+resolve                                    141.13ms    141.09ms     -0.04ms        329         +0
 ```
 
-### Per-frame profiling
-
-Each instrumented run records per-frame timing and allocation data. The default `piano report` shows aggregates (above). Use `--frames` for a per-frame breakdown with spike detection:
+### Per-frame breakdown
 
 ```
 $ piano report --frames
@@ -105,89 +106,28 @@ $ piano report --frames
 5 frames | 1 spikes (>2x median)
 ```
 
-Frames exceeding 2x the median total time are marked with `<<`.
-
-### Tag and compare runs
-
-```
-$ piano tag baseline
-tagged 'baseline'
-
-# ... make changes, rebuild, re-run ...
-
-$ piano tag current
-tagged 'current'
-
-$ piano diff baseline current
-Function                                   baseline    current      Delta     Allocs    A.Delta
-----------------------------------------------------------------------------------------------
-parse                                      341.21ms    198.44ms   -142.77ms        640       -200
-parse_item                                  94.58ms     88.12ms     -6.46ms       1240       -380
-resolve                                    141.13ms    141.09ms     -0.04ms        329         +0
-```
-
-`piano tag` with no arguments lists all saved tags. `piano diff` with no arguments compares the two most recent runs. Both `piano report` and `piano diff` accept file paths or tag names.
-
-### CPU time
-
-Add `--cpu-time` to measure per-thread CPU time alongside wall-clock time (Linux + macOS, 64-bit only):
-
-```
-$ piano build --cpu-time
-```
-
-The report adds CPU columns so you can distinguish computation from I/O or sleeping.
-
-### Multi-threaded programs
-
-Programs using rayon or `std::thread::spawn` work out of the box. Piano detects concurrency patterns (rayon `par_iter`, `scope`, `join`, `std::thread::scope`) and tracks timing across threads. Each thread writes its own timing data with a shared `run_id`. `piano report` consolidates all files from the same run automatically.
-
-### Async programs
-
-Async functions instrumented with Piano track self-time and allocations correctly across `.await` points, even when tasks migrate between threads:
-
-```
-$ piano profile --fn handle_request
-Function                                       Self    Calls   Allocs  Alloc Bytes
-----------------------------------------------------------------------------------
-handle_request                               12.44ms      100      450       34.2KB
-fetch_data                                    8.91ms      100      200       15.8KB
-process_response                              3.12ms      100      150       11.4KB
-```
-
-When a tokio task migrates mid-function, Piano's guard detects the thread change and preserves wall-time measurement. Allocation tracking uses a save/resume pattern around `.await` to carry data across thread hops.
-
-### Platform-gated allocators
-
-Projects that gate their global allocator behind `#[cfg(...)]` -- common with `tikv-jemallocator` or `mimalloc` -- work correctly. Piano detects the cfg gate and injects a fallback allocator for platforms where the user's allocator is compiled out:
-
-```rust
-// Your code -- Piano handles this automatically
-#[cfg(target_os = "linux")]
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-```
+Frames exceeding 2x the median are flagged with `<<` for spike detection.
 
 ## How it works
 
-1. `piano build` copies your project to a staging directory
-2. Adds `piano-runtime` as a dependency in the staged `Cargo.toml`
-3. Parses Rust source with `syn`, finds functions matching your patterns, and injects `let _guard = piano_runtime::enter("name")` at the top of each
-4. Detects existing `#[global_allocator]` declarations (including cfg-gated ones) and wraps them with `PianoAllocator` for heap tracking
-5. Builds with `cargo build --release`
+1. Copies your project to a staging directory (your source is never modified)
+2. Adds `piano-runtime` as a dependency in the staged Cargo.toml
+3. Parses source with `syn` and injects timing guards into matched functions
+4. Wraps your global allocator (including cfg-gated ones) for heap tracking
+5. Builds with `cargo build --release`, outputs to `target/piano/`
 
-Each guard records wall-clock time on construction and drop. Self-time is computed by subtracting children's time from total time. The allocator attributes heap operations to the currently executing instrumented function, and frame summaries are computed when top-level guards complete. For async functions, guards detect thread migration on drop and allocation accumulators carry data across `.await` points via save/resume.
+The runtime has zero external dependencies to avoid conflicts with your project.
 
-Two crates: `piano` (CLI, AST rewriting, build orchestration, requires Rust 1.88) and `piano-runtime` (zero-dependency timing and allocation runtime injected into user projects, MSRV 1.59). The runtime has zero external dependencies to avoid version conflicts with user projects.
+## When to use something else
+
+`piano` adds ~61ns/call overhead on Apple Silicon and ~319ns/call on x86-64. You can narrow instrumentation with `--fn`, `--file`, or `--mod` to reduce this. For programs with millions of short function calls, a sampling profiler like `perf` or `cargo-flamegraph` will add less overhead. `piano` is a better fit when you want exact call counts, self-time breakdowns, or allocation tracking without configuring OS-level tooling.
 
 ## Limitations
 
-- Wall-clock timing by default. Use `--cpu-time` to add per-thread CPU time (Linux + macOS, 64-bit only).
-- Functions shorter than the guard overhead (~12ns on x86-64, ~59ns on Apple Silicon) will have noisy measurements.
-- Async functions that migrate threads record wall time accurately but self-time uses wall-time-only accounting on the migrated path.
-- Allocation tracking counts heap operations only (`alloc`/`dealloc`). Stack allocations and memory-mapped regions are not tracked.
-- `const fn`, `unsafe fn`, and `extern fn` are skipped during instrumentation (use `--list-skipped` to see them).
-- Profiling data is captured even when the instrumented program panics.
+- Timing bias per call: ~0.25ns Apple Silicon, ~13ns x86-64 Linux. Functions faster than the bias floor will show inflated times.
+- `const fn`, `unsafe fn`, and `extern fn` are skipped (use `--list-skipped` to see them)
+- Allocation tracking covers heap operations only (stack allocations are not tracked)
+- Binary crates only (no libraries)
 
 ## License
 
