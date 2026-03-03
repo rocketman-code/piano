@@ -2,6 +2,8 @@
 //! The instrumented project should build and run successfully, with only
 //! normal functions appearing in the output.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -102,15 +104,8 @@ fn special_fns_are_skipped_during_instrumentation() {
     );
 
     // Verify run file contains normal_work but NOT const/unsafe/extern fns.
-    let run_files: Vec<_> = fs::read_dir(&runs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
-
-    assert!(!run_files.is_empty(), "expected at least one run file");
-
-    let content = fs::read_to_string(run_files[0].path()).unwrap();
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
     assert!(
         content.contains("\"normal_work\""),
         "output should contain normal_work"

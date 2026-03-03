@@ -1,5 +1,7 @@
 //! Integration test: verify --cpu-time flag produces CPU time data in output.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -98,19 +100,10 @@ fn cpu_time_flag_produces_cpu_data() {
     );
 
     // Verify run file was written.
-    let run_files: Vec<_> = fs::read_dir(&runs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
-
-    assert!(
-        !run_files.is_empty(),
-        "expected at least one run file in {runs_dir:?}"
-    );
+    let run_file = common::largest_ndjson_file(&runs_dir);
 
     // Verify the run file contains CPU time data.
-    let content = fs::read_to_string(run_files[0].path()).unwrap();
+    let content = fs::read_to_string(&run_file).unwrap();
 
     // NDJSON: header should have has_cpu_time, entries should have csn field.
     assert!(

@@ -142,29 +142,32 @@ fn cfg_gated_allocator_reports_nonzero() {
 
     let content = fs::read_to_string(run_file).unwrap();
 
-    // NDJSON format:
-    //   Line 1 (header): {"format_version":3,...,"functions":["do_allocs","main"]}
-    //   Line 2+ (frames): {"frame":0,"fns":[{"id":0,"calls":1,"self_ns":...,"ac":N,"ab":N,...}]}
-    // "ac" = alloc_count, "ab" = alloc_bytes.
-    let mut lines = content.lines();
-    let header_line = lines
-        .next()
-        .expect("NDJSON should have at least a header line");
-    let header: serde_json::Value =
-        serde_json::from_str(header_line).expect("header should be valid JSON");
+    // NDJSON v4 format:
+    //   Line 1 (header): {"format_version":4,"run_id":"...","timestamp_ms":...}
+    //   Lines 2..N (frames): {"frame":0,"fns":[{"id":0,"calls":1,"self_ns":...,"ac":N,"ab":N,...}]}
+    //   Last line (trailer): {"functions":["do_allocs","main"]}
+    // "ac" = alloc_count, "ab" = alloc_bytes. Functions referenced by index from trailer.
 
-    // Find the function index for "do_allocs" in the header's functions array.
-    let fn_names = header
+    // v4: function names are in the trailer (last non-empty line), not the header.
+    let all_lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let trailer_line = all_lines
+        .last()
+        .expect("should have at least header + trailer");
+    let trailer: serde_json::Value =
+        serde_json::from_str(trailer_line).expect("trailer should be valid JSON");
+    let fn_names = trailer
         .get("functions")
         .and_then(|f| f.as_array())
-        .expect("header should have functions array");
+        .expect("trailer should have functions array");
     let do_allocs_id = fn_names
         .iter()
         .position(|n| n.as_str() == Some("do_allocs"))
         .expect("do_allocs should be in functions list");
 
-    // Search frame lines for an entry with that function id and non-zero "ac".
-    let has_alloc_data = lines.any(|line| {
+    // Search frame lines (skip header and trailer) for an entry with that function id
+    // and non-zero "ac".
+    let frame_lines = &all_lines[1..all_lines.len() - 1];
+    let has_alloc_data = frame_lines.iter().any(|line| {
         if let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) {
             frame
                 .get("fns")
