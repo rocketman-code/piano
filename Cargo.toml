@@ -6,10 +6,10 @@ name = "piano"
 version = "0.9.3"
 edition = "2024"
 rust-version = "1.88"
-description = "Automated instrumentation-based profiling for Rust"
+description = "One-command Rust profiler. Self-time, call counts, and allocations per function. No code changes required."
 license = "MIT"
 repository = "https://github.com/rocketman-code/piano"
-keywords = ["profiling", "instrumentation", "performance"]
+keywords = ["profiling", "profiler", "instrumentation", "performance", "timing"]
 categories = ["development-tools::profiling"]
 
 [dependencies]
