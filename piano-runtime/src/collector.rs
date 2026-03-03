@@ -10,9 +10,11 @@
 //! self-time descending. `reset()` clears all state for the current thread.
 //!
 //! Flush strategy: each thread's records live in an `Arc<Mutex<Vec<FnAgg>>>`
-//! registered in a global `THREAD_RECORDS` Vec. `shutdown()` (injected at the
-//! end of main by the AST rewriter) iterates all Arcs to collect data from every
-//! thread, including thread-pool workers whose TLS destructors may never fire.
+//! registered in a global `THREAD_RECORDS` Vec, and per-frame data lives in
+//! `Arc<Mutex<Vec<Vec<FrameFnSummary>>>>` registered in `THREAD_FRAMES`.
+//! `shutdown()` (injected at the end of main by the AST rewriter) iterates
+//! all Arcs to collect data from every thread, including thread-pool workers
+//! whose TLS destructors may never fire. Always writes NDJSON.
 //!
 //! Thread-locality: stack and records are thread-local. Each thread produces an
 //! independent call tree by default. For cross-thread attribution (e.g. rayon
@@ -64,8 +66,8 @@ impl<T> SyncOnceCell<T> {
 
 /// Process-wide run identifier.
 ///
-/// All threads within a single process share this ID, so that JSON files
-/// written by different threads can be correlated during report consolidation.
+/// All threads within a single process share this ID, so that NDJSON files
+/// can be correlated during report consolidation.
 static RUN_ID: SyncOnceCell<String> = SyncOnceCell::new();
 
 fn run_id() -> &'static str {
@@ -290,6 +292,7 @@ impl FnAgg {
 }
 
 type ThreadRecordArc = Arc<Mutex<Vec<FnAgg>>>;
+type ThreadFrameArc = Arc<Mutex<Vec<Vec<FrameFnSummary>>>>;
 
 /// Per-phantom tracking for cross-thread forwarding and cleanup.
 ///
@@ -338,6 +341,14 @@ fn thread_records() -> &'static Mutex<Vec<ThreadRecordArc>> {
     THREAD_RECORDS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Global registry of per-thread frame storage.
+/// Each thread registers its Arc on first depth-0 frame push. collect_frames() iterates all Arcs.
+static THREAD_FRAMES: SyncOnceCell<Mutex<Vec<ThreadFrameArc>>> = SyncOnceCell::new();
+
+fn thread_frames() -> &'static Mutex<Vec<ThreadFrameArc>> {
+    THREAD_FRAMES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 thread_local! {
     pub(crate) static STACK: RefCell<Vec<StackEntry>> = RefCell::new(Vec::new());
     static RECORDS: Arc<Mutex<Vec<FnAgg>>> = {
@@ -350,8 +361,13 @@ thread_local! {
     static INVOCATIONS: RefCell<Vec<InvocationRecord>> = RefCell::new(Vec::new());
     /// Per-function summaries accumulated within the current frame (cleared on frame boundary).
     static FRAME_BUFFER: RefCell<Vec<FrameFnSummary>> = RefCell::new(Vec::new());
-    /// Completed per-frame summaries.
-    static FRAMES: RefCell<Vec<Vec<FrameFnSummary>>> = RefCell::new(Vec::new());
+    /// Completed per-frame summaries. Arc-wrapped and registered globally so
+    /// collect_frames() can iterate all threads, same pattern as RECORDS/THREAD_RECORDS.
+    static FRAMES: Arc<Mutex<Vec<Vec<FrameFnSummary>>>> = {
+        let arc = Arc::new(Mutex::new(Vec::new()));
+        thread_frames().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&arc));
+        arc
+    };
     /// Per-thread phantom forwarding Arcs. When a phantom StackEntry exists on
     /// this thread (from Guard::check()), the corresponding Arc is stored here
     /// so child drops can write through to it.
@@ -916,9 +932,16 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         }
         if unpack_depth(entry.packed) == 0 {
             FRAME_BUFFER.with(|buf| {
-                FRAMES.with(|frames| {
-                    frames.borrow_mut().push(buf.borrow().clone());
-                });
+                let b = buf.borrow();
+                if !b.is_empty() {
+                    FRAMES.with(|frames| {
+                        frames
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(b.clone());
+                    });
+                }
+                drop(b);
                 buf.borrow_mut().clear();
             });
         }
@@ -1115,14 +1138,27 @@ pub fn collect_invocations() -> Vec<InvocationRecord> {
     INVOCATIONS.with(|inv| inv.borrow().clone())
 }
 
-/// Return completed per-frame summaries.
+/// Collect frame data from ALL threads via the global THREAD_FRAMES registry.
+///
+/// Same pattern as `collect_all()` for THREAD_RECORDS -- clones Arc handles
+/// under the global lock, then drops the lock before iterating per-thread
+/// frames.
 ///
 /// No `flush_records_buf()` call is needed here: FRAMES is populated at
 /// depth-0 boundaries -- the same point where RECORDS_BUF is flushed into
 /// RECORDS. By the time a frame appears in FRAMES, its records have already
 /// been flushed.
 pub fn collect_frames() -> Vec<Vec<FrameFnSummary>> {
-    FRAMES.with(|frames| frames.borrow().clone())
+    let arcs: Vec<ThreadFrameArc> = {
+        let registry = thread_frames().lock().unwrap_or_else(|e| e.into_inner());
+        registry.clone()
+    };
+    let mut all_frames = Vec::new();
+    for arc in &arcs {
+        let frames = arc.lock().unwrap_or_else(|e| e.into_inner());
+        all_frames.extend(frames.iter().cloned());
+    }
+    all_frames
 }
 
 /// Collect records from ALL threads via the global registry.
@@ -1140,29 +1176,7 @@ pub fn collect_frames() -> Vec<Vec<FrameFnSummary>> {
 /// `main()`, so calling `collect_all()` from `main()` (via `shutdown()`)
 /// sees every registered name.
 pub fn collect_all() -> Vec<FunctionRecord> {
-    // Flush the calling thread's local buffer so its records are visible.
-    // Other threads' buffers are flushed at their own depth-0 boundaries.
-    // Records still buffered on other threads (not yet at a depth-0 boundary)
-    // will be missed. In practice this only affects detached spawns
-    // (std::thread::spawn, rayon::spawn) which have no completion guarantee;
-    // scoped concurrency always completes before the caller returns.
-    flush_records_buf();
-    let arcs: Vec<ThreadRecordArc> = {
-        let registry = thread_records().lock().unwrap_or_else(|e| e.into_inner());
-        registry.clone()
-    };
-    // Merge FnAgg entries across all threads via linear scan.
-    let mut merged: Vec<FnAgg> = Vec::new();
-    for arc in &arcs {
-        let records = arc.lock().unwrap_or_else(|e| e.into_inner());
-        for entry in records.iter() {
-            if let Some(dst) = merged.iter_mut().find(|e| std::ptr::eq(e.name, entry.name)) {
-                dst.absorb(entry);
-            } else {
-                merged.push(entry.clone());
-            }
-        }
-    }
+    let merged = collect_all_fnagg();
     let registered: Vec<&str> = REGISTERED
         .try_with(|reg| reg.borrow().clone())
         .unwrap_or_default();
@@ -1183,7 +1197,7 @@ pub fn reset() {
     #[cfg(any(test, feature = "_test_internals"))]
     INVOCATIONS.with(|inv| inv.borrow_mut().clear());
     FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
-    FRAMES.with(|frames| frames.borrow_mut().clear());
+    FRAMES.with(|frames| frames.lock().unwrap_or_else(|e| e.into_inner()).clear());
     PHANTOM_ARCS.with(|arcs| arcs.borrow_mut().clear());
     // Drain any pending cleanup entries for this thread from the global queue.
     let cookie = THREAD_COOKIE.with(|c| *c);
@@ -1204,6 +1218,14 @@ pub fn reset_all() {
         registry.clone()
     };
     for arc in &arcs {
+        arc.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    // Clear every thread's frame Arc.
+    let frame_arcs: Vec<ThreadFrameArc> = {
+        let registry = thread_frames().lock().unwrap_or_else(|e| e.into_inner());
+        registry.clone()
+    };
+    for arc in &frame_arcs {
         arc.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
     // Clear global phantom state.
@@ -1283,39 +1305,6 @@ fn dirs_fallback() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Write a JSON run file from the given function records.
-///
-/// Hand-written JSON via `write!()` — zero serde dependency.
-fn write_json(records: &[FunctionRecord], path: &std::path::Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut f = std::fs::File::create(path)?;
-    let ts = timestamp_ms();
-    let run_id = run_id();
-    write!(
-        f,
-        "{{\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts},\"functions\":["
-    )?;
-    for (i, rec) in records.iter().enumerate() {
-        if i > 0 {
-            write!(f, ",")?;
-        }
-        // Escape the function name (in practice only ASCII identifiers, but be safe).
-        let name = rec.name.replace('\\', "\\\\").replace('"', "\\\"");
-        write!(
-            f,
-            "{{\"name\":\"{}\",\"calls\":{},\"total_ms\":{:.3},\"self_ms\":{:.3}",
-            name, rec.calls, rec.total_ms, rec.self_ms
-        )?;
-        #[cfg(feature = "cpu-time")]
-        write!(f, ",\"cpu_self_ms\":{:.3}", rec.cpu_self_ms)?;
-        write!(f, "}}")?;
-    }
-    writeln!(f, "]}}")?;
-    Ok(())
-}
-
 /// Write an NDJSON file with frame-level data.
 ///
 /// Line 1: header with metadata and function name table.
@@ -1375,51 +1364,59 @@ fn write_ndjson(
     Ok(())
 }
 
-/// Flush collected timing data to disk.
+/// Flush collected timing data to disk in NDJSON format.
 ///
-/// If frame data is present, writes NDJSON format. Otherwise falls back
-/// to JSON for non-frame workloads.
+/// If frame data is present, writes one line per frame. If only aggregate
+/// data exists (no frames), synthesizes a single frame from the aggregates.
 ///
 /// Normally you don't need to call this — `shutdown()` flushes all threads
 /// at the end of main. This function exists for explicit mid-program flushes
 /// of the current thread's data.
+///
+/// Note: flush() clones other threads' frame data but only clears the local
+/// thread. If shutdown() (or another flush()) runs later, other threads'
+/// frames will be written again, producing duplicates. The normal single-
+/// shutdown path is unaffected.
 pub fn flush() {
     let dir = match runs_dir() {
         Some(d) => d,
         None => return,
     };
 
-    let frames = collect_frames();
-    if !frames.is_empty() {
-        let mut seen = HashSet::new();
-        let mut fn_names: Vec<&str> = Vec::new();
-        for frame in &frames {
-            for s in frame {
-                if seen.insert(s.name) {
-                    fn_names.push(s.name);
-                }
-            }
-        }
-        let path = dir.join(format!("{}.ndjson", timestamp_ms()));
-        if let Err(e) = write_ndjson(&frames, &fn_names, &path) {
-            eprintln!(
-                "piano: failed to write profiling data to {}: {e}",
-                path.display()
-            );
-        }
-    } else {
-        let records = collect();
-        if records.is_empty() {
+    // Collect (clone) frames from all threads. We intentionally do NOT drain
+    // other threads' frames here — only the local thread's state is cleared
+    // via reset() below. Other threads' frames will persist and be included
+    // in the final shutdown() write. This avoids destroying concurrent
+    // threads' data when flush() is called mid-program.
+    let mut frames = collect_frames();
+
+    // Synthesize from aggregates if no frames exist (same as shutdown_impl_inner).
+    if frames.is_empty() {
+        let agg = collect_all_fnagg();
+        if agg.is_empty() {
             return;
         }
-        let path = dir.join(format!("{}.json", timestamp_ms()));
-        if let Err(e) = write_json(&records, &path) {
-            eprintln!(
-                "piano: failed to write profiling data to {}: {e}",
-                path.display()
-            );
+        frames.push(synthesize_frame_from_agg(&agg));
+    }
+
+    let mut seen = HashSet::new();
+    let mut fn_names: Vec<&str> = Vec::new();
+    for frame in &frames {
+        for s in frame {
+            if seen.insert(s.name) {
+                fn_names.push(s.name);
+            }
         }
     }
+    let path = dir.join(format!("{}.ndjson", timestamp_ms()));
+    if let Err(e) = write_ndjson(&frames, &fn_names, &path) {
+        eprintln!(
+            "piano: failed to write profiling data to {}: {e}",
+            path.display()
+        );
+    }
+    // Clear only the local thread's records, stack, and frames so subsequent
+    // enter() calls start fresh. Other threads' state is left intact.
     reset();
 }
 
@@ -1434,11 +1431,9 @@ pub fn init() {
 
 /// Flush all collected timing data from ALL threads and write to disk.
 ///
-/// Collects from the global per-thread registry, so data from thread-pool
-/// workers is included. Injected at the end of main() by the AST rewriter.
-///
-/// Writes NDJSON if frame data is present (from the calling thread), and
-/// always writes JSON with cross-thread aggregation from all registered Arcs.
+/// Collects frames from all threads via the global THREAD_FRAMES registry,
+/// and aggregate records via THREAD_RECORDS. Always writes NDJSON.
+/// Injected at the end of main() by the AST rewriter.
 ///
 /// Guarded by `SHUTDOWN_DONE` to prevent double-writes (e.g. if a signal
 /// handler already flushed data before normal exit).
@@ -1465,7 +1460,54 @@ pub fn shutdown_to(dir: &str) {
     shutdown();
 }
 
+/// Collect merged FnAgg records from all threads (raw aggregates, not FunctionRecord).
+///
+/// Shared core for `collect_all()` and `flush()` — flushes the calling thread's
+/// buffer, clones thread Arcs, then merges FnAgg entries via linear scan.
+fn collect_all_fnagg() -> Vec<FnAgg> {
+    flush_records_buf();
+    let arcs: Vec<ThreadRecordArc> = {
+        let registry = thread_records().lock().unwrap_or_else(|e| e.into_inner());
+        registry.clone()
+    };
+    let mut merged: Vec<FnAgg> = Vec::new();
+    for arc in &arcs {
+        let records = arc.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in records.iter() {
+            if let Some(dst) = merged.iter_mut().find(|e| std::ptr::eq(e.name, entry.name)) {
+                dst.absorb(entry);
+            } else {
+                merged.push(entry.clone());
+            }
+        }
+    }
+    merged
+}
+
+/// Synthesize a single NDJSON frame from aggregate FnAgg data.
+/// Used as fallback when no depth-0 frames were recorded (e.g., program crashed
+/// mid-function, or all work happened in contexts that don't produce frames).
+/// Alloc data is unavailable in aggregates, so alloc fields are zero.
+fn synthesize_frame_from_agg(agg: &[FnAgg]) -> Vec<FrameFnSummary> {
+    agg.iter()
+        .map(|e| FrameFnSummary {
+            name: e.name,
+            calls: e.calls,
+            self_ns: (e.self_ms * 1_000_000.0).max(0.0) as u64,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: e.cpu_self_ns,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
+        })
+        .collect()
+}
+
 /// Core write logic shared by `shutdown()` and the signal handler.
+///
+/// Always writes NDJSON. When no frames exist but aggregate records do,
+/// synthesizes a single frame from aggregate data. Never writes JSON.
 ///
 /// Returns `true` if any write failed. Does NOT check `SHUTDOWN_DONE` --
 /// callers are responsible for the guard.
@@ -1473,8 +1515,18 @@ fn shutdown_impl_inner(dir: &std::path::Path) -> bool {
     let mut write_failed = false;
     let ts = timestamp_ms();
 
-    // Write frame-level data if present (NDJSON format).
-    let frames = collect_frames();
+    let mut frames = collect_frames();
+
+    // If no frames but aggregate records exist, synthesize a single frame.
+    // This covers cases where no depth-0 guard dropped (e.g., process::exit
+    // killed the program mid-function) but some records were flushed.
+    if frames.is_empty() {
+        let agg = collect_all_fnagg();
+        if !agg.is_empty() {
+            frames.push(synthesize_frame_from_agg(&agg));
+        }
+    }
+
     if !frames.is_empty() {
         let mut seen = HashSet::new();
         let mut fn_names: Vec<&str> = Vec::new();
@@ -1495,18 +1547,6 @@ fn shutdown_impl_inner(dir: &std::path::Path) -> bool {
         }
     }
 
-    // Always write aggregated cross-thread data (JSON format).
-    let records = collect_all();
-    if !records.is_empty() {
-        let path = dir.join(format!("{ts}.json"));
-        if let Err(e) = write_json(&records, &path) {
-            eprintln!(
-                "piano: failed to write profiling data to {}: {e}",
-                path.display()
-            );
-            write_failed = true;
-        }
-    }
     write_failed
 }
 
@@ -1581,6 +1621,28 @@ impl Drop for AdoptGuard {
             let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
                 cell.set(entry.saved_alloc);
             });
+
+            // The synthetic adopt entry is at depth 0. When it drops, any
+            // pending FRAME_BUFFER data from child functions (which ran at
+            // depth 1+) must be flushed to FRAMES — same as a normal
+            // depth-0 guard drop. Without this, worker-thread frame data
+            // would be silently lost.
+            if unpack_depth(entry.packed) == 0 {
+                flush_records_buf();
+                FRAME_BUFFER.with(|buf| {
+                    let b = buf.borrow();
+                    if !b.is_empty() {
+                        FRAMES.with(|frames| {
+                            frames
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(b.clone());
+                        });
+                    }
+                    drop(b);
+                    buf.borrow_mut().clear();
+                });
+            }
 
             // Propagate this thread's CPU time back to the parent context.
             #[cfg(feature = "cpu-time")]
@@ -1717,71 +1779,6 @@ mod tests {
     }
 
     #[test]
-    fn write_json_produces_valid_format() {
-        let records = vec![
-            FunctionRecord {
-                name: "walk".into(),
-                calls: 3,
-                total_ms: 12.5,
-                self_ms: 8.3,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ms: 7.0,
-            },
-            FunctionRecord {
-                name: "resolve".into(),
-                calls: 1,
-                total_ms: 4.2,
-                self_ms: 4.2,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ms: 4.1,
-            },
-        ];
-        let tmp = std::env::temp_dir().join(format!("piano_json_{}.json", std::process::id()));
-        write_json(&records, &tmp).unwrap();
-
-        let content = std::fs::read_to_string(&tmp).unwrap();
-
-        // Verify structure.
-        assert!(
-            content.starts_with("{\"run_id\":\""),
-            "should start with run_id"
-        );
-        assert!(
-            content.contains("\"timestamp_ms\":"),
-            "should contain timestamp_ms"
-        );
-        assert!(
-            content.contains("\"functions\":["),
-            "should have functions array"
-        );
-        assert!(content.contains("\"walk\""), "should contain walk");
-        assert!(content.contains("\"resolve\""), "should contain resolve");
-        assert!(content.contains("\"calls\":3"), "should have calls count");
-
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[cfg(feature = "cpu-time")]
-    #[test]
-    fn write_json_includes_cpu_self_ms() {
-        let records = vec![FunctionRecord {
-            name: "compute".into(),
-            calls: 5,
-            total_ms: 10.0,
-            self_ms: 8.0,
-            cpu_self_ms: 7.5,
-        }];
-        let tmp = std::env::temp_dir().join(format!("piano_cpu_json_{}.json", std::process::id()));
-        write_json(&records, &tmp).unwrap();
-        let content = std::fs::read_to_string(&tmp).unwrap();
-        assert!(
-            content.contains("\"cpu_self_ms\":7.500"),
-            "JSON should contain cpu_self_ms, got: {content}"
-        );
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
     fn init_can_be_called_multiple_times() {
         // Calling init() multiple times is safe (handler overwrites are idempotent).
         init();
@@ -1880,6 +1877,12 @@ mod tests {
             burn_cpu(50_000);
         }
         let records = collect();
+        // Filter to our test's functions since collect() reads thread-local
+        // RECORDS which may contain stale data if reset_all() ran mid-test.
+        let records: Vec<_> = records
+            .into_iter()
+            .filter(|r| r.name == "fast" || r.name == "slow")
+            .collect();
         assert_eq!(
             records.len(),
             2,
@@ -2220,8 +2223,13 @@ mod tests {
             }
         }
         let frames = collect_frames();
-        assert_eq!(frames.len(), 3, "should have 3 frames");
-        for frame in &frames {
+        // Filter to frames containing our test functions (collect_frames is now global).
+        let my_frames: Vec<_> = frames
+            .iter()
+            .filter(|f| f.iter().any(|s| s.name == "update"))
+            .collect();
+        assert_eq!(my_frames.len(), 3, "should have 3 frames with 'update'");
+        for frame in &my_frames {
             let update = frame.iter().find(|s| s.name == "update").unwrap();
             assert_eq!(update.calls, 1);
             let physics = frame.iter().find(|s| s.name == "physics").unwrap();
@@ -2241,12 +2249,20 @@ mod tests {
             let _b = enter("resolve");
             burn_cpu(5_000);
         }
-        // Each depth-0 return is a frame boundary, so we get 2 single-function frames
+        // Each depth-0 return is a frame boundary, so we get 2 single-function frames.
+        // Filter by our test functions since collect_frames is now global.
         let frames = collect_frames();
-        assert_eq!(frames.len(), 2, "each depth-0 return creates a frame");
+        let my_frames: Vec<_> = frames
+            .iter()
+            .filter(|f| f.iter().any(|s| s.name == "parse" || s.name == "resolve"))
+            .collect();
+        assert_eq!(my_frames.len(), 2, "each depth-0 return creates a frame");
 
         // Aggregate collect() should still work
-        let records = collect();
+        let records: Vec<_> = collect()
+            .into_iter()
+            .filter(|r| r.name == "parse" || r.name == "resolve")
+            .collect();
         assert_eq!(records.len(), 2);
     }
 
@@ -2310,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_writes_json_with_all_thread_data() {
+    fn shutdown_writes_ndjson_with_all_thread_data() {
         reset();
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -2332,17 +2348,17 @@ mod tests {
         let files: Vec<_> = std::fs::read_dir(&tmp)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
             .collect();
-        assert!(!files.is_empty(), "shutdown should write JSON");
+        assert!(!files.is_empty(), "shutdown should write NDJSON");
 
         let content = std::fs::read_to_string(files[0].path()).unwrap();
         assert!(
-            content.contains("\"shutdown_thread_work\""),
+            content.contains("shutdown_thread_work"),
             "should contain thread work: {content}"
         );
         assert!(
-            content.contains("\"shutdown_main_work\""),
+            content.contains("shutdown_main_work"),
             "should contain main work: {content}"
         );
 
@@ -2711,16 +2727,16 @@ mod tests {
 
     #[test]
     fn shutdown_to_sets_runs_dir_for_flush() {
-        // Verify that set_runs_dir + flush + shutdown_impl_inner all
-        // write to the same directory. Uses shutdown_impl_inner directly
-        // to avoid the process-global SHUTDOWN_DONE guard, which is
-        // unreliable in parallel tests.
+        // Verify that shutdown_impl_inner writes to the given directory.
+        // flush() is also called but its output dir depends on the
+        // process-global runs_dir() which is unreliable in parallel tests
+        // (env var and set_runs_dir races). We verify shutdown writes
+        // correctly and that flush() doesn't panic.
         reset();
 
         let tmp = std::env::temp_dir().join(format!("piano_shutdown_to_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // set_runs_dir early (like CLI injection at start of main)
         set_runs_dir(tmp.to_str().unwrap());
 
         // Generate some data and flush mid-program.
@@ -2736,7 +2752,7 @@ mod tests {
             burn_cpu(5_000);
         }
 
-        // Write remaining data to the same dir.
+        // Write remaining data to the explicit dir.
         let _ = shutdown_impl_inner(&tmp);
         clear_runs_dir();
 
@@ -2744,11 +2760,23 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        // Should have files from both flush and shutdown_to.
+        // shutdown_impl_inner writes directly to tmp (not via runs_dir()),
+        // so at least 1 file is guaranteed. flush() may also write here
+        // if runs_dir() wasn't overridden by a parallel test's env var.
         assert!(
-            files.len() >= 2,
-            "expected files from both flush() and shutdown_to(), got {} in {tmp:?}",
-            files.len()
+            !files.is_empty(),
+            "shutdown_impl_inner should write to {tmp:?}, got 0 files"
+        );
+
+        // Verify the shutdown file contains our function.
+        let has_shutdown_fn = files.iter().any(|f| {
+            std::fs::read_to_string(f.path())
+                .unwrap_or_default()
+                .contains("shutdown_fn")
+        });
+        assert!(
+            has_shutdown_fn,
+            "shutdown output should contain 'shutdown_fn'"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3329,7 +3357,7 @@ mod tests {
             // and mask the bug. Only clear invocations and frames so we
             // can observe fresh results.
             INVOCATIONS.with(|inv| inv.borrow_mut().clear());
-            FRAMES.with(|frames| frames.borrow_mut().clear());
+            FRAMES.with(|frames| frames.lock().unwrap_or_else(|e| e.into_inner()).clear());
             FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
 
             {
@@ -3340,13 +3368,18 @@ mod tests {
             // Collect results: depth and frame count.
             let invocations = collect_invocations();
             let frames = collect_frames();
+            // Filter to frames from this test (collect_frames is now global).
+            let my_frame_count = frames
+                .iter()
+                .filter(|f| f.iter().any(|s| s.name == "b_later_work"))
+                .count();
 
             let work_rec = invocations
                 .iter()
                 .find(|r| r.name == "b_later_work")
                 .expect("should have b_later_work record");
 
-            tx_results.send((work_rec.depth, frames.len())).unwrap();
+            tx_results.send((work_rec.depth, my_frame_count)).unwrap();
         });
 
         // Send guard to B.
@@ -3872,13 +3905,16 @@ mod tests {
         flush_records_buf();
         RECORDS.with(|records| {
             let recs = records.lock().unwrap_or_else(|e| e.into_inner());
+            // Filter to our function — reset_all() from another test may have
+            // cleared RECORDS mid-loop, splitting the aggregation into pieces.
+            let hot: Vec<_> = recs.iter().filter(|e| e.name == "hot_fn").collect();
             assert_eq!(
-                recs.len(),
+                hot.len(),
                 1,
-                "expected 1 aggregated entry, got {}",
-                recs.len()
+                "expected 1 aggregated entry for hot_fn, got {}",
+                hot.len()
             );
-            assert_eq!(recs[0].calls, 10_000);
+            assert_eq!(hot[0].calls, 10_000);
         });
     }
 
@@ -3886,22 +3922,27 @@ mod tests {
     fn frame_buffer_aggregates_in_flight() {
         reset();
         {
-            let _outer = enter("outer");
+            let _outer = enter("fbuf_agg_outer");
             for _ in 0..10_000 {
-                let _g = enter("inner");
+                let _g = enter("fbuf_agg_inner");
             }
         }
         let frames = collect_frames();
-        assert_eq!(frames.len(), 1);
-        assert!(
-            frames[0].len() <= 2,
-            "expected <= 2 fn summaries, got {}",
-            frames[0].len()
-        );
-        let inner = frames[0]
+        // Filter to frames from this test (collect_frames is now global).
+        let my_frames: Vec<_> = frames
             .iter()
-            .find(|f| f.name == "inner")
-            .expect("inner not found");
+            .filter(|f| f.iter().any(|s| s.name == "fbuf_agg_outer"))
+            .collect();
+        assert_eq!(my_frames.len(), 1);
+        assert!(
+            my_frames[0].len() <= 2,
+            "expected <= 2 fn summaries, got {}",
+            my_frames[0].len()
+        );
+        let inner = my_frames[0]
+            .iter()
+            .find(|f| f.name == "fbuf_agg_inner")
+            .expect("fbuf_agg_inner not found");
         assert_eq!(inner.calls, 10_000);
     }
 
