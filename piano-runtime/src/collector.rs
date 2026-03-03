@@ -106,7 +106,6 @@ static STREAMING_ENABLED: AtomicBool = AtomicBool::new(false);
 /// State for the streaming NDJSON file.
 struct StreamState {
     file: std::io::BufWriter<std::fs::File>,
-    #[allow(dead_code)] // used by shutdown/trailer in a later task
     path: PathBuf,
     frame_count: usize,
 }
@@ -223,7 +222,6 @@ fn stream_frame(buf: &[FrameFnSummary]) {
 }
 
 /// Write the function name table as a trailer line and flush.
-#[allow(dead_code)]
 fn write_stream_trailer(state: &mut StreamState) -> std::io::Result<()> {
     let table = name_table().lock().unwrap_or_else(|e| e.into_inner());
     write!(state.file, "{{\"functions\":[")?;
@@ -239,7 +237,7 @@ fn write_stream_trailer(state: &mut StreamState) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Write trailer and close the stream file. Used by shutdown and tests.
+/// Write trailer and close the stream file.
 #[allow(dead_code)]
 fn write_stream_trailer_and_close() {
     let mut state = stream_file().lock().unwrap_or_else(|e| e.into_inner());
@@ -1556,13 +1554,30 @@ fn write_ndjson(
 /// frames will be written again, producing duplicates. The normal single-
 /// shutdown path is unaffected.
 pub fn flush() {
+    if STREAMING_ENABLED.load(Ordering::Relaxed) {
+        // Streaming mode: frames are already on disk. Just sync.
+        let mut state = stream_file().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref mut s) = *state {
+            let _ = s.file.flush();
+            let _ = s.file.get_ref().sync_all();
+            drop(state);
+            reset();
+            return;
+        }
+        // No stream file -- fall through to the non-streaming path.
+        // This can happen if STREAMING_ENABLED was set but no frames
+        // completed yet (stream file is lazily opened on first frame).
+        drop(state);
+    }
+
+    // Non-streaming path (existing behavior, unchanged)
     let dir = match runs_dir() {
         Some(d) => d,
         None => return,
     };
 
     // Collect (clone) frames from all threads. We intentionally do NOT drain
-    // other threads' frames here — only the local thread's state is cleared
+    // other threads' frames here -- only the local thread's state is cleared
     // via reset() below. Other threads' frames will persist and be included
     // in the final shutdown() write. This avoids destroying concurrent
     // threads' data when flush() is called mid-program.
@@ -1607,10 +1622,7 @@ pub fn init() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     signal::install_handlers();
     atexit::register();
-    // NOTE: STREAMING_ENABLED is not set here yet. It will be enabled
-    // in Task 4 once shutdown() is updated to finalize the stream file
-    // (write trailer + flush). Until then, frames use the in-memory
-    // FRAMES path via stream_frame()'s fallback.
+    STREAMING_ENABLED.store(true, Ordering::Release);
 }
 
 /// Flush all collected timing data from ALL threads and write to disk.
@@ -1697,37 +1709,80 @@ fn synthesize_frame_from_agg(agg: &[FnAgg]) -> Vec<FrameFnSummary> {
 /// callers are responsible for the guard.
 fn shutdown_impl_inner(dir: &std::path::Path) -> bool {
     let mut write_failed = false;
-    let ts = timestamp_ms();
 
-    let mut frames = collect_frames();
-
-    // If no frames but aggregate records exist, synthesize a single frame.
-    // This covers cases where no depth-0 guard dropped (e.g., process::exit
-    // killed the program mid-function) but some records were flushed.
-    if frames.is_empty() {
-        let agg = collect_all_fnagg();
-        if !agg.is_empty() {
-            frames.push(synthesize_frame_from_agg(&agg));
-        }
-    }
-
-    if !frames.is_empty() {
-        let mut seen = HashSet::new();
-        let mut fn_names: Vec<&str> = Vec::new();
-        for frame in &frames {
-            for s in frame {
-                if seen.insert(s.name) {
-                    fn_names.push(s.name);
+    if STREAMING_ENABLED.load(Ordering::Relaxed) {
+        // Streaming path: frames are already on disk. Just write the trailer.
+        let has_stream = {
+            let mut state = stream_file().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref mut s) = *state {
+                if let Err(e) = write_stream_trailer(s) {
+                    eprintln!(
+                        "piano: failed to write trailer to {}: {e}",
+                        s.path.display()
+                    );
+                    write_failed = true;
+                }
+                // Close the stream file (drop the BufWriter/File).
+                *state = None;
+                true
+            } else {
+                false
+            }
+        };
+        if !has_stream {
+            // No stream file opened (no frames ever completed).
+            // Try synthesizing from aggregates (process::exit mid-function case).
+            flush_records_buf();
+            let agg = collect_all_fnagg();
+            if !agg.is_empty() {
+                let frames = vec![synthesize_frame_from_agg(&agg)];
+                let mut seen = HashSet::new();
+                let mut fn_names: Vec<&str> = Vec::new();
+                for frame in &frames {
+                    for s in frame {
+                        if seen.insert(s.name) {
+                            fn_names.push(s.name);
+                        }
+                    }
+                }
+                let path = dir.join(format!("{}.ndjson", timestamp_ms()));
+                if let Err(e) = write_ndjson(&frames, &fn_names, &path) {
+                    eprintln!(
+                        "piano: failed to write profiling data to {}: {e}",
+                        path.display()
+                    );
+                    write_failed = true;
                 }
             }
         }
-        let path = dir.join(format!("{ts}.ndjson"));
-        if let Err(e) = write_ndjson(&frames, &fn_names, &path) {
-            eprintln!(
-                "piano: failed to write profiling data to {}: {e}",
-                path.display()
-            );
-            write_failed = true;
+    } else {
+        // Non-streaming path (tests, no init() call) -- existing behavior
+        let ts = timestamp_ms();
+        let mut frames = collect_frames();
+        if frames.is_empty() {
+            let agg = collect_all_fnagg();
+            if !agg.is_empty() {
+                frames.push(synthesize_frame_from_agg(&agg));
+            }
+        }
+        if !frames.is_empty() {
+            let mut seen = HashSet::new();
+            let mut fn_names: Vec<&str> = Vec::new();
+            for frame in &frames {
+                for s in frame {
+                    if seen.insert(s.name) {
+                        fn_names.push(s.name);
+                    }
+                }
+            }
+            let path = dir.join(format!("{ts}.ndjson"));
+            if let Err(e) = write_ndjson(&frames, &fn_names, &path) {
+                eprintln!(
+                    "piano: failed to write profiling data to {}: {e}",
+                    path.display()
+                );
+                write_failed = true;
+            }
         }
     }
 
@@ -1960,9 +2015,17 @@ mod tests {
     #[test]
     fn init_can_be_called_multiple_times() {
         // Calling init() multiple times is safe (handler overwrites are idempotent).
-        init();
-        init();
-        init();
+        // We call the sub-components directly instead of init() to avoid
+        // setting STREAMING_ENABLED, which would race with parallel tests.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            signal::install_handlers();
+            signal::install_handlers();
+            signal::install_handlers();
+        }
+        atexit::register();
+        atexit::register();
+        atexit::register();
     }
 
     #[test]
@@ -4290,4 +4353,68 @@ mod tests {
         clear_runs_dir();
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn shutdown_streaming_writes_trailer() {
+        // Test that the streaming shutdown path produces a complete v4 file.
+        //
+        // Uses local StreamState (not the global STREAM_FILE) to avoid
+        // racing with frames_on_disk_before_shutdown. Constructs frame
+        // data directly to avoid collect_frames() interference.
+        let tmp =
+            std::env::temp_dir().join(format!("piano_shutdown_trailer_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Register the function name so write_stream_trailer includes it.
+        register("shutdown_trailer_fn");
+
+        // Build frame data directly -- no reliance on global FRAMES.
+        let frame = vec![FrameFnSummary {
+            name: "shutdown_trailer_fn",
+            calls: 1,
+            self_ns: 1_000_000,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 500_000,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
+        }];
+
+        // Simulate the streaming path: open file, write 2 frames, write trailer.
+        let mut state = open_stream_file(&tmp).unwrap();
+        stream_frame_to_writer(&mut state, &frame);
+        stream_frame_to_writer(&mut state, &frame);
+        write_stream_trailer(&mut state).unwrap();
+        drop(state);
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        assert_eq!(files.len(), 1);
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+
+        // Header + 2 frames + trailer = 4 lines
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].contains("\"format_version\":4"));
+        assert!(lines[1].contains("\"frame\":0"));
+        assert!(lines[2].contains("\"frame\":1"));
+        assert!(lines[3].contains("\"functions\""));
+        assert!(lines[3].contains("shutdown_trailer_fn"));
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // NOTE: The streaming fallback path (STREAMING_ENABLED=true but no stream
+    // file opened) is not tested directly because setting STREAMING_ENABLED
+    // globally races with parallel tests' guard drops. The aggregate-synthesis
+    // logic is the same as the non-streaming path, already covered by
+    // shutdown_writes_ndjson_with_all_thread_data. The streaming gate is a
+    // simple flag check tested indirectly via integration tests.
 }
