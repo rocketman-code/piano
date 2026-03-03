@@ -96,6 +96,162 @@ fn runs_dir_lock() -> &'static Mutex<Option<PathBuf>> {
 /// `shutdown_impl_inner` is a no-op once this flag is set.
 static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
 
+/// Whether frame streaming to disk is active.
+///
+/// Set by `init()`. When true, depth-0 frame boundaries write directly to
+/// disk via STREAM_FILE instead of buffering in the FRAMES thread-local.
+/// When false (tests, no init() call), FRAMES is used as before.
+static STREAMING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// State for the streaming NDJSON file.
+#[allow(dead_code)]
+struct StreamState {
+    file: std::io::BufWriter<std::fs::File>,
+    path: PathBuf,
+    frame_count: usize,
+}
+
+/// Global streaming file handle, lazily opened on first frame.
+static STREAM_FILE: SyncOnceCell<Mutex<Option<StreamState>>> = SyncOnceCell::new();
+
+fn stream_file() -> &'static Mutex<Option<StreamState>> {
+    STREAM_FILE.get_or_init(|| Mutex::new(None))
+}
+
+/// Open a new streaming NDJSON file and write the v4 header.
+#[allow(dead_code)]
+fn open_stream_file(dir: &std::path::Path) -> std::io::Result<StreamState> {
+    std::fs::create_dir_all(dir)?;
+    let ts = timestamp_ms();
+    let path = dir.join(format!("{ts}.ndjson"));
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path)?);
+    let run_id = run_id();
+
+    write!(
+        file,
+        "{{\"format_version\":4,\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts}"
+    )?;
+    #[cfg(feature = "cpu-time")]
+    write!(file, ",\"has_cpu_time\":true")?;
+    writeln!(file, "}}")?;
+
+    Ok(StreamState {
+        file,
+        path,
+        frame_count: 0,
+    })
+}
+
+/// Write a frame to an already-locked StreamState.
+#[allow(dead_code)]
+fn stream_frame_to_writer(state: &mut StreamState, buf: &[FrameFnSummary]) {
+    let frame_idx = state.frame_count;
+    let _ = write!(state.file, "{{\"frame\":{frame_idx},\"fns\":[");
+    for (i, entry) in buf.iter().enumerate() {
+        if i > 0 {
+            let _ = write!(state.file, ",");
+        }
+        let fn_id = intern_name(entry.name);
+        let _ = write!(
+            state.file,
+            "{{\"id\":{},\"calls\":{},\"self_ns\":{},\"ac\":{},\"ab\":{},\"fc\":{},\"fb\":{}",
+            fn_id,
+            entry.calls,
+            entry.self_ns,
+            entry.alloc_count,
+            entry.alloc_bytes,
+            entry.free_count,
+            entry.free_bytes
+        );
+        #[cfg(feature = "cpu-time")]
+        let _ = write!(state.file, ",\"csn\":{}", entry.cpu_self_ns);
+        let _ = write!(state.file, "}}");
+    }
+    let _ = writeln!(state.file, "]}}");
+    state.frame_count += 1;
+}
+
+/// Stream a completed frame to disk, or fall back to in-memory FRAMES.
+///
+/// When streaming is enabled (init() was called), writes one NDJSON line
+/// per frame to the global stream file. When not enabled (tests), pushes
+/// to the thread-local FRAMES vec as before.
+#[allow(dead_code)]
+fn stream_frame(buf: &[FrameFnSummary]) {
+    if !STREAMING_ENABLED.load(Ordering::Relaxed) {
+        FRAMES.with(|frames| {
+            frames
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(buf.to_vec());
+        });
+        return;
+    }
+
+    let dir = match runs_dir() {
+        Some(d) => d,
+        None => {
+            FRAMES.with(|frames| {
+                frames
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(buf.to_vec());
+            });
+            return;
+        }
+    };
+
+    let mut state = stream_file().lock().unwrap_or_else(|e| e.into_inner());
+
+    if state.is_none() {
+        match open_stream_file(&dir) {
+            Ok(s) => *state = Some(s),
+            Err(e) => {
+                eprintln!("piano: failed to open stream file: {e}");
+                drop(state);
+                FRAMES.with(|frames| {
+                    frames
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(buf.to_vec());
+                });
+                return;
+            }
+        }
+    }
+
+    if let Some(ref mut s) = *state {
+        stream_frame_to_writer(s, buf);
+    }
+}
+
+/// Write the function name table as a trailer line and flush.
+#[allow(dead_code)]
+fn write_stream_trailer(state: &mut StreamState) -> std::io::Result<()> {
+    let table = name_table().lock().unwrap_or_else(|e| e.into_inner());
+    write!(state.file, "{{\"functions\":[")?;
+    for (i, &name) in table.iter().enumerate() {
+        if i > 0 {
+            write!(state.file, ",")?;
+        }
+        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+        write!(state.file, "\"{escaped}\"")?;
+    }
+    writeln!(state.file, "]}}")?;
+    state.file.flush()?;
+    Ok(())
+}
+
+/// Write trailer and close the stream file. Used by shutdown and tests.
+#[allow(dead_code)]
+fn write_stream_trailer_and_close() {
+    let mut state = stream_file().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref mut s) = *state {
+        let _ = write_stream_trailer(s);
+    }
+    *state = None;
+}
+
 /// Signal handling for graceful data recovery on SIGTERM / SIGINT.
 ///
 /// On Unix, `init()` registers signal handlers so that profiling data is
@@ -1459,6 +1615,7 @@ pub fn init() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     signal::install_handlers();
     atexit::register();
+    STREAMING_ENABLED.store(true, Ordering::Release);
 }
 
 /// Flush all collected timing data from ALL threads and write to disk.
@@ -1816,6 +1973,8 @@ mod tests {
         init();
         init();
         init();
+        // init() enables streaming; reset so parallel tests use the FRAMES path.
+        STREAMING_ENABLED.store(false, Ordering::Release);
     }
 
     #[test]
@@ -3996,5 +4155,79 @@ mod tests {
             summary.calls, above_u32_max,
             "FrameFnSummary.calls must hold values above u32::MAX"
         );
+    }
+
+    #[test]
+    fn stream_writes_valid_v4_ndjson() {
+        reset();
+        let tmp = std::env::temp_dir().join(format!("piano_stream_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Test the streaming infrastructure directly by calling
+        // open_stream_file / stream_frame_to_writer / write_stream_trailer.
+        // This avoids setting the global STREAMING_ENABLED flag, which would
+        // interfere with parallel tests that expect the FRAMES path.
+        let mut state = open_stream_file(&tmp).unwrap();
+
+        // Generate 3 frames worth of data
+        for _ in 0..3 {
+            let _g = enter("stream_test_fn");
+            burn_cpu(5_000);
+        }
+
+        // Collect the frames that were pushed to FRAMES (streaming disabled).
+        let frames = collect_frames();
+        let my_frames: Vec<_> = frames
+            .iter()
+            .filter(|f| f.iter().any(|s| s.name == "stream_test_fn"))
+            .collect();
+        assert_eq!(
+            my_frames.len(),
+            3,
+            "should have 3 frames with stream_test_fn"
+        );
+
+        // Write each frame to the stream file
+        for frame in &my_frames {
+            stream_frame_to_writer(&mut state, frame);
+        }
+
+        // Write trailer and flush
+        write_stream_trailer(&mut state).unwrap();
+        drop(state);
+
+        // Find the .ndjson file
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        assert_eq!(files.len(), 1, "expected exactly one ndjson file");
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Header (line 0): metadata, no functions
+        assert!(
+            lines[0].contains("\"format_version\":4"),
+            "header should have format_version 4: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("\"run_id\""));
+        assert!(!lines[0].contains("\"functions\""));
+
+        // Frames (lines 1-3)
+        assert!(lines[1].contains("\"frame\":0"));
+        assert!(lines[2].contains("\"frame\":1"));
+        assert!(lines[3].contains("\"frame\":2"));
+
+        // Trailer (last line): functions array
+        let last = lines.last().unwrap();
+        assert!(last.contains("\"functions\""));
+        assert!(last.contains("stream_test_fn"));
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
