@@ -3973,7 +3973,7 @@ mod tests {
     #[test]
     fn drop_order_accumulator_before_guard() {
         // Prove that Rust drops in reverse declaration order:
-        // _piano_guard (declared first) drops AFTER _piano_alloc (declared second).
+        // __piano_guard (declared first) drops AFTER __piano_alloc (declared second).
         //
         // This means AllocAccumulator::drop() can write to ALLOC_COUNTERS
         // and Guard::drop() (via drop_cold) will read those values.
@@ -4006,8 +4006,8 @@ mod tests {
 
         DROP_ORDER.store(0, Ordering::SeqCst);
         {
-            let _first = First; // like: let _piano_guard = enter(...)
-            let _second = Second; // like: let _piano_alloc = AllocAccumulator::new()
+            let _first = First; // like: let __piano_guard = enter(...)
+            let _second = Second; // like: let __piano_alloc = AllocAccumulator::new()
         }
         assert_eq!(
             DROP_ORDER.load(Ordering::SeqCst),
