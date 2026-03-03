@@ -488,39 +488,19 @@ fn inject_adopt_in_concurrency_closures(expr: &mut syn::Expr, in_parallel_chain:
             }
         }
         syn::Expr::Block(b) => {
-            for stmt in &mut b.block.stmts {
-                if let syn::Stmt::Expr(e, _) = stmt {
-                    inject_adopt_in_concurrency_closures(e, false);
-                }
-            }
+            inject_adopt_in_stmts(&mut b.block.stmts);
         }
         syn::Expr::ForLoop(f) => {
-            for stmt in &mut f.body.stmts {
-                if let syn::Stmt::Expr(e, _) = stmt {
-                    inject_adopt_in_concurrency_closures(e, false);
-                }
-            }
+            inject_adopt_in_stmts(&mut f.body.stmts);
         }
         syn::Expr::While(w) => {
-            for stmt in &mut w.body.stmts {
-                if let syn::Stmt::Expr(e, _) = stmt {
-                    inject_adopt_in_concurrency_closures(e, false);
-                }
-            }
+            inject_adopt_in_stmts(&mut w.body.stmts);
         }
         syn::Expr::Loop(l) => {
-            for stmt in &mut l.body.stmts {
-                if let syn::Stmt::Expr(e, _) = stmt {
-                    inject_adopt_in_concurrency_closures(e, false);
-                }
-            }
+            inject_adopt_in_stmts(&mut l.body.stmts);
         }
         syn::Expr::If(i) => {
-            for stmt in &mut i.then_branch.stmts {
-                if let syn::Stmt::Expr(e, _) = stmt {
-                    inject_adopt_in_concurrency_closures(e, false);
-                }
-            }
+            inject_adopt_in_stmts(&mut i.then_branch.stmts);
             if let Some((_, else_branch)) = &mut i.else_branch {
                 inject_adopt_in_concurrency_closures(else_branch, false);
             }
@@ -2104,6 +2084,36 @@ fn concurrent_discover() {
         // The scope closure itself should NOT have an adopt (it's the coordinator).
         // The adopt should only be inside the s.spawn closures.
         // Verify by checking the generated code compiles structurally.
+        let parsed: syn::File = syn::parse_str(&result)
+            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
+        assert!(!parsed.items.is_empty());
+    }
+
+    #[test]
+    fn injects_adopt_in_let_binding_inside_for_loop() {
+        // Concurrency closure assigned to a let binding inside a for loop.
+        // Regression: inject_adopt_in_concurrency_closures only handled
+        // Stmt::Expr, missing Stmt::Local (let bindings).
+        let source = r#"
+fn work() {
+    rayon::scope(|s| {
+        for item in items {
+            let handle = s.spawn(|_| { compute(item); });
+        }
+    });
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap().source;
+
+        assert!(
+            result.contains("piano_runtime::fork()"),
+            "should inject fork. Got:\n{result}"
+        );
+        assert!(
+            result.contains("piano_runtime::adopt"),
+            "should inject adopt inside spawn closure bound to let. Got:\n{result}"
+        );
         let parsed: syn::File = syn::parse_str(&result)
             .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
         assert!(!parsed.items.is_empty());
