@@ -5,7 +5,7 @@ Automated instrumentation-based profiling for Rust. Point it at your project, ge
 ```
 $ piano profile
 found 5 function(s) across 3 file(s)
-built: target/piano/debug/my-project
+built: target/piano/release/my-project
 ... normal program output ...
 
 Function                                       Self    Calls   Allocs  Alloc Bytes
@@ -20,7 +20,7 @@ Or step by step:
 ```
 $ piano build
 found 5 function(s) across 3 file(s)
-built: target/piano/debug/my-project
+built: target/piano/release/my-project
 
 $ piano run
 ... normal program output ...
@@ -47,7 +47,7 @@ By default, `piano build` instruments all functions in your project:
 ```
 $ piano build
 found 5 function(s) across 3 file(s)
-built: target/piano/debug/my-project
+built: target/piano/release/my-project
 ```
 
 Narrow scope by name, file, or module:
@@ -67,7 +67,7 @@ See which functions Piano cannot instrument (const, unsafe, extern):
 $ piano build --list-skipped
 ```
 
-The instrumented binary is written to `target/piano/debug/<name>`.
+The instrumented binary is written to `target/piano/release/<name>`.
 
 ### Execute the instrumented binary
 
@@ -78,7 +78,7 @@ $ piano run
 $ piano run -- --input data.csv --verbose    # pass arguments after --
 ```
 
-It looks in `target/piano/debug/` and picks the most recent executable. Piano exits with the binary's exit code.
+It looks in `target/piano/release/` and picks the most recent executable. Piano exits with the binary's exit code.
 
 ### One-step profiling
 
@@ -174,7 +174,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 2. Adds `piano-runtime` as a dependency in the staged `Cargo.toml`
 3. Parses Rust source with `syn`, finds functions matching your patterns, and injects `let _guard = piano_runtime::enter("name")` at the top of each
 4. Detects existing `#[global_allocator]` declarations (including cfg-gated ones) and wraps them with `PianoAllocator` for heap tracking
-5. Builds with `cargo build`
+5. Builds with `cargo build --release`
 
 Each guard records wall-clock time on construction and drop. Self-time is computed by subtracting children's time from total time. The allocator attributes heap operations to the currently executing instrumented function, and frame summaries are computed when top-level guards complete. For async functions, guards detect thread migration on drop and allocation accumulators carry data across `.await` points via save/resume.
 

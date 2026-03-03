@@ -363,7 +363,7 @@ fn run_executes_last_built_binary() {
         String::from_utf8_lossy(&build_output.stderr)
     );
 
-    // Step 2: run (from project directory so target/piano/debug/ is found)
+    // Step 2: run (from project directory so target/piano/release/ is found)
     let run_output = Command::new(piano_bin)
         .arg("run")
         .current_dir(&project_dir)
@@ -554,7 +554,7 @@ fn run_errors_when_no_binary_exists() {
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
 
-    // Run from empty directory -- no target/piano/debug/
+    // Run from empty directory -- no target/piano/release/
     let output = Command::new(piano_bin)
         .arg("run")
         .current_dir(tmp.path())
