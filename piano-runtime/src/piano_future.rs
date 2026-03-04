@@ -145,6 +145,7 @@ mod tests {
     use super::*;
     use crate::collector;
 
+    #[cfg(not(miri))]
     fn run<F: Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -154,6 +155,58 @@ mod tests {
             .block_on(f)
     }
 
+    /// Minimal waker-based test that exercises the unsafe Pin projection
+    /// in PianoFuture::poll without pulling in tokio. Finishes in
+    /// milliseconds under Miri.
+    #[test]
+    fn piano_future_pin_projection_safety() {
+        use core::task::{RawWaker, RawWakerVTable, Waker};
+
+        fn noop_raw_waker() -> RawWaker {
+            fn no_op(_: *const ()) {}
+            fn clone(p: *const ()) -> RawWaker {
+                RawWaker::new(p, &VTABLE)
+            }
+            const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+
+        collector::reset();
+
+        // A future that yields once then completes.
+        let mut yielded = false;
+        let inner = core::future::poll_fn(move |cx| {
+            if !yielded {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                let _guard = collector::enter("pin_safe");
+                collector::register("pin_safe");
+                Poll::Ready(())
+            }
+        });
+
+        let mut fut = PianoFuture::new(inner);
+        // SAFETY: we never move `fut` after pinning.
+        let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+
+        let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll: Pending (inner yields)
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        // Second poll: Ready (inner completes)
+        assert!(fut.as_mut().poll(&mut cx).is_ready());
+
+        let records = collector::collect_all();
+        assert!(
+            records.iter().any(|r| r.name == "pin_safe"),
+            "pin_safe should appear in records after Pin-projected polling"
+        );
+    }
+
+    #[cfg(not(miri))]
     #[test]
     fn piano_future_basic_enter_drop() {
         collector::reset();
@@ -168,6 +221,7 @@ mod tests {
         assert!(records.iter().any(|r| r.name == "pf_basic"));
     }
 
+    #[cfg(not(miri))]
     #[test]
     fn piano_future_stack_restored_after_yield() {
         collector::reset();
@@ -186,6 +240,7 @@ mod tests {
         assert!(records.iter().any(|r| r.name == "pf_yield"));
     }
 
+    #[cfg(not(miri))]
     #[test]
     fn piano_future_nested_parent_child() {
         collector::reset();
@@ -206,20 +261,31 @@ mod tests {
         let records = collector::collect_all();
         let outer = records.iter().find(|r| r.name == "pf_outer").unwrap();
         let inner = records.iter().find(|r| r.name == "pf_inner").unwrap();
-        // Inner's total_ms should be ~50ms
-        assert!(
-            inner.total_ms > 40.0,
-            "inner total_ms too low: {}",
-            inner.total_ms
-        );
-        // Outer's self_ms should NOT include inner's ~50ms
-        assert!(
-            outer.self_ms < 30.0,
-            "outer self_ms ({}) should be small (not include inner's 50ms)",
-            outer.self_ms
-        );
+        // Under Miri, tokio::time::sleep completes near-instantly so
+        // wall-clock timing values are meaningless. Only check structure.
+        #[cfg(not(miri))]
+        {
+            // Inner's total_ms should be ~50ms
+            assert!(
+                inner.total_ms > 40.0,
+                "inner total_ms too low: {}",
+                inner.total_ms
+            );
+            // Outer's self_ms should NOT include inner's ~50ms
+            assert!(
+                outer.self_ms < 30.0,
+                "outer self_ms ({}) should be small (not include inner's 50ms)",
+                outer.self_ms
+            );
+        }
+        #[cfg(miri)]
+        {
+            // Structural check: both records exist (asserted above via unwrap)
+            let _ = (outer, inner);
+        }
     }
 
+    #[cfg(not(miri))]
     #[test]
     fn piano_future_stack_isolation_between_tasks() {
         collector::reset();
@@ -251,6 +317,7 @@ mod tests {
         });
     }
 
+    #[cfg(not(miri))]
     #[test]
     fn piano_future_cancelled_by_select() {
         // When select! cancels a branch, the PianoFuture is dropped without
@@ -285,6 +352,7 @@ mod tests {
         STACK.with(|s| assert_eq!(s.borrow().len(), 0));
     }
 
+    #[cfg(not(miri))]
     #[test]
     fn piano_future_alloc_tracking() {
         collector::reset();
@@ -315,6 +383,7 @@ mod tests {
         assert_eq!(rec.alloc_bytes, 800, "expected 500+300=800 bytes");
     }
 
+    #[cfg(not(miri))]
     #[test]
     fn piano_future_with_fork_adopt() {
         collector::reset();

@@ -19,11 +19,21 @@ static DENOM: AtomicU64 = AtomicU64::new(1);
 /// x86_64 (`rdtsc`) and aarch64 (`mrs cntvct_el0`).
 #[inline(always)]
 pub(crate) fn read() -> u64 {
-    #[cfg(target_arch = "x86_64")]
+    // Miri cannot interpret inline assembly; use Instant fallback so that
+    // Miri can exercise the rest of the runtime (PianoFuture Pin safety,
+    // allocator, collector logic) without hitting unsupported operations.
+    #[cfg(miri)]
+    {
+        use std::sync::OnceLock;
+        static FALLBACK_EPOCH: OnceLock<Instant> = OnceLock::new();
+        let epoch = FALLBACK_EPOCH.get_or_init(Instant::now);
+        Instant::now().duration_since(*epoch).as_nanos() as u64
+    }
+    #[cfg(all(not(miri), target_arch = "x86_64"))]
     unsafe {
         core::arch::x86_64::_rdtsc()
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(not(miri), target_arch = "aarch64"))]
     {
         let val: u64;
         unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) val) };
@@ -32,7 +42,7 @@ pub(crate) fn read() -> u64 {
     // Fallback: use Instant (loses the perf benefit but still works).
     // Uses its own epoch to avoid a deadlock cycle with collector::epoch()
     // which calls tsc::read() inside EPOCH.get_or_init.
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(any(miri, target_arch = "x86_64", target_arch = "aarch64")))]
     {
         use std::sync::OnceLock;
         static FALLBACK_EPOCH: OnceLock<Instant> = OnceLock::new();

@@ -40,13 +40,24 @@ extern "C" {
 /// and scheduling delays read as zero.
 #[cfg(feature = "cpu-time")]
 pub(crate) fn cpu_now_ns() -> u64 {
-    let mut ts = Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let ret = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-    debug_assert!(ret == 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    // Miri cannot call foreign functions; return a monotonic counter so
+    // tests exercise the cpu-time code paths without FFI.
+    #[cfg(miri)]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1_000, Ordering::Relaxed)
+    }
+    #[cfg(not(miri))]
+    {
+        let mut ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let ret = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        debug_assert!(ret == 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
 }
 
 #[cfg(test)]
