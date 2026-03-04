@@ -68,6 +68,7 @@ jobs:
       - run: cargo llvm-cov --workspace --features piano-runtime/cpu-time --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
 
   doc:
