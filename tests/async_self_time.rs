@@ -44,15 +44,16 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
         r#"use tokio::task;
 
 async fn expensive_child() -> u64 {
+    use std::hint::black_box;
     let mut sum = 0u64;
-    for i in 0..2_000_000 {
-        sum = sum.wrapping_add(i);
+    for i in 0..2_000_000u64 {
+        sum = sum.wrapping_add(black_box(i));
     }
     // Yield to give the scheduler a migration opportunity
     task::yield_now().await;
     let mut sum2 = 0u64;
-    for i in 0..2_000_000 {
-        sum2 = sum2.wrapping_add(i);
+    for i in 0..2_000_000u64 {
+        sum2 = sum2.wrapping_add(black_box(i));
     }
     sum.wrapping_add(sum2)
 }
@@ -157,7 +158,7 @@ fn async_self_time_accuracy() {
     //
     // By construction:
     //   parent_fn does ZERO computation (body is just two .await calls)
-    //   expensive_child does 4M wrapping_add iterations
+    //   expensive_child does 4M wrapping_add iterations (black_box prevents folding)
     //
     // Therefore: parent_fn.self ≈ 0  and  expensive_child.self >> 0
     // So: parent_fn.self_ns < expensive_child.self_ns  (always true if accounting works)
