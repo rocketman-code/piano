@@ -56,6 +56,20 @@ jobs:
         run: rustup toolchain install 1.59.0 --profile minimal
       - run: cargo test --workspace
 
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo llvm-cov --workspace --features piano-runtime/cpu-time --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+
   doc:
     runs-on: ubuntu-latest
     steps:
