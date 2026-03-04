@@ -435,11 +435,7 @@ pub(crate) struct StackEntry {
     pub(crate) cpu_start_ns: u64,
     /// Saved ALLOC_COUNTERS from before this scope, restored on Guard::drop.
     pub(crate) saved_alloc: crate::alloc::AllocSnapshot,
-    /// Packed identity: `[cookie:32][name_id:16][depth:16]`.
-    ///
-    /// Regular entries: matches the Guard's packed value (same thread pushed it).
-    /// Phantom entries: the migrated Guard's packed identity (different thread
-    /// cookie), used as a unique key for PHANTOM_REGISTRY / PHANTOM_ARCS lookup.
+    /// Packed identity: `[unused:32][name_id:16][depth:16]`.
     pub(crate) packed: u64,
 }
 
@@ -471,45 +467,6 @@ impl FnAgg {
 
 type ThreadRecordArc = Arc<Mutex<Vec<FnAgg>>>;
 type ThreadFrameArc = Arc<Mutex<Vec<Vec<FrameFnSummary>>>>;
-
-/// Per-phantom tracking for cross-thread forwarding and cleanup.
-///
-/// When `check()` pushes a phantom on thread B, it registers a `PhantomInfo`
-/// in the global `PHANTOM_REGISTRY`. This enables:
-/// - Forwarding: children_ns accumulated on B is readable by C via the Arc.
-/// - Cleanup: `host_cookie` identifies B so the cleanup queue can target it.
-struct PhantomInfo {
-    /// Thread cookie of the thread hosting this phantom StackEntry.
-    host_cookie: u64,
-    /// Shared children_ns accumulator. The host thread writes to this Arc
-    /// (via PHANTOM_ARCS) when children update the phantom; the next thread
-    /// reads from it to seed its own phantom.
-    children_arc: Arc<Mutex<u64>>,
-}
-
-/// Global registry mapping guard packed identity -> phantom info.
-///
-/// `check()` inserts when pushing a phantom. On re-migration, `check()` reads
-/// the old entry (forwarding + cleanup scheduling) and inserts a new one.
-/// `drop_cold` removes the final entry.
-static PHANTOM_REGISTRY: SyncOnceCell<Mutex<HashMap<u64, PhantomInfo>>> = SyncOnceCell::new();
-
-fn phantom_registry() -> &'static Mutex<HashMap<u64, PhantomInfo>> {
-    PHANTOM_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Cleanup queue: `(host_cookie, guard_packed)` pairs. Thread B drains entries
-/// where `host_cookie == B` on its next `enter_cold`, removing the stale phantom
-/// from its stack.
-static PHANTOM_CLEANUP: SyncOnceCell<Mutex<Vec<(u64, u64)>>> = SyncOnceCell::new();
-
-fn phantom_cleanup() -> &'static Mutex<Vec<(u64, u64)>> {
-    PHANTOM_CLEANUP.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Fast-path guard: skip the cleanup lock when the queue is empty.
-static HAS_PHANTOM_CLEANUP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Global registry of per-thread record storage.
 /// Each thread registers its Arc on first access. collect_all() iterates all Arcs.
@@ -546,10 +503,6 @@ thread_local! {
         thread_frames().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&arc));
         arc
     };
-    /// Per-thread phantom forwarding Arcs. When a phantom StackEntry exists on
-    /// this thread (from Guard::check()), the corresponding Arc is stored here
-    /// so child drops can write through to it.
-    static PHANTOM_ARCS: RefCell<Vec<(u64, Arc<Mutex<u64>>)>> = RefCell::new(Vec::new());
     /// Fast local buffer for FnAgg entries. Avoids the Mutex lock on RECORDS
     /// for every drop_cold call. Flushed to RECORDS at depth-0 boundaries.
     static RECORDS_BUF: RefCell<Vec<FnAgg>> = RefCell::new(Vec::new());
@@ -643,14 +596,6 @@ fn flush_records_buf() {
     });
 }
 
-/// Sequential per-thread identifier. Cheaper than `std::thread::current().id()`
-/// and packable into a u64 alongside the stack depth.
-static NEXT_THREAD_COOKIE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-thread_local! {
-    static THREAD_COOKIE: u64 = NEXT_THREAD_COOKIE.fetch_add(1, Ordering::Relaxed);
-}
-
 // -- Interned function name table ------------------------------------------
 //
 // Maps u16 IDs to `&'static str` function names so the Guard can carry a
@@ -700,8 +645,7 @@ fn intern_name_slow(name: &'static str, ptr: usize) -> u16 {
         );
         if len > u16::MAX as usize {
             // Table full (65536 entries, indices 0..=u16::MAX). Saturate
-            // instead of wrapping. lookup_name handles out-of-bounds by
-            // returning "<unknown>", so this degrades gracefully.
+            // instead of wrapping -- degrades gracefully.
             return u16::MAX;
         }
         let id = len as u16;
@@ -715,38 +659,12 @@ fn intern_name_slow(name: &'static str, ptr: usize) -> u16 {
     id
 }
 
-/// Look up a function name by its interned ID.
-/// Returns `"<unknown>"` if the ID is out of bounds (should never happen).
-fn lookup_name(id: u16) -> &'static str {
-    let table = name_table().lock().unwrap_or_else(|e| e.into_inner());
-    table.get(id as usize).copied().unwrap_or("<unknown>")
-}
-
-/// Pack a thread cookie (32 bits), name ID (16 bits), and stack depth (16 bits)
-/// into a single u64. Guard stays 16 bytes.
+/// Pack a name ID (16 bits) and stack depth (16 bits) into a u64.
 ///
-/// Layout: `[cookie:32][name_id:16][depth:16]`
-///
-/// Note: only the low 32 bits of the cookie are stored, limiting unique thread
-/// identification to ~4 billion threads per process. This is a deliberate
-/// tradeoff (from a previous 48-bit cookie) to make room for the 16-bit
-/// name_id. If THREAD_COOKIE exceeds 2^32, `unpack_cookie` returns only the
-/// low 32 bits, which could cause false migration detection in `drop_cold`.
+/// Layout: `[unused:32][name_id:16][depth:16]`
 #[inline(always)]
-fn pack_cookie_name_depth(cookie: u64, name_id: u16, depth: u16) -> u64 {
-    (cookie << 32) | ((name_id as u64) << 16) | (depth as u64)
-}
-
-/// Unpack the thread cookie (high 32 bits) from a packed u64.
-#[inline(always)]
-fn unpack_cookie(packed: u64) -> u64 {
-    packed >> 32
-}
-
-/// Unpack the name ID (bits 16..31) from a packed u64.
-#[inline(always)]
-fn unpack_name_id(packed: u64) -> u16 {
-    (packed >> 16) as u16
+fn pack_name_depth(name_id: u16, depth: u16) -> u64 {
+    ((name_id as u64) << 16) | (depth as u64)
 }
 
 /// Unpack the stack depth (low 16 bits) from a packed u64.
@@ -768,11 +686,9 @@ fn unpack_depth(packed: u64) -> u16 {
 #[non_exhaustive]
 pub struct Guard {
     start_tsc: u64,
-    /// Bit layout: `[cookie:32][name_id:16][depth:16]`
-    /// - cookie: identifies the thread that called enter()
-    /// - name_id: index into the global interned name table
-    /// - depth: stack depth at the time of enter()
-    packed: u64,
+    /// Padding to keep Guard at 16 bytes (two registers). The packed value
+    /// is only read from StackEntry, not from Guard.
+    _padding: u64,
 }
 
 // Guard must be Send so async runtimes can move futures containing guards
@@ -788,229 +704,15 @@ const _: () = {
     }
 };
 
-impl Guard {
-    /// Check for thread migration after an .await point.
-    ///
-    /// If the Guard has migrated to a different thread, pushes a phantom
-    /// StackEntry onto the new thread's stack so that children can update
-    /// it via the normal parent fast path. Also registers the Guard as
-    /// migrated so the original thread can clean up the orphaned entry.
-    ///
-    /// No-op if still on the same thread. Idempotent: safe to call
-    /// multiple times (skips if phantom already exists on current stack).
-    pub fn check(&self) {
-        let current_cookie = THREAD_COOKIE.with(|c| *c);
-        let enter_cookie = unpack_cookie(self.packed);
-        if current_cookie == enter_cookie {
-            return; // Same thread, no migration
-        }
-
-        // Push phantom on current thread's stack (idempotent).
-        // Children will update it via the normal parent fast path.
-        STACK.with(|stack| {
-            let mut s = stack.borrow_mut();
-            // Check if phantom already exists for this guard (exact packed match).
-            let already_has = s
-                .iter()
-                .any(|e| e.packed == self.packed && e.name == "<phantom>");
-            if already_has {
-                return;
-            }
-
-            // Read forwarded children_ns from a previous thread's phantom and
-            // schedule cleanup of the old host thread's phantom (multi-hop
-            // migration: A -> B -> C).
-            let (forwarded_children_ns, fwd_arc) = {
-                // Lock registry: remove old entry (if any) and insert new one.
-                let arc = Arc::new(Mutex::new(0u64));
-                let old_info = {
-                    let mut reg = phantom_registry().lock().unwrap_or_else(|e| e.into_inner());
-                    let old = reg.remove(&self.packed);
-                    reg.insert(
-                        self.packed,
-                        PhantomInfo {
-                            host_cookie: current_cookie,
-                            children_arc: Arc::clone(&arc),
-                        },
-                    );
-                    old
-                }; // registry lock dropped here
-
-                // Process old entry (if any) without holding registry lock.
-                let forwarded = if let Some(old) = old_info {
-                    // Schedule cleanup of old host's phantom.
-                    let mut cleanup = phantom_cleanup().lock().unwrap_or_else(|e| e.into_inner());
-                    cleanup.push((old.host_cookie, self.packed));
-                    HAS_PHANTOM_CLEANUP.store(true, Ordering::Relaxed);
-                    drop(cleanup); // cleanup lock dropped
-
-                    let val = *old.children_arc.lock().unwrap_or_else(|e| e.into_inner());
-                    *arc.lock().unwrap_or_else(|e| e.into_inner()) = val;
-                    val
-                } else {
-                    0
-                };
-
-                (forwarded, arc)
-            };
-
-            // Store the Arc for write-through from child drops.
-            PHANTOM_ARCS.with(|arcs| {
-                arcs.borrow_mut().push((self.packed, fwd_arc));
-            });
-
-            s.push(StackEntry {
-                name: "<phantom>",
-                children_ns: forwarded_children_ns,
-                #[cfg(feature = "cpu-time")]
-                cpu_children_ns: 0,
-                #[cfg(feature = "cpu-time")]
-                cpu_start_ns: crate::cpu_clock::cpu_now_ns(),
-                saved_alloc: crate::alloc::ALLOC_COUNTERS
-                    .try_with(|cell| {
-                        let snap = cell.get();
-                        cell.set(crate::alloc::AllocSnapshot::new());
-                        snap
-                    })
-                    .unwrap_or_default(),
-                packed: self.packed,
-            });
-        });
-    }
-}
-
-/// Bookkeeping half of Guard::drop(): thread check, alloc restore, stack pop,
+/// Bookkeeping half of Guard::drop(): alloc restore, stack pop,
 /// recording. Kept out-of-line so the inlined drop is just a counter read + call.
 #[inline(never)]
 fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_ns: u64) {
-    let drop_cookie = THREAD_COOKIE.with(|c| *c);
-    let enter_cookie = unpack_cookie(guard.packed);
-    let migrated = drop_cookie != enter_cookie;
-
-    if migrated {
-        let name = lookup_name(unpack_name_id(guard.packed));
-        let elapsed_ns = crate::tsc::elapsed_ns(guard.start_tsc, end_tsc);
-
-        // Post-migration children (Case 2): find and pop our phantom
-        // StackEntry. Its children_ns was updated by children via the
-        // normal parent fast path, and seeded with forwarded children
-        // from previous thread hops (multi-hop migration).
-        let phantom_entry = STACK.with(|stack| {
-            let mut s = stack.borrow_mut();
-            s.iter()
-                .rposition(|e| e.packed == guard.packed && e.name == "<phantom>")
-                .map(|pos| s.remove(pos))
-        });
-        let (phantom_children_ns, phantom_saved_alloc) = if let Some(ref p) = phantom_entry {
-            (p.children_ns, p.saved_alloc)
-        } else {
-            (0, crate::alloc::AllocSnapshot::new())
-        };
-
-        // CPU time for the post-migration segment: measure from when check()
-        // created the phantom on this thread to the Guard's drop. Pre-migration
-        // CPU time (on the original thread) is lost -- acceptable since that
-        // segment ran on a different thread's CPU clock.
-        // When no phantom exists (check() never called), report 0.
-        #[cfg(feature = "cpu-time")]
-        let cpu_self_ns = if let Some(ref p) = phantom_entry {
-            let cpu_elapsed = cpu_end_ns.saturating_sub(p.cpu_start_ns);
-            cpu_elapsed.saturating_sub(p.cpu_children_ns)
-        } else {
-            0
-        };
-
-        // Clean up the phantom registry and PHANTOM_ARCS for this guard.
-        {
-            let mut reg = phantom_registry().lock().unwrap_or_else(|e| e.into_inner());
-            reg.remove(&guard.packed);
-        }
-        PHANTOM_ARCS.with(|arcs| {
-            arcs.borrow_mut().retain(|(pk, _)| *pk != guard.packed);
-        });
-
-        let self_ns = elapsed_ns.saturating_sub(phantom_children_ns);
-
-        // Migrated path: merge directly into Mutex-guarded RECORDS (not the
-        // fast buffer) because this thread has no depth-0 boundary to flush.
-        RECORDS.with(|records| {
-            let mut recs = records.lock().unwrap_or_else(|e| e.into_inner());
-            merge_into_fnagg_vec(
-                &mut recs,
-                name,
-                elapsed_ns,
-                phantom_children_ns,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns,
-            );
-        });
-
-        let scope_alloc = crate::alloc::ALLOC_COUNTERS
-            .try_with(|cell| cell.get())
-            .unwrap_or_default();
-
-        // Restore the phantom's saved alloc counters (parent scope's data on this thread).
-        let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
-            cell.set(phantom_saved_alloc);
-        });
-
-        #[cfg(any(test, feature = "_test_internals"))]
-        {
-            let start_ns = crate::tsc::ticks_to_epoch_ns(guard.start_tsc, crate::tsc::epoch_tsc());
-            INVOCATIONS.with(|inv| {
-                inv.borrow_mut().push(InvocationRecord {
-                    name,
-                    start_ns,
-                    elapsed_ns,
-                    self_ns,
-                    #[cfg(feature = "cpu-time")]
-                    cpu_self_ns,
-                    alloc_count: scope_alloc.alloc_count,
-                    alloc_bytes: scope_alloc.alloc_bytes,
-                    free_count: scope_alloc.free_count,
-                    free_bytes: scope_alloc.free_bytes,
-                    depth: 0,
-                });
-            });
-        }
-
-        FRAME_BUFFER.with(|buf| {
-            merge_into_frame_buf(
-                &mut buf.borrow_mut(),
-                name,
-                self_ns,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns,
-                scope_alloc.alloc_count,
-                scope_alloc.alloc_bytes,
-                scope_alloc.free_count,
-                scope_alloc.free_bytes,
-            );
-        });
-        return;
-    }
-
-    // Same thread -- existing logic with orphan drain prefix.
     let scope_alloc = crate::alloc::ALLOC_COUNTERS
         .try_with(|cell| cell.get())
         .unwrap_or_default();
 
     STACK.with(|stack| {
-        // Drain orphaned entries left by migrated child guards.
-        {
-            let mut s = stack.borrow_mut();
-            let guard_depth = unpack_depth(guard.packed);
-            while s
-                .last()
-                .map_or(false, |e| unpack_depth(e.packed) > guard_depth)
-            {
-                let orphan = s.pop().unwrap();
-                let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
-                    cell.set(orphan.saved_alloc);
-                });
-            }
-        }
-
         let entry = match stack.borrow_mut().pop() {
             Some(e) => e,
             None => {
@@ -1035,18 +737,6 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
 
         if let Some(parent) = stack.borrow_mut().last_mut() {
             parent.children_ns += elapsed_ns;
-            // If parent is a phantom (cookie differs from this thread),
-            // write through to its forwarding Arc so subsequent thread
-            // hops can read the accumulated children_ns.
-            if unpack_cookie(parent.packed) != drop_cookie {
-                let children = parent.children_ns;
-                let pk = parent.packed;
-                PHANTOM_ARCS.with(|arcs| {
-                    if let Some((_, arc)) = arcs.borrow().iter().find(|(k, _)| *k == pk) {
-                        *arc.lock().unwrap_or_else(|e| e.into_inner()) = children;
-                    }
-                });
-            }
             #[cfg(feature = "cpu-time")]
             {
                 parent.cpu_children_ns += cpu_elapsed_ns;
@@ -1145,55 +835,11 @@ impl Drop for Guard {
     }
 }
 
-/// Drain stale phantom StackEntries scheduled for cleanup on this thread.
-///
-/// Called from `enter_cold` before pushing the new entry. The cleanup queue
-/// is populated by `check()` on other threads when a guard re-migrates
-/// (e.g., A -> B -> C: C schedules B's phantom for cleanup).
-fn drain_phantom_cleanup(my_cookie: u64) {
-    if !HAS_PHANTOM_CLEANUP.load(Ordering::Relaxed) {
-        return;
-    }
-    let mut queue = phantom_cleanup().lock().unwrap_or_else(|e| e.into_inner());
-    let mine: Vec<u64> = queue
-        .iter()
-        .filter(|(cookie, _)| *cookie == my_cookie)
-        .map(|(_, packed)| *packed)
-        .collect();
-    queue.retain(|(cookie, _)| *cookie != my_cookie);
-    if queue.is_empty() {
-        HAS_PHANTOM_CLEANUP.store(false, Ordering::Relaxed);
-    }
-    drop(queue);
-
-    if mine.is_empty() {
-        return;
-    }
-
-    // Remove matching phantom StackEntries from this thread's stack.
-    STACK.with(|stack| {
-        stack
-            .borrow_mut()
-            .retain(|e| !(e.name == "<phantom>" && mine.contains(&e.packed)));
-    });
-    // Remove matching PHANTOM_ARCS entries.
-    PHANTOM_ARCS.with(|arcs| {
-        arcs.borrow_mut()
-            .retain(|(packed, _)| !mine.contains(packed));
-    });
-}
-
 /// Bookkeeping half of enter(): epoch, alloc save, stack push, name interning.
-/// Returns a packed u64: `[cookie:32][name_id:16][depth:16]`.
+/// Returns a packed u64: `[unused:32][name_id:16][depth:16]`.
 #[inline(never)]
 fn enter_cold(name: &'static str) -> u64 {
     let _ = epoch();
-
-    let cookie = THREAD_COOKIE.with(|c| *c);
-
-    // Drain stale phantoms before computing depth, so the new entry
-    // gets the correct stack position.
-    drain_phantom_cleanup(cookie);
 
     let name_id = intern_name(name);
 
@@ -1210,7 +856,7 @@ fn enter_cold(name: &'static str) -> u64 {
 
     STACK.with(|stack| {
         let depth = stack.borrow().len() as u16;
-        let packed = pack_cookie_name_depth(cookie, name_id, depth);
+        let packed = pack_name_depth(name_id, depth);
         stack.borrow_mut().push(StackEntry {
             name,
             children_ns: 0,
@@ -1237,7 +883,10 @@ fn enter_cold(name: &'static str) -> u64 {
 pub fn enter(name: &'static str) -> Guard {
     let packed = enter_cold(name);
     let start_tsc = crate::tsc::read();
-    Guard { start_tsc, packed }
+    Guard {
+        start_tsc,
+        _padding: packed,
+    }
 }
 
 /// Register a function name so it appears in output even if never called.
@@ -1357,9 +1006,6 @@ pub fn collect_all() -> Vec<FunctionRecord> {
 }
 
 /// Clear all collected timing data for the current thread.
-///
-/// Also drains any pending phantom cleanup entries targeting this thread
-/// from the global queue, so stale phantoms don't leak across test runs.
 pub fn reset() {
     STACK.with(|stack| stack.borrow_mut().clear());
     RECORDS_BUF.with(|buf| buf.borrow_mut().clear());
@@ -1371,10 +1017,6 @@ pub fn reset() {
     INVOCATIONS.with(|inv| inv.borrow_mut().clear());
     FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
     FRAMES.with(|frames| frames.lock().unwrap_or_else(|e| e.into_inner()).clear());
-    PHANTOM_ARCS.with(|arcs| arcs.borrow_mut().clear());
-    // Drain any pending cleanup entries for this thread from the global queue.
-    let cookie = THREAD_COOKIE.with(|c| *c);
-    drain_phantom_cleanup(cookie);
 }
 
 /// Clear collected timing data across ALL threads, plus the calling thread's
@@ -1400,16 +1042,6 @@ pub fn reset_all() {
     };
     for arc in &frame_arcs {
         arc.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
-    // Clear global phantom state.
-    phantom_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
-    {
-        let mut cleanup = phantom_cleanup().lock().unwrap_or_else(|e| e.into_inner());
-        cleanup.clear();
-        HAS_PHANTOM_CLEANUP.store(false, Ordering::Relaxed);
     }
     // Clear the calling thread's local state.
     reset();
@@ -1929,7 +1561,6 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
     #[cfg(feature = "cpu-time")]
     let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
 
-    let cookie = THREAD_COOKIE.with(|c| *c);
     STACK.with(|stack| {
         let depth = stack.borrow().len() as u16;
         stack.borrow_mut().push(StackEntry {
@@ -1940,7 +1571,7 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
             #[cfg(feature = "cpu-time")]
             cpu_start_ns,
             saved_alloc,
-            packed: pack_cookie_name_depth(cookie, intern_name(ctx.parent_name), depth),
+            packed: pack_name_depth(intern_name(ctx.parent_name), depth),
         });
     });
 
@@ -2792,151 +2423,6 @@ mod tests {
     }
 
     #[test]
-    fn async_guard_migrated_wall_time() {
-        reset();
-        let guard = enter("migrating_fn");
-        burn_cpu(10_000);
-
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                burn_cpu(10_000);
-                drop(guard);
-            });
-        });
-
-        let records = collect_all();
-        let rec = records.iter().find(|r| r.name == "migrating_fn");
-        assert!(
-            rec.is_some(),
-            "migrated guard should preserve function name 'migrating_fn'. Got: {:?}",
-            records.iter().map(|r| &r.name).collect::<Vec<_>>()
-        );
-        assert!(
-            rec.unwrap().total_ms > 0.5,
-            "wall time should reflect work on both threads"
-        );
-    }
-
-    #[test]
-    fn async_guard_orphan_cleanup() {
-        reset();
-        {
-            let _parent = enter("parent");
-            burn_cpu(5_000);
-
-            let child = enter("child");
-            burn_cpu(5_000);
-
-            std::thread::scope(|s| {
-                s.spawn(move || {
-                    burn_cpu(5_000);
-                    drop(child);
-                });
-            });
-
-            burn_cpu(5_000);
-        }
-
-        let records = collect();
-        let parent = records.iter().find(|r| r.name == "parent").unwrap();
-        assert_eq!(parent.calls, 1, "parent should have exactly 1 call");
-        assert!(parent.total_ms > 0.0, "parent wall time should be positive");
-        assert!(parent.self_ms > 0.0, "parent self time should be positive");
-    }
-
-    #[test]
-    fn async_guard_nested_migration() {
-        reset();
-        {
-            let _parent = enter("gp_parent");
-            burn_cpu(5_000);
-            {
-                let _child = enter("gp_child");
-                burn_cpu(5_000);
-
-                let grandchild = enter("gp_grandchild");
-                burn_cpu(5_000);
-
-                std::thread::scope(|s| {
-                    s.spawn(move || {
-                        drop(grandchild);
-                    });
-                });
-
-                burn_cpu(5_000);
-            }
-            burn_cpu(5_000);
-        }
-
-        let records = collect();
-        let parent = records.iter().find(|r| r.name == "gp_parent").unwrap();
-        let child = records.iter().find(|r| r.name == "gp_child").unwrap();
-        assert_eq!(parent.calls, 1);
-        assert_eq!(child.calls, 1);
-        assert!(parent.self_ms > 0.0, "parent not corrupted");
-        assert!(child.self_ms > 0.0, "child not corrupted");
-        assert!(
-            parent.self_ms < parent.total_ms,
-            "parent has child time subtracted"
-        );
-    }
-
-    #[test]
-    fn async_guard_alloc_restore_on_orphan() {
-        // When a child guard migrates, its stack entry's saved_alloc is
-        // orphaned. During the parent's drop, the orphan drain restores
-        // those saved counters to ALLOC_COUNTERS before the parent's own
-        // saved_alloc is restored. This ensures the grandparent scope
-        // sees consistent alloc state after the parent completes.
-        reset();
-
-        // Set a known alloc baseline before any guards.
-        crate::alloc::ALLOC_COUNTERS.with(|cell| {
-            cell.set(crate::alloc::AllocSnapshot {
-                alloc_count: 42,
-                alloc_bytes: 4200,
-                free_count: 0,
-                free_bytes: 0,
-            });
-        });
-
-        {
-            let _parent = enter("alloc_parent");
-            // enter() saved {42, 4200} and zeroed counters.
-            // Simulate allocations in parent scope.
-            crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                cell.set(crate::alloc::AllocSnapshot {
-                    alloc_count: 10,
-                    alloc_bytes: 1000,
-                    free_count: 0,
-                    free_bytes: 0,
-                });
-            });
-
-            let child = enter("alloc_child");
-            // enter() saved {10, 1000} and zeroed counters.
-
-            std::thread::scope(|s| {
-                s.spawn(move || {
-                    drop(child);
-                });
-            });
-            // child's stack entry is now orphaned with saved_alloc = {10, 1000}.
-        }
-        // After parent drops: orphan drain restores {10, 1000}, then parent
-        // restores its own saved {42, 4200}. ALLOC_COUNTERS should be {42, 4200}.
-        let restored = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
-        assert_eq!(
-            restored.alloc_count, 42,
-            "grandparent alloc_count should be restored after orphan drain"
-        );
-        assert_eq!(
-            restored.alloc_bytes, 4200,
-            "grandparent alloc_bytes should be restored after orphan drain"
-        );
-    }
-
-    #[test]
     fn set_runs_dir_used_by_flush() {
         // set_runs_dir() should configure where flush() writes data,
         // without requiring PIANO_RUNS_DIR env var or ~/.piano/ fallback.
@@ -3025,129 +2511,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[cfg(feature = "cpu-time")]
-    #[test]
-    fn async_guard_cpu_time_skipped_on_migration() {
-        reset();
-        let guard = enter("cpu_migrated");
-        burn_cpu(20_000);
-
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                burn_cpu(20_000);
-                drop(guard);
-            });
-        });
-
-        let records = collect_all();
-        let rec = records
-            .iter()
-            .find(|r| r.name == "cpu_migrated")
-            .expect("migrated guard should preserve name 'cpu_migrated'");
-        assert!(rec.total_ms > 0.0, "wall time captured");
-        assert!(
-            rec.cpu_self_ms == 0.0,
-            "cpu_self_ms should be exactly 0 for migrated guard, got {:.3}",
-            rec.cpu_self_ms
-        );
-    }
-
-    #[cfg(feature = "cpu-time")]
-    #[test]
-    fn migrated_guard_with_check_captures_cpu_time() {
-        // When check() is called after migration, the phantom records
-        // cpu_start_ns on the new thread. CPU time from that point to
-        // Guard::drop should be captured (post-migration segment).
-        reset();
-        let guard = enter("cpu_mig_check");
-
-        // Collect invocations from the spawned thread (INVOCATIONS is TLS).
-        let child_invocations = std::thread::scope(|s| {
-            s.spawn(move || {
-                guard.check();
-                // Burn CPU after check() so the post-migration segment
-                // has measurable CPU time on this thread.
-                burn_cpu(100_000);
-                drop(guard);
-                collect_invocations()
-            })
-            .join()
-            .unwrap()
-        });
-
-        let inv = child_invocations
-            .iter()
-            .find(|r| r.name == "cpu_mig_check")
-            .expect("migrated guard should preserve name 'cpu_mig_check'");
-        assert!(
-            inv.cpu_self_ns > 0,
-            "cpu_self_ns should be non-zero for migrated guard with check(), got {}",
-            inv.cpu_self_ns
-        );
-
-        let records = collect_all();
-        let rec = records
-            .iter()
-            .find(|r| r.name == "cpu_mig_check")
-            .expect("migrated guard should preserve name 'cpu_mig_check'");
-        assert!(
-            rec.cpu_self_ms > 0.0,
-            "cpu_self_ms should be non-zero for migrated guard with check(), got {:.6}",
-            rec.cpu_self_ms
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "cpu-time")]
-    fn migrated_guard_cpu_self_excludes_children() {
-        // After migration + check(), a child function called on the new thread
-        // should have its CPU time subtracted from the parent's cpu_self_ns.
-        reset();
-        let parent_guard = enter("mig_cpu_parent");
-
-        let child_invocations = std::thread::scope(|s| {
-            s.spawn(move || {
-                parent_guard.check();
-
-                // Child function burns CPU after the parent migrated.
-                let child_guard = enter("mig_cpu_child");
-                burn_cpu(200_000);
-                drop(child_guard);
-
-                // Parent also burns a small amount so its self time is non-zero.
-                burn_cpu(50_000);
-                drop(parent_guard);
-                collect_invocations()
-            })
-            .join()
-            .unwrap()
-        });
-
-        let parent = child_invocations
-            .iter()
-            .find(|r| r.name == "mig_cpu_parent")
-            .expect("parent invocation should exist");
-        let child = child_invocations
-            .iter()
-            .find(|r| r.name == "mig_cpu_child")
-            .expect("child invocation should exist");
-
-        assert!(
-            child.cpu_self_ns > 0,
-            "child cpu_self_ns should be non-zero, got {}",
-            child.cpu_self_ns
-        );
-        // The parent's cpu_self_ns must exclude the child's CPU time.
-        // Without the fix, parent.cpu_self_ns >= child.cpu_self_ns (double-counted).
-        assert!(
-            parent.cpu_self_ns < child.cpu_self_ns,
-            "parent cpu_self_ns ({}) should be less than child cpu_self_ns ({}) \
-             because child CPU time must be subtracted",
-            parent.cpu_self_ns,
-            child.cpu_self_ns
-        );
-    }
-
     #[test]
     fn stack_entry_size() {
         let size = core::mem::size_of::<StackEntry>();
@@ -3160,501 +2523,19 @@ mod tests {
     }
 
     #[test]
-    fn guard_check_pushes_phantom_on_migration() {
-        reset();
-        let guard = enter("check_parent");
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                guard.check();
-                STACK.with(|stack| {
-                    let s = stack.borrow();
-                    assert_eq!(s.len(), 1, "phantom should be pushed");
-                    assert_eq!(s[0].name, "<phantom>");
-                });
-                drop(guard);
-            });
-        });
-    }
-
-    #[test]
-    fn guard_check_is_noop_on_same_thread() {
-        reset();
-        let guard = enter("same_thread");
-        guard.check();
-        STACK.with(|stack| {
-            let s = stack.borrow();
-            assert_eq!(s.len(), 1, "no phantom on same thread");
-            assert_eq!(s[0].name, "same_thread");
-        });
-        drop(guard);
-    }
-
-    #[test]
-    fn guard_check_is_idempotent() {
-        reset();
-        let guard = enter("idempotent");
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                guard.check();
-                guard.check();
-                STACK.with(|stack| {
-                    let s = stack.borrow();
-                    assert_eq!(s.len(), 1, "only one phantom after two checks");
-                });
-                drop(guard);
-            });
-        });
-    }
-
-    #[test]
-    fn phantom_saves_host_thread_alloc_counters() {
-        // When check() creates a phantom on thread B, it should save B's
-        // current ALLOC_COUNTERS (from a parent scope) and zero them,
-        // just like enter() does. This protects parent scopes from having
-        // their alloc data destroyed when the phantom is later popped.
-        reset();
-
-        // Thread A: enter creates the guard.
-        let guard = enter("phantom_alloc_test");
-
-        // Move guard to thread B where there's a parent scope with alloc data.
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                // B has a parent scope with alloc data.
-                crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                    cell.set(crate::alloc::AllocSnapshot {
-                        alloc_count: 42,
-                        alloc_bytes: 9999,
-                        free_count: 10,
-                        free_bytes: 500,
-                    });
-                });
-
-                // check() detects migration A->B, creates phantom on B.
-                // It should save B's {42, 9999, 10, 500} into phantom.saved_alloc
-                // and zero B's counters.
-                guard.check();
-
-                let after_check = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
-                assert_eq!(
-                    after_check.alloc_count, 0,
-                    "check() should zero ALLOC_COUNTERS after saving to phantom"
-                );
-                assert_eq!(
-                    after_check.alloc_bytes, 0,
-                    "check() should zero alloc_bytes"
-                );
-
-                drop(guard);
-            });
-        });
-    }
-
-    #[test]
-    fn migrated_parent_subtracts_post_migration_children() {
-        reset();
-        let parent_guard = enter("mig_parent");
-        let invocations = std::thread::scope(|s| {
-            s.spawn(move || {
-                parent_guard.check();
-                {
-                    let _child = enter("mig_child");
-                    burn_cpu(20_000);
-                }
-                drop(parent_guard);
-                collect_invocations()
-            })
-            .join()
-            .unwrap()
-        });
-
-        let parent_inv = invocations
-            .iter()
-            .find(|r| r.name == "mig_parent")
-            .expect("migrated parent should preserve name 'mig_parent'");
-        let child_inv = invocations
-            .iter()
-            .find(|r| r.name == "mig_child")
-            .expect("child should produce an invocation");
-
-        assert!(
-            parent_inv.self_ns < parent_inv.elapsed_ns,
-            "self_ns ({}) should be < elapsed_ns ({}) after subtracting child",
-            parent_inv.self_ns,
-            parent_inv.elapsed_ns,
-        );
-        assert!(
-            child_inv.elapsed_ns > 500_000,
-            "child should have substantial elapsed time, got {}",
-            child_inv.elapsed_ns,
-        );
-    }
-
-    #[test]
-    fn migrated_record_has_children_subtracted_in_collect() {
-        reset();
-        let parent_guard = enter("rec_parent");
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                parent_guard.check();
-                {
-                    let _child = enter("rec_child");
-                    burn_cpu(20_000);
-                }
-                drop(parent_guard);
-            });
-        });
-
-        let records = collect_all();
-        let parent_rec = records
-            .iter()
-            .find(|r| r.name == "rec_parent")
-            .expect("migrated parent should preserve name 'rec_parent'");
-
-        assert!(
-            parent_rec.self_ms < parent_rec.total_ms,
-            "self_ms ({:.3}) should be < total_ms ({:.3})",
-            parent_rec.self_ms,
-            parent_rec.total_ms,
-        );
-    }
-
-    #[test]
-    fn root_function_does_not_affect_migrated_guard() {
-        reset();
-        {
-            let _root = enter("root_fn");
-            burn_cpu(20_000);
-        }
-
-        let guard = std::thread::scope(|s| s.spawn(|| enter("other_thread")).join().unwrap());
-        guard.check();
-        drop(guard);
-
-        let invocations = collect_invocations();
-        let migrated = invocations
-            .iter()
-            .find(|r| r.name == "other_thread")
-            .expect("migrated guard should preserve name 'other_thread'");
-
-        assert_eq!(
-            migrated.self_ns, migrated.elapsed_ns,
-            "migrated guard with no children: self_ns ({}) should equal elapsed_ns ({})",
-            migrated.self_ns, migrated.elapsed_ns,
-        );
-    }
-
-    #[test]
-    fn phantom_on_second_migration_captures_children() {
-        // A->B->C migration: guard enters on A, migrates to B (phantom on B,
-        // child on B updates it), migrates to C (phantom on C, child on C
-        // updates it), drops on C. Both B's and C's phantom children should
-        // be subtracted from the migrated record's self_ns via forwarding.
-        reset();
-        let guard = enter("bc_parent");
-        let (guard, _b_invocations) = std::thread::scope(|s| {
-            s.spawn(move || {
-                guard.check();
-                {
-                    let _child = enter("b_child");
-                    burn_cpu(10_000);
-                }
-                let inv = collect_invocations();
-                (guard, inv)
-            })
-            .join()
-            .unwrap()
-        });
-
-        let c_invocations = std::thread::scope(|s| {
-            s.spawn(move || {
-                guard.check();
-                {
-                    let _child = enter("c_child");
-                    burn_cpu(10_000);
-                }
-                drop(guard);
-                collect_invocations()
-            })
-            .join()
-            .unwrap()
-        });
-
-        let b_child_ns = _b_invocations
-            .iter()
-            .find(|r| r.name == "b_child")
-            .expect("b_child invocation")
-            .elapsed_ns;
-
-        let c_child_ns = c_invocations
-            .iter()
-            .find(|r| r.name == "c_child")
-            .expect("c_child invocation")
-            .elapsed_ns;
-
-        let migrated = c_invocations
-            .iter()
-            .find(|r| r.name == "bc_parent")
-            .expect("migrated guard should preserve name 'bc_parent'");
-
-        // Both B's and C's children should be subtracted from self_ns.
-        let children_ns = migrated.elapsed_ns - migrated.self_ns;
-        assert!(
-            migrated.self_ns < migrated.elapsed_ns,
-            "self_ns ({}) should be < elapsed_ns ({}) with children on B and C",
-            migrated.self_ns,
-            migrated.elapsed_ns,
-        );
-        // Verify B's children were forwarded: children_ns should account
-        // for both b_child and c_child (with tolerance for timing noise).
-        let expected_children_min = (b_child_ns + c_child_ns) / 2;
-        assert!(
-            children_ns >= expected_children_min,
-            "children_ns ({children_ns}) should include both b_child ({b_child_ns}) \
-             and c_child ({c_child_ns}) (min threshold: {expected_children_min})",
-        );
-    }
-
-    #[test]
-    fn multiple_checks_on_same_thread_are_idempotent() {
-        reset();
-        let guard = enter("multi_check");
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                guard.check();
-                {
-                    let _child1 = enter("child1");
-                    burn_cpu(10_000);
-                }
-                guard.check();
-                {
-                    let _child2 = enter("child2");
-                    burn_cpu(10_000);
-                }
-                STACK.with(|stack| {
-                    let s = stack.borrow();
-                    assert_eq!(s.len(), 1, "only one phantom on stack");
-                    assert!(
-                        s[0].children_ns > 0,
-                        "phantom should have accumulated children_ns"
-                    );
-                });
-                drop(guard);
-            });
-        });
-    }
-
-    #[test]
-    fn migrated_guard_preserves_function_name() {
-        // Migrated guards should report the actual function name,
-        // not a generic "<migrated>" placeholder.
-        reset();
-        let guard = enter("real_fn_name");
-        burn_cpu(10_000);
-
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                burn_cpu(10_000);
-                drop(guard);
-            });
-        });
-
-        let records = collect_all();
-        let rec = records.iter().find(|r| r.name == "real_fn_name");
-        assert!(
-            rec.is_some(),
-            "migrated guard should preserve function name 'real_fn_name'. Got: {:?}",
-            records.iter().map(|r| &r.name).collect::<Vec<_>>()
-        );
-        assert!(
-            rec.unwrap().total_ms > 0.0,
-            "should have recorded wall time"
-        );
-    }
-
-    #[test]
-    fn migrated_guards_distinguish_multiple_functions() {
-        // When multiple functions migrate, each should retain its own name
-        // instead of collapsing into a single "<migrated>" bucket.
-        reset();
-        let guard_a = enter("fn_alpha");
-        burn_cpu(5_000);
-
-        let guard_b = std::thread::scope(|s| s.spawn(|| enter("fn_beta")).join().unwrap());
-        burn_cpu(5_000);
-
-        // Drop both guards on different threads than where they were created.
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                drop(guard_a);
-            });
-        });
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                drop(guard_b);
-            });
-        });
-
-        let records = collect_all();
-        let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
-        assert!(
-            names.contains(&"fn_alpha"),
-            "should have fn_alpha in records. Got: {names:?}"
-        );
-        assert!(
-            names.contains(&"fn_beta"),
-            "should have fn_beta in records. Got: {names:?}"
-        );
-        assert!(
-            !names.contains(&"<migrated>"),
-            "should NOT have <migrated> placeholder. Got: {names:?}"
-        );
-    }
-
-    #[test]
-    fn migrated_invocation_has_real_name() {
-        // Verify InvocationRecord also carries the real function name.
-        reset();
-        let guard = enter("inv_migrated_fn");
-        burn_cpu(10_000);
-
-        let invocations = std::thread::scope(|s| {
-            s.spawn(move || {
-                burn_cpu(10_000);
-                drop(guard);
-                collect_invocations()
-            })
-            .join()
-            .unwrap()
-        });
-
-        let inv = invocations.iter().find(|r| r.name == "inv_migrated_fn");
-        assert!(
-            inv.is_some(),
-            "migrated invocation should have name 'inv_migrated_fn'. Got: {:?}",
-            invocations.iter().map(|r| r.name).collect::<Vec<_>>()
-        );
-        assert!(
-            inv.unwrap().elapsed_ns > 0,
-            "should have recorded elapsed time"
-        );
-    }
-
-    #[test]
     fn pack_unpack_round_trip() {
-        let cookie = 42u64;
-        let name_id = 1234u16;
-        let depth = 567u16;
-        let packed = pack_cookie_name_depth(cookie, name_id, depth);
-        assert_eq!(unpack_cookie(packed), cookie);
-        assert_eq!(unpack_name_id(packed), name_id);
+        let name_id: u16 = 42;
+        let depth: u16 = 7;
+        let packed = pack_name_depth(name_id, depth);
         assert_eq!(unpack_depth(packed), depth);
 
-        // Max values: verifies the full bit range.
-        let packed_max = pack_cookie_name_depth(u32::MAX as u64, u16::MAX, u16::MAX);
-        assert_eq!(unpack_cookie(packed_max), u32::MAX as u64);
-        assert_eq!(unpack_name_id(packed_max), u16::MAX);
+        // Max values
+        let packed_max = pack_name_depth(u16::MAX, u16::MAX);
         assert_eq!(unpack_depth(packed_max), u16::MAX);
 
-        // Zero values: verifies zero-packing.
-        let packed_zero = pack_cookie_name_depth(0, 0, 0);
-        assert_eq!(unpack_cookie(packed_zero), 0);
-        assert_eq!(unpack_name_id(packed_zero), 0);
+        // Zero values
+        let packed_zero = pack_name_depth(0, 0);
         assert_eq!(unpack_depth(packed_zero), 0);
-    }
-
-    #[test]
-    fn phantom_cleaned_up_on_intermediate_thread() {
-        // A -> B -> C migration: after the guard migrates from B to C, B's
-        // phantom StackEntry should be cleaned up so that subsequent functions
-        // on B get correct depth and frame boundaries.
-        //
-        // This test uses a long-lived thread B (via channels) so we can:
-        // 1. Send the guard to B (check() pushes phantom)
-        // 2. Send the guard to C (check() on C detects re-migration, drops on C)
-        // 3. Run a new function on B and verify correct behavior
-        use std::sync::mpsc;
-
-        reset();
-
-        let guard = enter("async_fn");
-
-        // Thread B: stays alive across the full test.
-        let (tx_guard_to_b, rx_guard_on_b) = mpsc::channel::<Guard>();
-        let (tx_guard_from_b, rx_guard_from_b) = mpsc::channel::<Guard>();
-        let (tx_verify, rx_verify) = mpsc::channel::<()>();
-        let (tx_results, rx_results) = mpsc::channel::<(u16, usize)>(); // (depth, frame_count)
-
-        let b_handle = std::thread::spawn(move || {
-            // Phase 1: receive guard, push phantom.
-            let guard = rx_guard_on_b.recv().unwrap();
-            guard.check();
-            // Send guard to main so it can go to C.
-            tx_guard_from_b.send(guard).unwrap();
-
-            // Phase 2: wait for signal that guard has been dropped on C.
-            rx_verify.recv().unwrap();
-
-            // Phase 3: run a new top-level function on B.
-            // Do NOT call reset() here -- that would clear the stack
-            // and mask the bug. Only clear invocations and frames so we
-            // can observe fresh results.
-            INVOCATIONS.with(|inv| inv.borrow_mut().clear());
-            FRAMES.with(|frames| frames.lock().unwrap_or_else(|e| e.into_inner()).clear());
-            FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
-
-            {
-                let _work = enter("b_later_work");
-                burn_cpu(1_000);
-            }
-
-            // Collect results: depth and frame count.
-            let invocations = collect_invocations();
-            let frames = collect_frames();
-            // Filter to frames from this test (collect_frames is now global).
-            let my_frame_count = frames
-                .iter()
-                .filter(|f| f.iter().any(|s| s.name == "b_later_work"))
-                .count();
-
-            let work_rec = invocations
-                .iter()
-                .find(|r| r.name == "b_later_work")
-                .expect("should have b_later_work record");
-
-            tx_results.send((work_rec.depth, my_frame_count)).unwrap();
-        });
-
-        // Send guard to B.
-        tx_guard_to_b.send(guard).unwrap();
-        // Get guard back from B.
-        let guard = rx_guard_from_b.recv().unwrap();
-
-        // Send guard to C, where it drops.
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                guard.check();
-                drop(guard);
-            });
-        });
-
-        // Signal B that the guard has dropped.
-        tx_verify.send(()).unwrap();
-
-        // Get results from B.
-        let (depth, frame_count) = rx_results.recv().unwrap();
-        b_handle.join().unwrap();
-
-        // After phantom cleanup, b_later_work should be depth 0 (top-level on B).
-        assert_eq!(
-            depth, 0,
-            "b_later_work depth should be 0 after phantom cleanup (got {depth})"
-        );
-        // Frame boundary should have triggered (depth == 0).
-        assert_eq!(
-            frame_count, 1,
-            "should have 1 frame after b_later_work completes (got {frame_count})"
-        );
     }
 
     #[test]
@@ -3677,466 +2558,6 @@ mod tests {
 
         // Clean up.
         let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn alloc_accumulator_carries_data_across_thread_hop() {
-        // Simulates: async fn foo() {
-        //     alloc 1000 bytes         // segment 1 on thread A
-        //     _acc.save();
-        //     something.await;          // migrates to thread B
-        //     _guard.check();
-        //     _acc.resume();
-        //     alloc 2000 bytes         // segment 2 on thread B
-        // }                            // acc drops -> writes total to ALLOC_COUNTERS
-        reset();
-
-        let _guard = enter("acc_test");
-        let mut acc = crate::alloc::AllocAccumulator::new();
-
-        // Segment 1: allocations on thread A.
-        crate::alloc::ALLOC_COUNTERS.with(|cell| {
-            cell.set(crate::alloc::AllocSnapshot {
-                alloc_count: 5,
-                alloc_bytes: 1000,
-                free_count: 1,
-                free_bytes: 200,
-            });
-        });
-
-        // Pre-await: save alloc state while still on A.
-        acc.save();
-
-        // At this point, A's ALLOC_COUNTERS should be zeroed.
-        let after_save = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
-        assert_eq!(after_save.alloc_count, 0, "save() should zero counters");
-
-        // --- Simulate thread migration ---
-        // Move acc to thread B (simulating future state machine migration).
-        // Guard stays on A for this test since we're testing the accumulator,
-        // not the guard's migration path.
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                // Post-migration: resume on new thread.
-                // First, B might have garbage in its counters from other work.
-                crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                    cell.set(crate::alloc::AllocSnapshot {
-                        alloc_count: 999,
-                        alloc_bytes: 99999,
-                        free_count: 0,
-                        free_bytes: 0,
-                    });
-                });
-
-                // resume() zeros B's counters, isolating our scope.
-                acc.resume();
-
-                let after_resume = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
-                assert_eq!(
-                    after_resume.alloc_count, 0,
-                    "resume() should zero B's counters"
-                );
-
-                // Segment 2: allocations on thread B.
-                crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                    cell.set(crate::alloc::AllocSnapshot {
-                        alloc_count: 3,
-                        alloc_bytes: 2000,
-                        free_count: 2,
-                        free_bytes: 500,
-                    });
-                });
-
-                // Drop writes cumulative + final segment to ALLOC_COUNTERS.
-                drop(acc);
-
-                let total = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
-                assert_eq!(total.alloc_count, 8, "5 from A + 3 from B");
-                assert_eq!(total.alloc_bytes, 3000, "1000 from A + 2000 from B");
-                assert_eq!(total.free_count, 3, "1 from A + 2 from B");
-                assert_eq!(total.free_bytes, 700, "200 from A + 500 from B");
-            });
-        });
-    }
-
-    #[test]
-    fn alloc_accumulator_multi_hop() {
-        // Simulates A -> B -> C migration (two awaits, three segments).
-        reset();
-
-        let _guard = enter("multi_hop_test");
-        let mut acc = crate::alloc::AllocAccumulator::new();
-
-        // Segment 1 on A: 100 bytes.
-        crate::alloc::ALLOC_COUNTERS.with(|cell| {
-            cell.set(crate::alloc::AllocSnapshot {
-                alloc_count: 1,
-                alloc_bytes: 100,
-                free_count: 0,
-                free_bytes: 0,
-            });
-        });
-        acc.save();
-
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                // Now on B.
-                acc.resume();
-
-                // Segment 2 on B: 200 bytes.
-                crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                    cell.set(crate::alloc::AllocSnapshot {
-                        alloc_count: 2,
-                        alloc_bytes: 200,
-                        free_count: 0,
-                        free_bytes: 0,
-                    });
-                });
-                acc.save(); // pre-await on B
-
-                std::thread::scope(|s2| {
-                    s2.spawn(move || {
-                        // Now on C.
-                        acc.resume();
-
-                        // Segment 3 on C: 300 bytes.
-                        crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                            cell.set(crate::alloc::AllocSnapshot {
-                                alloc_count: 3,
-                                alloc_bytes: 300,
-                                free_count: 0,
-                                free_bytes: 0,
-                            });
-                        });
-
-                        // Drop writes cumulative + final segment to ALLOC_COUNTERS.
-                        drop(acc);
-
-                        let total = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
-                        assert_eq!(total.alloc_count, 6, "1 + 2 + 3 from three segments");
-                        assert_eq!(total.alloc_bytes, 600, "100 + 200 + 300");
-                    });
-                });
-            });
-        });
-    }
-
-    #[test]
-    fn alloc_accumulator_with_nested_children() {
-        // Simulates an async parent that calls child functions which allocate.
-        // Children's allocs should be excluded (by enter/drop save/restore),
-        // and the accumulator should only capture the parent's self-allocs.
-        //
-        // async fn parent() {
-        //     alloc 100            // parent on A
-        //     child()              // child allocs 500
-        //     alloc 200            // parent on A
-        //     _acc.save();
-        //     something.await;     // migrate to B
-        //     _guard.check();
-        //     _acc.resume();
-        //     alloc 300            // parent on B
-        //     child2()             // child2 allocs 700
-        //     alloc 400            // parent on B
-        // }
-        // Expected parent self-allocs: 100 + 200 + 300 + 400 = 1000
-        reset();
-
-        let _parent_guard = enter("parent_with_children");
-        let mut acc = crate::alloc::AllocAccumulator::new();
-
-        // --- Segment 1 on thread A ---
-
-        // Parent allocs 100 bytes.
-        crate::alloc::ALLOC_COUNTERS.with(|cell| {
-            cell.set(crate::alloc::AllocSnapshot {
-                alloc_count: 1,
-                alloc_bytes: 100,
-                free_count: 0,
-                free_bytes: 0,
-            });
-        });
-
-        // Child enters: saves parent's {1, 100}, zeros counters.
-        {
-            let _child = enter("child1");
-
-            // Child allocs 500 bytes.
-            crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                cell.set(crate::alloc::AllocSnapshot {
-                    alloc_count: 10,
-                    alloc_bytes: 500,
-                    free_count: 0,
-                    free_bytes: 0,
-                });
-            });
-        }
-        // Child drops: records child's {10, 500}, restores parent's {1, 100}.
-
-        // Verify: ALLOC_COUNTERS should be back to parent's {1, 100}.
-        let after_child1 = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
-        assert_eq!(
-            after_child1.alloc_count, 1,
-            "parent's counters restored after child1"
-        );
-        assert_eq!(after_child1.alloc_bytes, 100);
-
-        // Parent allocs 200 more bytes (total on A: 100 + 200 = 300).
-        crate::alloc::ALLOC_COUNTERS.with(|cell| {
-            let mut snap = cell.get();
-            snap.alloc_count += 2;
-            snap.alloc_bytes += 200;
-            cell.set(snap);
-        });
-
-        // Pre-await: save. Should capture {3, 300} (parent's self-allocs on A).
-        acc.save();
-
-        // After save, counters should be zeroed.
-        let after_save = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
-        assert_eq!(after_save.alloc_count, 0, "save() should zero counters");
-
-        // --- Simulate migration to thread B ---
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                // B might have garbage counters from other work.
-                crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                    cell.set(crate::alloc::AllocSnapshot {
-                        alloc_count: 777,
-                        alloc_bytes: 77777,
-                        free_count: 0,
-                        free_bytes: 0,
-                    });
-                });
-
-                // Post-migration: resume zeros B's counters.
-                acc.resume();
-
-                // --- Segment 2 on thread B ---
-
-                // Parent allocs 300 bytes.
-                crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                    cell.set(crate::alloc::AllocSnapshot {
-                        alloc_count: 3,
-                        alloc_bytes: 300,
-                        free_count: 0,
-                        free_bytes: 0,
-                    });
-                });
-
-                // Child2 enters: saves parent's {3, 300}, zeros counters.
-                {
-                    let _child2 = enter("child2");
-
-                    // Child2 allocs 700 bytes.
-                    crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                        cell.set(crate::alloc::AllocSnapshot {
-                            alloc_count: 20,
-                            alloc_bytes: 700,
-                            free_count: 0,
-                            free_bytes: 0,
-                        });
-                    });
-                }
-                // Child2 drops: records child2's {20, 700}, restores parent's {3, 300}.
-
-                // Verify: counters back to parent's {3, 300} on B.
-                let after_child2 = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
-                assert_eq!(
-                    after_child2.alloc_count, 3,
-                    "parent's counters restored after child2"
-                );
-                assert_eq!(after_child2.alloc_bytes, 300);
-
-                // Parent allocs 400 more bytes (total on B: 300 + 400 = 700).
-                crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                    let mut snap = cell.get();
-                    snap.alloc_count += 4;
-                    snap.alloc_bytes += 400;
-                    cell.set(snap);
-                });
-
-                // Drop writes cumulative + final segment to ALLOC_COUNTERS.
-                drop(acc);
-
-                let total = crate::alloc::ALLOC_COUNTERS.with(|cell| cell.get());
-
-                // Parent self-allocs only: (100 + 200) from A + (300 + 400) from B = 1000
-                assert_eq!(total.alloc_count, 10, "3 from A + 7 from B");
-                assert_eq!(total.alloc_bytes, 1000, "300 from A + 700 from B");
-                assert_eq!(total.free_count, 0);
-                assert_eq!(total.free_bytes, 0);
-            });
-        });
-    }
-
-    #[test]
-    fn drop_order_accumulator_before_guard() {
-        // Prove that Rust drops in reverse declaration order:
-        // __piano_guard (declared first) drops AFTER __piano_alloc (declared second).
-        //
-        // This means AllocAccumulator::drop() can write to ALLOC_COUNTERS
-        // and Guard::drop() (via drop_cold) will read those values.
-        use std::sync::atomic::{AtomicU8, Ordering};
-
-        static DROP_ORDER: AtomicU8 = AtomicU8::new(0);
-
-        struct First; // simulates Guard (declared first, should drop second)
-        struct Second; // simulates AllocAccumulator (declared second, should drop first)
-
-        impl Drop for First {
-            fn drop(&mut self) {
-                let prev = DROP_ORDER.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(
-                    prev, 1,
-                    "First (Guard) should drop SECOND (after Second/Accumulator)"
-                );
-            }
-        }
-
-        impl Drop for Second {
-            fn drop(&mut self) {
-                let prev = DROP_ORDER.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(
-                    prev, 0,
-                    "Second (Accumulator) should drop FIRST (before First/Guard)"
-                );
-            }
-        }
-
-        DROP_ORDER.store(0, Ordering::SeqCst);
-        {
-            let _first = First; // like: let __piano_guard = enter(...)
-            let _second = Second; // like: let __piano_alloc = AllocAccumulator::new()
-        }
-        assert_eq!(
-            DROP_ORDER.load(Ordering::SeqCst),
-            2,
-            "both should have dropped"
-        );
-    }
-
-    #[test]
-    fn accumulator_drop_writes_to_counters_before_guard_reads() {
-        // End-to-end proof: AllocAccumulator::drop() writes cumulative allocs
-        // to ALLOC_COUNTERS, and Guard::drop() (drop_cold) reads them.
-        //
-        // Reverse declaration order ensures acc drops first (writes to
-        // ALLOC_COUNTERS), then _guard drops (reads ALLOC_COUNTERS).
-        reset();
-
-        {
-            let _guard = enter("drop_order_test");
-            let mut acc = crate::alloc::AllocAccumulator::new();
-
-            // Segment 1: allocate 100 bytes.
-            crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                cell.set(crate::alloc::AllocSnapshot {
-                    alloc_count: 1,
-                    alloc_bytes: 100,
-                    free_count: 0,
-                    free_bytes: 0,
-                });
-            });
-
-            // save() captures {1, 100} into cumulative, zeros counters.
-            acc.save();
-
-            // resume() after .await -- sets active = true, zeros counters.
-            acc.resume();
-
-            // Segment 2: allocate 200 bytes.
-            crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                cell.set(crate::alloc::AllocSnapshot {
-                    alloc_count: 2,
-                    alloc_bytes: 200,
-                    free_count: 0,
-                    free_bytes: 0,
-                });
-            });
-
-            // When this scope ends:
-            //   1. acc drops first (reverse declaration order):
-            //      writes {1+2=3, 100+200=300} to ALLOC_COUNTERS.
-            //   2. _guard drops second: drop_cold reads ALLOC_COUNTERS.
-        }
-
-        // Guard's drop_cold should have recorded alloc_count=3, alloc_bytes=300.
-        let invocations = collect_invocations();
-        let rec = invocations
-            .iter()
-            .find(|r| r.name == "drop_order_test")
-            .unwrap();
-        assert_eq!(
-            rec.alloc_count, 3,
-            "should see 1+2 allocs from both segments"
-        );
-        assert_eq!(
-            rec.alloc_bytes, 300,
-            "should see 100+200 bytes from both segments"
-        );
-    }
-
-    #[test]
-    fn migrated_drop_cold_reads_alloc_counters() {
-        // End-to-end: an async fn migrates A -> B.
-        // AllocAccumulator::Drop writes total to ALLOC_COUNTERS on B.
-        // Guard::drop_cold on B should read those values into InvocationRecord.
-        reset();
-
-        let record = std::thread::scope(|s| {
-            // Thread A: enter and allocate.
-            let guard = enter("migrated_alloc");
-            let mut acc = crate::AllocAccumulator::new();
-
-            crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                cell.set(crate::alloc::AllocSnapshot {
-                    alloc_count: 5,
-                    alloc_bytes: 1000,
-                    free_count: 1,
-                    free_bytes: 200,
-                });
-            });
-            acc.save();
-
-            // Migrate to thread B.
-            s.spawn(move || {
-                // check() pushes phantom on B.
-                guard.check();
-                acc.resume();
-
-                // Segment 2 on B.
-                crate::alloc::ALLOC_COUNTERS.with(|cell| {
-                    cell.set(crate::alloc::AllocSnapshot {
-                        alloc_count: 3,
-                        alloc_bytes: 2000,
-                        free_count: 2,
-                        free_bytes: 500,
-                    });
-                });
-
-                // acc drops first (reverse declaration order):
-                //   writes {5+3=8, 1000+2000=3000, ...} to ALLOC_COUNTERS.
-                // guard drops second (drop_cold migrated path):
-                //   should read {8, 3000, ...} from ALLOC_COUNTERS.
-                drop(acc);
-                drop(guard);
-
-                // Collect on thread B where the invocation was recorded.
-                let invocations = collect_invocations();
-                invocations
-                    .into_iter()
-                    .find(|r| r.name == "migrated_alloc")
-                    .expect("should have recorded migrated_alloc")
-            })
-            .join()
-            .unwrap()
-        });
-
-        assert_eq!(record.alloc_count, 8, "5 from A + 3 from B");
-        assert_eq!(record.alloc_bytes, 3000, "1000 from A + 2000 from B");
-        assert_eq!(record.free_count, 3, "1 from A + 2 from B");
-        assert_eq!(record.free_bytes, 700, "200 from A + 500 from B");
     }
 
     #[test]
