@@ -686,9 +686,6 @@ fn unpack_depth(packed: u64) -> u16 {
 #[non_exhaustive]
 pub struct Guard {
     start_tsc: u64,
-    /// Padding to keep Guard at 16 bytes (two registers). The packed value
-    /// is only read from StackEntry, not from Guard.
-    _padding: u64,
 }
 
 // Guard must be Send so async runtimes can move futures containing guards
@@ -698,9 +695,9 @@ const _: () = {
     fn _check() {
         _assert_send::<Guard>();
     }
-    // Verify Guard is exactly 16 bytes (fits in 2 registers).
+    // Verify Guard is exactly 8 bytes (fits in 1 register).
     fn _assert_size() {
-        let _ = core::mem::transmute::<Guard, [u8; 16]>;
+        let _ = core::mem::transmute::<Guard, [u8; 8]>;
     }
 };
 
@@ -836,9 +833,8 @@ impl Drop for Guard {
 }
 
 /// Bookkeeping half of enter(): epoch, alloc save, stack push, name interning.
-/// Returns a packed u64: `[unused:32][name_id:16][depth:16]`.
 #[inline(never)]
-fn enter_cold(name: &'static str) -> u64 {
+fn enter_cold(name: &'static str) {
     let _ = epoch();
 
     let name_id = intern_name(name);
@@ -867,7 +863,6 @@ fn enter_cold(name: &'static str) -> u64 {
             saved_alloc,
             packed,
         });
-        packed
     })
 }
 
@@ -876,17 +871,13 @@ fn enter_cold(name: &'static str) -> u64 {
 /// Inlined so the counter read (`rdtsc`/`cntvct_el0`) happens at the call
 /// site as a single inline instruction — no function call, no vDSO overhead.
 ///
-/// Guard is 16 bytes: fits in two registers on both x86_64 and aarch64,
-/// so the compiler keeps it in registers across the call — zero memory
-/// stores inside the measurement window.
+/// Guard is 8 bytes: fits in one register, zero memory stores inside the
+/// measurement window.
 #[inline(always)]
 pub fn enter(name: &'static str) -> Guard {
-    let packed = enter_cold(name);
+    enter_cold(name);
     let start_tsc = crate::tsc::read();
-    Guard {
-        start_tsc,
-        _padding: packed,
-    }
+    Guard { start_tsc }
 }
 
 /// Register a function name so it appears in output even if never called.
