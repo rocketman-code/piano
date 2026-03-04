@@ -1,7 +1,8 @@
 //! Fast inline timestamp via hardware counter (TSC on x86_64, CNTVCT on aarch64).
 //!
-//! `read()` returns raw counter ticks. `elapsed_ns()` converts a tick delta
-//! to nanoseconds using a ratio calibrated once at startup.
+//! `read()` returns raw counter ticks. `ticks_to_ns()` converts a tick count
+//! to nanoseconds using a ratio calibrated once at startup. `bias_ticks()`
+//! returns the calibrated measurement overhead in raw ticks.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -10,10 +11,15 @@ use std::time::Instant;
 /// `ns = ticks * NUMER / DENOM`
 ///
 /// Stored as atomics so that `calibrate()` (called once from `epoch()`)
-/// publishes them with Release and `elapsed_ns()` reads with Relaxed
+/// publishes them with Release and `ticks_to_ns()` reads with Relaxed
 /// (after the Once-guarded init, every thread sees the calibrated values).
 static NUMER: AtomicU64 = AtomicU64::new(0);
 static DENOM: AtomicU64 = AtomicU64::new(1);
+
+/// Calibrated measurement bias in raw ticks. Subtracted from every
+/// elapsed measurement in `drop_cold` to correct for instructions
+/// between the two TSC reads that are not user code.
+static BIAS_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the hardware cycle counter. Single inline instruction on both
 /// x86_64 (`rdtsc`) and aarch64 (`mrs cntvct_el0`).
@@ -41,26 +47,29 @@ pub(crate) fn read() -> u64 {
     }
 }
 
-/// Convert a tick delta to nanoseconds using the calibrated ratio.
+/// Convert a raw tick count to nanoseconds using the calibrated ratio.
 #[inline(always)]
-pub(crate) fn elapsed_ns(start: u64, end: u64) -> u64 {
-    let ticks = end.wrapping_sub(start);
+pub(crate) fn ticks_to_ns(ticks: u64) -> u64 {
     let n = NUMER.load(Ordering::Relaxed);
     let d = DENOM.load(Ordering::Relaxed);
-    // Guard: if denominator is zero (should not happen after calibrate(),
-    // but defend against it), return 0 instead of panicking.
     if d == 0 {
         return 0;
     }
-    // Use u128 to avoid overflow on large tick counts
     (ticks as u128 * n as u128 / d as u128) as u64
+}
+
+/// Convert a tick delta to nanoseconds using the calibrated ratio.
+#[cfg(any(test, feature = "_test_internals"))]
+#[inline(always)]
+pub(crate) fn elapsed_ns(start: u64, end: u64) -> u64 {
+    ticks_to_ns(end.wrapping_sub(start))
 }
 
 /// Convert a tick value to nanoseconds-since-epoch for absolute timestamps.
 #[cfg(any(test, feature = "_test_internals"))]
 #[inline]
 pub(crate) fn ticks_to_epoch_ns(ticks: u64, epoch_tsc: u64) -> u64 {
-    elapsed_ns(epoch_tsc, ticks)
+    ticks_to_ns(ticks.wrapping_sub(epoch_tsc))
 }
 
 /// Calibrate the tick-to-nanosecond ratio. Called once from `epoch()`.
@@ -98,11 +107,50 @@ pub(crate) fn calibrate() {
         }
 
         // ns = ticks * wall_ns / tsc_ticks
-        // Simplify the fraction to avoid overflow in elapsed_ns
+        // Simplify the fraction to avoid overflow in ticks_to_ns
         let g = gcd(wall_ns, tsc_ticks);
         NUMER.store(wall_ns / g, Ordering::Release);
         DENOM.store(tsc_ticks / g, Ordering::Release);
     }
+}
+
+/// Calibrate the measurement bias (cost of a TSC read pair in ticks).
+/// Uses trimmed mean (2% trim) for robustness against VM preemption outliers.
+/// Called once from `epoch()` after `calibrate()`.
+pub(crate) fn calibrate_bias() {
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        // Fallback: read() returns nanoseconds directly, no hardware bias.
+        return;
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        const N: usize = 10_000;
+        let mut samples = Vec::with_capacity(N);
+        for _ in 0..N {
+            let start = read();
+            // Optimization barrier: prevent the compiler from reordering or
+            // eliding the two read() calls. Uses volatile instead of
+            // core::hint::black_box which requires Rust 1.66+.
+            unsafe { core::ptr::read_volatile(&()) };
+            let end = read();
+            samples.push(end.wrapping_sub(start));
+        }
+        samples.sort_unstable();
+        // Trimmed mean: discard top/bottom 2%
+        let trim = N / 50;
+        let trimmed = &samples[trim..N - trim];
+        let sum: u64 = trimmed.iter().sum();
+        let mean_ticks = sum / trimmed.len() as u64;
+        BIAS_TICKS.store(mean_ticks, Ordering::Release);
+    }
+}
+
+/// Return the calibrated bias in raw ticks.
+#[inline(always)]
+pub(crate) fn bias_ticks() -> u64 {
+    BIAS_TICKS.load(Ordering::Relaxed)
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {
@@ -174,6 +222,50 @@ mod tests {
         // Must not panic -- should return 0 for zero denominator
         let result = elapsed_ns(0, 1000);
         assert_eq!(result, 0);
+
+        NUMER.store(saved_n, Ordering::Release);
+        DENOM.store(saved_d, Ordering::Release);
+    }
+
+    #[test]
+    fn ticks_to_ns_uses_calibrated_ratio() {
+        let saved_n = NUMER.load(Ordering::Relaxed);
+        let saved_d = DENOM.load(Ordering::Relaxed);
+
+        // 1000 ticks * (3/2) = 1500 ns
+        NUMER.store(3, Ordering::Release);
+        DENOM.store(2, Ordering::Release);
+
+        assert_eq!(ticks_to_ns(1000), 1500);
+        assert_eq!(ticks_to_ns(0), 0);
+
+        NUMER.store(saved_n, Ordering::Release);
+        DENOM.store(saved_d, Ordering::Release);
+    }
+
+    #[test]
+    fn ticks_to_ns_zero_denom_returns_zero() {
+        let saved_n = NUMER.load(Ordering::Relaxed);
+        let saved_d = DENOM.load(Ordering::Relaxed);
+
+        NUMER.store(1, Ordering::Release);
+        DENOM.store(0, Ordering::Release);
+
+        assert_eq!(ticks_to_ns(1000), 0);
+
+        NUMER.store(saved_n, Ordering::Release);
+        DENOM.store(saved_d, Ordering::Release);
+    }
+
+    #[test]
+    fn elapsed_ns_delegates_to_ticks_to_ns() {
+        let saved_n = NUMER.load(Ordering::Relaxed);
+        let saved_d = DENOM.load(Ordering::Relaxed);
+
+        NUMER.store(1, Ordering::Release);
+        DENOM.store(1, Ordering::Release);
+
+        assert_eq!(elapsed_ns(10, 110), ticks_to_ns(100));
 
         NUMER.store(saved_n, Ordering::Release);
         DENOM.store(saved_d, Ordering::Release);
