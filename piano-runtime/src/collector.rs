@@ -2985,4 +2985,29 @@ mod tests {
             b.self_ns,
         );
     }
+
+    #[test]
+    fn double_flush_idempotency() {
+        reset();
+        {
+            let _g = enter("dflush_fn");
+            burn_cpu(1_000);
+        }
+        // drop_cold already flushed RECORDS_BUF at the depth-0 boundary.
+        // collect() calls flush_records_buf() again.
+        let records = collect();
+        let rec = records.iter().find(|r| r.name == "dflush_fn").unwrap();
+        assert_eq!(rec.calls, 1, "double flush should not double-count calls");
+
+        // Also verify via raw RECORDS that there's exactly one entry.
+        flush_records_buf();
+        RECORDS.with(|records| {
+            let recs = records.lock().unwrap_or_else(|e| e.into_inner());
+            let count = recs.iter().filter(|e| e.name == "dflush_fn").count();
+            assert_eq!(
+                count, 1,
+                "RECORDS should have exactly one dflush_fn entry, got {count}"
+            );
+        });
+    }
 }
