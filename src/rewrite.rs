@@ -309,6 +309,18 @@ fn inject_adopt_in_concurrency_closures(expr: &mut syn::Expr, in_parallel_chain:
                 inject_adopt_in_concurrency_closures(else_branch, false);
             }
         }
+        syn::Expr::Match(m) => {
+            inject_adopt_in_concurrency_closures(&mut m.expr, in_parallel_chain);
+            for arm in &mut m.arms {
+                if let Some((_, guard)) = &mut arm.guard {
+                    inject_adopt_in_concurrency_closures(guard, in_parallel_chain);
+                }
+                inject_adopt_in_concurrency_closures(&mut arm.body, in_parallel_chain);
+            }
+        }
+        syn::Expr::Unsafe(u) => {
+            inject_adopt_in_stmts(&mut u.block.stmts);
+        }
         _ => {}
     }
 }
@@ -1944,6 +1956,65 @@ fn work() {
         assert!(
             result.contains("piano_runtime::adopt"),
             "should inject adopt inside spawn closure bound to let. Got:\n{result}"
+        );
+        let parsed: syn::File = syn::parse_str(&result)
+            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
+        assert!(!parsed.items.is_empty());
+    }
+
+    #[test]
+    fn injects_adopt_in_match_arms_inside_scope() {
+        // Concurrency closures inside match arms should get adopt injection.
+        // Bug #331: match expressions were skipped by the catch-all.
+        let source = r#"
+fn work(kind: Kind) {
+    rayon::scope(|s| {
+        match kind {
+            Kind::A => { s.spawn(|_| { work_a(); }); }
+            Kind::B => { s.spawn(|_| { work_b(); }); }
+        }
+    });
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap().source;
+
+        assert!(
+            result.contains("piano_runtime::fork()"),
+            "should inject fork. Got:\n{result}"
+        );
+        assert!(
+            result.contains("piano_runtime::adopt"),
+            "should inject adopt inside spawn closures in match arms. Got:\n{result}"
+        );
+        let parsed: syn::File = syn::parse_str(&result)
+            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
+        assert!(!parsed.items.is_empty());
+    }
+
+    #[test]
+    fn injects_adopt_in_unsafe_block_inside_scope() {
+        // Concurrency closures inside unsafe blocks should get adopt injection.
+        // Bug #331: unsafe expressions were skipped by the catch-all.
+        let source = r#"
+fn work() {
+    rayon::scope(|s| {
+        unsafe {
+            s.spawn(|_| { do_unsafe_work(); });
+        }
+    });
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap().source;
+
+        assert!(
+            result.contains("piano_runtime::fork()"),
+            "should inject fork. Got:\n{result}"
+        );
+        assert!(
+            result.contains("piano_runtime::adopt"),
+            "should inject adopt inside spawn closure in unsafe block. Got:\n{result}"
         );
         let parsed: syn::File = syn::parse_str(&result)
             .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
