@@ -163,34 +163,27 @@ fn async_self_time_accuracy() {
     // Therefore: parent_fn.self ≈ 0  and  expensive_child.self >> 0
     // So: parent_fn.self_ns < expensive_child.self_ns  (always true if accounting works)
     //
-    // With the bug (migrated guard sets self = elapsed):
-    //   parent_fn.self ≈ parent_fn.total ≈ 2 * expensive_child.total
-    //   which is GREATER than expensive_child.self  → assertion fails
-    //
-    // This assertion holds regardless of whether migration occurred:
-    // - No migration: normal parent-child subtraction makes parent self ≈ 0
-    // - Migration + fix: phantom subtraction makes parent self ≈ 0
+    // PianoFuture carries the call stack inside each future's state machine,
+    // so parent-child subtraction is correct regardless of thread migration.
     let child_self = stats.get("expensive_child").unwrap().self_ns;
     assert!(
         child_self > 0,
         "expensive_child should have non-zero self_ns (it does real work)"
     );
 
-    // Migrated guards now preserve the real function name, so parent_fn
-    // always appears under its own name.
-    if let Some(parent_stats) = stats.get("parent_fn") {
-        assert!(
-            parent_stats.self_ns < child_self,
-            "parent_fn.self_ns ({}) must be < expensive_child.self_ns \
-             ({child_self}) -- parent does no computation, child does all of it",
-            parent_stats.self_ns,
-        );
-    }
+    let parent_stats = stats
+        .get("parent_fn")
+        .expect("parent_fn should appear in output");
+    assert!(
+        parent_stats.self_ns < child_self,
+        "parent_fn.self_ns ({}) must be < expensive_child.self_ns \
+         ({child_self}) -- parent does no computation, child does all of it",
+        parent_stats.self_ns,
+    );
 
-    // Migrated guards now preserve their real function names, so there
-    // should be no "<migrated>" bucket in the output.
+    // PianoFuture carries real function names; no "<migrated>" bucket.
     assert!(
         !stats.contains_key("<migrated>"),
-        "should not have a <migrated> bucket -- migrated guards preserve real names"
+        "should not have a <migrated> bucket"
     );
 }
