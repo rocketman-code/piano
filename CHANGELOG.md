@@ -7,6 +7,29 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-03-04
+
+Async profiling rewritten for correctness and lower overhead, plus automatic bias calibration that reduces measurement overhead by up to 81% on x86_64.
+
+### Added
+
+- Measurement bias calibrated at startup using trimmed-mean statistics and subtracted from all timing data, reducing per-call overhead by up to 81% on x86_64 (#306)
+
+### Fixed
+
+- Nested `tokio::select!` no longer inflates self-time by up to 5x due to rewritten async instrumentation that carries timing state inside the future (#332)
+- `.await` inside `match` and `unsafe` blocks in spawned tasks now correctly tracked for thread migration (#331)
+- Parallel iterator chains with `.await` in if/else branches now correctly instrumented for fork/adopt (#344)
+- `let` bindings containing spawned tasks now instrumented for thread migration (#329)
+- Generic bounds containing `->` no longer break function detection in macro definitions (#328)
+- Injected profiling variables use double-underscore prefix to avoid name collisions with user code (#327)
+- Write failure on profiling data flush now prints an error message instead of exiting silently (#304)
+- Error message when zero functions are instrumented now explains the cause instead of blaming disk space (#305)
+
+### Changed
+
+- Per-call instrumentation overhead reduced by halving the guard struct from 16 to 8 bytes
+
 ## [0.10.0] - 2026-03-03
 
 Piano is now a true multi-threaded profiler -- worker thread data that was previously lost is captured correctly, profiling data survives process::exit() and crashes, and instrumented builds use release mode by default.
@@ -270,7 +293,8 @@ Per-frame allocation tracking, cross-thread instrumentation, NDJSON output, and 
 
 Initial tagged release.
 
-[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/rocketman-code/piano/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rocketman-code/piano/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/rocketman-code/piano/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/rocketman-code/piano/compare/v0.9.1...v0.9.2
