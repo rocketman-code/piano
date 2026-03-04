@@ -3107,4 +3107,47 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn collect_all_captures_all_threads(
+                thread_count in 2u8..=6,
+                fns_per_thread in 1u8..=4,
+            ) {
+                reset();
+                let thread_count = thread_count as usize;
+                let fns_per_thread = fns_per_thread as usize;
+
+                std::thread::scope(|s| {
+                    for t in 0..thread_count {
+                        s.spawn(move || {
+                            for f in 0..fns_per_thread {
+                                let name: &'static str =
+                                    Box::leak(format!("prop_t{t}_f{f}").into_boxed_str());
+                                register(name);
+                                let _g = enter(name);
+                                burn_cpu(100);
+                            }
+                        });
+                    }
+                });
+
+                let all = collect_all();
+                for t in 0..thread_count {
+                    for f in 0..fns_per_thread {
+                        let expected = format!("prop_t{t}_f{f}");
+                        prop_assert!(
+                            all.iter().any(|r| r.name == expected),
+                            "missing function {} from collect_all()",
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

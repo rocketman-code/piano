@@ -28,3 +28,12 @@ pub use piano_future::PianoFuture;
 pub use collector::clear_runs_dir;
 #[cfg(any(test, feature = "_test_internals"))]
 pub use collector::collect_invocations;
+
+#[cfg(kani)]
+mod kani_proofs;
+#[cfg(kani)]
+mod kani_serialization_proofs;
+#[cfg(kani)]
+mod kani_state_machine_proofs;
+#[cfg(test)]
+mod loom_tests;

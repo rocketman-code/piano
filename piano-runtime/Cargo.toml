@@ -9,10 +9,16 @@ repository = "https://github.com/rocketman-code/piano"
 keywords = ["profiling", "instrumentation"]
 categories = ["development-tools::profiling"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [features]
 cpu-time = []
 _test_internals = []
+_loom = []
 
 [dev-dependencies]
+loom = "0.7"
+proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
