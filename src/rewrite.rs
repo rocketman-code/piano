@@ -235,10 +235,14 @@ fn inject_adopt_in_concurrency_closures(expr: &mut syn::Expr, in_parallel_chain:
                     }
                 }
             } else if (chain_active && !is_par) || is_spawn {
-                // Worker closures: inject adopt so their time is attributed.
+                // Worker closures: inject adopt so their time is attributed,
+                // then recurse into the body for nested concurrency patterns.
                 for arg in &mut mc.args {
                     if let syn::Expr::Closure(closure) = arg {
                         inject_adopt_at_closure_start(closure);
+                        if let syn::Expr::Block(block) = &mut *closure.body {
+                            inject_adopt_in_stmts(&mut block.block.stmts, false);
+                        }
                     } else {
                         inject_adopt_in_concurrency_closures(arg, false);
                     }
@@ -276,6 +280,9 @@ fn inject_adopt_in_concurrency_closures(expr: &mut syn::Expr, in_parallel_chain:
                 for arg in &mut call.args {
                     if let syn::Expr::Closure(closure) = arg {
                         inject_adopt_at_closure_start(closure);
+                        if let syn::Expr::Block(block) = &mut *closure.body {
+                            inject_adopt_in_stmts(&mut block.block.stmts, false);
+                        }
                     } else {
                         inject_adopt_in_concurrency_closures(arg, false);
                     }
@@ -292,21 +299,21 @@ fn inject_adopt_in_concurrency_closures(expr: &mut syn::Expr, in_parallel_chain:
             }
         }
         syn::Expr::Block(b) => {
-            inject_adopt_in_stmts(&mut b.block.stmts);
+            inject_adopt_in_stmts(&mut b.block.stmts, in_parallel_chain);
         }
         syn::Expr::ForLoop(f) => {
-            inject_adopt_in_stmts(&mut f.body.stmts);
+            inject_adopt_in_stmts(&mut f.body.stmts, in_parallel_chain);
         }
         syn::Expr::While(w) => {
-            inject_adopt_in_stmts(&mut w.body.stmts);
+            inject_adopt_in_stmts(&mut w.body.stmts, in_parallel_chain);
         }
         syn::Expr::Loop(l) => {
-            inject_adopt_in_stmts(&mut l.body.stmts);
+            inject_adopt_in_stmts(&mut l.body.stmts, in_parallel_chain);
         }
         syn::Expr::If(i) => {
-            inject_adopt_in_stmts(&mut i.then_branch.stmts);
+            inject_adopt_in_stmts(&mut i.then_branch.stmts, in_parallel_chain);
             if let Some((_, else_branch)) = &mut i.else_branch {
-                inject_adopt_in_concurrency_closures(else_branch, false);
+                inject_adopt_in_concurrency_closures(else_branch, in_parallel_chain);
             }
         }
         syn::Expr::Match(m) => {
@@ -319,7 +326,7 @@ fn inject_adopt_in_concurrency_closures(expr: &mut syn::Expr, in_parallel_chain:
             }
         }
         syn::Expr::Unsafe(u) => {
-            inject_adopt_in_stmts(&mut u.block.stmts);
+            inject_adopt_in_stmts(&mut u.block.stmts, in_parallel_chain);
         }
         _ => {}
     }
@@ -361,22 +368,22 @@ fn inject_adopt_at_closure_start(closure: &mut syn::ExprClosure) {
 /// not a worker — we don't adopt the coordinator, but its spawn calls need adopt.
 fn recurse_closure_body_for_spawns(closure: &mut syn::ExprClosure) {
     if let syn::Expr::Block(block) = &mut *closure.body {
-        inject_adopt_in_stmts(&mut block.block.stmts);
+        inject_adopt_in_stmts(&mut block.block.stmts, false);
     }
 }
 
 /// Walk statements, injecting adopt into spawn closures.
 /// `__piano_ctx` is `Option<&SpanContext>` which is `Copy`, so `move` closures
 /// can capture it without ownership issues.
-fn inject_adopt_in_stmts(stmts: &mut [syn::Stmt]) {
+fn inject_adopt_in_stmts(stmts: &mut [syn::Stmt], in_parallel_chain: bool) {
     for stmt in stmts.iter_mut() {
         match stmt {
             syn::Stmt::Expr(e, _) => {
-                inject_adopt_in_concurrency_closures(e, false);
+                inject_adopt_in_concurrency_closures(e, in_parallel_chain);
             }
             syn::Stmt::Local(local) => {
                 if let Some(init) = &mut local.init {
-                    inject_adopt_in_concurrency_closures(&mut init.expr, false);
+                    inject_adopt_in_concurrency_closures(&mut init.expr, in_parallel_chain);
                 }
             }
             _ => {}
@@ -2015,6 +2022,45 @@ fn work() {
         assert!(
             result.contains("piano_runtime::adopt"),
             "should inject adopt inside spawn closure in unsafe block. Got:\n{result}"
+        );
+        let parsed: syn::File = syn::parse_str(&result)
+            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
+        assert!(!parsed.items.is_empty());
+    }
+
+    #[test]
+    fn propagates_parallel_chain_through_control_flow() {
+        // in_parallel_chain must propagate through if/else, for, while,
+        // loop, block, match, and unsafe so that closures nested inside
+        // control flow within a par_iter chain still get adopt injection.
+        // Bug #344: inject_adopt_in_stmts hardcoded false, losing context.
+        let source = r#"
+fn work(items: &[Item]) {
+    items.par_iter().for_each(|item| {
+        if item.ready {
+            item.parts.par_iter().for_each(|p| process(p));
+        } else {
+            item.fallbacks.par_iter().for_each(|f| fallback(f));
+        }
+        for sub in &item.subs {
+            sub.entries.par_iter().for_each(|e| handle(e));
+        }
+        match item.kind {
+            Kind::A => item.as_.par_iter().for_each(|a| do_a(a)),
+            Kind::B => item.bs.par_iter().for_each(|b| do_b(b)),
+        }
+    });
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap().source;
+
+        // Count adopt injections: outer for_each closure + 5 inner par_iter closures
+        // (if-branch, else-branch, for-body, match-arm-A, match-arm-B)
+        let adopt_count = result.matches("piano_runtime::adopt").count();
+        assert!(
+            adopt_count >= 6,
+            "expected at least 6 adopt injections (1 outer + 5 inner), got {adopt_count}. Got:\n{result}"
         );
         let parsed: syn::File = syn::parse_str(&result)
             .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
