@@ -146,3 +146,44 @@ fn bias_empty_fn() {
 
     piano_runtime::reset();
 }
+
+/// After bias calibration, the reported time for an empty function should
+/// be near zero. On aarch64 (~0ns uncorrected) this is marginal. On x86_64
+/// (~12ns uncorrected on KVM) this validates the correction works.
+#[cfg(feature = "_test_internals")]
+#[test]
+#[ignore]
+fn bias_calibration_reduces_empty_fn() {
+    const N: usize = 1_000_000;
+    piano_runtime::reset();
+
+    for _ in 0..N {
+        let _g = piano_runtime::enter("bias_corrected");
+        std::hint::black_box(());
+    }
+
+    let invocations = piano_runtime::collect_invocations();
+    let piano_total_ns: u64 = invocations
+        .iter()
+        .filter(|r| r.name == "bias_corrected")
+        .map(|r| r.elapsed_ns)
+        .sum();
+
+    let bias_per_call = piano_total_ns as f64 / N as f64;
+
+    eprintln!();
+    eprintln!("--- Bias-Corrected Empty Function ({N} iterations) ---");
+    eprintln!("  total reported: {piano_total_ns}ns");
+    eprintln!("  per call: {bias_per_call:.2}ns");
+    eprintln!("  (should be near 0 after bias subtraction)");
+    eprintln!();
+
+    // After correction, per-call bias should be under 5ns on all platforms.
+    // aarch64: ~0ns, x86_64 bare metal: ~0-3ns, x86_64 KVM: ~0-4ns.
+    assert!(
+        bias_per_call < 5.0,
+        "bias-corrected per-call time {bias_per_call:.2}ns exceeds 5ns"
+    );
+
+    piano_runtime::reset();
+}
