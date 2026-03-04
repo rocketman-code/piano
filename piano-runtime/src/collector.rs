@@ -374,6 +374,7 @@ mod atexit {
 fn epoch() -> Instant {
     *EPOCH.get_or_init(|| {
         crate::tsc::calibrate();
+        crate::tsc::calibrate_bias();
         let tsc_val = crate::tsc::read();
         let now = Instant::now();
         crate::tsc::set_epoch_tsc(tsc_val);
@@ -723,7 +724,9 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             cell.set(entry.saved_alloc);
         });
 
-        let elapsed_ns = crate::tsc::elapsed_ns(guard.start_tsc, end_tsc);
+        let raw_ticks = end_tsc.wrapping_sub(guard.start_tsc);
+        let corrected_ticks = raw_ticks.saturating_sub(crate::tsc::bias_ticks());
+        let elapsed_ns = crate::tsc::ticks_to_ns(corrected_ticks);
         let children_ns = entry.children_ns;
         let self_ns = elapsed_ns.saturating_sub(children_ns);
 
