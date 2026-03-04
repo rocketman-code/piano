@@ -3,4 +3,5 @@ CLAUDE.md
 /docs/plans/
 /.worktrees/
 /.claude/
+.mcp.json
 /experiments/
