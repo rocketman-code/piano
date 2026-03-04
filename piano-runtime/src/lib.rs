@@ -5,6 +5,7 @@
 mod alloc;
 mod collector;
 mod cpu_clock;
+mod piano_future;
 mod tsc;
 
 // User-facing API: visible in docs
@@ -16,12 +17,12 @@ pub use collector::{
 
 // Injection-only API: public for rewriter-generated code, hidden from docs
 #[doc(hidden)]
-pub use alloc::AllocAccumulator;
-#[doc(hidden)]
 pub use collector::{
     adopt, flush, fork, init, register, reset, set_runs_dir, shutdown, shutdown_to, AdoptGuard,
     SpanContext,
 };
+#[doc(hidden)]
+pub use piano_future::PianoFuture;
 
 #[cfg(test)]
 pub use collector::clear_runs_dir;
