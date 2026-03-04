@@ -261,28 +261,18 @@ mod tests {
         let records = collector::collect_all();
         let outer = records.iter().find(|r| r.name == "pf_outer").unwrap();
         let inner = records.iter().find(|r| r.name == "pf_inner").unwrap();
-        // Under Miri, tokio::time::sleep completes near-instantly so
-        // wall-clock timing values are meaningless. Only check structure.
-        #[cfg(not(miri))]
-        {
-            // Inner's total_ms should be ~50ms
-            assert!(
-                inner.total_ms > 40.0,
-                "inner total_ms too low: {}",
-                inner.total_ms
-            );
-            // Outer's self_ms should NOT include inner's ~50ms
-            assert!(
-                outer.self_ms < 30.0,
-                "outer self_ms ({}) should be small (not include inner's 50ms)",
-                outer.self_ms
-            );
-        }
-        #[cfg(miri)]
-        {
-            // Structural check: both records exist (asserted above via unwrap)
-            let _ = (outer, inner);
-        }
+        // Inner's total_ms should be ~50ms
+        assert!(
+            inner.total_ms > 40.0,
+            "inner total_ms too low: {}",
+            inner.total_ms
+        );
+        // Outer's self_ms should NOT include inner's ~50ms
+        assert!(
+            outer.self_ms < 30.0,
+            "outer self_ms ({}) should be small (not include inner's 50ms)",
+            outer.self_ms
+        );
     }
 
     #[cfg(not(miri))]

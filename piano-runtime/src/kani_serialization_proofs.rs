@@ -38,28 +38,3 @@ fn proof_json_escaping_correctness() {
         }
     }
 }
-
-/// I24/I25: Frame JSON structure -- field names are always present.
-#[kani::proof]
-fn proof_frame_field_names_present() {
-    let calls: u64 = kani::any();
-    let self_ns: u64 = kani::any();
-    let ac: u64 = kani::any();
-    let ab: u64 = kani::any();
-    let fc: u64 = kani::any();
-    let fb: u64 = kani::any();
-    let fn_id: u16 = kani::any();
-
-    let json = format!(
-        "{{\"id\":{},\"calls\":{},\"self_ns\":{},\"ac\":{},\"ab\":{},\"fc\":{},\"fb\":{}}}",
-        fn_id, calls, self_ns, ac, ab, fc, fb
-    );
-
-    assert!(json.contains("\"id\":"));
-    assert!(json.contains("\"calls\":"));
-    assert!(json.contains("\"self_ns\":"));
-    assert!(json.contains("\"ac\":"));
-    assert!(json.contains("\"ab\":"));
-    assert!(json.contains("\"fc\":"));
-    assert!(json.contains("\"fb\":"));
-}

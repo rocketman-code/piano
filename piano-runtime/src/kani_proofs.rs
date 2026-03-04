@@ -14,20 +14,6 @@ fn proof_depth_u16_truncation() {
     // For depth > u16::MAX, truncation is documented behavior
 }
 
-/// I5: Name table u16 overflow -- verify saturation guard returns u16::MAX.
-#[kani::proof]
-fn proof_name_table_saturation() {
-    let len: usize = kani::any();
-    kani::assume(len <= 70_000);
-    if len > u16::MAX as usize {
-        let result = u16::MAX; // code returns u16::MAX (saturation)
-        assert_eq!(result, u16::MAX);
-    } else {
-        let id = len as u16;
-        assert_eq!(id as usize, len, "no overflow for valid lengths");
-    }
-}
-
 /// I11: elapsed_ns uses wrapping_sub + u128 -- no panic, no UB.
 #[kani::proof]
 fn proof_elapsed_ns_no_overflow() {
@@ -43,16 +29,6 @@ fn proof_elapsed_ns_no_overflow() {
     let ticks = end.wrapping_sub(start);
     let result = (ticks as u128 * numer as u128 / denom as u128) as u64;
     let _ = result; // no panic = proof passes
-}
-
-/// I11 supplement: elapsed_ns returns 0 when denom is 0.
-#[kani::proof]
-fn proof_elapsed_ns_zero_denom_returns_zero() {
-    let start: u64 = kani::any();
-    let end: u64 = kani::any();
-    // Models the guard: if d == 0 { return 0; }
-    let result: u64 = 0;
-    assert_eq!(result, 0);
 }
 
 /// I32: synthesize ms-to-ns: (self_ms * 1_000_000.0).max(0.0) as u64

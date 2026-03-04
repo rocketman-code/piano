@@ -2,25 +2,6 @@
 //!
 //! Run with: cargo kani -p piano-runtime
 
-/// I1: SyncOnceCell guarantees exactly-once initialization.
-#[kani::proof]
-fn proof_sync_once_cell_idempotent() {
-    let init_val: u64 = kani::any();
-    let mut initialized = false;
-    let mut stored_val: u64 = 0;
-
-    for _ in 0..2 {
-        if !initialized {
-            stored_val = init_val;
-            initialized = true;
-        }
-        assert_eq!(
-            stored_val, init_val,
-            "get_or_init must return consistent value"
-        );
-    }
-}
-
 /// I10/I41: PianoFuture split_off correctness.
 /// push N entries at base, split_off(base) returns exactly those entries.
 #[kani::proof]
