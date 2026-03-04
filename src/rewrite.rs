@@ -72,203 +72,6 @@ const SCOPE_FUNCTIONS: &[&str] = &["scope", "scope_fifo"];
 /// SpanContext stays on the parent thread.
 const FORK_TRIGGER_FUNCTIONS: &[&str] = &["scope", "scope_fifo", "join"];
 
-/// Check whether a statement contains `.await` or a macro invocation at its
-/// own expression level, excluding awaits inside sub-blocks of control-flow
-/// expressions (if, match, loop, while, for). Those sub-blocks are handled
-/// by the recursive visitor.
-///
-/// Also excludes closures, async blocks, and nested fn items since those are
-/// separate async contexts.
-///
-/// Macro invocations (e.g. `tokio::select!`, `tokio::join!`) are treated as
-/// potential `.await` points because syn cannot see inside macro token streams.
-/// The injected `check()` is a fast no-op (~2ns) when no thread migration
-/// occurred, so false positives are negligible.
-fn stmt_has_direct_await(stmt: &syn::Stmt) -> bool {
-    // Statement-level macros with curly braces (e.g. `tokio::select! { ... }`)
-    // are parsed by syn as Stmt::Macro, not as expressions containing ExprMacro.
-    // These may contain .await points invisible to the AST.
-    if matches!(stmt, syn::Stmt::Macro(_)) {
-        return true;
-    }
-
-    struct AwaitFinder {
-        found: bool,
-    }
-    impl<'ast> syn::visit::Visit<'ast> for AwaitFinder {
-        fn visit_expr_await(&mut self, _: &'ast syn::ExprAwait) {
-            self.found = true;
-        }
-        // Expression-position macros (e.g. `let x = some_macro!(...)`) may
-        // also contain .await points invisible to the AST.
-        fn visit_expr_macro(&mut self, _: &'ast syn::ExprMacro) {
-            self.found = true;
-        }
-        // Don't descend into closures -- separate async context.
-        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
-        // Don't descend into async blocks -- separate async context.
-        fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
-        // Don't descend into nested fn items -- they have their own guards.
-        fn visit_item_fn(&mut self, _: &'ast syn::ItemFn) {}
-        // Don't descend into sub-blocks of control-flow expressions.
-        // The recursive VisitMut will process those blocks separately.
-        fn visit_block(&mut self, _: &'ast syn::Block) {}
-    }
-    let mut finder = AwaitFinder { found: false };
-    syn::visit::Visit::visit_stmt(&mut finder, stmt);
-    finder.found
-}
-
-/// For if/while/match statements where `.await` is in the condition/scrutinee,
-/// inject `__piano_alloc.resume()` at the start and `__piano_alloc.save()` at
-/// the end of each body block. This ensures allocations inside the body are
-/// tracked rather than being zeroed by the save/resume that wraps the entire
-/// statement.
-///
-/// Without this, `if stream.next().await.is_some() { allocate(); }` would
-/// have `save(); if ... { allocate(); } resume();` -- the body runs between
-/// save and resume, so its allocations are lost when resume() zeroes counters.
-///
-/// With this fix, the pattern becomes:
-///   `save(); if cond.await { resume(); body; save(); } check(); resume();`
-/// The body's resume/save bracket re-enables tracking for the body only.
-fn inject_alloc_body_brackets(stmt: &mut syn::Stmt) {
-    let expr = match stmt {
-        syn::Stmt::Expr(e, _) => e,
-        syn::Stmt::Local(local) => {
-            if let Some(init) = &mut local.init {
-                &mut *init.expr
-            } else {
-                return;
-            }
-        }
-        _ => return,
-    };
-
-    match expr {
-        syn::Expr::If(expr_if) => {
-            inject_alloc_brackets_in_if(expr_if);
-        }
-        syn::Expr::While(expr_while) => {
-            bracket_block(&mut expr_while.body);
-        }
-        syn::Expr::Match(expr_match) => {
-            for arm in &mut expr_match.arms {
-                if let syn::Expr::Block(block_expr) = &mut *arm.body {
-                    bracket_block(&mut block_expr.block);
-                } else {
-                    // Wrap the bare expression in a block so we can inject
-                    // resume/save around it (e.g. `Some(v) => process(v)`
-                    // becomes `Some(v) => { resume(); process(v); save(); }`).
-                    let bare_expr = std::mem::replace(&mut *arm.body, syn::Expr::PLACEHOLDER);
-                    let mut block = syn::Block {
-                        brace_token: syn::token::Brace::default(),
-                        stmts: vec![syn::Stmt::Expr(bare_expr, None)],
-                    };
-                    bracket_block(&mut block);
-                    *arm.body = syn::Expr::Block(syn::ExprBlock {
-                        attrs: Vec::new(),
-                        label: None,
-                        block,
-                    });
-                }
-            }
-        }
-        syn::Expr::ForLoop(expr_for) => {
-            bracket_block(&mut expr_for.body);
-        }
-        _ => {}
-    }
-}
-
-/// Inject resume/save brackets into an if-expression and all its else-if/else
-/// branches recursively.
-fn inject_alloc_brackets_in_if(expr_if: &mut syn::ExprIf) {
-    bracket_block(&mut expr_if.then_branch);
-    if let Some((_, else_branch)) = &mut expr_if.else_branch {
-        match &mut **else_branch {
-            syn::Expr::If(nested_if) => {
-                inject_alloc_brackets_in_if(nested_if);
-            }
-            syn::Expr::Block(block_expr) => {
-                bracket_block(&mut block_expr.block);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Insert `__piano_alloc.resume()` as the first statement and
-/// `__piano_alloc.save()` as the last statement of a block.
-fn bracket_block(block: &mut syn::Block) {
-    let resume: syn::Stmt = syn::parse_quote! { __piano_alloc.resume(); };
-    let save: syn::Stmt = syn::parse_quote! { __piano_alloc.save(); };
-    block.stmts.insert(0, resume);
-    block.stmts.push(save);
-}
-
-/// Recursively inject `__piano_guard.check();` after each statement that
-/// directly contains `.await` or a macro invocation, at every nesting depth.
-///
-/// Uses `VisitMut` to walk into if/match/loop/while/for/block bodies so
-/// that `check()` is placed immediately after the `.await` or macro, not
-/// after the enclosing top-level statement.
-fn inject_await_checks(block: &mut syn::Block) {
-    struct AwaitCheckInjector;
-
-    impl AwaitCheckInjector {
-        /// Process a block's statements: for each statement that directly
-        /// contains `.await` or a macro invocation (potential hidden `.await`),
-        /// insert a `check()` call after it. Then recurse into nested blocks
-        /// within each statement.
-        fn process_block(&mut self, block: &mut syn::Block) {
-            let mut new_stmts = Vec::with_capacity(block.stmts.len() * 2);
-            for mut stmt in block.stmts.drain(..) {
-                let has_await = stmt_has_direct_await(&stmt);
-                // Recurse into nested blocks within this statement first.
-                self.visit_stmt_mut(&mut stmt);
-                if has_await {
-                    // For if/while/match where .await is in the condition/
-                    // scrutinee, inject resume/save brackets around each body
-                    // block so allocations inside the body are tracked.
-                    inject_alloc_body_brackets(&mut stmt);
-                    let save_stmt: syn::Stmt = syn::parse_quote! {
-                        __piano_alloc.save();
-                    };
-                    new_stmts.push(save_stmt);
-                }
-                new_stmts.push(stmt);
-                if has_await {
-                    let check_stmt: syn::Stmt = syn::parse_quote! {
-                        __piano_guard.check();
-                    };
-                    let resume_stmt: syn::Stmt = syn::parse_quote! {
-                        __piano_alloc.resume();
-                    };
-                    new_stmts.push(check_stmt);
-                    new_stmts.push(resume_stmt);
-                }
-            }
-            block.stmts = new_stmts;
-        }
-    }
-
-    impl VisitMut for AwaitCheckInjector {
-        fn visit_block_mut(&mut self, block: &mut syn::Block) {
-            self.process_block(block);
-        }
-
-        // Don't descend into closures -- separate async context.
-        fn visit_expr_closure_mut(&mut self, _: &mut syn::ExprClosure) {}
-        // Don't descend into async blocks -- separate async context.
-        fn visit_expr_async_mut(&mut self, _: &mut syn::ExprAsync) {}
-        // Don't descend into nested fn items -- they have their own guards.
-        fn visit_item_fn_mut(&mut self, _: &mut syn::ItemFn) {}
-    }
-
-    AwaitCheckInjector.process_block(block);
-}
-
 struct Instrumenter {
     targets: HashSet<String>,
     instrument_macros: bool,
@@ -287,21 +90,6 @@ impl Instrumenter {
             let __piano_guard = piano_runtime::enter(#name);
         };
         block.stmts.insert(0, guard_stmt);
-
-        // For async functions, inject check() after each .await statement
-        // so the phantom StackEntry is pushed on migration.
-        if is_async {
-            let guard_stmt = block.stmts.remove(0);
-            inject_await_checks(block);
-            block.stmts.insert(0, guard_stmt);
-
-            // Inject AllocAccumulator as second statement. Drops first due to
-            // reverse declaration order, writing alloc total before Guard reads it.
-            let alloc_stmt: syn::Stmt = syn::parse_quote! {
-                let mut __piano_alloc = piano_runtime::AllocAccumulator::new();
-            };
-            block.stmts.insert(1, alloc_stmt);
-        }
 
         // If the function body contains concurrency calls, inject fork
         // and adopt in the relevant closures.
@@ -331,6 +119,22 @@ impl Instrumenter {
                     _ => {}
                 }
             }
+        }
+
+        // For async functions, wrap the entire body in PianoFuture.
+        // The guard (and any fork/adopt stmts) are inside the async move block.
+        if is_async {
+            let inner_stmts: Vec<syn::Stmt> = block.stmts.drain(..).collect();
+
+            let inner_block = syn::Block {
+                brace_token: syn::token::Brace::default(),
+                stmts: inner_stmts,
+            };
+
+            let wrapper_expr: syn::Expr = syn::parse_quote! {
+                piano_runtime::PianoFuture::new(async move #inner_block).await
+            };
+            block.stmts = vec![syn::Stmt::Expr(wrapper_expr, None)];
         }
     }
 }
@@ -1393,10 +1197,32 @@ impl VisitMut for ShutdownInjector {
                 if has_return_type && !existing_stmts.is_empty() {
                     let (body, tail) = existing_stmts.split_at(existing_stmts.len() - 1);
                     stmts.extend(body.to_vec());
-                    stmts.push(shutdown_stmt);
-                    stmts.extend(tail.to_vec());
+                    // If the tail is a bare expression (e.g. PianoFuture wrapper),
+                    // bind its result, shutdown, then return. Otherwise shutdown
+                    // would run before the tail expression completes.
+                    if let Some(syn::Stmt::Expr(tail_expr, None)) = tail.first() {
+                        let tail_expr = tail_expr.clone();
+                        let bind_stmt: syn::Stmt = syn::parse_quote! {
+                            let __piano_result = #tail_expr;
+                        };
+                        stmts.push(bind_stmt);
+                        stmts.push(shutdown_stmt);
+                        let return_expr: syn::Expr = syn::parse_quote! { __piano_result };
+                        stmts.push(syn::Stmt::Expr(return_expr, None));
+                    } else {
+                        stmts.push(shutdown_stmt);
+                        stmts.extend(tail.to_vec());
+                    }
                 } else {
-                    stmts.extend(existing_stmts);
+                    let mut body = existing_stmts;
+                    // If the last statement is a tail expression (no semicolon),
+                    // add a semicolon so shutdown can follow. Safe because
+                    // main without return type always returns ().
+                    if let Some(syn::Stmt::Expr(expr, semi @ None)) = body.last_mut() {
+                        *semi = Some(syn::token::Semi::default());
+                        let _ = expr; // suppress unused warning
+                    }
+                    stmts.extend(body);
                     stmts.push(shutdown_stmt);
                 }
                 node.block.stmts = stmts;
@@ -1867,12 +1693,17 @@ async fn main() -> ExitCode {
             !result.contains("catch_unwind"),
             "async main should NOT use catch_unwind. Got:\n{result}"
         );
-        // shutdown should come before the tail expression
-        let shutdown_pos = result.find("piano_runtime::shutdown()").unwrap();
-        let exit_code_pos = result.rfind("ExitCode::SUCCESS").unwrap();
+        // Tail expression is bound to __piano_result, shutdown runs,
+        // then __piano_result is returned as the tail expression.
         assert!(
-            shutdown_pos < exit_code_pos,
-            "shutdown should come before the tail expression. Got:\n{result}"
+            result.contains("__piano_result"),
+            "tail expression should be bound to __piano_result. Got:\n{result}"
+        );
+        let shutdown_pos = result.find("piano_runtime::shutdown()").unwrap();
+        let return_pos = result.rfind("__piano_result").unwrap();
+        assert!(
+            shutdown_pos < return_pos,
+            "shutdown should come before the return. Got:\n{result}"
         );
     }
 
@@ -2195,6 +2026,16 @@ async fn fetch_data(id: u32) -> String {
             "async function SHOULD be instrumented. Got:\n{}",
             result.source
         );
+        assert!(
+            result.source.contains("piano_runtime::PianoFuture::new"),
+            "async fn should be wrapped in PianoFuture. Got:\n{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("async move"),
+            "async fn body should use async move. Got:\n{}",
+            result.source
+        );
     }
 
     #[test]
@@ -2234,6 +2075,11 @@ impl Client {
             "async impl method SHOULD be instrumented. Got:\n{}",
             result.source
         );
+        assert!(
+            result.source.contains("piano_runtime::PianoFuture::new"),
+            "async impl method should be wrapped in PianoFuture. Got:\n{}",
+            result.source
+        );
     }
 
     #[test]
@@ -2254,48 +2100,55 @@ trait Service {
             "async trait default method SHOULD be instrumented. Got:\n{}",
             result.source
         );
-    }
-
-    #[test]
-    fn injects_check_after_await_in_async_fn() {
-        let targets: HashSet<String> = ["do_work".to_string()].into_iter().collect();
-        let source = r#"
-async fn do_work() {
-    setup();
-    fetch().await;
-    process();
-    save().await;
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        let check_count = result.source.matches("__piano_guard.check()").count();
-        assert_eq!(
-            check_count, 2,
-            "should inject check() after each .await statement. Got:\n{}",
+        assert!(
+            result.source.contains("piano_runtime::PianoFuture::new"),
+            "async trait method should be wrapped in PianoFuture. Got:\n{}",
             result.source
         );
     }
 
     #[test]
-    fn no_check_injection_in_sync_fn() {
-        let targets: HashSet<String> = ["do_work".to_string()].into_iter().collect();
+    fn wraps_async_fn_body_in_piano_future() {
         let source = r#"
-fn do_work() {
-    setup();
-    process();
+async fn handler(x: i32) -> String {
+    let result = fetch(x).await;
+    format!("{result}")
 }
 "#;
+        let targets: HashSet<String> = ["handler".to_string()].into();
         let result = instrument_source(source, &targets, false).unwrap();
-        assert_eq!(
-            result.source.matches("__piano_guard.check()").count(),
-            0,
-            "sync fn should not get check() calls. Got:\n{}",
+        assert!(result.source.contains("piano_runtime::PianoFuture::new"));
+        assert!(result.source.contains("async move"));
+        assert!(result.source.contains(".await"));
+        assert!(result.source.contains("piano_runtime::enter"));
+        // Should NOT have check(), save(), resume(), or AllocAccumulator
+        assert!(!result.source.contains("__piano_guard.check()"));
+        assert!(!result.source.contains("__piano_alloc"));
+        assert!(!result.source.contains("AllocAccumulator"));
+    }
+
+    #[test]
+    fn does_not_wrap_sync_fn_in_piano_future() {
+        let source = r#"
+fn compute(x: u64) -> u64 {
+    x * 2
+}
+"#;
+        let targets: HashSet<String> = ["compute".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert!(
+            result.source.contains("piano_runtime::enter(\"compute\")"),
+            "sync fn should be instrumented"
+        );
+        assert!(
+            !result.source.contains("PianoFuture"),
+            "sync fn should NOT be wrapped in PianoFuture. Got:\n{}",
             result.source
         );
     }
 
     #[test]
-    fn no_check_injection_for_non_target_async_fn() {
+    fn non_target_async_fn_not_wrapped() {
         let targets: HashSet<String> = ["other".to_string()].into_iter().collect();
         let source = r#"
 async fn not_targeted() {
@@ -2303,12 +2156,11 @@ async fn not_targeted() {
 }
 "#;
         let result = instrument_source(source, &targets, false).unwrap();
-        assert_eq!(
-            result.source.matches("__piano_guard.check()").count(),
-            0,
-            "non-target async fn should not get check() calls. Got:\n{}",
-            result.source
+        assert!(
+            !result.source.contains("PianoFuture"),
+            "non-target async fn should not be wrapped"
         );
+        assert!(!result.source.contains("piano_runtime::enter"));
     }
 
     #[test]
@@ -2641,807 +2493,6 @@ fn main() {}
         assert!(
             result.contains(r#"piano_runtime::enter("process")"#),
             "fn inside impl block in macro should be instrumented. Got:\n{result}"
-        );
-    }
-
-    // -- Nested .await check() injection tests --
-    //
-    // These tests verify check() is injected INSIDE nested blocks, directly
-    // after the .await, not just after the enclosing top-level statement.
-
-    /// Assert that `needle_a` appears before `needle_b` in `haystack`.
-    fn assert_appears_before(haystack: &str, needle_a: &str, needle_b: &str, context: &str) {
-        let pos_a = haystack
-            .find(needle_a)
-            .unwrap_or_else(|| panic!("{needle_a} not found in output. {context}:\n{haystack}"));
-        let pos_b = haystack
-            .find(needle_b)
-            .unwrap_or_else(|| panic!("{needle_b} not found in output. {context}:\n{haystack}"));
-        assert!(
-            pos_a < pos_b,
-            "{needle_a} should appear before {needle_b} ({context}). Got:\n{haystack}",
-        );
-    }
-
-    #[test]
-    fn injects_check_inside_if_block_not_after_it() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        // The .await is inside the if block. check() must appear between
-        // fetch().await and process(), not after the closing brace of `if`.
-        let source = r#"
-async fn example() {
-    if condition {
-        fetch().await;
-        process();
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        // check() must appear before process() (i.e. inside the if block),
-        // not after the if statement.
-        assert_appears_before(
-            &result.source,
-            "__piano_guard.check()",
-            "process()",
-            "inside if block",
-        );
-    }
-
-    #[test]
-    fn injects_check_inside_match_arm() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example(x: u32) {
-    match x {
-        0 => {
-            fetch().await;
-            process();
-        }
-        _ => {}
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        assert_appears_before(
-            &result.source,
-            "__piano_guard.check()",
-            "process()",
-            "inside match arm",
-        );
-    }
-
-    #[test]
-    fn injects_check_inside_loop() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    loop {
-        fetch().await;
-        process();
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        assert_appears_before(
-            &result.source,
-            "__piano_guard.check()",
-            "process()",
-            "inside loop",
-        );
-    }
-
-    #[test]
-    fn injects_check_at_every_nesting_depth() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    if condition {
-        fetch().await;
-        if other {
-            save().await;
-            cleanup();
-        }
-    }
-    send().await;
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        let check_count = result.source.matches("__piano_guard.check()").count();
-        assert_eq!(
-            check_count, 3,
-            "should inject check() after every .await at any depth. Got:\n{}",
-            result.source
-        );
-        // Verify the innermost check() is between save().await and cleanup()
-        let save_pos = result.source.find("save()").unwrap();
-        let cleanup_pos = result.source.find("cleanup()").unwrap();
-        let check_between = result.source[save_pos..cleanup_pos].contains("__piano_guard.check()");
-        assert!(
-            check_between,
-            "check() should appear between save().await and cleanup(). Got:\n{}",
-            result.source,
-        );
-    }
-
-    #[test]
-    fn injects_check_inside_else_block() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    if condition {
-        sync_work();
-    } else {
-        fetch().await;
-        process();
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        assert_appears_before(
-            &result.source,
-            "__piano_guard.check()",
-            "process()",
-            "inside else block",
-        );
-    }
-
-    #[test]
-    fn injects_check_inside_while_let_body() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    while let Some(item) = iter.next() {
-        process(item).await;
-        log();
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        assert_appears_before(
-            &result.source,
-            "__piano_guard.check()",
-            "log()",
-            "inside while let body",
-        );
-    }
-
-    #[test]
-    fn injects_check_inside_for_loop_body() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    for item in items {
-        process(item).await;
-        log();
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        assert_appears_before(
-            &result.source,
-            "__piano_guard.check()",
-            "log()",
-            "inside for loop body",
-        );
-    }
-
-    #[test]
-    fn injects_check_inside_bare_block() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    {
-        fetch().await;
-        process();
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        assert_appears_before(
-            &result.source,
-            "__piano_guard.check()",
-            "process()",
-            "inside bare block",
-        );
-    }
-
-    #[test]
-    fn injects_check_after_await_in_condition_expression() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    if stream.next().await.is_some() {
-        process();
-    }
-    cleanup();
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        // The .await is in the condition, so check() goes after the whole if statement
-        assert_eq!(
-            result.source.matches("__piano_guard.check()").count(),
-            1,
-            "expected exactly 1 check() call",
-        );
-        assert_appears_before(
-            &result.source,
-            "process()",
-            "__piano_guard.check()",
-            "check() should be after the if block containing process()",
-        );
-        assert_appears_before(
-            &result.source,
-            "__piano_guard.check()",
-            "cleanup()",
-            "after if with .await in condition",
-        );
-    }
-
-    #[test]
-    fn alloc_body_brackets_for_if_with_await_in_condition() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    if stream.next().await.is_some() {
-        process();
-    }
-    cleanup();
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        let src = &result.source;
-        // The if body must have resume() at start and save() at end so
-        // allocations inside process() are tracked, not zeroed.
-        assert_appears_before(
-            src,
-            "__piano_alloc.save()",
-            "stream.next()",
-            "save before if",
-        );
-        // resume() injected at start of if body, before process()
-        assert!(
-            src.contains("__piano_alloc.resume()"),
-            "should have resume() call. Got:\n{src}",
-        );
-        // The resume inside the body must come before process()
-        // Find resume inside body: after "is_some()" and before "process()"
-        let cond_pos = src.find("is_some()").unwrap();
-        let process_pos = src.find("process()").unwrap();
-        let body_resume_pos = src[cond_pos..].find("__piano_alloc.resume()").unwrap() + cond_pos;
-        assert!(
-            body_resume_pos < process_pos,
-            "resume() should appear in body before process(). Got:\n{src}",
-        );
-        // save() at end of body, after process() but before check()
-        let body_save_pos = src[process_pos..].find("__piano_alloc.save()").unwrap() + process_pos;
-        let check_pos = src.find("__piano_guard.check()").unwrap();
-        assert!(
-            body_save_pos < check_pos,
-            "body save() should appear after process() but before check(). Got:\n{src}",
-        );
-    }
-
-    #[test]
-    fn alloc_body_brackets_for_if_else_with_await_in_condition() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    if stream.next().await.is_some() {
-        process();
-    } else {
-        fallback();
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        let src = &result.source;
-        // Both branches must have resume/save brackets
-        let process_pos = src.find("process()").unwrap();
-        let fallback_pos = src.find("fallback()").unwrap();
-        // resume before process in then-branch
-        let then_resume = src[..process_pos]
-            .rfind("__piano_alloc.resume()")
-            .expect("then-branch should have resume() before process()");
-        assert!(then_resume < process_pos);
-        // resume before fallback in else-branch
-        let else_resume = src[..fallback_pos]
-            .rfind("__piano_alloc.resume()")
-            .expect("else-branch should have resume() before fallback()");
-        assert!(
-            else_resume > process_pos,
-            "else resume should be after then-branch"
-        );
-        // save after process in then-branch
-        let then_save = src[process_pos..fallback_pos]
-            .find("__piano_alloc.save()")
-            .expect("then-branch should have save() after process()");
-        assert!(then_save > 0);
-        // save after fallback in else-branch
-        let after_fallback = src[fallback_pos..].find("__piano_alloc.save()");
-        assert!(
-            after_fallback.is_some(),
-            "else-branch should have save() after fallback(). Got:\n{src}",
-        );
-    }
-
-    #[test]
-    fn alloc_body_brackets_for_while_with_await_in_condition() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    while stream.next().await.is_some() {
-        process();
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        let src = &result.source;
-        let cond_pos = src.find("is_some()").unwrap();
-        let process_pos = src.find("process()").unwrap();
-        // resume at start of while body
-        let body_resume = src[cond_pos..].find("__piano_alloc.resume()").unwrap() + cond_pos;
-        assert!(
-            body_resume < process_pos,
-            "while body should have resume() before process(). Got:\n{src}",
-        );
-        // save at end of while body
-        let body_save = src[process_pos..].find("__piano_alloc.save()");
-        assert!(
-            body_save.is_some(),
-            "while body should have save() after process(). Got:\n{src}",
-        );
-    }
-
-    #[test]
-    fn alloc_body_brackets_for_match_with_await_in_scrutinee() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    match stream.next().await {
-        Some(v) => { process(v); }
-        None => { fallback(); }
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        let src = &result.source;
-        let process_pos = src.find("process(v)").unwrap();
-        let fallback_pos = src.find("fallback()").unwrap();
-        // resume before process in Some arm
-        let some_resume = src[..process_pos]
-            .rfind("__piano_alloc.resume()")
-            .expect("Some arm should have resume() before process(v)");
-        assert!(some_resume < process_pos);
-        // resume before fallback in None arm
-        let none_resume = src[..fallback_pos]
-            .rfind("__piano_alloc.resume()")
-            .expect("None arm should have resume() before fallback()");
-        assert!(
-            none_resume > process_pos,
-            "None arm resume should be after Some arm"
-        );
-    }
-
-    #[test]
-    fn alloc_body_brackets_for_for_loop_with_await_in_iterator() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    for item in get_items().await {
-        process(item);
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        let src = &result.source;
-        let await_pos = src.find("get_items()").unwrap();
-        let process_pos = src.find("process(item)").unwrap();
-        // resume at start of for body
-        let body_resume = src[await_pos..].find("__piano_alloc.resume()").unwrap() + await_pos;
-        assert!(
-            body_resume < process_pos,
-            "for body should have resume() before process(item). Got:\n{src}",
-        );
-        // save at end of for body
-        let body_save = src[process_pos..].find("__piano_alloc.save()");
-        assert!(
-            body_save.is_some(),
-            "for body should have save() after process(item). Got:\n{src}",
-        );
-    }
-
-    #[test]
-    fn alloc_body_brackets_for_if_let_with_await_in_condition() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    if let Some(v) = stream.next().await {
-        process(v);
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        let src = &result.source;
-        let process_pos = src.find("process(v)").unwrap();
-        // resume before process in body
-        let body_resume = src[..process_pos]
-            .rfind("__piano_alloc.resume()")
-            .expect("if-let body should have resume() before process(v)");
-        assert!(body_resume < process_pos);
-        // save after process in body
-        let body_save = src[process_pos..].find("__piano_alloc.save()");
-        assert!(
-            body_save.is_some(),
-            "if-let body should have save() after process(v). Got:\n{src}",
-        );
-    }
-
-    #[test]
-    fn no_alloc_body_brackets_for_bare_await_statement() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    fetch().await;
-    process();
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        let src = &result.source;
-        // A bare .await statement should have save/check/resume around it
-        // but NOT inject extra resume/save brackets (no body to bracket).
-        // Count resume() calls: should be exactly 1 (after check)
-        let resume_count = src.matches("__piano_alloc.resume()").count();
-        assert_eq!(
-            resume_count, 1,
-            "bare .await should have exactly 1 resume(), got {resume_count}:\n{src}",
-        );
-        let save_count = src.matches("__piano_alloc.save()").count();
-        assert_eq!(
-            save_count, 1,
-            "bare .await should have exactly 1 save(), got {save_count}:\n{src}",
-        );
-    }
-
-    #[test]
-    fn no_check_injection_inside_closure_or_async_block() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    let f = || async { fetch().await; };
-    let g = async { save().await; };
-    send().await;
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        // Only one check() -- after send().await. The closure and async block
-        // have separate async contexts with their own guards.
-        let check_count = result.source.matches("__piano_guard.check()").count();
-        assert_eq!(
-            check_count, 1,
-            "expected 1 check() (after send().await only), got {check_count}:\n{}",
-            result.source,
-        );
-    }
-
-    #[test]
-    fn injects_check_after_macro_invocation_in_async_fn() {
-        let targets: HashSet<String> = ["handler".to_string()].into_iter().collect();
-        let source = r#"
-async fn handler() {
-    setup();
-    tokio::select! {
-        val = rx.recv() => { process(val); }
-        _ = sleep(timeout) => { handle_timeout(); }
-    }
-    cleanup();
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        // The select! macro may contain .await points invisible to syn.
-        // save/check/resume should be injected around it.
-        assert!(
-            result.source.contains("__piano_alloc.save()"),
-            "should inject save() before macro invocation. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.source.contains("__piano_guard.check()"),
-            "should inject check() after macro invocation. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.source.contains("__piano_alloc.resume()"),
-            "should inject resume() after macro invocation. Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn no_check_after_macro_in_sync_fn() {
-        let targets: HashSet<String> = ["handler".to_string()].into_iter().collect();
-        let source = r#"
-fn handler() {
-    setup();
-    println!("hello {}", name);
-    cleanup();
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        // Sync functions should not get check()/save()/resume() even with macros.
-        assert_eq!(
-            result.source.matches("__piano_guard.check()").count(),
-            0,
-            "sync fn should not get check() calls. Got:\n{}",
-            result.source
-        );
-        assert_eq!(
-            result.source.matches("__piano_alloc.save()").count(),
-            0,
-            "sync fn should not get save() calls. Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn injects_check_after_expr_macro_in_async_fn() {
-        let targets: HashSet<String> = ["handler".to_string()].into_iter().collect();
-        let source = r#"
-async fn handler() {
-    let result = tokio::join!(future_a(), future_b());
-    process(result);
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        // Expression-position macros (with parens) are ExprMacro in syn.
-        // They should also get save/check/resume.
-        assert!(
-            result.source.contains("__piano_guard.check()"),
-            "should inject check() after expression-position macro. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.source.contains("__piano_alloc.save()"),
-            "should inject save() before expression-position macro. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.source.contains("__piano_alloc.resume()"),
-            "should inject resume() after expression-position macro. Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn injects_alloc_accumulator_in_async_fn() {
-        let source = r#"
-async fn fetch() {
-    work().await;
-}
-"#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
-
-        assert!(
-            result.source.contains("AllocAccumulator::new()"),
-            "async fn should get AllocAccumulator. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.source.contains("__piano_alloc"),
-            "accumulator variable should be named __piano_alloc. Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn does_not_inject_alloc_accumulator_in_sync_fn() {
-        let source = r#"
-fn compute(x: u64) -> u64 {
-    x * 2
-}
-"#;
-        let targets: HashSet<String> = ["compute".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
-
-        assert!(
-            !result.source.contains("AllocAccumulator"),
-            "sync fn should NOT get AllocAccumulator. Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn injects_save_and_resume_around_await() {
-        let source = r#"
-async fn fetch() {
-    setup();
-    data().await;
-    process();
-}
-"#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
-
-        let save_pos = result
-            .source
-            .find("__piano_alloc.save()")
-            .expect("should have save()");
-        let await_pos = result
-            .source
-            .find("data().await")
-            .expect("should have .await");
-        let check_pos = result
-            .source
-            .find("__piano_guard.check()")
-            .expect("should have check()");
-        let resume_pos = result
-            .source
-            .find("__piano_alloc.resume()")
-            .expect("should have resume()");
-
-        assert!(
-            save_pos < await_pos,
-            "save() should come before .await. Got:\n{}",
-            result.source
-        );
-        assert!(await_pos < check_pos, "check() should come after .await");
-        assert!(check_pos < resume_pos, "resume() should come after check()");
-    }
-
-    #[test]
-    fn injects_save_resume_for_multiple_awaits() {
-        let source = r#"
-async fn multi() {
-    a().await;
-    b().await;
-    c().await;
-}
-"#;
-        let targets: HashSet<String> = ["multi".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
-
-        let save_count = result.source.matches("__piano_alloc.save()").count();
-        let resume_count = result.source.matches("__piano_alloc.resume()").count();
-        let check_count = result.source.matches("__piano_guard.check()").count();
-
-        assert_eq!(
-            save_count, 3,
-            "should have 3 save() calls. Got:\n{}",
-            result.source
-        );
-        assert_eq!(
-            resume_count, 3,
-            "should have 3 resume() calls. Got:\n{}",
-            result.source
-        );
-        assert_eq!(
-            check_count, 3,
-            "should have 3 check() calls. Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn detect_cfg_attr_global_allocator() {
-        let src = r#"
-            #[cfg_attr(target_os = "linux", global_allocator)]
-            static ALLOC: Jemalloc = Jemalloc;
-            fn main() {}
-        "#;
-        let kind = detect_allocator_kind(src).unwrap();
-        match kind {
-            AllocatorKind::CfgGated(preds) => {
-                assert_eq!(preds.len(), 1);
-                let pred_str = quote::quote!(#(#preds)*).to_string();
-                assert!(
-                    pred_str.contains("target_os"),
-                    "predicate should contain target_os, got: {pred_str}"
-                );
-            }
-            other => panic!("expected CfgGated, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cfg_attr_without_global_allocator_is_absent() {
-        let src = r#"
-            #[cfg_attr(unix, derive(Debug))]
-            static ALLOC: Jemalloc = Jemalloc;
-            fn main() {}
-        "#;
-        let kind = detect_allocator_kind(src).unwrap();
-        assert!(matches!(kind, AllocatorKind::Absent));
-    }
-
-    #[test]
-    fn cfg_attr_with_multiple_attrs_detects_global_allocator() {
-        let src = r#"
-            #[cfg_attr(unix, global_allocator, allow(unused))]
-            static ALLOC: Jemalloc = Jemalloc;
-            fn main() {}
-        "#;
-        let kind = detect_allocator_kind(src).unwrap();
-        assert!(matches!(kind, AllocatorKind::CfgGated(_)));
-    }
-
-    #[test]
-    fn multiple_cfg_attrs_on_same_static() {
-        let src = r#"
-            #[cfg(target_os = "linux")]
-            #[cfg(target_arch = "x86_64")]
-            #[global_allocator]
-            static ALLOC: Jemalloc = Jemalloc;
-            fn main() {}
-        "#;
-        let kind = detect_allocator_kind(src).unwrap();
-        match kind {
-            AllocatorKind::CfgGated(preds) => {
-                assert_eq!(
-                    preds.len(),
-                    1,
-                    "multiple cfgs on same item should be combined into one predicate"
-                );
-                let pred_str = quote::quote!(#(#preds)*).to_string();
-                assert!(
-                    pred_str.contains("all"),
-                    "combined predicate should use all(...), got: {pred_str}"
-                );
-                assert!(pred_str.contains("target_os"), "should contain target_os");
-                assert!(
-                    pred_str.contains("target_arch"),
-                    "should contain target_arch"
-                );
-            }
-            other => panic!("expected CfgGated, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cfg_attr_allocator_gets_fallback_injection() {
-        let src = r#"
-            #[cfg_attr(target_os = "linux", global_allocator)]
-            static ALLOC: Jemalloc = Jemalloc;
-            fn main() {}
-        "#;
-        let kind = detect_allocator_kind(src).unwrap();
-        let result = inject_global_allocator(src, kind).unwrap();
-        assert!(result.contains("PianoAllocator"), "should wrap allocator");
-        assert!(result.contains("_PIANO_ALLOC"), "should inject fallback");
-        assert!(result.contains("not"), "fallback should have negated cfg");
-    }
-
-    #[test]
-    fn alloc_body_brackets_for_non_block_match_arms() {
-        let targets: HashSet<String> = ["example".to_string()].into_iter().collect();
-        let source = r#"
-async fn example() {
-    match stream.next().await {
-        Some(v) => process(v),
-        None => fallback(),
-    }
-}
-"#;
-        let result = instrument_source(source, &targets, false).unwrap();
-        let src = &result.source;
-        let process_pos = src.find("process(v)").unwrap();
-        let fallback_pos = src.find("fallback()").unwrap();
-        // resume before process in Some arm (non-block)
-        let some_resume = src[..process_pos]
-            .rfind("__piano_alloc.resume()")
-            .expect("Some arm should have resume() before process(v)");
-        assert!(some_resume < process_pos);
-        // save after process in Some arm
-        let some_save = src[process_pos..fallback_pos]
-            .find("__piano_alloc.save()")
-            .expect("Some arm should have save() after process(v)");
-        assert!(some_save > 0);
-        // resume before fallback in None arm (non-block)
-        let none_resume = src[..fallback_pos]
-            .rfind("__piano_alloc.resume()")
-            .expect("None arm should have resume() before fallback()");
-        assert!(
-            none_resume > process_pos,
-            "None arm resume should be after Some arm"
         );
     }
 
