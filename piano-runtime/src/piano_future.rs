@@ -314,4 +314,53 @@ mod tests {
         assert_eq!(rec.alloc_count, 8, "expected 5+3=8 allocs");
         assert_eq!(rec.alloc_bytes, 800, "expected 500+300=800 bytes");
     }
+
+    #[test]
+    fn piano_future_with_fork_adopt() {
+        collector::reset();
+        run(async {
+            PianoFuture::new(async {
+                let _guard = collector::enter("pf_fork_parent");
+                collector::register("pf_fork_parent");
+                collector::register("pf_fork_child");
+
+                let ctx = collector::fork().expect("should have parent on stack");
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        let _adopt = collector::adopt(&ctx);
+                        let _child_guard = collector::enter("pf_fork_child");
+                        collector::burn_cpu(20_000);
+                    });
+                });
+                collector::burn_cpu(2_000);
+            })
+            .await;
+        });
+        let records = collector::collect_all();
+        assert!(
+            records.iter().any(|r| r.name == "pf_fork_parent"),
+            "parent should appear in records"
+        );
+        assert!(
+            records.iter().any(|r| r.name == "pf_fork_child"),
+            "child should appear in records"
+        );
+
+        let parent = records.iter().find(|r| r.name == "pf_fork_parent").unwrap();
+        let child = records.iter().find(|r| r.name == "pf_fork_child").unwrap();
+        // Parent total_ms includes blocking on std::thread::scope, so it
+        // should exceed the child's total_ms.
+        assert!(
+            parent.total_ms > child.total_ms,
+            "parent total_ms ({:.3}) should exceed child total_ms ({:.3})",
+            parent.total_ms,
+            child.total_ms,
+        );
+        // Child should have measurable wall time from burn_cpu(20_000).
+        assert!(
+            child.total_ms > 0.5,
+            "child total_ms ({:.3}) should reflect actual CPU work",
+            child.total_ms,
+        );
+    }
 }
