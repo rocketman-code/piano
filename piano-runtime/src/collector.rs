@@ -3010,4 +3010,101 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn trailer_fn_id_round_trip() {
+        let tmp = std::env::temp_dir().join(format!("piano_trailer_rt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut state = open_stream_file(&tmp).unwrap();
+
+        let name_plain: &'static str = "simple_fn";
+        let name_generic: &'static str = "Vec<String>::push";
+        let name_backslash: &'static str = "path\\to\\fn";
+
+        let id_plain = intern_name(name_plain);
+        let id_generic = intern_name(name_generic);
+        let id_backslash = intern_name(name_backslash);
+
+        let frame = vec![
+            FrameFnSummary {
+                name: name_plain,
+                calls: 1,
+                self_ns: 100,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 0,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            },
+            FrameFnSummary {
+                name: name_generic,
+                calls: 2,
+                self_ns: 200,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 0,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            },
+            FrameFnSummary {
+                name: name_backslash,
+                calls: 3,
+                self_ns: 300,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 0,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            },
+        ];
+        stream_frame_to_writer(&mut state, &frame);
+        write_stream_trailer(&mut state).unwrap();
+        drop(state);
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let trailer = *lines.last().unwrap();
+
+        // Parse trailer: {"functions":["name0","name1",...]}
+        let fns_start = trailer.find("\"functions\":[").unwrap() + "\"functions\":[".len();
+        let fns_end = trailer[fns_start..].find(']').unwrap();
+        let fns_str = &trailer[fns_start..fns_start + fns_end];
+
+        let parsed: Vec<String> = fns_str
+            .split("\",\"")
+            .map(|s| {
+                s.trim_matches('"')
+                    .replace("\\\\", "\\")
+                    .replace("\\\"", "\"")
+            })
+            .collect();
+
+        assert_eq!(
+            parsed.get(id_plain as usize).map(|s| s.as_str()),
+            Some("simple_fn"),
+            "plain name at id {id_plain}"
+        );
+        assert_eq!(
+            parsed.get(id_generic as usize).map(|s| s.as_str()),
+            Some("Vec<String>::push"),
+            "generic name at id {id_generic}"
+        );
+        assert_eq!(
+            parsed.get(id_backslash as usize).map(|s| s.as_str()),
+            Some("path\\to\\fn"),
+            "backslash name at id {id_backslash}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
