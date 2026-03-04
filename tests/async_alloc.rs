@@ -24,7 +24,7 @@ name = "async-alloc-test"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 "#,
     )
     .unwrap();
@@ -46,7 +46,8 @@ async fn allocating_work() -> Vec<u8> {
 }
 
 fn wrapper() {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
