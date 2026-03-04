@@ -43,6 +43,8 @@ Integration tests in `tests/`. Unit tests in source files (`#[cfg(test)]` module
 - `strict_lints.rs` -- runtime compiles with strict warnings
 - `workspace_member.rs` -- workspace member instrumentation
 - `custom_bin_path.rs` -- non-default binary entry points
+- `async_main_return_type.rs` -- async main with return type pipeline
+- `exit_in_non_main.rs` -- process::exit in non-main function data capture
 
 ## CI
 
