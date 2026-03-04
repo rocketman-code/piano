@@ -1712,6 +1712,41 @@ mod tests {
     }
 
     #[test]
+    fn self_time_numerical_precision() {
+        reset();
+        {
+            let _outer = enter("prec_outer");
+            burn_cpu(5_000);
+            {
+                let _inner = enter("prec_inner");
+                burn_cpu(20_000);
+            }
+            burn_cpu(5_000);
+        }
+        let records = collect();
+        let outer = records.iter().find(|r| r.name == "prec_outer").unwrap();
+        let inner = records.iter().find(|r| r.name == "prec_inner").unwrap();
+
+        // Inner is a leaf: self ≈ total.
+        assert!(
+            (inner.self_ms - inner.total_ms).abs() < inner.total_ms * 0.15,
+            "inner: self_ms={:.3} total_ms={:.3}",
+            inner.self_ms,
+            inner.total_ms,
+        );
+
+        // Precision check: outer.self_ms ≈ outer.total_ms - inner.total_ms
+        // within 30% tolerance (accounts for TSC conversion and scheduling jitter).
+        let expected_outer_self = outer.total_ms - inner.total_ms;
+        let error = (outer.self_ms - expected_outer_self).abs();
+        assert!(
+            error < expected_outer_self * 0.30,
+            "outer.self_ms ({:.3}) should be within 30% of (total_ms - inner.total_ms) = {:.3}, error = {:.3}",
+            outer.self_ms, expected_outer_self, error,
+        );
+    }
+
+    #[test]
     fn call_count_tracking() {
         reset();
         for _ in 0..5 {
