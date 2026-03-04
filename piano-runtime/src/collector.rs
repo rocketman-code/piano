@@ -1712,6 +1712,41 @@ mod tests {
     }
 
     #[test]
+    fn self_time_numerical_precision() {
+        reset();
+        {
+            let _outer = enter("prec_outer");
+            burn_cpu(5_000);
+            {
+                let _inner = enter("prec_inner");
+                burn_cpu(20_000);
+            }
+            burn_cpu(5_000);
+        }
+        let records = collect();
+        let outer = records.iter().find(|r| r.name == "prec_outer").unwrap();
+        let inner = records.iter().find(|r| r.name == "prec_inner").unwrap();
+
+        // Inner is a leaf: self ≈ total.
+        assert!(
+            (inner.self_ms - inner.total_ms).abs() < inner.total_ms * 0.15,
+            "inner: self_ms={:.3} total_ms={:.3}",
+            inner.self_ms,
+            inner.total_ms,
+        );
+
+        // Precision check: outer.self_ms ≈ outer.total_ms - inner.total_ms
+        // within 30% tolerance (accounts for TSC conversion and scheduling jitter).
+        let expected_outer_self = outer.total_ms - inner.total_ms;
+        let error = (outer.self_ms - expected_outer_self).abs();
+        assert!(
+            error < expected_outer_self * 0.30,
+            "outer.self_ms ({:.3}) should be within 30% of (total_ms - inner.total_ms) = {:.3}, error = {:.3}",
+            outer.self_ms, expected_outer_self, error,
+        );
+    }
+
+    #[test]
     fn call_count_tracking() {
         reset();
         for _ in 0..5 {
@@ -2833,10 +2868,243 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn stream_frame_field_values_round_trip() {
+        let tmp = std::env::temp_dir().join(format!("piano_rt_roundtrip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut state = open_stream_file(&tmp).unwrap();
+
+        let frame_data = vec![FrameFnSummary {
+            name: "roundtrip_fn",
+            calls: 42,
+            self_ns: 123_456_789,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 100_000_000,
+            alloc_count: 7,
+            alloc_bytes: 2048,
+            free_count: 3,
+            free_bytes: 1024,
+        }];
+
+        stream_frame_to_writer(&mut state, &frame_data);
+        write_stream_trailer(&mut state).unwrap();
+        drop(state);
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+
+        let frame_line = lines[1];
+        assert!(frame_line.contains("\"frame\":0"), "frame index");
+
+        let fns_start = frame_line.find("\"fns\":[").unwrap() + "\"fns\":[".len();
+        let fns_end = frame_line[fns_start..].rfind(']').unwrap();
+        let entry_str = &frame_line[fns_start..fns_start + fns_end];
+
+        fn extract(s: &str, key: &str) -> u64 {
+            let start = s.find(key).unwrap() + key.len();
+            let end = s[start..]
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(s.len() - start);
+            s[start..start + end].parse().unwrap()
+        }
+
+        assert_eq!(extract(entry_str, "\"calls\":"), 42, "calls");
+        assert_eq!(extract(entry_str, "\"self_ns\":"), 123_456_789, "self_ns");
+        assert_eq!(extract(entry_str, "\"ac\":"), 7, "alloc_count");
+        assert_eq!(extract(entry_str, "\"ab\":"), 2048, "alloc_bytes");
+        assert_eq!(extract(entry_str, "\"fc\":"), 3, "free_count");
+        assert_eq!(extract(entry_str, "\"fb\":"), 1024, "free_bytes");
+
+        let trailer = *lines.last().unwrap();
+        assert!(
+            trailer.contains("roundtrip_fn"),
+            "trailer should contain function name"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     // NOTE: The streaming fallback path (STREAMING_ENABLED=true but no stream
     // file opened) is not tested directly because setting STREAMING_ENABLED
     // globally races with parallel tests' guard drops. The aggregate-synthesis
     // logic is the same as the non-streaming path, already covered by
     // shutdown_writes_ndjson_with_all_thread_data. The streaming gate is a
     // simple flag check tested indirectly via integration tests.
+
+    #[test]
+    fn synthesize_frame_from_agg_precision() {
+        reset();
+
+        let agg = vec![
+            FnAgg {
+                name: "synth_fn_a",
+                calls: 5,
+                total_ms: 100.0,
+                self_ms: 75.5,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 50_000_000,
+            },
+            FnAgg {
+                name: "synth_fn_b",
+                calls: 1,
+                total_ms: 10.0,
+                self_ms: 10.0,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 8_000_000,
+            },
+        ];
+
+        let frames = synthesize_frame_from_agg(&agg);
+
+        assert_eq!(frames.len(), 2, "should have 2 function summaries");
+
+        let a = frames.iter().find(|f| f.name == "synth_fn_a").unwrap();
+        assert_eq!(a.calls, 5);
+        assert!(
+            (a.self_ns as i64 - 75_500_000i64).unsigned_abs() <= 1,
+            "synth_fn_a.self_ns = {}, expected ~75_500_000",
+            a.self_ns,
+        );
+        assert_eq!(a.alloc_count, 0);
+        assert_eq!(a.alloc_bytes, 0);
+        assert_eq!(a.free_count, 0);
+        assert_eq!(a.free_bytes, 0);
+
+        let b = frames.iter().find(|f| f.name == "synth_fn_b").unwrap();
+        assert_eq!(b.calls, 1);
+        assert!(
+            (b.self_ns as i64 - 10_000_000i64).unsigned_abs() <= 1,
+            "synth_fn_b.self_ns = {}, expected ~10_000_000",
+            b.self_ns,
+        );
+    }
+
+    #[test]
+    fn double_flush_idempotency() {
+        reset();
+        {
+            let _g = enter("dflush_fn");
+            burn_cpu(1_000);
+        }
+        // drop_cold already flushed RECORDS_BUF at the depth-0 boundary.
+        // collect() calls flush_records_buf() again.
+        let records = collect();
+        let rec = records.iter().find(|r| r.name == "dflush_fn").unwrap();
+        assert_eq!(rec.calls, 1, "double flush should not double-count calls");
+
+        // Also verify via raw RECORDS that there's exactly one entry.
+        flush_records_buf();
+        RECORDS.with(|records| {
+            let recs = records.lock().unwrap_or_else(|e| e.into_inner());
+            let count = recs.iter().filter(|e| e.name == "dflush_fn").count();
+            assert_eq!(
+                count, 1,
+                "RECORDS should have exactly one dflush_fn entry, got {count}"
+            );
+        });
+    }
+
+    #[test]
+    fn trailer_fn_id_round_trip() {
+        let tmp = std::env::temp_dir().join(format!("piano_trailer_rt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut state = open_stream_file(&tmp).unwrap();
+
+        let name_plain: &'static str = "simple_fn";
+        let name_generic: &'static str = "Vec<String>::push";
+        let name_backslash: &'static str = "path\\to\\fn";
+
+        let id_plain = intern_name(name_plain);
+        let id_generic = intern_name(name_generic);
+        let id_backslash = intern_name(name_backslash);
+
+        let frame = vec![
+            FrameFnSummary {
+                name: name_plain,
+                calls: 1,
+                self_ns: 100,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 0,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            },
+            FrameFnSummary {
+                name: name_generic,
+                calls: 2,
+                self_ns: 200,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 0,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            },
+            FrameFnSummary {
+                name: name_backslash,
+                calls: 3,
+                self_ns: 300,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 0,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            },
+        ];
+        stream_frame_to_writer(&mut state, &frame);
+        write_stream_trailer(&mut state).unwrap();
+        drop(state);
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let trailer = *lines.last().unwrap();
+
+        // Parse trailer: {"functions":["name0","name1",...]}
+        let fns_start = trailer.find("\"functions\":[").unwrap() + "\"functions\":[".len();
+        let fns_end = trailer[fns_start..].find(']').unwrap();
+        let fns_str = &trailer[fns_start..fns_start + fns_end];
+
+        let parsed: Vec<String> = fns_str
+            .split("\",\"")
+            .map(|s| {
+                s.trim_matches('"')
+                    .replace("\\\\", "\\")
+                    .replace("\\\"", "\"")
+            })
+            .collect();
+
+        assert_eq!(
+            parsed.get(id_plain as usize).map(|s| s.as_str()),
+            Some("simple_fn"),
+            "plain name at id {id_plain}"
+        );
+        assert_eq!(
+            parsed.get(id_generic as usize).map(|s| s.as_str()),
+            Some("Vec<String>::push"),
+            "generic name at id {id_generic}"
+        );
+        assert_eq!(
+            parsed.get(id_backslash as usize).map(|s| s.as_str()),
+            Some("path\\to\\fn"),
+            "backslash name at id {id_backslash}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
