@@ -206,16 +206,18 @@ pub fn find_project_root(start_dir: &Path) -> Result<PathBuf, Error> {
 
 /// Find the binary entry point for a Cargo project.
 ///
-/// Reads `Cargo.toml` and resolves the entry point using Cargo's rules:
+/// When `bin_name` is `Some`, looks for the named `[[bin]]` entry only.
+/// When `None`, resolves the entry point using Cargo's rules:
 ///
 /// 1. `[[bin]]` entries with an explicit `path` field -- returns the first match.
 /// 2. `[[bin]]` entries with a `name` but no `path` -- infers the source as
 ///    `src/bin/<name>.rs` or `src/bin/<name>/main.rs` (Cargo's convention).
 /// 3. Falls back to `src/main.rs` if no `[[bin]]` section or no matches.
 ///
-/// When multiple `[[bin]]` entries exist, the first match (in declaration order)
-/// is used. Returns an error if no entry point can be found.
-pub fn find_bin_entry_point(project_dir: &Path) -> Result<PathBuf, Error> {
+/// When multiple `[[bin]]` entries exist and no `bin_name` is given, the first
+/// match (in declaration order) is used. Returns an error if no entry point
+/// can be found.
+pub fn find_bin_entry_point(project_dir: &Path, bin_name: Option<&str>) -> Result<PathBuf, Error> {
     let cargo_toml_path = project_dir.join("Cargo.toml");
     let content =
         std::fs::read_to_string(&cargo_toml_path).map_err(io_context("read", &cargo_toml_path))?;
@@ -224,6 +226,25 @@ pub fn find_bin_entry_point(project_dir: &Path) -> Result<PathBuf, Error> {
         .map_err(|e| Error::BuildFailed(format!("failed to parse Cargo.toml: {e}")))?;
 
     if let Some(bins) = doc.get("bin").and_then(|b| b.as_array_of_tables()) {
+        if let Some(target) = bin_name {
+            // Find the specific named binary.
+            for bin in bins {
+                let name = bin.get("name").and_then(|n| n.as_str());
+                if name != Some(target) {
+                    continue;
+                }
+                if let Some(path) = bin.get("path").and_then(|p| p.as_str()) {
+                    return Ok(PathBuf::from(path));
+                }
+                // Infer path from name.
+                return resolve_bin_path(project_dir, target);
+            }
+            return Err(Error::BuildFailed(format!(
+                "no [[bin]] entry named '{target}' in Cargo.toml"
+            )));
+        }
+
+        // No --bin specified: use first match (existing behavior).
         // First pass: check for an explicit path.
         for bin in bins {
             if let Some(path) = bin.get("path").and_then(|p| p.as_str()) {
@@ -234,17 +255,15 @@ pub fn find_bin_entry_point(project_dir: &Path) -> Result<PathBuf, Error> {
         // Second pass: infer from name (src/bin/<name>.rs or src/bin/<name>/main.rs).
         for bin in bins {
             if let Some(name) = bin.get("name").and_then(|n| n.as_str()) {
-                let single_file = PathBuf::from("src").join("bin").join(format!("{name}.rs"));
-                if project_dir.join(&single_file).exists() {
-                    return Ok(single_file);
-                }
-
-                let dir_main = PathBuf::from("src").join("bin").join(name).join("main.rs");
-                if project_dir.join(&dir_main).exists() {
-                    return Ok(dir_main);
+                if let Ok(path) = resolve_bin_path(project_dir, name) {
+                    return Ok(path);
                 }
             }
         }
+    } else if let Some(target) = bin_name {
+        return Err(Error::BuildFailed(format!(
+            "no [[bin]] entry named '{target}' in Cargo.toml"
+        )));
     }
 
     // Cargo default: src/main.rs
@@ -259,15 +278,37 @@ pub fn find_bin_entry_point(project_dir: &Path) -> Result<PathBuf, Error> {
     )))
 }
 
+/// Resolve the source path for a named binary target using Cargo conventions:
+/// `src/bin/<name>.rs` or `src/bin/<name>/main.rs`.
+fn resolve_bin_path(project_dir: &Path, name: &str) -> Result<PathBuf, Error> {
+    let single_file = PathBuf::from("src").join("bin").join(format!("{name}.rs"));
+    if project_dir.join(&single_file).exists() {
+        return Ok(single_file);
+    }
+
+    let dir_main = PathBuf::from("src").join("bin").join(name).join("main.rs");
+    if project_dir.join(&dir_main).exists() {
+        return Ok(dir_main);
+    }
+
+    Err(Error::BuildFailed(format!(
+        "could not find source for binary '{name}': \
+         neither src/bin/{name}.rs nor src/bin/{name}/main.rs exists"
+    )))
+}
+
 /// Build the instrumented binary using `cargo build --release --message-format=json`.
 /// Returns the path to the compiled executable.
 ///
 /// When `package` is `Some`, passes `-p <name>` to cargo to build a specific
 /// workspace member (used when staging an entire workspace).
+/// When `bin` is `Some`, passes `--bin <name>` to cargo to build a specific
+/// binary target.
 pub fn build_instrumented(
     staging_dir: &Path,
     target_dir: &Path,
     package: Option<&str>,
+    bin: Option<&str>,
 ) -> Result<PathBuf, Error> {
     // Remove RUSTUP_TOOLCHAIN so the target project's rust-toolchain.toml
     // is respected. Without this, nested cargo invocations inherit the
@@ -281,6 +322,9 @@ pub fn build_instrumented(
         .current_dir(staging_dir);
     if let Some(pkg) = package {
         cmd.arg("-p").arg(pkg);
+    }
+    if let Some(bin_name) = bin {
+        cmd.arg("--bin").arg(bin_name);
     }
     let output = cmd.output()?;
 
@@ -488,7 +532,7 @@ path = "src/custom/app.rs"
         create_file(tmp.path(), "Cargo.toml", toml);
         create_file(tmp.path(), "src/custom/app.rs", "fn main() {}");
 
-        let result = find_bin_entry_point(tmp.path()).unwrap();
+        let result = find_bin_entry_point(tmp.path(), None).unwrap();
         assert_eq!(result, PathBuf::from("src/custom/app.rs"));
     }
 
@@ -505,7 +549,7 @@ name = "mytool"
         create_file(tmp.path(), "Cargo.toml", toml);
         create_file(tmp.path(), "src/bin/mytool.rs", "fn main() {}");
 
-        let result = find_bin_entry_point(tmp.path()).unwrap();
+        let result = find_bin_entry_point(tmp.path(), None).unwrap();
         assert_eq!(result, PathBuf::from("src/bin/mytool.rs"));
     }
 
@@ -523,7 +567,7 @@ name = "mytool"
         // No src/bin/mytool.rs, but src/bin/mytool/main.rs exists.
         create_file(tmp.path(), "src/bin/mytool/main.rs", "fn main() {}");
 
-        let result = find_bin_entry_point(tmp.path()).unwrap();
+        let result = find_bin_entry_point(tmp.path(), None).unwrap();
         assert_eq!(result, PathBuf::from("src/bin/mytool/main.rs"));
     }
 
@@ -537,7 +581,7 @@ version = "0.1.0"
         create_file(tmp.path(), "Cargo.toml", toml);
         create_file(tmp.path(), "src/main.rs", "fn main() {}");
 
-        let result = find_bin_entry_point(tmp.path()).unwrap();
+        let result = find_bin_entry_point(tmp.path(), None).unwrap();
         assert_eq!(result, PathBuf::from("src/main.rs"));
     }
 
@@ -619,6 +663,97 @@ version = "0.1.0"
     }
 
     #[test]
+    fn find_bin_entry_point_named_with_explicit_path() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[[bin]]
+name = "server"
+path = "src/custom/server.rs"
+
+[[bin]]
+name = "worker"
+path = "src/custom/worker.rs"
+"#;
+        create_file(tmp.path(), "Cargo.toml", toml);
+        create_file(tmp.path(), "src/custom/server.rs", "fn main() {}");
+        create_file(tmp.path(), "src/custom/worker.rs", "fn main() {}");
+
+        let result = find_bin_entry_point(tmp.path(), Some("worker")).unwrap();
+        assert_eq!(result, PathBuf::from("src/custom/worker.rs"));
+    }
+
+    #[test]
+    fn find_bin_entry_point_named_infers_path() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[[bin]]
+name = "cli"
+
+[[bin]]
+name = "daemon"
+"#;
+        create_file(tmp.path(), "Cargo.toml", toml);
+        create_file(tmp.path(), "src/bin/cli.rs", "fn main() {}");
+        create_file(tmp.path(), "src/bin/daemon/main.rs", "fn main() {}");
+
+        // Infer src/bin/cli.rs
+        let result = find_bin_entry_point(tmp.path(), Some("cli")).unwrap();
+        assert_eq!(result, PathBuf::from("src/bin/cli.rs"));
+
+        // Infer src/bin/daemon/main.rs
+        let result = find_bin_entry_point(tmp.path(), Some("daemon")).unwrap();
+        assert_eq!(result, PathBuf::from("src/bin/daemon/main.rs"));
+    }
+
+    #[test]
+    fn find_bin_entry_point_named_not_found_in_entries() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[[bin]]
+name = "server"
+path = "src/server.rs"
+"#;
+        create_file(tmp.path(), "Cargo.toml", toml);
+        create_file(tmp.path(), "src/server.rs", "fn main() {}");
+
+        let result = find_bin_entry_point(tmp.path(), Some("nonexistent"));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no [[bin]] entry named 'nonexistent'"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn find_bin_entry_point_named_no_bin_section() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"[package]
+name = "demo"
+version = "0.1.0"
+"#;
+        create_file(tmp.path(), "Cargo.toml", toml);
+        create_file(tmp.path(), "src/main.rs", "fn main() {}");
+
+        let result = find_bin_entry_point(tmp.path(), Some("mybin"));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no [[bin]] entry named 'mybin'"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
     fn find_bin_entry_point_errors_when_no_entry_found() {
         let tmp = TempDir::new().unwrap();
         let toml = r#"[package]
@@ -628,7 +763,7 @@ version = "0.1.0"
         create_file(tmp.path(), "Cargo.toml", toml);
         // No src/main.rs, no [[bin]] entries.
 
-        let result = find_bin_entry_point(tmp.path());
+        let result = find_bin_entry_point(tmp.path(), None);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
