@@ -61,6 +61,11 @@ struct BuildOpts {
     #[arg(long)]
     runtime_path: Option<PathBuf>,
 
+    /// Build and profile a specific binary target (for projects with multiple
+    /// [[bin]] entries). Matches cargo's --bin flag.
+    #[arg(long)]
+    bin: Option<String>,
+
     /// Capture per-thread CPU time alongside wall time (Unix only).
     #[arg(long)]
     cpu_time: bool,
@@ -185,6 +190,7 @@ fn build_project(
         mod_patterns,
         project,
         runtime_path,
+        bin,
         cpu_time,
         list_skipped,
     } = opts;
@@ -354,7 +360,7 @@ fn build_project(
     }
 
     // Inject register calls into the binary entry point for all instrumented functions.
-    let bin_entry = find_bin_entry_point(&member_staging)?;
+    let bin_entry = find_bin_entry_point(&member_staging, bin.as_deref())?;
     let main_file = member_staging.join(&bin_entry);
     let target_dir = project.join("target").join("piano");
     let runs_dir = target_dir.join("runs");
@@ -399,7 +405,12 @@ fn build_project(
     }
 
     // Build the instrumented binary.
-    let binary = build_instrumented(&staging, &target_dir, package_name.as_deref())?;
+    let binary = build_instrumented(
+        &staging,
+        &target_dir,
+        package_name.as_deref(),
+        bin.as_deref(),
+    )?;
 
     Ok(Some((binary, runs_dir, total_fns)))
 }
