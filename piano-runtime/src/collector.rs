@@ -31,7 +31,7 @@
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1139,8 +1139,8 @@ fn timestamp_ms() -> u128 {
 /// `flush()` and `shutdown()` write to the project-local directory.
 /// `PIANO_RUNS_DIR` env var still takes priority (for testing and user
 /// overrides).
-pub fn set_runs_dir(dir: &str) {
-    *runs_dir_lock().lock().unwrap_or_else(|e| e.into_inner()) = Some(PathBuf::from(dir));
+pub fn set_runs_dir(dir: &Path) {
+    *runs_dir_lock().lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.to_path_buf());
 }
 
 /// Clear the configured runs directory.
@@ -1377,7 +1377,7 @@ pub fn shutdown() {
 /// Stores `dir` via `set_runs_dir` and delegates to `shutdown()`, so
 /// directory resolution goes through a single code path. `PIANO_RUNS_DIR`
 /// env var still takes priority (checked inside `runs_dir()`).
-pub fn shutdown_to(dir: &str) {
+pub fn shutdown_to(dir: &Path) {
     set_runs_dir(dir);
     shutdown();
 }
@@ -2596,7 +2596,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
 
         // Configure runs dir via set_runs_dir, NOT env var.
-        set_runs_dir(tmp.to_str().unwrap());
+        set_runs_dir(&tmp);
         flush();
 
         // Clear the global so other tests aren't affected.
@@ -2627,7 +2627,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("piano_shutdown_to_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        set_runs_dir(tmp.to_str().unwrap());
+        set_runs_dir(&tmp);
 
         // Generate some data and flush mid-program.
         {
@@ -2881,7 +2881,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
-        set_runs_dir(tmp.to_str().unwrap());
+        set_runs_dir(&tmp);
 
         // Pre-open the stream file so the spawned thread doesn't race
         // with other threads on the lazy initialization.
