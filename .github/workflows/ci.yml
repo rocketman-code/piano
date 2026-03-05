@@ -71,6 +71,21 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
 
+  test-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject unsafe env var mutation in runtime tests
+        run: |
+          # Tests must not use std::env::set_var / remove_var -- it causes
+          # flaky failures by racing with parallel tests on process-global
+          # state. Use flush_to(dir) or Command::env() instead.
+          if grep -rn 'env::set_var\|env::remove_var' piano-runtime/src/ --include='*.rs'; then
+            echo "::error::Found unsafe env var mutation in piano-runtime (see above)."
+            echo "Use flush_to(dir) or Command::env() instead of std::env::set_var."
+            exit 1
+          fi
+
   doc:
     runs-on: ubuntu-latest
     steps:
