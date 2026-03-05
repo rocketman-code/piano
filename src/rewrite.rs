@@ -2225,6 +2225,42 @@ trait Service {
     }
 
     #[test]
+    fn skips_uninstrumentable_trait_default_methods() {
+        let source = r#"
+trait Processor {
+    fn process(&self);
+    fn default_method(&self) {
+        do_work();
+    }
+    unsafe fn unsafe_default(&self) {
+        dangerous_work();
+    }
+}
+"#;
+        // Only the safe default method is targeted
+        let targets: HashSet<String> = [
+            "Processor::default_method".to_string(),
+            "Processor::unsafe_default".to_string(),
+        ]
+        .into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert!(
+            result
+                .source
+                .contains("piano_runtime::enter(\"Processor::default_method\")"),
+            "safe trait default method should be instrumented. Got:\n{}",
+            result.source
+        );
+        assert!(
+            !result
+                .source
+                .contains("piano_runtime::enter(\"Processor::unsafe_default\")"),
+            "unsafe trait default method should NOT be instrumented. Got:\n{}",
+            result.source
+        );
+    }
+
+    #[test]
     fn wraps_async_fn_body_in_piano_future() {
         let source = r#"
 async fn handler(x: i32) -> String {
