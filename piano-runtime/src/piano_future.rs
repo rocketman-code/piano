@@ -139,6 +139,7 @@ const _: () = {
 mod tests {
     use super::*;
     use crate::collector;
+    use crate::collector::{lookup_name, unpack_name_id};
 
     fn run<F: Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_multi_thread()
@@ -224,7 +225,9 @@ mod tests {
                 collector::register("task_a");
                 for _ in 0..10 {
                     with_stack_ref(|s| {
-                        assert!(s.iter().all(|e| e.name != "task_b"));
+                        assert!(s
+                            .iter()
+                            .all(|e| lookup_name(unpack_name_id(e.packed)) != "task_b"));
                     });
                     tokio::task::yield_now().await;
                 }
@@ -234,7 +237,9 @@ mod tests {
                 collector::register("task_b");
                 for _ in 0..10 {
                     with_stack_ref(|s| {
-                        assert!(s.iter().all(|e| e.name != "task_a"));
+                        assert!(s
+                            .iter()
+                            .all(|e| lookup_name(unpack_name_id(e.packed)) != "task_a"));
                     });
                     tokio::task::yield_now().await;
                 }
@@ -436,7 +441,7 @@ mod tests {
                         "stack should have only parent after select! (got {})",
                         s.len()
                     );
-                    assert_eq!(s[0].name, "drop_parent");
+                    assert_eq!(lookup_name(unpack_name_id(s[0].packed)), "drop_parent");
                 });
             })
             .await;
