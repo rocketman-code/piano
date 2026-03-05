@@ -1883,6 +1883,82 @@ fn do_work() {
     }
 
     #[test]
+    fn skips_fork_for_rayon_spawn_free_function() {
+        // rayon::spawn(|| ...) is a free function call (Call arm, not MethodCall).
+        // It is detached ('static bound), so no fork/adopt should be injected.
+        let source = r#"
+fn do_work() {
+    rayon::spawn(|| {
+        heavy_computation();
+    });
+}
+"#;
+        let targets: HashSet<String> = ["do_work".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+
+        assert!(
+            !result.source.contains("piano_runtime::fork()"),
+            "should NOT inject fork for rayon::spawn free function. Got:\n{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("piano_runtime::adopt"),
+            "should NOT inject adopt for rayon::spawn free function. Got:\n{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("piano_runtime::enter(\"do_work\")"),
+            "should still inject enter guard. Got:\n{}",
+            result.source
+        );
+        assert!(
+            result.concurrency.is_empty(),
+            "rayon::spawn free function should not report concurrency. Got: {:?}",
+            result.concurrency
+        );
+    }
+
+    #[test]
+    fn nested_scope_inside_detached_spawn() {
+        // A scoped concurrency primitive (rayon::scope) nested inside a
+        // detached spawn (std::thread::spawn). The outer detached spawn
+        // suppresses fork/adopt for the entire function body -- the inner
+        // rayon::scope should not trigger fork/adopt injection.
+        let source = r#"
+fn work() {
+    std::thread::spawn(|| {
+        rayon::scope(|s| {
+            s.spawn(|_| { inner(); });
+        });
+    });
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+
+        assert!(
+            !result.source.contains("piano_runtime::fork()"),
+            "should NOT inject fork when scope is nested inside detached spawn. Got:\n{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("piano_runtime::adopt"),
+            "should NOT inject adopt when scope is nested inside detached spawn. Got:\n{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("piano_runtime::enter(\"work\")"),
+            "should still inject enter guard. Got:\n{}",
+            result.source
+        );
+        assert!(
+            result.concurrency.is_empty(),
+            "nested scope inside detached spawn should not report concurrency. Got: {:?}",
+            result.concurrency
+        );
+    }
+
+    #[test]
     fn injects_adopt_in_rayon_scope_spawn() {
         let source = r#"
 fn parallel_work() {
