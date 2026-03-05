@@ -441,19 +441,16 @@ fn find_latest_binary() -> Result<PathBuf, Error> {
                 continue;
             }
         }
+        let meta = entry
+            .metadata()
+            .map_err(io_context("read metadata", &path))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let meta = entry
-                .metadata()
-                .map_err(io_context("read metadata", &path))?;
             if meta.permissions().mode() & 0o111 == 0 {
                 continue; // not executable
             }
         }
-        let meta = entry
-            .metadata()
-            .map_err(io_context("read metadata", &path))?;
         let mtime = meta
             .modified()
             .map_err(io_context("read modified time", &path))?;
