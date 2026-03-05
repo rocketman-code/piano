@@ -1199,11 +1199,16 @@ pub fn flush() {
         None => return,
     };
 
-    // Collect (clone) frames from all threads. We intentionally do NOT drain
-    // other threads' frames here -- only the local thread's state is cleared
-    // via reset() below. Other threads' frames will persist and be included
-    // in the final shutdown() write. This avoids destroying concurrent
-    // threads' data when flush() is called mid-program.
+    flush_impl(&dir);
+}
+
+/// Collect frames from all threads and write them to the given directory.
+///
+/// Shared implementation for `flush()` (non-streaming path) and `flush_to()`.
+/// Collects (clones) frames from all threads -- we intentionally do NOT drain
+/// other threads' frames here. Only the local thread's state is cleared via
+/// `reset()`. Other threads' frames persist for the final `shutdown()` write.
+fn flush_impl(dir: &std::path::Path) {
     let mut frames = collect_frames();
 
     // Synthesize from aggregates if no frames exist (same as shutdown_impl_inner).
@@ -1234,6 +1239,19 @@ pub fn flush() {
     // Clear only the local thread's records, stack, and frames so subsequent
     // enter() calls start fresh. Other threads' state is left intact.
     reset();
+}
+
+/// Write collected profiling data to the specified directory.
+///
+/// Like `flush()` but takes an explicit directory, bypassing the global
+/// `runs_dir()` resolution. Used by tests to avoid races on the
+/// process-global `RUNS_DIR` / `PIANO_RUNS_DIR` env var.
+///
+/// Streaming mode is intentionally not handled here -- test-only callers
+/// never call `init()`, so streaming is never active.
+#[cfg(test)]
+pub fn flush_to(dir: &std::path::Path) {
+    flush_impl(dir);
 }
 
 /// Initialize the runtime: install handlers for data recovery.
@@ -1606,11 +1624,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("piano_test_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // Point flush at our temp dir.
-        // SAFETY: Test runs serially (no concurrent env access).
-        unsafe { std::env::set_var("PIANO_RUNS_DIR", &tmp) };
-        flush();
-        unsafe { std::env::remove_var("PIANO_RUNS_DIR") };
+        flush_to(&tmp);
 
         // Find written file (NDJSON for frame workloads).
         let files: Vec<_> = std::fs::read_dir(&tmp)
@@ -1635,6 +1649,39 @@ mod tests {
         );
 
         // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn flush_to_writes_to_explicit_dir() {
+        reset();
+        {
+            let _g = enter("flush_to_test");
+            burn_cpu(5_000);
+        }
+
+        let tmp = std::env::temp_dir().join(format!("piano_flush_to_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        flush_to(&tmp);
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|ext| ext == "ndjson" || ext == "json")
+            })
+            .collect();
+        assert!(!files.is_empty(), "flush_to should write output files");
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        assert!(
+            content.contains("flush_to_test"),
+            "should contain function name"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1838,9 +1885,7 @@ mod tests {
         }
         let tmp = std::env::temp_dir().join(format!("piano_rid_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var("PIANO_RUNS_DIR", &tmp) };
-        flush();
-        unsafe { std::env::remove_var("PIANO_RUNS_DIR") };
+        flush_to(&tmp);
         let files: Vec<_> = std::fs::read_dir(&tmp)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -2076,10 +2121,10 @@ mod tests {
     fn write_ndjson_format() {
         reset();
         for _ in 0..2 {
-            let _outer = enter("update");
+            let _outer = enter("ndjson_update");
             burn_cpu(5_000);
             {
-                let _inner = enter("physics");
+                let _inner = enter("ndjson_physics");
                 burn_cpu(5_000);
             }
         }
@@ -2087,9 +2132,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("piano_ndjson_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        unsafe { std::env::set_var("PIANO_RUNS_DIR", &tmp) };
-        flush();
-        unsafe { std::env::remove_var("PIANO_RUNS_DIR") };
+        flush_to(&tmp);
 
         let files: Vec<_> = std::fs::read_dir(&tmp)
             .unwrap()
