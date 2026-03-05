@@ -1156,18 +1156,12 @@ mod tests {
 
     #[test]
     fn hint_empty_when_only_file_and_mod_specs() {
-        let tmp = TempDir::new().unwrap();
-        create_test_project(tmp.path());
-
-        let src = tmp.path().join("src");
-        let rs_files: Vec<PathBuf> = vec![src.join("lib.rs")];
-
         // Only --file and --mod specs, no --fn specs.
         let specs = [
             TargetSpec::File("lib.rs".into()),
             TargetSpec::Mod("mymod".into()),
         ];
-        let hint = build_suggestion_hint(&specs, &rs_files);
+        let hint = build_suggestion_hint(&specs, &[]);
         assert!(
             hint.is_empty(),
             "hint should be empty when no --fn specs are present, got: {hint:?}"
