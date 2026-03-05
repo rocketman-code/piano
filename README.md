@@ -40,6 +40,8 @@ Requires Rust 1.88+.
 
 ## Usage
 
+Piano instruments binary crates only. Your project must have a `src/main.rs` or a `[[bin]]` target; library crates cannot be profiled directly.
+
 Three steps: instrument, run, report.
 
 ```
