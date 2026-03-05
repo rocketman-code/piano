@@ -571,7 +571,7 @@ fn truncate_label(label: &str, max_len: usize) -> String {
 }
 
 /// Structured JSON entry for a single function in a report.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct JsonFnEntry {
     pub name: String,
     pub self_ms: f64,
@@ -691,7 +691,7 @@ pub fn format_json_with_frames(frame_data: &FrameData, show_all: bool) -> String
 }
 
 /// Structured JSON entry for a diff comparison.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct JsonDiffEntry {
     pub name: String,
     pub self_ms_a: f64,
@@ -3207,5 +3207,250 @@ mod tests {
             label.contains("ago"),
             "expected relative time, got: {label}"
         );
+    }
+
+    #[test]
+    fn format_json_sorts_by_self_time() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![
+                FnEntry {
+                    name: "fast".into(),
+                    calls: 1,
+                    self_ms: 1.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "slow".into(),
+                    calls: 2,
+                    self_ms: 15.0,
+                    ..Default::default()
+                },
+            ],
+        };
+        let json = format_json(&run, false);
+        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "slow");
+        assert!((entries[0].self_ms - 15.0).abs() < f64::EPSILON);
+        assert_eq!(entries[0].calls, 2);
+        assert_eq!(entries[1].name, "fast");
+    }
+
+    #[test]
+    fn format_json_filters_zero_calls() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![
+                FnEntry {
+                    name: "called".into(),
+                    calls: 5,
+                    self_ms: 3.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "unused".into(),
+                    calls: 0,
+                    self_ms: 0.0,
+                    ..Default::default()
+                },
+            ],
+        };
+        let json = format_json(&run, false);
+        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "called");
+
+        let json_all = format_json(&run, true);
+        let entries_all: Vec<JsonFnEntry> = serde_json::from_str(&json_all).unwrap();
+        assert_eq!(entries_all.len(), 2);
+    }
+
+    #[test]
+    fn format_json_includes_cpu_time() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 1,
+                self_ms: 10.0,
+                cpu_self_ms: Some(8.5),
+                alloc_count: 42,
+                alloc_bytes: 1024,
+                ..Default::default()
+            }],
+        };
+        let json = format_json(&run, false);
+        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries[0].cpu_self_ms, Some(8.5));
+        assert_eq!(entries[0].alloc_count, 42);
+        assert_eq!(entries[0].alloc_bytes, 1024);
+    }
+
+    #[test]
+    fn format_json_with_frames_aggregates() {
+        let frame_data = FrameData {
+            fn_names: vec!["alpha".into(), "beta".into()],
+            frames: vec![
+                vec![
+                    FrameFnEntry {
+                        fn_id: 0,
+                        calls: 2,
+                        self_ns: 5_000_000,
+                        cpu_self_ns: None,
+                        alloc_count: 10,
+                        alloc_bytes: 200,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                    FrameFnEntry {
+                        fn_id: 1,
+                        calls: 1,
+                        self_ns: 3_000_000,
+                        cpu_self_ns: None,
+                        alloc_count: 5,
+                        alloc_bytes: 100,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                ],
+                vec![FrameFnEntry {
+                    fn_id: 0,
+                    calls: 3,
+                    self_ns: 7_000_000,
+                    cpu_self_ns: None,
+                    alloc_count: 15,
+                    alloc_bytes: 300,
+                    free_count: 0,
+                    free_bytes: 0,
+                }],
+            ],
+        };
+        let json = format_json_with_frames(&frame_data, false);
+        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 2);
+        // alpha: 5ms + 7ms = 12ms, sorted first
+        assert_eq!(entries[0].name, "alpha");
+        assert!((entries[0].self_ms - 12.0).abs() < f64::EPSILON);
+        assert_eq!(entries[0].calls, 5);
+        assert_eq!(entries[0].alloc_count, 25);
+        assert_eq!(entries[0].alloc_bytes, 500);
+        // beta: 3ms
+        assert_eq!(entries[1].name, "beta");
+        assert!((entries[1].self_ms - 3.0).abs() < f64::EPSILON);
+        assert_eq!(entries[1].cpu_self_ms, None);
+    }
+
+    #[test]
+    fn format_json_with_frames_cpu_time() {
+        let frame_data = FrameData {
+            fn_names: vec!["work".into()],
+            frames: vec![vec![FrameFnEntry {
+                fn_id: 0,
+                calls: 1,
+                self_ns: 10_000_000,
+                cpu_self_ns: Some(8_000_000),
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            }]],
+        };
+        let json = format_json_with_frames(&frame_data, false);
+        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries[0].cpu_self_ms, Some(8.0));
+    }
+
+    #[test]
+    fn format_json_with_frames_show_all_includes_zero_call_fns() {
+        let frame_data = FrameData {
+            fn_names: vec!["called".into(), "uncalled".into()],
+            frames: vec![vec![FrameFnEntry {
+                fn_id: 0,
+                calls: 1,
+                self_ns: 1_000_000,
+                cpu_self_ns: None,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            }]],
+        };
+        let json = format_json_with_frames(&frame_data, false);
+        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 1);
+
+        let json_all = format_json_with_frames(&frame_data, true);
+        let entries_all: Vec<JsonFnEntry> = serde_json::from_str(&json_all).unwrap();
+        assert_eq!(entries_all.len(), 2);
+    }
+
+    #[test]
+    fn diff_runs_json_computes_delta() {
+        let run_a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 10,
+                self_ms: 20.0,
+                ..Default::default()
+            }],
+        };
+        let run_b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 12,
+                self_ms: 25.0,
+                ..Default::default()
+            }],
+        };
+        let json = diff_runs_json(&run_a, &run_b);
+        let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "work");
+        assert!((entries[0].self_ms_a - 20.0).abs() < f64::EPSILON);
+        assert!((entries[0].self_ms_b - 25.0).abs() < f64::EPSILON);
+        assert!((entries[0].delta_ms - 5.0).abs() < f64::EPSILON);
+        assert!((entries[0].delta_pct.unwrap() - 25.0).abs() < f64::EPSILON);
+        assert_eq!(entries[0].calls_a, 10);
+        assert_eq!(entries[0].calls_b, 12);
+    }
+
+    #[test]
+    fn diff_runs_json_new_function_has_null_pct() {
+        let run_a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![],
+        };
+        let run_b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "new_fn".into(),
+                calls: 1,
+                self_ms: 5.0,
+                ..Default::default()
+            }],
+        };
+        let json = diff_runs_json(&run_a, &run_b);
+        let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "new_fn");
+        assert!((entries[0].self_ms_a).abs() < f64::EPSILON);
+        assert!(entries[0].delta_pct.is_none());
     }
 }
