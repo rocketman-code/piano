@@ -446,7 +446,6 @@ pub struct InvocationRecord {
 /// Entry on the thread-local timing stack.
 #[derive(Clone, Copy)]
 pub(crate) struct StackEntry {
-    pub(crate) name: &'static str,
     pub(crate) children_ns: u64,
     #[cfg(feature = "cpu-time")]
     pub(crate) cpu_children_ns: u64,
@@ -749,10 +748,34 @@ fn pack_name_depth(name_id: u16, depth: u16) -> u64 {
     ((name_id as u64) << 16) | (depth as u64)
 }
 
+/// Unpack the name ID (bits 16..31) from a packed u64.
+#[inline(always)]
+pub(crate) fn unpack_name_id(packed: u64) -> u16 {
+    (packed >> 16) as u16
+}
+
 /// Unpack the stack depth (low 16 bits) from a packed u64.
 #[inline(always)]
 fn unpack_depth(packed: u64) -> u16 {
     packed as u16
+}
+
+/// Resolve a name ID back to its interned `&'static str`.
+///
+/// Panics (debug) / returns `"<unknown>"` (release) if the ID is out of range.
+#[inline(always)]
+pub(crate) fn lookup_name(name_id: u16) -> &'static str {
+    let table = name_table().lock().unwrap_or_else(|e| e.into_inner());
+    if (name_id as usize) < table.len() {
+        table[name_id as usize]
+    } else {
+        debug_assert!(
+            false,
+            "lookup_name: id {name_id} out of range (table len {})",
+            table.len()
+        );
+        "<unknown>"
+    }
 }
 
 /// RAII timing guard. Records elapsed time on drop.
@@ -800,6 +823,9 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             }
         };
 
+        // Resolve name once from the interned table.
+        let name = lookup_name(unpack_name_id(entry.packed));
+
         // Restore parent's saved alloc counters.
         let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
             cell.set(entry.saved_alloc);
@@ -827,7 +853,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         RECORDS_BUF.with(|buf| {
             merge_into_fnagg_vec(
                 &mut buf.borrow_mut(),
-                entry.name,
+                name,
                 elapsed_ns,
                 children_ns,
                 #[cfg(feature = "cpu-time")]
@@ -840,7 +866,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             let start_ns = crate::tsc::ticks_to_epoch_ns(guard.start_tsc, crate::tsc::epoch_tsc());
             INVOCATIONS.with(|inv| {
                 inv.borrow_mut().push(InvocationRecord {
-                    name: entry.name,
+                    name,
                     start_ns,
                     elapsed_ns,
                     self_ns,
@@ -858,7 +884,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         FRAME_BUFFER.with(|buf| {
             merge_into_frame_buf(
                 &mut buf.borrow_mut(),
-                entry.name,
+                name,
                 self_ns,
                 #[cfg(feature = "cpu-time")]
                 cpu_self_ns,
@@ -938,7 +964,6 @@ fn enter_cold(name: &'static str) {
         let depth = s.len() as u16;
         let packed = pack_name_depth(name_id, depth);
         s.push(StackEntry {
-            name,
             children_ns: 0,
             #[cfg(feature = "cpu-time")]
             cpu_children_ns: 0,
@@ -1624,7 +1649,7 @@ pub fn fork() -> Option<SpanContext> {
     with_stack_ref(|s| {
         let top = s.last()?;
         Some(SpanContext {
-            parent_name: top.name,
+            parent_name: lookup_name(unpack_name_id(top.packed)),
             #[cfg(feature = "cpu-time")]
             children_cpu_ns: Arc::new(Mutex::new(0)),
             finalized: false,
@@ -1653,7 +1678,6 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
     with_stack_mut(|s| {
         let depth = s.len() as u16;
         s.push(StackEntry {
-            name: ctx.parent_name,
             children_ns: 0,
             #[cfg(feature = "cpu-time")]
             cpu_children_ns: 0,
@@ -2669,12 +2693,13 @@ mod tests {
     #[test]
     fn stack_entry_size() {
         let size = core::mem::size_of::<StackEntry>();
-        // Without cpu-time: 64 bytes (power-of-two enables lsl #6 indexing on ARM).
-        // With cpu-time: 80 bytes (two extra u64 fields for cpu_children_ns, cpu_start_ns).
+        // Without cpu-time: 48 bytes (name resolved via packed name_id).
+        // With cpu-time: 64 bytes (two extra u64 fields for cpu_children_ns, cpu_start_ns;
+        // power-of-two enables lsl #6 indexing on ARM).
         #[cfg(not(feature = "cpu-time"))]
-        assert_eq!(size, 64, "StackEntry without cpu-time must be 64 bytes");
+        assert_eq!(size, 48, "StackEntry without cpu-time must be 48 bytes");
         #[cfg(feature = "cpu-time")]
-        assert_eq!(size, 80, "StackEntry with cpu-time must be 80 bytes");
+        assert_eq!(size, 64, "StackEntry with cpu-time must be 64 bytes");
     }
 
     #[test]
@@ -2683,14 +2708,17 @@ mod tests {
         let depth: u16 = 7;
         let packed = pack_name_depth(name_id, depth);
         assert_eq!(unpack_depth(packed), depth);
+        assert_eq!(unpack_name_id(packed), name_id);
 
         // Max values
         let packed_max = pack_name_depth(u16::MAX, u16::MAX);
         assert_eq!(unpack_depth(packed_max), u16::MAX);
+        assert_eq!(unpack_name_id(packed_max), u16::MAX);
 
         // Zero values
         let packed_zero = pack_name_depth(0, 0);
         assert_eq!(unpack_depth(packed_zero), 0);
+        assert_eq!(unpack_name_id(packed_zero), 0);
     }
 
     #[test]
