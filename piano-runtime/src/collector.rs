@@ -735,6 +735,17 @@ fn name_table_get(idx: usize) -> Option<&'static str> {
 
 /// Append a name to the lock-free table. Caller must hold NAME_TABLE_WRITE_LOCK.
 /// Returns the assigned index.
+/// Compute the saturation index when the name table is full.
+///
+/// Returns the last valid slot so that lookups remain in-bounds even if
+/// a new unique function name appears after the table is exhausted.
+/// Extracted as a pure function for testability in debug builds where
+/// `name_table_push` panics via `debug_assert` on overflow.
+#[inline(always)]
+fn name_table_overflow_index() -> u16 {
+    (NAME_TABLE_CAPACITY - 1) as u16
+}
+
 fn name_table_push(name: &'static str) -> u16 {
     let idx = NAME_TABLE_LEN.load(Ordering::Acquire);
     debug_assert!(
@@ -743,7 +754,7 @@ fn name_table_push(name: &'static str) -> u16 {
     );
     if idx >= NAME_TABLE_CAPACITY {
         // Saturate at max capacity -- degrades gracefully.
-        return (NAME_TABLE_CAPACITY - 1) as u16;
+        return name_table_overflow_index();
     }
     NAME_TABLE_PTRS[idx].store(name.as_ptr() as *mut u8, Ordering::Release);
     NAME_TABLE_LENS[idx].store(name.len(), Ordering::Release);
@@ -3333,6 +3344,23 @@ mod tests {
         assert!(
             result.is_err(),
             "nested STACK access should panic in debug mode"
+        );
+    }
+
+    #[test]
+    fn name_table_overflow_index_is_last_valid_slot() {
+        // The overflow saturation index must be the last valid slot
+        // (capacity - 1) so that lookups stay in-bounds.
+        let idx = name_table_overflow_index();
+        let expected = (NAME_TABLE_CAPACITY - 1) as u16;
+        assert_eq!(
+            idx, expected,
+            "overflow index should be capacity-1 ({expected}), got {idx}"
+        );
+        // The index must be within the table's bounds.
+        assert!(
+            (idx as usize) < NAME_TABLE_CAPACITY,
+            "overflow index {idx} must be < capacity {NAME_TABLE_CAPACITY}"
         );
     }
 }
