@@ -2161,10 +2161,10 @@ mod tests {
         reset();
         // Simulate 3 frames: depth-0 function called 3 times
         for _frame in 0..3u32 {
-            let _outer = enter("update");
+            let _outer = enter("fba_update");
             burn_cpu(5_000);
             {
-                let _inner = enter("physics");
+                let _inner = enter("fba_physics");
                 burn_cpu(5_000);
             }
         }
@@ -2172,13 +2172,13 @@ mod tests {
         // Filter to frames containing our test functions (collect_frames is now global).
         let my_frames: Vec<_> = frames
             .iter()
-            .filter(|f| f.iter().any(|s| s.name == "update"))
+            .filter(|f| f.iter().any(|s| s.name == "fba_update"))
             .collect();
-        assert_eq!(my_frames.len(), 3, "should have 3 frames with 'update'");
+        assert_eq!(my_frames.len(), 3, "should have 3 frames with 'fba_update'");
         for frame in &my_frames {
-            let update = frame.iter().find(|s| s.name == "update").unwrap();
+            let update = frame.iter().find(|s| s.name == "fba_update").unwrap();
             assert_eq!(update.calls, 1);
-            let physics = frame.iter().find(|s| s.name == "physics").unwrap();
+            let physics = frame.iter().find(|s| s.name == "fba_physics").unwrap();
             assert_eq!(physics.calls, 1);
         }
     }
