@@ -50,13 +50,13 @@ Publishing order matters: `piano build` injects `piano-runtime` as a dependency 
 
 ## Git Tags
 
-Format: `v0.x.y` (e.g., `v0.1.0`, `v0.2.0`). Tag the version bump commit.
+Format: `v0.x.y` (e.g., `v0.1.0`, `v0.2.0`). Tag the merge commit on main.
 
 ## Changelog
 
 `CHANGELOG.md` in the repo root, following [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/) format.
 Each release maps to a closed GitHub milestone.
-Update the changelog as part of the release commit, before tagging.
+Update the changelog in the release PR, before merging and tagging.
 
 Standards (enforced by the `changelog` skill):
 - Every entry written for users, not the team -- no audit rounds, internal struct names, or milestone labels
