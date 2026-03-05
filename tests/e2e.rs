@@ -5,6 +5,8 @@ mod common;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+#[cfg(unix)]
+use std::time::Duration;
 
 /// Create a minimal Rust project that we can instrument.
 fn create_mini_project(dir: &Path) {
@@ -239,5 +241,144 @@ fn report_no_runs_shows_recovery_guidance() {
     assert!(
         stderr.contains("piano profile"),
         "NoRuns error should include recovery guidance mentioning `piano profile`, got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Signal recovery
+// ---------------------------------------------------------------------------
+
+/// Create a project whose binary sleeps long enough for us to send SIGTERM.
+#[cfg(unix)]
+fn create_sleeping_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "sleeper"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "sleeper"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    // The binary calls `work()` (instrumented), then sleeps for 60 seconds.
+    // We send SIGTERM while it sleeps; the signal handler should flush the
+    // profiling data that `work()` already recorded.
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"fn main() {
+    let _ = work();
+    // Sleep long enough for the test harness to send SIGTERM.
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+fn work() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..1000 {
+        sum += i;
+    }
+    sum
+}
+"#,
+    )
+    .unwrap();
+}
+
+/// Verify the full signal-recovery pipeline: instrumented binary receives
+/// SIGTERM, the signal handler fires, and profiling data is flushed to disk.
+#[cfg(unix)]
+#[test]
+fn signal_recovery_flushes_profiling_data_on_sigterm() {
+    const SIGTERM: i32 = 15;
+
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("sleeper");
+    create_sleeping_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Build the instrumented binary.
+    let build_output = Command::new(piano_bin)
+        .args(["build", "--fn", "work", "--fn", "main", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&build_output.stderr);
+    let stdout = String::from_utf8_lossy(&build_output.stdout);
+    assert!(
+        build_output.status.success(),
+        "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let binary_path = stdout.trim();
+
+    // Spawn the instrumented binary (it will sleep for 60s).
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let mut child = Command::new(binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .spawn()
+        .expect("failed to spawn instrumented binary");
+
+    // Give the binary time to start, call work(), and reach the sleep.
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Send SIGTERM to the child process.
+    let pid = child.id() as i32;
+    let ret = unsafe { kill(pid, SIGTERM) };
+    assert_eq!(ret, 0, "kill(2) should succeed");
+
+    // Wait for the child to exit (should be quick after SIGTERM).
+    let status = child.wait().expect("failed to wait on child");
+
+    // On Unix, a process killed by SIGTERM exits via signal, not success.
+    assert!(
+        !status.success(),
+        "process should have been terminated by signal, got: {status}"
+    );
+
+    // Verify that the signal handler flushed profiling data.
+    let entries: Vec<_> = fs::read_dir(&runs_dir)
+        .expect("runs dir should exist")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+        .collect();
+
+    assert!(
+        !entries.is_empty(),
+        "signal handler should have flushed at least one .ndjson file to {runs_dir:?}"
+    );
+
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+
+    assert!(
+        !content.is_empty(),
+        "NDJSON output should be non-empty after signal recovery"
+    );
+    assert!(
+        content.contains("work"),
+        "output should contain the instrumented function name 'work'"
+    );
+    assert!(
+        content.contains("\"timestamp_ms\""),
+        "output should contain timestamp_ms"
     );
 }
