@@ -1180,7 +1180,7 @@ impl ShutdownInjector {
     fn shutdown_stmt(&self) -> syn::Stmt {
         match &self.runs_dir {
             Some(dir) => syn::parse_quote! {
-                piano_runtime::shutdown_to(#dir);
+                piano_runtime::shutdown_to(std::path::Path::new(#dir));
             },
             None => syn::parse_quote! {
                 piano_runtime::shutdown();
@@ -1191,7 +1191,7 @@ impl ShutdownInjector {
     fn set_runs_dir_stmt(&self) -> Option<syn::Stmt> {
         self.runs_dir.as_ref().map(|dir| {
             syn::parse_quote! {
-                piano_runtime::set_runs_dir(#dir);
+                piano_runtime::set_runs_dir(std::path::Path::new(#dir));
             }
         })
     }
@@ -1603,8 +1603,9 @@ fn main() {
 "#;
         let result = inject_shutdown(source, Some("/tmp/my-project/target/piano/runs")).unwrap();
         assert!(
-            result.contains("piano_runtime::shutdown_to(\"/tmp/my-project/target/piano/runs\")"),
-            "should inject shutdown_to with dir. Got:\n{result}"
+            result.contains("piano_runtime::shutdown_to")
+                && result.contains("std::path::Path::new(\"/tmp/my-project/target/piano/runs\")"),
+            "should inject shutdown_to with Path::new. Got:\n{result}"
         );
     }
 
