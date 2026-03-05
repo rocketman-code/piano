@@ -1,6 +1,6 @@
 //! Micro-benchmark: PianoFuture overhead per yield at varying nesting depths.
 //!
-//! Measures the cost of split_off/extend on each poll() relative to a bare
+//! Measures the cost of extend_from_slice/truncate on each poll() relative to a bare
 //! tokio::task::yield_now().
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
