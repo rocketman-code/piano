@@ -107,6 +107,17 @@ fn async_modifier() -> impl Strategy<Value = String> {
     prop_oneof![Just("".to_string()), Just("async ".to_string()),]
 }
 
+/// Function modifier that makes a function uninstrumentable.
+/// Piano skips unsafe fn, const fn, and extern "C" fn.
+fn skip_modifier() -> impl Strategy<Value = String> {
+    prop_oneof![
+        6 => Just("".to_string()),
+        1 => Just("unsafe ".to_string()),
+        1 => Just("const ".to_string()),
+        1 => Just("extern \"C\" ".to_string()),
+    ]
+}
+
 /// Generic parameters.
 fn generics() -> impl Strategy<Value = String> {
     prop_oneof![
@@ -151,10 +162,13 @@ fn params() -> impl Strategy<Value = String> {
 }
 
 /// A single function definition with randomized attributes/signature.
-fn function_def() -> impl Strategy<Value = (String, String)> {
+/// Returns (name, source, instrumentable) where instrumentable is false for
+/// unsafe/const/extern "C" functions.
+fn function_def() -> impl Strategy<Value = (String, String, bool)> {
     (
         attr_stack(),
         visibility(),
+        skip_modifier(),
         async_modifier(),
         ident(),
         generics(),
@@ -163,7 +177,16 @@ fn function_def() -> impl Strategy<Value = (String, String)> {
         where_clause(),
     )
         .prop_map(
-            |(attrs, vis, async_mod, name, generics, params, ret, where_cl)| {
+            |(attrs, vis, skip_mod, async_mod, name, generics, params, ret, where_cl)| {
+                let instrumentable = skip_mod.is_empty();
+
+                // const fn and extern "C" fn cannot be async.
+                let effective_async = if skip_mod.is_empty() {
+                    async_mod
+                } else {
+                    String::new()
+                };
+
                 // Build a body that returns the right type.
                 let body = match ret.as_str() {
                     "" => "let _ = 42;".to_string(),
@@ -183,29 +206,35 @@ fn function_def() -> impl Strategy<Value = (String, String)> {
                 };
 
                 let source = format!(
-                    "{attrs_block}{vis}{async_mod}fn {name}{generics}({params}){ret}{where_cl} {{\n    {body}\n}}\n"
+                    "{attrs_block}{vis}{skip_mod}{effective_async}fn {name}{generics}({params}){ret}{where_cl} {{\n    {body}\n}}\n"
                 );
 
-                (name, source)
+                (name, source, instrumentable)
             },
         )
 }
 
 /// A full Rust file with 1-4 functions (deduplicated names).
-fn rust_file() -> impl Strategy<Value = (Vec<String>, String)> {
+/// Returns (names, source, instrumentable_names).
+fn rust_file() -> impl Strategy<Value = (Vec<String>, String, Vec<String>)> {
     prop::collection::vec(function_def(), 1..=4).prop_map(|fns| {
         let mut seen = std::collections::HashSet::new();
         let fns: Vec<_> = fns
             .into_iter()
-            .filter(|(n, _)| seen.insert(n.clone()))
+            .filter(|(n, _, _)| seen.insert(n.clone()))
             .collect();
-        let names: Vec<String> = fns.iter().map(|(n, _)| n.clone()).collect();
+        let names: Vec<String> = fns.iter().map(|(n, _, _)| n.clone()).collect();
+        let instrumentable_names: Vec<String> = fns
+            .iter()
+            .filter(|(_, _, instrumentable)| *instrumentable)
+            .map(|(n, _, _)| n.clone())
+            .collect();
         let source = fns
             .into_iter()
-            .map(|(_, s)| s)
+            .map(|(_, s, _)| s)
             .collect::<Vec<_>>()
             .join("\n");
-        (names, source)
+        (names, source, instrumentable_names)
     })
 }
 
@@ -216,7 +245,7 @@ fn rust_file() -> impl Strategy<Value = (Vec<String>, String)> {
 proptest! {
     /// Instrumented output must always parse as valid Rust.
     #[test]
-    fn output_parses_as_valid_rust((names, source) in rust_file()) {
+    fn output_parses_as_valid_rust((names, source, _instrumentable) in rust_file()) {
         // Only test inputs that are valid Rust (syn can parse them).
         if syn::parse_str::<syn::File>(&source).is_err() {
             return Ok(());
@@ -234,16 +263,16 @@ proptest! {
         );
     }
 
-    /// Every targeted function should have a guard injected.
+    /// Every targeted instrumentable function should have a guard injected.
     #[test]
-    fn targeted_functions_get_guards((names, source) in rust_file()) {
+    fn targeted_functions_get_guards((names, source, instrumentable) in rust_file()) {
         if syn::parse_str::<syn::File>(&source).is_err() {
             return Ok(());
         }
         let targets: HashSet<String> = names.iter().cloned().collect();
         let result = instrument_source(&source, &targets, false)
             .expect("instrument_source should succeed on valid Rust input");
-        for name in &names {
+        for name in &instrumentable {
             let guard_pattern = format!("piano_runtime::enter(\"{name}\")");
             prop_assert!(
                 result.source.contains(&guard_pattern),
@@ -256,8 +285,15 @@ proptest! {
 
     /// Async functions should be wrapped with PianoFuture.
     #[test]
-    fn async_functions_get_piano_future((names, source) in rust_file()) {
+    fn async_functions_get_piano_future((names, source, instrumentable) in rust_file()) {
         if !source.contains("async fn") {
+            return Ok(());
+        }
+        // Only expect PianoFuture if at least one instrumentable function is async.
+        let has_instrumentable_async = instrumentable.iter().any(|name| {
+            source.contains(&format!("async fn {name}"))
+        });
+        if !has_instrumentable_async {
             return Ok(());
         }
         if syn::parse_str::<syn::File>(&source).is_err() {
@@ -275,7 +311,7 @@ proptest! {
 
     /// Non-targeted functions should NOT be instrumented.
     #[test]
-    fn non_targeted_functions_untouched((names, source) in rust_file()) {
+    fn non_targeted_functions_untouched((names, source, _instrumentable) in rust_file()) {
         if names.len() < 2 {
             return Ok(());
         }
@@ -291,6 +327,36 @@ proptest! {
             prop_assert!(
                 !result.source.contains(&guard_pattern),
                 "non-targeted '{}' was instrumented in:\n{}",
+                name,
+                result.source
+            );
+        }
+    }
+
+    /// Uninstrumentable functions (unsafe, const, extern) should NOT get guards.
+    #[test]
+    fn uninstrumentable_functions_skipped((names, source, instrumentable) in rust_file()) {
+        if syn::parse_str::<syn::File>(&source).is_err() {
+            return Ok(());
+        }
+        let instrumentable_set: HashSet<&str> =
+            instrumentable.iter().map(|s| s.as_str()).collect();
+        let skipped: Vec<&str> = names
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|n| !instrumentable_set.contains(n))
+            .collect();
+        if skipped.is_empty() {
+            return Ok(());
+        }
+        let targets: HashSet<String> = names.iter().cloned().collect();
+        let result = instrument_source(&source, &targets, false)
+            .expect("instrument_source should succeed on valid Rust input");
+        for name in &skipped {
+            let guard_pattern = format!("piano_runtime::enter(\"{name}\")");
+            prop_assert!(
+                !result.source.contains(&guard_pattern),
+                "uninstrumentable '{}' was instrumented in:\n{}",
                 name,
                 result.source
             );
