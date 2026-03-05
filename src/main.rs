@@ -691,7 +691,7 @@ fn cmd_tag(name: Option<String>) -> Result<(), Error> {
             Err(e) => return Err(e),
         };
         let mut entries: Vec<String> = std::fs::read_dir(&tags_dir)
-            .map_err(|source| Error::RunReadError {
+            .map_err(|source| Error::TagReadError {
                 path: tags_dir.clone(),
                 source,
             })?
