@@ -45,6 +45,13 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    #[error("failed to read tags directory {}: {source}", path.display())]
+    TagReadError {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("invalid run data in {}: {reason}", path.display())]
     InvalidRunData { path: PathBuf, reason: String },
 
