@@ -3,6 +3,33 @@
 //! `read()` returns raw counter ticks. `ticks_to_ns()` converts a tick count
 //! to nanoseconds using a ratio calibrated once at startup. `bias_ticks()`
 //! returns the calibrated measurement overhead in raw ticks.
+//!
+//! # Cross-core monotonicity (x86_64)
+//!
+//! On x86_64, `read()` uses the `rdtsc` instruction. This relies on the
+//! invariant TSC feature (CPUID leaf 0x80000007, EDX bit 8), available on
+//! all Intel processors since Nehalem (2008) and all AMD processors since
+//! Athlon 64 X2 / Turion 64 X2 revision F (2006).
+//!
+//! On processors with invariant TSC, the counter runs at a constant rate
+//! across all cores and is synchronized at boot, so timestamps are
+//! monotonic even when a thread migrates between cores.
+//!
+//! On pre-Nehalem processors without invariant TSC, each core may maintain
+//! an independent counter. If a thread migrates between cores between the
+//! enter and exit `rdtsc` reads, the elapsed delta can be negative (the
+//! exit timestamp from core B is less than the enter timestamp from core A).
+//! Because we compute deltas with `wrapping_sub`, a negative result wraps
+//! to a large positive value, which would appear as an outlier in the
+//! profiling output.
+//!
+//! This is not checked at runtime. The practical impact is negligible: any
+//! x86_64 hardware from the last ~15 years has invariant TSC. Piano does
+//! not attempt to pin threads to cores or detect the feature at startup.
+//!
+//! On aarch64, `cntvct_el0` reads the generic timer which is architecturally
+//! defined as a single system-wide counter, so cross-core monotonicity is
+//! guaranteed by the architecture.
 
 use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 use std::time::Instant;
