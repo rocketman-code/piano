@@ -882,77 +882,28 @@ pub fn load_run_by_id(runs_dir: &Path, run_id: &str) -> Result<Run, Error> {
     Ok(merge_runs(&refs))
 }
 
-/// Load the latest run, consolidating all files sharing the same run_id.
-///
-/// Files written by different threads within one process share a run_id. This
-/// function finds the latest run_id (by max timestamp) and merges all files
-/// that belong to it. Legacy files without a run_id fall back to single-file
-/// loading (the highest-timestamp file).
-pub fn load_latest_run(runs_dir: &Path) -> Result<Run, Error> {
+/// Load all run files and return them grouped by run_id, sorted by max
+/// timestamp ascending. Each group contains all files sharing a run_id
+/// (multi-threaded runs). Legacy files without a run_id get a synthetic
+/// key so they form their own single-file group.
+fn load_grouped_runs(runs_dir: &Path) -> Result<Vec<Vec<Run>>, Error> {
     let all_files = collect_run_files(runs_dir)?;
     if all_files.is_empty() {
-        return Err(Error::NoRuns);
+        return Ok(Vec::new());
     }
 
-    let mut runs: Vec<Run> = Vec::new();
-    for path in &all_files {
-        match load_run(path) {
-            Ok(run) => runs.push(run),
-            Err(_) => continue,
-        }
-    }
-
-    if runs.is_empty() {
-        return Err(Error::NoRuns);
-    }
-
-    // Find the latest run_id by max timestamp.
-    let latest_run_id = runs
+    let runs: Vec<Run> = all_files
         .iter()
-        .filter_map(|r| r.run_id.as_ref().map(|id| (id.as_str(), r.timestamp_ms)))
-        .max_by_key(|(_, ts)| *ts)
-        .map(|(id, _)| id.to_owned());
-
-    let to_merge: Vec<&Run> = match &latest_run_id {
-        Some(id) => runs
-            .iter()
-            .filter(|r| r.run_id.as_deref() == Some(id))
-            .collect(),
-        None => {
-            // Legacy files without run_id: just use the latest single file.
-            let latest = runs.iter().max_by_key(|r| r.timestamp_ms);
-            latest.into_iter().collect()
-        }
-    };
-
-    Ok(merge_runs(&to_merge))
-}
-
-/// Load the two most recent runs, grouped by run_id.
-///
-/// Returns `(previous, latest)` where latest has the highest timestamp.
-/// Files sharing a run_id are merged (multi-threaded runs).
-pub fn load_two_latest_runs(runs_dir: &Path) -> Result<(Run, Run), Error> {
-    let all_files = collect_run_files(runs_dir)?;
-    if all_files.is_empty() {
-        return Err(Error::NotEnoughRuns);
-    }
-
-    let mut runs: Vec<Run> = Vec::new();
-    for path in &all_files {
-        match load_run(path) {
-            Ok(run) => runs.push(run),
-            Err(_) => continue,
-        }
-    }
+        .filter_map(|path| load_run(path).ok())
+        .collect();
 
     if runs.is_empty() {
-        return Err(Error::NoRuns);
+        return Ok(Vec::new());
     }
 
-    // Group by run_id, track max timestamp per group.
-    let mut groups: HashMap<String, Vec<&Run>> = HashMap::new();
-    for run in &runs {
+    // Group by run_id, using a synthetic key for legacy files.
+    let mut groups: HashMap<String, Vec<Run>> = HashMap::new();
+    for run in runs {
         let key = run
             .run_id
             .clone()
@@ -960,19 +911,39 @@ pub fn load_two_latest_runs(runs_dir: &Path) -> Result<(Run, Run), Error> {
         groups.entry(key).or_default().push(run);
     }
 
+    // Sort groups by their max timestamp (ascending).
+    let mut group_list: Vec<Vec<Run>> = groups.into_values().collect();
+    group_list.sort_by_key(|runs| runs.iter().map(|r| r.timestamp_ms).max().unwrap_or(0));
+
+    Ok(group_list)
+}
+
+/// Load the latest run, consolidating all files sharing the same run_id.
+///
+/// Files written by different threads within one process share a run_id. This
+/// function finds the latest run_id (by max timestamp) and merges all files
+/// that belong to it. Legacy files without a run_id fall back to single-file
+/// loading (the highest-timestamp file).
+pub fn load_latest_run(runs_dir: &Path) -> Result<Run, Error> {
+    let groups = load_grouped_runs(runs_dir)?;
+    let last_group = groups.last().ok_or(Error::NoRuns)?;
+    let refs: Vec<&Run> = last_group.iter().collect();
+    Ok(merge_runs(&refs))
+}
+
+/// Load the two most recent runs, grouped by run_id.
+///
+/// Returns `(previous, latest)` where latest has the highest timestamp.
+/// Files sharing a run_id are merged (multi-threaded runs).
+pub fn load_two_latest_runs(runs_dir: &Path) -> Result<(Run, Run), Error> {
+    let groups = load_grouped_runs(runs_dir)?;
     if groups.len() < 2 {
         return Err(Error::NotEnoughRuns);
     }
-
-    // Sort groups by their max timestamp (ascending).
-    let mut group_list: Vec<(String, Vec<&Run>)> = groups.into_iter().collect();
-    group_list.sort_by_key(|(_, runs)| runs.iter().map(|r| r.timestamp_ms).max().unwrap_or(0));
-
-    let len = group_list.len();
-    let (_, prev_runs) = &group_list[len - 2];
-    let (_, latest_runs) = &group_list[len - 1];
-
-    Ok((merge_runs(prev_runs), merge_runs(latest_runs)))
+    let len = groups.len();
+    let prev_refs: Vec<&Run> = groups[len - 2].iter().collect();
+    let latest_refs: Vec<&Run> = groups[len - 1].iter().collect();
+    Ok((merge_runs(&prev_refs), merge_runs(&latest_refs)))
 }
 
 /// Find the path to the latest run file without loading it.
