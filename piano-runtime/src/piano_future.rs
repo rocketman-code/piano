@@ -356,4 +356,97 @@ mod tests {
             child.total_ms,
         );
     }
+
+    #[test]
+    fn piano_future_split_index_correctness() {
+        // Verifies that the stack split in poll() correctly separates
+        // this future's entries from entries below it on the stack.
+        // Regression test: cargo-mutants found that replacing `-` with
+        // `+` or `/` in the split arithmetic produced no test failure.
+        collector::reset();
+        run(async {
+            // Outer future pushes one entry onto the stack.
+            PianoFuture::new(async {
+                let _outer = collector::enter("split_outer");
+                collector::register("split_outer");
+
+                // Inner future pushes another entry. After yield,
+                // the inner future should save exactly 2 entries
+                // (split_outer + split_inner) -- not more, not fewer.
+                PianoFuture::new(async {
+                    let _inner = collector::enter("split_inner");
+                    collector::register("split_inner");
+
+                    // Before yield: stack should have 2 entries
+                    with_stack_ref(|s| {
+                        assert_eq!(s.len(), 2, "stack should have outer + inner before yield");
+                    });
+
+                    tokio::task::yield_now().await;
+
+                    // After yield + restore: stack should still have 2 entries
+                    with_stack_ref(|s| {
+                        assert_eq!(s.len(), 2, "stack should have outer + inner after yield");
+                    });
+                })
+                .await;
+            })
+            .await;
+        });
+
+        let records = collector::collect_all();
+        assert!(records.iter().any(|r| r.name == "split_outer"));
+        assert!(records.iter().any(|r| r.name == "split_inner"));
+    }
+
+    #[test]
+    fn piano_future_drop_restores_stack_for_cancelled_guards() {
+        // Verifies that PianoFuture::drop pushes saved_entries back onto
+        // the STACK so Guards inside the cancelled future can pop cleanly.
+        // Regression test: cargo-mutants found that replacing Drop::drop
+        // body with () produced no test failure.
+        collector::reset();
+        run(async {
+            PianoFuture::new(async {
+                let _parent = collector::enter("drop_parent");
+                collector::register("drop_parent");
+                collector::register("drop_cancelled");
+
+                tokio::select! {
+                    _ = PianoFuture::new(async {
+                        let _fast = collector::enter("drop_fast");
+                        collector::register("drop_fast");
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }) => {}
+                    _ = PianoFuture::new(async {
+                        let _cancelled = collector::enter("drop_cancelled");
+                        // This guard must be dropped cleanly after PianoFuture::drop
+                        // restores saved_entries to the stack.
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }) => {}
+                }
+
+                // After select!, the stack should only contain the parent entry.
+                // If Drop::drop is a no-op, the cancelled guard can't find its
+                // entry and either panics or corrupts the stack.
+                with_stack_ref(|s| {
+                    assert_eq!(
+                        s.len(),
+                        1,
+                        "stack should have only parent after select! (got {})",
+                        s.len()
+                    );
+                    assert_eq!(s[0].name, "drop_parent");
+                });
+            })
+            .await;
+        });
+
+        // Both branches should appear in records (winner completed, loser dropped).
+        let records = collector::collect_all();
+        assert!(records.iter().any(|r| r.name == "drop_parent"));
+        assert!(records.iter().any(|r| r.name == "drop_fast"));
+        // Stack should be clean.
+        with_stack_ref(|s| assert_eq!(s.len(), 0));
+    }
 }
