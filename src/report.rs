@@ -329,6 +329,23 @@ pub fn format_table(run: &Run, show_all: bool) -> String {
     out
 }
 
+/// Format multiple thread runs as separate tables, one per thread.
+///
+/// Each section is prefixed with a thread header showing the 1-based index.
+/// For a single thread, this produces output identical to `format_table` but
+/// with a "Thread 1" header.
+pub fn format_per_thread_tables(runs: &[Run], show_all: bool) -> String {
+    let mut out = String::new();
+    for (i, run) in runs.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("{HEADER}--- Thread {} ---{HEADER:#}\n", i + 1));
+        out.push_str(&format_table(run, show_all));
+    }
+    out
+}
+
 /// Format frame-level data as a summary table with allocation columns.
 ///
 /// Columns: Function | Self | Calls | Allocs | Alloc Bytes
@@ -932,6 +949,18 @@ pub fn load_latest_run(runs_dir: &Path) -> Result<Run, Error> {
     let last_group = groups.last().ok_or(Error::NoRuns)?;
     let refs: Vec<&Run> = last_group.iter().collect();
     Ok(merge_runs(&refs))
+}
+
+/// Load the latest run's individual thread files without merging.
+///
+/// Returns one `Run` per file sharing the latest run_id, sorted by timestamp.
+/// Each `Run` represents one thread's data. For single-threaded programs,
+/// this returns a single-element vector identical to `load_latest_run`.
+pub fn load_latest_runs_per_thread(runs_dir: &Path) -> Result<Vec<Run>, Error> {
+    let groups = load_grouped_runs(runs_dir)?;
+    let mut last_group = groups.into_iter().last().ok_or(Error::NoRuns)?;
+    last_group.sort_by_key(|r| r.timestamp_ms);
+    Ok(last_group)
 }
 
 /// Load the two most recent runs, grouped by run_id.
