@@ -584,6 +584,13 @@ impl Widget {
     unsafe fn raw_ptr(&self) -> *const u8 { std::ptr::null() }
     fn valid_method(&self) {}
 }
+
+trait Processor {
+    fn process(&self);
+    fn default_method(&self) { }
+    unsafe fn unsafe_default(&self) { }
+    fn required_method(&self);
+}
 ",
         )
         .unwrap();
@@ -699,7 +706,7 @@ mod tests {
             "error should mention the pattern: {err}"
         );
         assert!(
-            err.contains("Found 10 functions"),
+            err.contains("Found 11 functions"),
             "error should show function count: {err}"
         );
         assert!(
@@ -851,6 +858,50 @@ mod tests {
         assert!(
             !all_fns.contains(&"Widget::raw_ptr"),
             "should skip unsafe impl method"
+        );
+    }
+
+    #[test]
+    fn resolve_skips_trait_methods_with_unsafe_qualifier() {
+        let tmp = TempDir::new().unwrap();
+        create_test_project(tmp.path());
+
+        let specs = [TargetSpec::File("special_fns.rs".into())];
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
+
+        let all_fns: Vec<&str> = result
+            .targets
+            .iter()
+            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .collect();
+
+        // Trait default methods that are instrumentable should be included
+        assert!(
+            all_fns.contains(&"Processor::default_method"),
+            "should include instrumentable trait default method"
+        );
+
+        // Unsafe trait default methods should be skipped
+        assert!(
+            !all_fns.contains(&"Processor::unsafe_default"),
+            "should skip unsafe trait default method"
+        );
+
+        // Trait methods without default bodies should not appear at all
+        assert!(
+            !all_fns.contains(&"Processor::process"),
+            "should not include trait method without default body"
+        );
+        assert!(
+            !all_fns.contains(&"Processor::required_method"),
+            "should not include trait method without default body"
+        );
+
+        // Verify unsafe_default appears in skipped list
+        let skipped_names: Vec<&str> = result.skipped.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            skipped_names.contains(&"Processor::unsafe_default"),
+            "unsafe trait default method should appear in skipped list"
         );
     }
 
