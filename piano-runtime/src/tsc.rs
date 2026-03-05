@@ -214,6 +214,7 @@ pub(crate) fn epoch_tsc() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn gcd_normal_cases() {
@@ -241,6 +242,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn elapsed_ns_with_zero_denom_does_not_panic() {
         // If DENOM were zero (e.g., broken TSC), elapsed_ns must not panic.
         // Temporarily store 0 in DENOM, call elapsed_ns, then restore.
@@ -259,6 +261,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn ticks_to_ns_uses_calibrated_ratio() {
         let saved_n = NUMER.load(Ordering::Relaxed);
         let saved_d = DENOM.load(Ordering::Relaxed);
@@ -275,6 +278,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn ticks_to_ns_zero_denom_returns_zero() {
         let saved_n = NUMER.load(Ordering::Relaxed);
         let saved_d = DENOM.load(Ordering::Relaxed);
@@ -289,6 +293,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn elapsed_ns_delegates_to_ticks_to_ns() {
         let saved_n = NUMER.load(Ordering::Relaxed);
         let saved_d = DENOM.load(Ordering::Relaxed);
