@@ -411,6 +411,48 @@ mod tests {
 
     #[test]
     #[serial]
+    fn calibrate_loop_spins_long_enough_for_accurate_ratio() {
+        // If `<` in `while elapsed < target` is mutated to `>` or `<=`,
+        // the loop either never spins (>) or spins one extra iteration (<=).
+        // With `>`, wall_ns and tsc_ticks are near-zero, producing a ratio
+        // that yields wildly wrong results for real durations.
+        // With `<=`, the test might still pass since it spins at least 2ms,
+        // but `<=` would spin one extra check after hitting exactly 2ms --
+        // still producing a valid calibration. That's semantically equivalent.
+        //
+        // To kill `>`: verify that a known TSC delta converts to approximately
+        // the correct wall time. If calibration didn't spin, the ratio is garbage.
+        let saved_n = NUMER.load(Ordering::Relaxed);
+        let saved_d = DENOM.load(Ordering::Relaxed);
+
+        calibrate();
+
+        // Measure 10ms of wall time and verify TSC-based conversion is close.
+        let tsc_before = read();
+        let wall_before = std::time::Instant::now();
+        let target = std::time::Duration::from_millis(10);
+        while wall_before.elapsed() < target {}
+        let tsc_after = read();
+        let wall_actual_ns = wall_before.elapsed().as_nanos() as u64;
+
+        let tsc_delta = tsc_after.wrapping_sub(tsc_before);
+        let converted_ns = ticks_to_ns(tsc_delta);
+
+        // Should be within 50% of wall time. If calibration used `>` (no spin),
+        // the ratio would be orders of magnitude off.
+        let ratio = converted_ns as f64 / wall_actual_ns as f64;
+        assert!(
+            ratio > 0.5 && ratio < 2.0,
+            "TSC-to-ns conversion ratio {ratio:.3} is too far from 1.0 \
+             (calibration likely didn't spin: converted={converted_ns}ns, wall={wall_actual_ns}ns)"
+        );
+
+        NUMER.store(saved_n, Ordering::Release);
+        DENOM.store(saved_d, Ordering::Release);
+    }
+
+    #[test]
+    #[serial]
     fn calibrate_uses_division_not_multiplication() {
         // The GCD simplification does: NUMER = wall_ns / g, DENOM = tsc_ticks / g
         // If `/` is mutated to `*`, both values balloon to huge numbers.
