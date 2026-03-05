@@ -58,6 +58,7 @@ fn special_fns_are_skipped_during_instrumentation() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("special");
     create_project_with_special_fns(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -129,6 +130,7 @@ fn list_skipped_shows_excluded_functions() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("special");
     create_project_with_special_fns(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -177,6 +179,7 @@ fn build_warns_about_skipped_functions() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("special");
     create_project_with_special_fns(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -214,6 +217,7 @@ fn build_no_warning_in_instrument_everything_mode() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("special");
     create_project_with_special_fns(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -282,6 +286,7 @@ fn list_skipped_shows_message_when_none_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("normal");
     create_project_without_special_fns(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -319,6 +324,7 @@ fn no_targets_found_error_prints_once() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("special");
     create_project_with_special_fns(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));

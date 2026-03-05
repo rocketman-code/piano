@@ -66,6 +66,7 @@ fn macro_generated_fns_appear_in_output() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("macro-fns");
     create_project_with_macro_fns(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));

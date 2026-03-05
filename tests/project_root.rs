@@ -1,5 +1,7 @@
 //! Tests for project root auto-detection.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -68,6 +70,7 @@ fn build_auto_detects_project_from_subdirectory() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("myproject");
     create_mini_project(&project);
+    common::prepopulate_deps(&project, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -95,6 +98,7 @@ fn report_works_from_subdirectory() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("myproject");
     create_mini_project(&project);
+    common::prepopulate_deps(&project, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -140,6 +144,7 @@ fn run_works_from_subdirectory() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("myproject");
     create_mini_project(&project);
+    common::prepopulate_deps(&project, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
