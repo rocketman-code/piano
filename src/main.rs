@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -86,6 +87,10 @@ enum Commands {
     /// Execute the last-built instrumented binary.
     /// Pass arguments to the binary after --.
     Run {
+        /// Stop profiling after N seconds (sends SIGTERM to the binary).
+        #[arg(long, value_name = "SECONDS")]
+        duration: Option<u64>,
+
         /// Arguments to pass to the instrumented binary (after --).
         #[arg(last = true)]
         args: Vec<String>,
@@ -107,6 +112,10 @@ enum Commands {
         /// Suppress warning when program exits with non-zero code.
         #[arg(long)]
         ignore_exit_code: bool,
+
+        /// Stop profiling after N seconds (sends SIGTERM to the binary).
+        #[arg(long, value_name = "SECONDS")]
+        duration: Option<u64>,
 
         /// Arguments to pass to the instrumented binary (after --).
         #[arg(last = true)]
@@ -151,14 +160,23 @@ fn run(cli: Cli) -> Result<(), Error> {
     let project_root = find_project_root(&std::env::current_dir()?).ok();
     match cli.command {
         Commands::Build { opts } => cmd_build(opts, &project_root),
-        Commands::Run { args } => cmd_run(args, &project_root),
+        Commands::Run { duration, args } => cmd_run(duration, args, &project_root),
         Commands::Profile {
             opts,
             all,
             frames,
             ignore_exit_code,
+            duration,
             args,
-        } => cmd_profile(opts, &project_root, all, frames, ignore_exit_code, args),
+        } => cmd_profile(
+            opts,
+            &project_root,
+            all,
+            frames,
+            ignore_exit_code,
+            duration,
+            args,
+        ),
         Commands::Report { run, all, frames } => cmd_report(run, all, frames, &project_root),
         Commands::Diff { a, b } => cmd_diff(a, b, &project_root),
         Commands::Tag { name } => cmd_tag(name, &project_root),
@@ -478,14 +496,56 @@ fn find_latest_binary(project_root: &Option<PathBuf>) -> Result<PathBuf, Error> 
     best.map(|(p, _)| p).ok_or(Error::NoBinary)
 }
 
-fn cmd_run(args: Vec<String>, project_root: &Option<PathBuf>) -> Result<(), Error> {
+/// Spawn a child process, optionally killing it after a timeout.
+///
+/// When `timeout` is `Some`, a background thread sleeps for the given duration
+/// then sends SIGTERM (Unix) or kills (Windows) the child. The existing
+/// signal handler in the instrumented binary flushes profiling data on SIGTERM,
+/// so this composes cleanly with signal recovery.
+fn run_child(
+    binary: &Path,
+    args: &[String],
+    timeout: Option<Duration>,
+) -> Result<process::ExitStatus, Error> {
+    let mut child = process::Command::new(binary)
+        .args(args)
+        .spawn()
+        .map_err(|e| Error::RunFailed(format!("failed to run {}: {e}", binary.display())))?;
+
+    if let Some(dur) = timeout {
+        let child_id = child.id();
+        eprintln!("will stop after {} second(s)", dur.as_secs());
+        std::thread::spawn(move || {
+            std::thread::sleep(dur);
+            #[cfg(unix)]
+            {
+                // SAFETY: sending a signal to a known PID is safe.
+                unsafe {
+                    libc::kill(child_id as libc::pid_t, libc::SIGTERM);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child_id;
+            }
+        });
+    }
+
+    child
+        .wait()
+        .map_err(|e| Error::RunFailed(format!("failed to wait for {}: {e}", binary.display())))
+}
+
+fn cmd_run(
+    duration: Option<u64>,
+    args: Vec<String>,
+    project_root: &Option<PathBuf>,
+) -> Result<(), Error> {
     let binary = find_latest_binary(project_root)?;
     eprintln!("running: {}", binary.display());
 
-    let status = std::process::Command::new(&binary)
-        .args(&args)
-        .status()
-        .map_err(|e| Error::RunFailed(format!("failed to run {}: {e}", binary.display())))?;
+    let timeout = duration.map(Duration::from_secs);
+    let status = run_child(&binary, &args, timeout)?;
 
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -496,6 +556,7 @@ fn cmd_profile(
     show_all: bool,
     frames: bool,
     ignore_exit_code: bool,
+    duration: Option<u64>,
     args: Vec<String>,
 ) -> Result<(), Error> {
     let Some((binary, runs_dir, total_fns)) = build_project(opts, project_root)? else {
@@ -507,10 +568,8 @@ fn cmd_profile(
         .unwrap_or_else(|| binary.display().to_string());
     eprintln!("built: {display_name}");
 
-    let status = std::process::Command::new(&binary)
-        .args(&args)
-        .status()
-        .map_err(|e| Error::RunFailed(format!("failed to run {}: {e}", binary.display())))?;
+    let timeout = duration.map(Duration::from_secs);
+    let status = run_child(&binary, &args, timeout)?;
 
     if !status.success() && !ignore_exit_code {
         if let Some(code) = status.code() {
