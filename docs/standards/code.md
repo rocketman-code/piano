@@ -41,7 +41,7 @@ Integration tests in `tests/`. Unit tests in source files (`#[cfg(test)]` module
 
 ### ci.yml (all PRs + push to main)
 
-Seven jobs:
+Eight jobs:
 
 1. `fmt` (ubuntu-latest) -- `cargo fmt --check`
 2. `clippy` (ubuntu-latest) -- `cargo clippy --workspace --all-targets -- -D warnings`
@@ -50,7 +50,31 @@ Seven jobs:
 5. `doc` (ubuntu-latest) -- `cargo doc --workspace --no-deps` with `-D warnings`
 6. `coverage` (ubuntu-latest) -- `cargo llvm-cov --workspace --features piano-runtime/cpu-time --lcov`, uploads to Codecov
 7. `test-hygiene` (ubuntu-latest) -- rejects `std::env::set_var` / `remove_var` in `piano-runtime/src/` to prevent flaky test regressions
+8. `mutants` (ubuntu-latest) -- `cargo mutants --package piano-runtime --jobs 4 --timeout 120`
 
 ### release.yml (release/* PRs only)
 
 1. `version-bump-scope` -- ensures `chore(cargo): bump version` commits only touch `Cargo.toml`, `piano-runtime/Cargo.toml`, and `Cargo.lock`
+
+## QA Infrastructure
+
+Three automated pillars supplement line coverage (CodeCov):
+
+### Mutation Testing (cargo-mutants)
+- Runs on every PR for `piano-runtime` (~3 min)
+- Survivors are test gaps -- fix by adding targeted tests
+- `cargo mutants --package piano-runtime --jobs 4 --timeout 120`
+
+### Property Testing (proptest)
+- `tests/proptest_rewrite.rs` generates random function signatures
+- Checks: output parses, guards injected, async wrapped, non-targets untouched
+- Runs as part of `cargo test --workspace`
+
+### Allocation Oracles
+- `piano-runtime/tests/alloc_oracle.rs` verifies exact allocation counts
+- Fully deterministic, no CI flakiness
+- Catches silent alloc data corruption/loss
+
+### Accuracy Oracles
+- `piano-runtime/tests/accuracy.rs` validates timing ratio accuracy
+- Relaxed bounds (+-20%) catch catastrophic regression but tolerate CI noise
