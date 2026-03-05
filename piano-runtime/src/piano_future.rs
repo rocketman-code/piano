@@ -3,7 +3,9 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use crate::alloc::{AllocSnapshot, ALLOC_COUNTERS};
-use crate::collector::{StackEntry, STACK};
+#[cfg(test)]
+use crate::collector::with_stack_ref;
+use crate::collector::{with_stack_mut, StackEntry};
 
 /// Future wrapper that carries the profiling call stack inside the future's
 /// state machine. On each poll(), pushes saved entries onto the thread-local
@@ -46,36 +48,31 @@ impl<F: Future> Future for PianoFuture<F> {
 
         // --- Install phase ---
 
-        // Save this thread's alloc counters (restored on exit).
+        // Save this thread's alloc counters and install our carry in one
+        // TLS lookup (halves ALLOC_COUNTERS try_with calls: 4 -> 2).
         let thread_alloc = ALLOC_COUNTERS
-            .try_with(|cell| cell.get())
+            .try_with(|cell| {
+                let saved = cell.get();
+                cell.set(this.alloc_carry);
+                saved
+            })
             .unwrap_or_default();
-
-        // Install our accumulated allocs so new allocs build on previous
-        // segments. enter() will save this and zero, so the function body
-        // sees carry + new allocs across polls.
-        let _ = ALLOC_COUNTERS.try_with(|cell| {
-            cell.set(this.alloc_carry);
-        });
         this.alloc_carry = AllocSnapshot::new();
 
         // Push saved entries onto the thread-local STACK.
-        let base = STACK.with(|stack| {
-            let mut s = stack.borrow_mut();
+        let base = with_stack_mut(|s| {
             let base = *this.base_depth.get_or_insert(s.len());
 
             #[cfg(feature = "cpu-time")]
             {
-                // Fix up cpu_start_ns on our bottom entry to this thread's
-                // CPU clock. Previous segments' CPU time is in
-                // cpu_accumulated_ns.
                 if let Some(first) = this.saved_entries.first_mut() {
                     first.cpu_start_ns = crate::cpu_clock::cpu_now_ns() - this.cpu_accumulated_ns;
                     this.cpu_accumulated_ns = 0;
                 }
             }
 
-            s.extend(this.saved_entries.drain(..));
+            s.extend_from_slice(&this.saved_entries);
+            this.saved_entries.clear();
             base
         });
 
@@ -86,32 +83,29 @@ impl<F: Future> Future for PianoFuture<F> {
 
         // --- Save phase ---
 
-        #[cfg(feature = "cpu-time")]
-        {
-            // Accumulate CPU time for this poll segment before splitting off.
-            STACK.with(|stack| {
-                let s = stack.borrow();
+        // Capture alloc carry and restore thread's counters in one TLS lookup.
+        this.alloc_carry = ALLOC_COUNTERS
+            .try_with(|cell| {
+                let carry = cell.get();
+                cell.set(thread_alloc);
+                carry
+            })
+            .unwrap_or_default();
+
+        // Save our entries from the STACK, reusing saved_entries' buffer
+        // from the previous poll to avoid allocating on every yield.
+        with_stack_mut(|s| {
+            #[cfg(feature = "cpu-time")]
+            {
                 if let Some(entry) = s.get(base) {
                     let cpu_now = crate::cpu_clock::cpu_now_ns();
                     this.cpu_accumulated_ns = cpu_now.saturating_sub(entry.cpu_start_ns);
                 }
-            });
-        }
+            }
 
-        // Capture alloc state: carry forward for next poll (or discard if
-        // Ready, since Guard already consumed and recorded the allocs).
-        this.alloc_carry = ALLOC_COUNTERS
-            .try_with(|cell| cell.get())
-            .unwrap_or_default();
-
-        // Restore this thread's alloc counters.
-        let _ = ALLOC_COUNTERS.try_with(|cell| {
-            cell.set(thread_alloc);
-        });
-
-        // Split off our entries from the STACK.
-        STACK.with(|stack| {
-            this.saved_entries = stack.borrow_mut().split_off(base);
+            this.saved_entries.clear();
+            this.saved_entries.extend_from_slice(&s[base..]);
+            s.truncate(base);
         });
 
         result
@@ -126,8 +120,9 @@ impl<F: Future> Future for PianoFuture<F> {
 impl<F> Drop for PianoFuture<F> {
     fn drop(&mut self) {
         if !self.saved_entries.is_empty() {
-            STACK.with(|stack| {
-                stack.borrow_mut().extend(self.saved_entries.drain(..));
+            with_stack_mut(|s| {
+                s.extend_from_slice(&self.saved_entries);
+                self.saved_entries.clear();
             });
         }
     }
@@ -175,10 +170,10 @@ mod tests {
             PianoFuture::new(async {
                 let _guard = collector::enter("pf_yield");
                 collector::register("pf_yield");
-                STACK.with(|s| assert_eq!(s.borrow().len(), 1));
+                with_stack_ref(|s| assert_eq!(s.len(), 1));
                 tokio::task::yield_now().await;
                 // After yield + restore, entry should still be on stack
-                STACK.with(|s| assert_eq!(s.borrow().len(), 1));
+                with_stack_ref(|s| assert_eq!(s.len(), 1));
             })
             .await;
         });
@@ -228,9 +223,8 @@ mod tests {
                 let _guard = collector::enter("task_a");
                 collector::register("task_a");
                 for _ in 0..10 {
-                    STACK.with(|s| {
-                        let stack = s.borrow();
-                        assert!(stack.iter().all(|e| e.name != "task_b"));
+                    with_stack_ref(|s| {
+                        assert!(s.iter().all(|e| e.name != "task_b"));
                     });
                     tokio::task::yield_now().await;
                 }
@@ -239,9 +233,8 @@ mod tests {
                 let _guard = collector::enter("task_b");
                 collector::register("task_b");
                 for _ in 0..10 {
-                    STACK.with(|s| {
-                        let stack = s.borrow();
-                        assert!(stack.iter().all(|e| e.name != "task_a"));
+                    with_stack_ref(|s| {
+                        assert!(s.iter().all(|e| e.name != "task_a"));
                     });
                     tokio::task::yield_now().await;
                 }
@@ -282,7 +275,7 @@ mod tests {
         assert!(records.iter().any(|r| r.name == "pf_select_parent"));
         assert!(records.iter().any(|r| r.name == "pf_winner"));
         // The STACK should be clean after completion.
-        STACK.with(|s| assert_eq!(s.borrow().len(), 0));
+        with_stack_ref(|s| assert_eq!(s.len(), 0));
     }
 
     #[test]
