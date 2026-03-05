@@ -187,9 +187,12 @@ fn stream_frame_to_writer(state: &mut StreamState, buf: &[FrameFnSummary]) {
 }
 
 /// Push a frame into the thread-local in-memory buffer (fallback path).
-fn push_to_frames(buf: Vec<FrameFnSummary>) {
+fn push_to_frames(buf: &[FrameFnSummary]) {
     FRAMES.with(|frames| {
-        frames.lock().unwrap_or_else(|e| e.into_inner()).push(buf);
+        frames
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(buf.to_vec());
     });
 }
 
@@ -198,7 +201,7 @@ fn push_to_frames(buf: Vec<FrameFnSummary>) {
 /// When streaming is enabled (init() was called), writes one NDJSON line
 /// per frame to the global stream file. When not enabled (tests), pushes
 /// to the thread-local FRAMES vec as before.
-fn stream_frame(buf: Vec<FrameFnSummary>) {
+fn stream_frame(buf: &[FrameFnSummary]) {
     if !STREAMING_ENABLED.load(Ordering::Relaxed) {
         push_to_frames(buf);
         return;
@@ -233,7 +236,7 @@ fn stream_frame(buf: Vec<FrameFnSummary>) {
     }
 
     if let Some(ref mut s) = *state {
-        stream_frame_to_writer(s, &buf);
+        stream_frame_to_writer(s, buf);
     }
 }
 
@@ -872,10 +875,12 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         }
         if unpack_depth(entry.packed) == 0 {
             FRAME_BUFFER.with(|buf| {
-                let taken = std::mem::take(&mut *buf.borrow_mut());
-                if !taken.is_empty() {
-                    stream_frame(taken);
+                let b = buf.borrow();
+                if !b.is_empty() {
+                    stream_frame(&b);
                 }
+                drop(b);
+                buf.borrow_mut().clear();
             });
         }
     });
@@ -1577,10 +1582,12 @@ impl Drop for AdoptGuard {
             if unpack_depth(entry.packed) == 0 {
                 flush_records_buf();
                 FRAME_BUFFER.with(|buf| {
-                    let taken = std::mem::take(&mut *buf.borrow_mut());
-                    if !taken.is_empty() {
-                        stream_frame(taken);
+                    let b = buf.borrow();
+                    if !b.is_empty() {
+                        stream_frame(&b);
                     }
+                    drop(b);
+                    buf.borrow_mut().clear();
                 });
             }
 
