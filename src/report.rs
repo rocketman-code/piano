@@ -34,7 +34,8 @@ pub struct Run {
 pub struct FnEntry {
     pub name: String,
     pub calls: u64,
-    pub total_ms: f64,
+    #[serde(default)]
+    pub total_ms: Option<f64>,
     pub self_ms: f64,
     #[serde(default)]
     pub cpu_self_ms: Option<f64>,
@@ -241,7 +242,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
             FnEntry {
                 name: name.clone(),
                 calls: agg.calls,
-                total_ms: 0.0, // NDJSON format has no total_ms (only per-frame self_ns)
+                total_ms: None, // NDJSON format has no total_ms (only per-frame self_ns)
                 self_ms,
                 cpu_self_ms: if has_cpu {
                     Some(agg.cpu_self_ns as f64 / 1_000_000.0)
@@ -726,14 +727,16 @@ fn merge_runs(runs: &[&Run]) -> Run {
             let entry = merged.entry(f.name.clone()).or_insert(FnEntry {
                 name: f.name.clone(),
                 calls: 0,
-                total_ms: 0.0,
+                total_ms: None,
                 self_ms: 0.0,
                 cpu_self_ms: None,
                 alloc_count: 0,
                 alloc_bytes: 0,
             });
             entry.calls += f.calls;
-            entry.total_ms += f.total_ms;
+            if let Some(t) = f.total_ms {
+                *entry.total_ms.get_or_insert(0.0) += t;
+            }
             entry.self_ms += f.self_ms;
             if let Some(cpu) = f.cpu_self_ms {
                 *entry.cpu_self_ms.get_or_insert(0.0) += cpu;
@@ -1031,7 +1034,7 @@ mod tests {
         assert_eq!(run.functions.len(), 2);
         assert_eq!(run.functions[0].name, "walk");
         assert_eq!(run.functions[0].calls, 3);
-        assert!((run.functions[0].total_ms - 10.5).abs() < f64::EPSILON);
+        assert!((run.functions[0].total_ms.unwrap() - 10.5).abs() < f64::EPSILON);
         assert!((run.functions[0].self_ms - 7.2).abs() < f64::EPSILON);
     }
 
@@ -1045,14 +1048,14 @@ mod tests {
                 FnEntry {
                     name: "fast".into(),
                     calls: 1,
-                    total_ms: 2.0,
+                    total_ms: Some(2.0),
                     self_ms: 1.0,
                     ..Default::default()
                 },
                 FnEntry {
                     name: "slow".into(),
                     calls: 1,
-                    total_ms: 20.0,
+                    total_ms: Some(20.0),
                     self_ms: 15.0,
                     ..Default::default()
                 },
@@ -1076,7 +1079,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "walk".into(),
                 calls: 3,
-                total_ms: 12.0,
+                total_ms: Some(12.0),
                 self_ms: 10.0,
                 ..Default::default()
             }],
@@ -1088,7 +1091,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "walk".into(),
                 calls: 3,
-                total_ms: 9.0,
+                total_ms: Some(9.0),
                 self_ms: 8.0,
                 ..Default::default()
             }],
@@ -1122,7 +1125,7 @@ mod tests {
             .find(|f| f.name == "parse")
             .expect("parse");
         assert_eq!(parse.calls, 80);
-        assert!((parse.total_ms - 160.0).abs() < 0.01);
+        assert!((parse.total_ms.unwrap() - 160.0).abs() < 0.01);
         assert!((parse.self_ms - 160.0).abs() < 0.01);
 
         let resolve = run
@@ -1284,7 +1287,7 @@ mod tests {
                 FnEntry {
                     name: "called".into(),
                     calls: 5,
-                    total_ms: 10.0,
+                    total_ms: Some(10.0),
                     self_ms: 8.0,
                     ..Default::default()
                 },
@@ -1328,7 +1331,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "active".into(),
                 calls: 3,
-                total_ms: 5.0,
+                total_ms: Some(5.0),
                 self_ms: 4.0,
                 ..Default::default()
             }],
@@ -1459,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn ndjson_total_ms_is_zero_not_self_ms() {
+    fn ndjson_total_ms_is_none() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"format_version":2,"run_id":"total_ms_test","timestamp_ms":2000,"functions":["compute","helper"]}
 {"frame":0,"fns":[{"id":0,"calls":5,"self_ns":10000000,"ac":0,"ab":0,"fc":0,"fb":0},{"id":1,"calls":10,"self_ns":3000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
@@ -1469,12 +1472,11 @@ mod tests {
         let (run, _frame_data) = load_ndjson(&dir.path().join("2000.ndjson")).unwrap();
         assert_eq!(run.source_format, RunFormat::Ndjson);
 
-        // NDJSON has no total (elapsed) time, so total_ms must be 0.0 — not
-        // approximated from self_ms.
+        // NDJSON has no total (elapsed) time, so total_ms must be None.
         for f in &run.functions {
             assert!(
-                f.total_ms.abs() < f64::EPSILON,
-                "{}: total_ms should be 0.0 for NDJSON, got {}",
+                f.total_ms.is_none(),
+                "{}: total_ms should be None for NDJSON, got {:?}",
                 f.name,
                 f.total_ms
             );
@@ -1504,9 +1506,9 @@ mod tests {
         let (run_a, _) = load_ndjson(&dir.path().join("1000.ndjson")).unwrap();
         let (run_b, _) = load_ndjson(&dir.path().join("2000.ndjson")).unwrap();
 
-        // Both runs should have total_ms == 0.0
-        assert!(run_a.functions[0].total_ms.abs() < f64::EPSILON);
-        assert!(run_b.functions[0].total_ms.abs() < f64::EPSILON);
+        // Both runs should have total_ms == None
+        assert!(run_a.functions[0].total_ms.is_none());
+        assert!(run_b.functions[0].total_ms.is_none());
 
         // Diff should show self_ms delta (8ms - 5ms = +3ms), not total_ms.
         let diff = diff_runs(&run_a, &run_b, "before", "after");
@@ -1602,7 +1604,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "walk".into(),
                 calls: 3,
-                total_ms: 12.0,
+                total_ms: Some(12.0),
                 self_ms: 10.0,
                 cpu_self_ms: None,
                 alloc_count: 100,
@@ -1616,7 +1618,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "walk".into(),
                 calls: 3,
-                total_ms: 9.0,
+                total_ms: Some(9.0),
                 self_ms: 8.0,
                 cpu_self_ms: None,
                 alloc_count: 50,
@@ -1641,7 +1643,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "alloc_heavy".into(),
                 calls: 1,
-                total_ms: 1.0,
+                total_ms: Some(1.0),
                 self_ms: 1.0,
                 cpu_self_ms: None,
                 alloc_count: large_count,
@@ -1655,7 +1657,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "alloc_heavy".into(),
                 calls: 1,
-                total_ms: 1.0,
+                total_ms: Some(1.0),
                 self_ms: 1.0,
                 cpu_self_ms: None,
                 alloc_count: 0,
@@ -1857,7 +1859,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "compute".into(),
                 calls: 10,
-                total_ms: 50.0,
+                total_ms: Some(50.0),
                 self_ms: 40.0,
                 cpu_self_ms: Some(35.0),
                 ..Default::default()
@@ -1883,7 +1885,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "compute".into(),
                 calls: 10,
-                total_ms: 50.0,
+                total_ms: Some(50.0),
                 self_ms: 40.0,
                 ..Default::default()
             }],
@@ -1930,7 +1932,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 1,
-                total_ms: 10.0,
+                total_ms: Some(10.0),
                 self_ms: 10.0,
                 cpu_self_ms: Some(8.0),
                 ..Default::default()
@@ -1943,7 +1945,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 1,
-                total_ms: 12.0,
+                total_ms: Some(12.0),
                 self_ms: 12.0,
                 cpu_self_ms: Some(10.0),
                 ..Default::default()
@@ -2024,7 +2026,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 1,
-                total_ms: 10.0,
+                total_ms: Some(10.0),
                 self_ms: 10.0,
                 cpu_self_ms: Some(8.0),
                 ..Default::default()
@@ -2037,7 +2039,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 1,
-                total_ms: 12.0,
+                total_ms: Some(12.0),
                 self_ms: 12.0,
                 // No CPU data.
                 ..Default::default()
@@ -2071,7 +2073,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 1,
-                total_ms: 10.0,
+                total_ms: Some(10.0),
                 self_ms: 10.0,
                 ..Default::default()
             }],
@@ -2083,7 +2085,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 1,
-                total_ms: 12.0,
+                total_ms: Some(12.0),
                 self_ms: 12.0,
                 ..Default::default()
             }],
@@ -2105,7 +2107,7 @@ mod tests {
                 FnEntry {
                     name: "active".into(),
                     calls: 5,
-                    total_ms: 20.0,
+                    total_ms: Some(20.0),
                     self_ms: 15.0,
                     cpu_self_ms: Some(12.0),
                     ..Default::default()
@@ -2299,7 +2301,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 5,
-                total_ms: 20.0,
+                total_ms: Some(20.0),
                 self_ms: 15.0,
                 cpu_self_ms: Some(10.0),
                 ..Default::default()
@@ -2312,7 +2314,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 3,
-                total_ms: 12.0,
+                total_ms: Some(12.0),
                 self_ms: 9.0,
                 // No CPU data in this run.
                 ..Default::default()
@@ -2481,7 +2483,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 5,
-                total_ms: 20.0,
+                total_ms: Some(20.0),
                 self_ms: 15.0,
                 ..Default::default()
             }],
@@ -2502,7 +2504,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 5,
-                total_ms: 20.0,
+                total_ms: Some(20.0),
                 self_ms: 15.0,
                 ..Default::default()
             }],
@@ -2525,7 +2527,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 5,
-                total_ms: 20.0,
+                total_ms: Some(20.0),
                 self_ms: 15.0,
                 cpu_self_ms: Some(12.0),
                 ..Default::default()
@@ -2641,7 +2643,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 1,
-                total_ms: 10.0,
+                total_ms: Some(10.0),
                 self_ms: 10.0,
                 ..Default::default()
             }],
@@ -2653,7 +2655,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 1,
-                total_ms: 12.0,
+                total_ms: Some(12.0),
                 self_ms: 12.0,
                 ..Default::default()
             }],
@@ -2686,7 +2688,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 1,
-                total_ms: 10.0,
+                total_ms: Some(10.0),
                 self_ms: 10.0,
                 cpu_self_ms: Some(8.0),
                 ..Default::default()
@@ -2699,7 +2701,7 @@ mod tests {
             functions: vec![FnEntry {
                 name: "work".into(),
                 calls: 1,
-                total_ms: 12.0,
+                total_ms: Some(12.0),
                 self_ms: 12.0,
                 cpu_self_ms: Some(10.0),
                 ..Default::default()
@@ -2721,7 +2723,7 @@ mod tests {
         let entry = || FnEntry {
             name: "work".into(),
             calls: 1,
-            total_ms: 10.0,
+            total_ms: Some(10.0),
             self_ms: 10.0,
             ..Default::default()
         };
@@ -2755,7 +2757,7 @@ mod tests {
         let entry = || FnEntry {
             name: "work".into(),
             calls: 1,
-            total_ms: 10.0,
+            total_ms: Some(10.0),
             self_ms: 10.0,
             ..Default::default()
         };
