@@ -12,10 +12,10 @@ use piano::build::{
 };
 use piano::error::{Error, io_context};
 use piano::report::{
-    diff_runs, find_latest_run_file, find_ndjson_by_run_id, format_frames_table, format_table,
-    format_table_with_frames, load_latest_run, load_ndjson, load_run, load_run_by_id,
-    load_tagged_run, load_two_latest_runs, relative_time, resolve_tag, reverse_resolve_tag,
-    save_tag,
+    diff_runs, find_latest_run_file, find_ndjson_by_run_id, format_frames_table,
+    format_per_thread_tables, format_table, format_table_with_frames, load_latest_run,
+    load_latest_runs_per_thread, load_ndjson, load_run, load_run_by_id, load_tagged_run,
+    load_two_latest_runs, relative_time, resolve_tag, reverse_resolve_tag, save_tag,
 };
 use piano::resolve::{ResolveResult, SkippedFunction, TargetSpec, resolve_targets};
 use piano::rewrite::{
@@ -109,6 +109,10 @@ enum Commands {
         #[arg(long)]
         frames: bool,
 
+        /// Show per-thread breakdown instead of aggregated view.
+        #[arg(long)]
+        threads: bool,
+
         /// Suppress warning when program exits with non-zero code.
         #[arg(long)]
         ignore_exit_code: bool,
@@ -133,6 +137,10 @@ enum Commands {
         /// Show per-frame breakdown with spike detection.
         #[arg(long)]
         frames: bool,
+
+        /// Show per-thread breakdown instead of aggregated view.
+        #[arg(long)]
+        threads: bool,
     },
     /// Compare two profiling runs.
     Diff {
@@ -165,6 +173,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             opts,
             all,
             frames,
+            threads,
             ignore_exit_code,
             duration,
             args,
@@ -173,11 +182,17 @@ fn run(cli: Cli) -> Result<(), Error> {
             &project_root,
             all,
             frames,
+            threads,
             ignore_exit_code,
             duration,
             args,
         ),
-        Commands::Report { run, all, frames } => cmd_report(run, all, frames, &project_root),
+        Commands::Report {
+            run,
+            all,
+            frames,
+            threads,
+        } => cmd_report(run, all, frames, threads, &project_root),
         Commands::Diff { a, b } => cmd_diff(a, b, &project_root),
         Commands::Tag { name } => cmd_tag(name, &project_root),
     }
@@ -551,11 +566,13 @@ fn cmd_run(
     std::process::exit(status.code().unwrap_or(1));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_profile(
     opts: BuildOpts,
     project_root: &Option<PathBuf>,
     show_all: bool,
     frames: bool,
+    threads: bool,
     ignore_exit_code: bool,
     duration: Option<u64>,
     args: Vec<String>,
@@ -595,7 +612,7 @@ fn cmd_profile(
     }
 
     eprintln!("--- profiling report ---");
-    let report_result = match cmd_report(None, show_all, frames, project_root) {
+    let report_result = match cmd_report(None, show_all, frames, threads, project_root) {
         Ok(()) => Ok(()),
         Err(Error::NoRuns) if !status.success() && !ignore_exit_code => {
             // Program failed and produced no data. The program's own error
@@ -634,6 +651,7 @@ fn cmd_report(
     run_path: Option<PathBuf>,
     show_all: bool,
     frames: bool,
+    threads: bool,
     project_root: &Option<PathBuf>,
 ) -> Result<(), Error> {
     // Resolve the run file path.
@@ -677,6 +695,14 @@ fn cmd_report(
         } else {
             anstream::print!("{}", format_table_with_frames(&frame_data, show_all));
         }
+        return Ok(());
+    }
+
+    // Per-thread mode: load individual thread files without merging.
+    if threads {
+        let dir = default_runs_dir(project_root)?;
+        let thread_runs = load_latest_runs_per_thread(&dir)?;
+        anstream::print!("{}", format_per_thread_tables(&thread_runs, show_all));
         return Ok(());
     }
 
