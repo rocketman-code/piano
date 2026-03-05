@@ -215,3 +215,29 @@ fn build_with_no_targets_instruments_all_functions() {
     assert!(content.contains("\"main\""), "output should contain 'main'");
     assert!(content.contains("\"work\""), "output should contain 'work'");
 }
+
+#[test]
+fn report_no_runs_shows_recovery_guidance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+
+    let output = Command::new(piano_bin)
+        .args(["report"])
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run piano report");
+
+    assert!(
+        !output.status.success(),
+        "piano report with no runs should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("piano profile"),
+        "NoRuns error should include recovery guidance mentioning `piano profile`, got: {stderr}"
+    );
+}
