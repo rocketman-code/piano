@@ -320,13 +320,20 @@ fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
-/// Returns false for function signatures that cannot be instrumented:
-/// const fn (enter() is not const), unsafe fn, extern fn (non-Rust ABI).
+/// Returns false for function signatures that should not be instrumented.
+///
+/// Technical limitations (instrumentation would not compile):
+/// - const fn: `enter()` is not a const fn
+/// - extern fn: non-Rust ABI, cannot call into the runtime
+///
+/// Design choices (instrumentation is possible but intentionally avoided):
+/// - unsafe fn: `enter()` is safe and callable inside unsafe blocks, but we
+///   avoid injecting code into unsafe functions as a conservative policy
 pub(crate) fn is_instrumentable(sig: &syn::Signature) -> bool {
     classify_skip(sig).is_none()
 }
 
-/// Classify why a function signature cannot be instrumented.
+/// Classify why a function signature should not be instrumented.
 /// Returns None if the function is instrumentable.
 pub(crate) fn classify_skip(sig: &syn::Signature) -> Option<SkipReason> {
     if sig.unsafety.is_some() {
