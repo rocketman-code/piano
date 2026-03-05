@@ -1086,6 +1086,10 @@ pub fn reset() {
     INVOCATIONS.with(|inv| inv.borrow_mut().clear());
     FRAME_BUFFER.with(|buf| buf.borrow_mut().clear());
     FRAMES.with(|frames| frames.lock().unwrap_or_else(|e| e.into_inner()).clear());
+    // NAME_TABLE and NAME_CACHE are intentionally NOT cleared here.
+    // The intern table is append-only: IDs are stable process-wide and may be
+    // cached in other threads' NAME_CACHE. Clearing either would invalidate
+    // those cached IDs, causing stale or incorrect name lookups.
 }
 
 /// Clear collected timing data across ALL threads, plus the calling thread's
