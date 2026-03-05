@@ -32,7 +32,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -247,12 +247,13 @@ fn stream_frame(buf: &[FrameFnSummary]) {
 
 /// Write the function name table as a trailer line and flush.
 fn write_stream_trailer(state: &mut StreamState) -> std::io::Result<()> {
-    let table = name_table().lock().unwrap_or_else(|e| e.into_inner());
+    let len = NAME_TABLE_LEN.load(Ordering::Acquire);
     write!(state.file, "{{\"functions\":[")?;
-    for (i, &name) in table.iter().enumerate() {
+    for i in 0..len {
         if i > 0 {
             write!(state.file, ",")?;
         }
+        let name = name_table_get(i).unwrap_or("<unknown>");
         let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
         write!(state.file, "\"{escaped}\"")?;
     }
@@ -686,11 +687,68 @@ fn flush_records_buf() {
 // lock briefly; writes happen once per unique name in enter_cold.
 // A thread-local cache avoids the global lock on the hot path.
 
-/// Global interned name table: index -> &'static str.
-static NAME_TABLE: SyncOnceCell<Mutex<Vec<&'static str>>> = SyncOnceCell::new();
+/// Lock-free interned name table: index -> &'static str.
+///
+/// Each slot stores a `&'static str` as (AtomicPtr<u8>, AtomicUsize) for the
+/// data pointer and length. Reads use Acquire ordering; writes use Release.
+/// The table is append-only: once written, a slot never changes.
+/// NAME_TABLE_LEN tracks how many slots are valid.
+///
+/// Maximum 4096 unique function names. This covers all practical programs
+/// (typical instrumented binaries have <100 unique functions). The table
+/// occupies 64KB of BSS (zero-initialized, no runtime cost until used).
+const NAME_TABLE_CAPACITY: usize = 4096;
 
-fn name_table() -> &'static Mutex<Vec<&'static str>> {
-    NAME_TABLE.get_or_init(|| Mutex::new(Vec::new()))
+static NAME_TABLE_PTRS: [AtomicPtr<u8>; NAME_TABLE_CAPACITY] = {
+    // SAFETY: AtomicPtr<u8> has the same representation as *mut u8,
+    // and null is a valid value for AtomicPtr.
+    // const { } blocks aren't available at MSRV 1.59, so we use transmute.
+    // This is a well-known pattern for initializing large atomic arrays.
+    unsafe { core::mem::transmute([core::ptr::null_mut::<u8>(); NAME_TABLE_CAPACITY]) }
+};
+#[allow(unused_braces)]
+static NAME_TABLE_LENS: [AtomicUsize; NAME_TABLE_CAPACITY] =
+    { unsafe { core::mem::transmute([0usize; NAME_TABLE_CAPACITY]) } };
+static NAME_TABLE_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Mutex protecting writes to the name table. Reads are lock-free.
+/// Uses SyncOnceCell for MSRV 1.59 compatibility (Mutex::new is not const).
+static NAME_TABLE_WRITE_LOCK: SyncOnceCell<Mutex<()>> = SyncOnceCell::new();
+
+fn name_table_lock() -> &'static Mutex<()> {
+    NAME_TABLE_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Read a name from the lock-free table by index.
+/// Returns None if index is out of range.
+#[inline(always)]
+fn name_table_get(idx: usize) -> Option<&'static str> {
+    if idx >= NAME_TABLE_LEN.load(Ordering::Acquire) {
+        return None;
+    }
+    let ptr = NAME_TABLE_PTRS[idx].load(Ordering::Acquire);
+    let len = NAME_TABLE_LENS[idx].load(Ordering::Acquire);
+    // SAFETY: the pointer and length were stored from a valid &'static str
+    // and the slot is immutable once written (append-only table).
+    Some(unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len)) })
+}
+
+/// Append a name to the lock-free table. Caller must hold NAME_TABLE_WRITE_LOCK.
+/// Returns the assigned index.
+fn name_table_push(name: &'static str) -> u16 {
+    let idx = NAME_TABLE_LEN.load(Ordering::Acquire);
+    debug_assert!(
+        idx < NAME_TABLE_CAPACITY,
+        "interned name table overflow: more than {NAME_TABLE_CAPACITY} unique function names"
+    );
+    if idx >= NAME_TABLE_CAPACITY {
+        // Saturate at max capacity -- degrades gracefully.
+        return (NAME_TABLE_CAPACITY - 1) as u16;
+    }
+    NAME_TABLE_PTRS[idx].store(name.as_ptr() as *mut u8, Ordering::Release);
+    NAME_TABLE_LENS[idx].store(name.len(), Ordering::Release);
+    NAME_TABLE_LEN.store(idx + 1, Ordering::Release);
+    idx as u16
 }
 
 // Thread-local cache mapping name pointer -> interned ID.
@@ -701,7 +759,7 @@ thread_local! {
 
 /// Intern a function name, returning its u16 ID.
 /// Fast path: thread-local cache hit (no global lock).
-/// Slow path: global table lookup/insert under lock, then cache.
+/// Slow path: global table lookup/insert under write lock, then cache.
 #[inline(always)]
 fn intern_name(name: &'static str) -> u16 {
     let ptr = name.as_ptr() as usize;
@@ -714,26 +772,20 @@ fn intern_name(name: &'static str) -> u16 {
 
 #[inline(never)]
 fn intern_name_slow(name: &'static str, ptr: usize) -> u16 {
-    let mut table = name_table().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = name_table_lock().lock().unwrap_or_else(|e| e.into_inner());
     // Check if already in global table (another thread may have added it).
-    let id = if let Some(pos) = table.iter().position(|&n| n.as_ptr() as usize == ptr) {
-        pos as u16
-    } else {
-        let len = table.len();
-        debug_assert!(
-            len <= u16::MAX as usize,
-            "interned name table overflow: more than 65535 unique function names"
-        );
-        if len > u16::MAX as usize {
-            // Table full (65536 entries, indices 0..=u16::MAX). Saturate
-            // instead of wrapping -- degrades gracefully.
-            return u16::MAX;
+    let len = NAME_TABLE_LEN.load(Ordering::Acquire);
+    let id = {
+        let found = NAME_TABLE_PTRS[..len]
+            .iter()
+            .position(|p| p.load(Ordering::Acquire) as usize == ptr);
+        if let Some(pos) = found {
+            pos as u16
+        } else {
+            name_table_push(name)
         }
-        let id = len as u16;
-        table.push(name);
-        id
     };
-    drop(table);
+    drop(_guard);
     NAME_CACHE.with(|cache| {
         cache.borrow_mut().insert(ptr, id);
     });
@@ -762,19 +814,22 @@ fn unpack_depth(packed: u64) -> u16 {
 
 /// Resolve a name ID back to its interned `&'static str`.
 ///
+/// Lock-free: reads directly from the static atomic arrays.
+/// No TLS access, no Mutex, no allocation.
+///
 /// Panics (debug) / returns `"<unknown>"` (release) if the ID is out of range.
 #[inline(always)]
 pub(crate) fn lookup_name(name_id: u16) -> &'static str {
-    let table = name_table().lock().unwrap_or_else(|e| e.into_inner());
-    if (name_id as usize) < table.len() {
-        table[name_id as usize]
-    } else {
-        debug_assert!(
-            false,
-            "lookup_name: id {name_id} out of range (table len {})",
-            table.len()
-        );
-        "<unknown>"
+    match name_table_get(name_id as usize) {
+        Some(name) => name,
+        None => {
+            debug_assert!(
+                false,
+                "lookup_name: id {name_id} out of range (table len {})",
+                NAME_TABLE_LEN.load(Ordering::Relaxed)
+            );
+            "<unknown>"
+        }
     }
 }
 
