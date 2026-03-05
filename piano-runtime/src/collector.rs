@@ -91,6 +91,11 @@ static EPOCH: SyncOnceCell<Instant> = SyncOnceCell::new();
 ///
 /// Uses `SyncOnceCell<Mutex<_>>` instead of `static Mutex` because
 /// `Mutex::new` is not `const fn` on Rust < 1.63 (runtime MSRV is 1.59).
+///
+/// TESTING: Process-global. Tests that call `set_runs_dir()` or
+/// `clear_runs_dir()` must use `#[serial]` to prevent concurrent mutation.
+/// Prefer `flush_to(dir)` or `shutdown_impl_inner(dir)` when you only need
+/// to direct output to a specific directory.
 static RUNS_DIR: SyncOnceCell<Mutex<Option<PathBuf>>> = SyncOnceCell::new();
 
 fn runs_dir_lock() -> &'static Mutex<Option<PathBuf>> {
@@ -107,6 +112,10 @@ static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
 /// Set by `init()`. When true, depth-0 frame boundaries write directly to
 /// disk via STREAM_FILE instead of buffering in the FRAMES thread-local.
 /// When false (tests, no init() call), FRAMES is used as before.
+///
+/// TESTING: Process-global. Tests that store to this flag must use
+/// `#[serial]` -- any concurrent guard drop will take the streaming path
+/// and write to STREAM_FILE instead of buffering in FRAMES.
 static STREAMING_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// State for the streaming NDJSON file.
@@ -117,6 +126,9 @@ struct StreamState {
 }
 
 /// Global streaming file handle, lazily opened on first frame.
+///
+/// TESTING: Process-global. Tests that open or close the stream file must
+/// use `#[serial]` to avoid corrupting concurrent tests' output.
 static STREAM_FILE: SyncOnceCell<Mutex<Option<StreamState>>> = SyncOnceCell::new();
 
 fn stream_file() -> &'static Mutex<Option<StreamState>> {
