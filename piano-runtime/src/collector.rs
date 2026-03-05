@@ -30,7 +30,7 @@
 
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
@@ -1196,7 +1196,7 @@ fn write_ndjson(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut f = std::fs::File::create(path)?;
+    let mut f = BufWriter::new(std::fs::File::create(path)?);
     let ts = timestamp_ms();
     let run_id = run_id();
 
