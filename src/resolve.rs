@@ -80,6 +80,9 @@ pub fn resolve_targets(
 
     let mut results: Vec<ResolvedTarget> = Vec::new();
     let mut skipped: Vec<SkippedFunction> = Vec::new();
+    // Collect all function names seen during resolution for suggestion hints,
+    // avoiding a redundant re-parse in build_suggestion_hint.
+    let mut all_seen_names: Vec<String> = Vec::new();
 
     if specs.is_empty() {
         // No specs = instrument all functions in all files.
@@ -107,6 +110,7 @@ pub fn resolve_targets(
                         })?;
                         let (all_fns, file_skipped) =
                             extract_functions(&source, file, rel_path(file));
+                        all_seen_names.extend(all_fns.iter().cloned());
                         let matched: Vec<String> = all_fns
                             .into_iter()
                             .filter(|name| {
@@ -151,6 +155,7 @@ pub fn resolve_targets(
                         })?;
                         let (all_fns, file_skipped) =
                             extract_functions(&source, file, rel_path(file));
+                        all_seen_names.extend(all_fns.iter().cloned());
                         if !all_fns.is_empty() {
                             merge_into(&mut results, file, all_fns);
                         }
@@ -181,6 +186,7 @@ pub fn resolve_targets(
                         })?;
                         let (all_fns, file_skipped) =
                             extract_functions(&source, file, rel_path(file));
+                        all_seen_names.extend(all_fns.iter().cloned());
                         if !all_fns.is_empty() {
                             merge_into(&mut results, file, all_fns);
                         }
@@ -202,7 +208,7 @@ pub fn resolve_targets(
                 .join(", ");
 
             let hint = if skipped.is_empty() {
-                build_suggestion_hint(specs, &rs_files)
+                build_suggestion_hint(specs, &all_seen_names)
             } else {
                 let reasons = skipped
                     .iter()
@@ -478,7 +484,8 @@ fn levenshtein(a: &str, b: &str) -> usize {
 ///
 /// For `--fn` specs: computes Levenshtein suggestions against all function names.
 /// Falls back to showing function count with guidance when no close matches exist.
-fn build_suggestion_hint(specs: &[TargetSpec], rs_files: &[PathBuf]) -> String {
+/// Accepts pre-collected function names from the resolution pass to avoid re-parsing.
+fn build_suggestion_hint(specs: &[TargetSpec], seen_names: &[String]) -> String {
     // Collect --fn patterns only; other spec types don't get suggestions.
     let fn_patterns: Vec<&str> = specs
         .iter()
@@ -492,16 +499,8 @@ fn build_suggestion_hint(specs: &[TargetSpec], rs_files: &[PathBuf]) -> String {
         return String::new();
     }
 
-    // Collect all instrumentable function names across all files.
-    let mut all_names: Vec<String> = Vec::new();
-    for file in rs_files {
-        let Ok(source) = std::fs::read_to_string(file) else {
-            continue;
-        };
-        // path unused — only collecting function names for suggestions
-        let (fns, _skipped) = extract_functions(&source, file, PathBuf::new());
-        all_names.extend(fns);
-    }
+    // Deduplicate the pre-collected names.
+    let mut all_names: Vec<&String> = seen_names.iter().collect();
     all_names.sort();
     all_names.dedup();
 
@@ -511,20 +510,20 @@ fn build_suggestion_hint(specs: &[TargetSpec], rs_files: &[PathBuf]) -> String {
     let mut suggestions: Vec<String> = Vec::new();
     for pattern in &fn_patterns {
         let threshold = pattern.len() / 3;
-        let mut scored: Vec<(usize, &String)> = all_names
+        let mut scored: Vec<(usize, &str)> = all_names
             .iter()
             .filter_map(|name| {
                 let bare = name.rsplit("::").next().unwrap_or(name);
                 let dist = levenshtein(pattern, bare).min(levenshtein(pattern, name));
                 if dist <= threshold && dist > 0 {
-                    Some((dist, name))
+                    Some((dist, name.as_str()))
                 } else {
                     None
                 }
             })
             .collect();
         scored.sort_by_key(|(d, _)| *d);
-        suggestions.extend(scored.iter().take(5).map(|(_, name)| (*name).clone()));
+        suggestions.extend(scored.iter().take(5).map(|(_, name)| (*name).to_owned()));
     }
     suggestions.sort();
     suggestions.dedup();
