@@ -52,13 +52,14 @@ fn finds_root_from_nested_subdirectory() {
 
 #[test]
 fn errors_when_no_cargo_toml() {
-    let tmp = tempfile::tempdir().unwrap();
-    let empty = tmp.path().join("empty");
-    fs::create_dir_all(&empty).unwrap();
+    // Start from the filesystem root: no Cargo.toml exists at `/` and
+    // `parent()` returns `None`, so find_project_root must hit the error
+    // path without any sentinel tricks.
+    let root = Path::new("/");
+    let result = piano::build::find_project_root(root);
 
-    let result = piano::build::find_project_root(&empty);
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
+    let err = result.expect_err("find_project_root should fail when no Cargo.toml exists");
+    let msg = err.to_string();
     assert!(
         msg.contains("no Cargo.toml found"),
         "error should mention Cargo.toml, got: {msg}"
