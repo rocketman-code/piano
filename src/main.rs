@@ -143,19 +143,20 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), Error> {
+    let project_root = find_project_root(&std::env::current_dir()?).ok();
     match cli.command {
-        Commands::Build { opts } => cmd_build(opts),
-        Commands::Run { args } => cmd_run(args),
+        Commands::Build { opts } => cmd_build(opts, &project_root),
+        Commands::Run { args } => cmd_run(args, &project_root),
         Commands::Profile {
             opts,
             all,
             frames,
             ignore_exit_code,
             args,
-        } => cmd_profile(opts, all, frames, ignore_exit_code, args),
-        Commands::Report { run, all, frames } => cmd_report(run, all, frames),
-        Commands::Diff { a, b } => cmd_diff(a, b),
-        Commands::Tag { name } => cmd_tag(name),
+        } => cmd_profile(opts, &project_root, all, frames, ignore_exit_code, args),
+        Commands::Report { run, all, frames } => cmd_report(run, all, frames, &project_root),
+        Commands::Diff { a, b } => cmd_diff(a, b, &project_root),
+        Commands::Tag { name } => cmd_tag(name, &project_root),
     }
 }
 
@@ -173,7 +174,10 @@ fn unique_skip_reasons(skipped: &[SkippedFunction]) -> String {
 /// Build an instrumented binary and return (binary_path, runs_dir, instrumented_fn_count).
 ///
 /// Returns `Ok(None)` when `--list-skipped` is used (early exit after printing).
-fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf, usize)>, Error> {
+fn build_project(
+    opts: BuildOpts,
+    project_root: &Option<PathBuf>,
+) -> Result<Option<(PathBuf, PathBuf, usize)>, Error> {
     let BuildOpts {
         fn_patterns,
         exact,
@@ -187,7 +191,9 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf, usize)>, E
 
     let project = match project {
         Some(p) => p,
-        None => find_project_root(&std::env::current_dir()?)?,
+        None => project_root.clone().ok_or_else(|| {
+            Error::BuildFailed("could not find Cargo.toml in any parent directory".into())
+        })?,
     };
 
     if !project.exists() {
@@ -398,8 +404,8 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf, usize)>, E
     Ok(Some((binary, runs_dir, total_fns)))
 }
 
-fn cmd_build(opts: BuildOpts) -> Result<(), Error> {
-    let Some((binary, _runs_dir, _total_fns)) = build_project(opts)? else {
+fn cmd_build(opts: BuildOpts, project_root: &Option<PathBuf>) -> Result<(), Error> {
+    let Some((binary, _runs_dir, _total_fns)) = build_project(opts, project_root)? else {
         return Ok(());
     };
     let display_name = binary
@@ -421,8 +427,8 @@ fn is_binary_extension(ext: &std::ffi::OsStr) -> bool {
     cfg!(windows) && ext == "exe"
 }
 
-fn find_latest_binary() -> Result<PathBuf, Error> {
-    let project = find_project_root(&std::env::current_dir()?).map_err(|_| Error::NoBinary)?;
+fn find_latest_binary(project_root: &Option<PathBuf>) -> Result<PathBuf, Error> {
+    let project = project_root.as_ref().ok_or(Error::NoBinary)?;
     let dir = project.join("target/piano/release");
     if !dir.is_dir() {
         return Err(Error::NoBinary);
@@ -464,8 +470,8 @@ fn find_latest_binary() -> Result<PathBuf, Error> {
     best.map(|(p, _)| p).ok_or(Error::NoBinary)
 }
 
-fn cmd_run(args: Vec<String>) -> Result<(), Error> {
-    let binary = find_latest_binary()?;
+fn cmd_run(args: Vec<String>, project_root: &Option<PathBuf>) -> Result<(), Error> {
+    let binary = find_latest_binary(project_root)?;
     eprintln!("running: {}", binary.display());
 
     let status = std::process::Command::new(&binary)
@@ -478,12 +484,13 @@ fn cmd_run(args: Vec<String>) -> Result<(), Error> {
 
 fn cmd_profile(
     opts: BuildOpts,
+    project_root: &Option<PathBuf>,
     show_all: bool,
     frames: bool,
     ignore_exit_code: bool,
     args: Vec<String>,
 ) -> Result<(), Error> {
-    let Some((binary, runs_dir, total_fns)) = build_project(opts)? else {
+    let Some((binary, runs_dir, total_fns)) = build_project(opts, project_root)? else {
         return Ok(());
     };
     let display_name = binary
@@ -519,7 +526,7 @@ fn cmd_profile(
     }
 
     eprintln!();
-    let report_result = match cmd_report(None, show_all, frames) {
+    let report_result = match cmd_report(None, show_all, frames, project_root) {
         Ok(()) => Ok(()),
         Err(Error::NoRuns) if !status.success() => {
             // Program failed and produced no data. The program's own error
@@ -550,15 +557,20 @@ fn cmd_profile(
     Ok(())
 }
 
-fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result<(), Error> {
+fn cmd_report(
+    run_path: Option<PathBuf>,
+    show_all: bool,
+    frames: bool,
+    project_root: &Option<PathBuf>,
+) -> Result<(), Error> {
     // Resolve the run file path.
     let resolved_path = match &run_path {
         Some(p) if p.exists() => Some(p.clone()),
         Some(p) => {
             // Tag lookup — resolve to NDJSON file if available.
             let tag = p.to_string_lossy();
-            let tags_dir = default_tags_dir()?;
-            let runs_dir = default_runs_dir()?;
+            let tags_dir = default_tags_dir(project_root)?;
+            let runs_dir = default_runs_dir(project_root)?;
             let run_id = resolve_tag(&tags_dir, &tag)?;
             match find_ndjson_by_run_id(&runs_dir, &run_id)? {
                 Some(ndjson_path) => Some(ndjson_path),
@@ -577,7 +589,7 @@ fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result
         }
         None => {
             // Find the latest run file.
-            let dir = default_runs_dir()?;
+            let dir = default_runs_dir(project_root)?;
             find_latest_run_file(&dir)?
         }
     };
@@ -599,7 +611,7 @@ fn cmd_report(run_path: Option<PathBuf>, show_all: bool, frames: bool) -> Result
     let run = match resolved_path {
         Some(p) => load_run(&p)?,
         None => {
-            let dir = default_runs_dir()?;
+            let dir = default_runs_dir(project_root)?;
             load_latest_run(&dir)?
         }
     };
@@ -620,18 +632,22 @@ fn diff_label(arg: &Path) -> String {
     }
 }
 
-fn cmd_diff(a: Option<PathBuf>, b: Option<PathBuf>) -> Result<(), Error> {
+fn cmd_diff(
+    a: Option<PathBuf>,
+    b: Option<PathBuf>,
+    project_root: &Option<PathBuf>,
+) -> Result<(), Error> {
     match (a, b) {
         (Some(a), Some(b)) => {
             let label_a = diff_label(&a);
             let label_b = diff_label(&b);
-            let run_a = resolve_run_arg(&a)?;
-            let run_b = resolve_run_arg(&b)?;
+            let run_a = resolve_run_arg(&a, project_root)?;
+            let run_b = resolve_run_arg(&b, project_root)?;
             anstream::print!("{}", diff_runs(&run_a, &run_b, &label_a, &label_b));
         }
         (None, None) => {
-            let runs_dir = default_runs_dir()?;
-            let tags_dir = default_tags_dir().ok();
+            let runs_dir = default_runs_dir(project_root)?;
+            let tags_dir = default_tags_dir(project_root).ok();
             let (previous, latest) = load_two_latest_runs(&runs_dir)?;
 
             let label_a = resolve_diff_label(&tags_dir, &previous, &runs_dir, "previous");
@@ -680,9 +696,9 @@ fn resolve_diff_label(
     format!("{role} ({stem})")
 }
 
-fn cmd_tag(name: Option<String>) -> Result<(), Error> {
+fn cmd_tag(name: Option<String>, project_root: &Option<PathBuf>) -> Result<(), Error> {
     let Some(name) = name else {
-        let tags_dir = match default_tags_dir() {
+        let tags_dir = match default_tags_dir(project_root) {
             Ok(dir) => dir,
             Err(Error::NoRuns) => {
                 eprintln!("no tags saved");
@@ -715,8 +731,8 @@ fn cmd_tag(name: Option<String>) -> Result<(), Error> {
         return Ok(());
     };
 
-    let runs_dir = default_runs_dir()?;
-    let tags_dir = default_tags_dir()?;
+    let runs_dir = default_runs_dir(project_root)?;
+    let tags_dir = default_tags_dir(project_root)?;
     let latest = load_latest_run(&runs_dir)?;
     let run_id = latest.run_id.ok_or(Error::NoRuns)?;
     save_tag(&tags_dir, &name, &run_id)?;
@@ -724,21 +740,24 @@ fn cmd_tag(name: Option<String>) -> Result<(), Error> {
     Ok(())
 }
 
-fn resolve_run_arg(arg: &Path) -> Result<piano::report::Run, Error> {
+fn resolve_run_arg(
+    arg: &Path,
+    project_root: &Option<PathBuf>,
+) -> Result<piano::report::Run, Error> {
     if arg.exists() {
         return load_run(arg);
     }
     let tag = arg.to_string_lossy();
-    let tags_dir = default_tags_dir()?;
-    let runs_dir = default_runs_dir()?;
+    let tags_dir = default_tags_dir(project_root)?;
+    let runs_dir = default_runs_dir(project_root)?;
     load_tagged_run(&tags_dir, &runs_dir, &tag)
 }
 
-fn default_runs_dir() -> Result<PathBuf, Error> {
+fn default_runs_dir(project_root: &Option<PathBuf>) -> Result<PathBuf, Error> {
     if let Ok(dir) = std::env::var("PIANO_RUNS_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    let project = find_project_root(&std::env::current_dir()?).map_err(|_| Error::NoRuns)?;
+    let project = project_root.as_ref().ok_or(Error::NoRuns)?;
     let local = project.join("target/piano/runs");
     if local.is_dir() {
         return Ok(local);
@@ -746,11 +765,11 @@ fn default_runs_dir() -> Result<PathBuf, Error> {
     Err(Error::NoRuns)
 }
 
-fn default_tags_dir() -> Result<PathBuf, Error> {
+fn default_tags_dir(project_root: &Option<PathBuf>) -> Result<PathBuf, Error> {
     if let Ok(dir) = std::env::var("PIANO_TAGS_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    let project = find_project_root(&std::env::current_dir()?).map_err(|_| Error::NoRuns)?;
+    let project = project_root.as_ref().ok_or(Error::NoRuns)?;
     let local = project.join("target/piano/tags");
     if local.is_dir() {
         return Ok(local);
