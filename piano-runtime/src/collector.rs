@@ -1611,6 +1611,7 @@ pub(crate) fn burn_cpu(iterations: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::thread;
 
     #[test]
@@ -1686,6 +1687,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn init_can_be_called_multiple_times() {
         // Calling init() multiple times is safe (handler overwrites are idempotent).
         // We call the sub-components directly instead of init() to avoid
@@ -2213,6 +2215,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn records_from_other_threads_are_captured_via_shutdown() {
         reset();
         // Spawn a thread that does work, then joins.
@@ -2355,7 +2358,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // reset_all() clears ALL threads' records; must run in isolation
+    #[serial]
+    #[ignore] // reset_all() clears ALL threads; must run in full isolation (--ignored)
     fn reset_all_clears_cross_thread_records() {
         reset();
         // Produce records on a spawned thread.
@@ -2495,6 +2499,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn set_runs_dir_used_by_flush() {
         // set_runs_dir() should configure where flush() writes data,
         // without requiring PIANO_RUNS_DIR env var or ~/.piano/ fallback.
@@ -2527,6 +2532,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn shutdown_to_sets_runs_dir_for_flush() {
         // Verify that shutdown_impl_inner writes to the given directory.
         // flush() is also called but its output dir depends on the
@@ -2777,6 +2783,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn frames_on_disk_before_shutdown() {
         // Verify the end-to-end wiring: drop_cold at depth 0 calls
         // stream_frame(), which writes to disk when streaming is enabled.
