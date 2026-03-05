@@ -110,7 +110,7 @@ Frames exceeding 2x the median are flagged with `<<` for spike detection.
 
 ## How it works
 
-1. Copies your project to a staging directory (your source is never modified)
+1. Copies your project to `target/piano/staging/` (your source is never modified). The staging directory lives inside `target/` so `cargo clean` removes it. Because the path is stable across runs, cargo caches incremental builds there -- dependencies compile once and only instrumented source files recompile.
 2. Adds `piano-runtime` as a dependency in the staged Cargo.toml
 3. Parses source with `syn` and injects timing guards into matched functions
 4. Wraps your global allocator (including cfg-gated ones) for heap tracking
