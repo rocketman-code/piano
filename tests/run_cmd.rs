@@ -222,6 +222,82 @@ fn profile_suppresses_no_runs_error_on_nonzero_exit() {
     );
 }
 
+/// Project that exits non-zero before calling any instrumented function.
+/// The `work` function exists in source (so it gets instrumented) but never
+/// runs, meaning the runtime never writes profiling data.
+fn create_exit_early_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "exit-early"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"fn main() {
+    // Exit immediately -- work() is never called.
+    std::process::exit(1);
+}
+
+fn work() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..100 {
+        sum += i;
+    }
+    sum
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn profile_ignore_exit_code_surfaces_no_data_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("exit-early");
+    create_exit_early_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Create the runs dir so cmd_report hits NoRuns (empty dir) not an IO error.
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let output = Command::new(piano_bin)
+        .args(["profile", "--fn", "work", "--ignore-exit-code", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run piano profile with --ignore-exit-code");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // With --ignore-exit-code, the user wants profiling results despite
+    // non-zero exit. NoRuns should NOT be suppressed -- it surfaces as
+    // NoDataWritten so they know something went wrong with data collection.
+    assert!(
+        stderr.contains("profiling data was not written"),
+        "should show NoDataWritten error with --ignore-exit-code, got: {stderr}"
+    );
+
+    // The exit code warning should NOT appear (--ignore-exit-code suppresses it).
+    assert!(
+        !stderr.contains("exited with code"),
+        "should NOT warn about exit code with --ignore-exit-code, got: {stderr}"
+    );
+}
+
 #[test]
 fn profile_propagates_child_exit_code() {
     let tmp = tempfile::tempdir().unwrap();
