@@ -48,6 +48,7 @@ fn full_pipeline_instrument_build_run_verify() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("mini");
     create_mini_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     // Find the piano binary (built by cargo test).
     let piano_bin = env!("CARGO_BIN_EXE_piano");
@@ -157,6 +158,7 @@ fn build_with_no_targets_instruments_all_functions() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("mini");
     create_mini_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
