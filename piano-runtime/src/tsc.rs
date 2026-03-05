@@ -4,7 +4,7 @@
 //! to nanoseconds using a ratio calibrated once at startup. `bias_ticks()`
 //! returns the calibrated measurement overhead in raw ticks.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Numerator/denominator for converting ticks to nanoseconds.
@@ -137,7 +137,7 @@ pub(crate) fn calibrate_bias() {
             // future changes. Note: the previous read_volatile(&()) was a
             // no-op (ZST has no bytes to read, LLVM elides it entirely).
             // black_box requires Rust 1.66+ (MSRV is 1.59).
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            compiler_fence(Ordering::SeqCst);
             let end = read();
             samples.push(end.wrapping_sub(start));
         }
