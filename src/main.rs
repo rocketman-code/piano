@@ -543,6 +543,7 @@ fn cmd_run(
 ) -> Result<(), Error> {
     let binary = find_latest_binary(project_root)?;
     eprintln!("running: {}", binary.display());
+    eprintln!("--- program output ---");
 
     let timeout = duration.map(Duration::from_secs);
     let status = run_child(&binary, &args, timeout)?;
@@ -567,6 +568,7 @@ fn cmd_profile(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| binary.display().to_string());
     eprintln!("built: {display_name}");
+    eprintln!("--- program output ---");
 
     let timeout = duration.map(Duration::from_secs);
     let status = run_child(&binary, &args, timeout)?;
@@ -592,7 +594,7 @@ fn cmd_profile(
         unsafe { std::env::set_var("PIANO_RUNS_DIR", &runs_dir) };
     }
 
-    eprintln!();
+    eprintln!("--- profiling report ---");
     let report_result = match cmd_report(None, show_all, frames, project_root) {
         Ok(()) => Ok(()),
         Err(Error::NoRuns) if !status.success() && !ignore_exit_code => {
