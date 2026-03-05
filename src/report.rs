@@ -570,6 +570,188 @@ fn truncate_label(label: &str, max_len: usize) -> String {
     }
 }
 
+/// Structured JSON entry for a single function in a report.
+#[derive(serde::Serialize)]
+pub struct JsonFnEntry {
+    pub name: String,
+    pub self_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_self_ms: Option<f64>,
+    pub calls: u64,
+    pub alloc_count: u64,
+    pub alloc_bytes: u64,
+}
+
+/// Serialize a `Run` as a JSON array of function entries.
+///
+/// Mirrors the table columns: function name, self time, CPU time, calls,
+/// alloc count, alloc bytes. Sorted by self time descending.
+pub fn format_json(run: &Run, show_all: bool) -> String {
+    let mut entries: Vec<&FnEntry> = run.functions.iter().collect();
+    if !show_all {
+        entries.retain(|e| e.calls > 0);
+    }
+    entries.sort_by(|a, b| {
+        b.self_ms
+            .partial_cmp(&a.self_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let json_entries: Vec<JsonFnEntry> = entries
+        .iter()
+        .map(|e| JsonFnEntry {
+            name: e.name.clone(),
+            self_ms: e.self_ms,
+            cpu_self_ms: e.cpu_self_ms,
+            calls: e.calls,
+            alloc_count: e.alloc_count,
+            alloc_bytes: e.alloc_bytes,
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&json_entries).expect("JSON serialization should not fail")
+}
+
+/// Accumulated per-function counters for JSON frame aggregation.
+#[derive(Default)]
+struct JsonFnAgg {
+    name: String,
+    calls: u64,
+    self_ns: u64,
+    cpu_self_ns: Option<u64>,
+    alloc_count: u64,
+    alloc_bytes: u64,
+}
+
+/// Serialize frame-aggregated data as a JSON array of function entries.
+///
+/// Aggregates per-frame data into per-function totals, matching the summary
+/// table structure. Self time is converted from nanoseconds to milliseconds.
+pub fn format_json_with_frames(frame_data: &FrameData, show_all: bool) -> String {
+    let has_cpu = frame_data
+        .frames
+        .iter()
+        .any(|f| f.iter().any(|e| e.cpu_self_ns.is_some()));
+
+    let mut stats_map: HashMap<usize, JsonFnAgg> = HashMap::new();
+    for frame in &frame_data.frames {
+        for entry in frame {
+            let fn_id = entry.fn_id;
+            let stats = stats_map.entry(fn_id).or_insert_with(|| {
+                let name = frame_data
+                    .fn_names
+                    .get(fn_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("<fn_{fn_id}>"));
+                JsonFnAgg {
+                    name,
+                    cpu_self_ns: if has_cpu { Some(0) } else { None },
+                    ..Default::default()
+                }
+            });
+            stats.calls += entry.calls;
+            stats.self_ns += entry.self_ns;
+            if let (Some(total), Some(cpu)) = (&mut stats.cpu_self_ns, entry.cpu_self_ns) {
+                *total += cpu;
+            }
+            stats.alloc_count += entry.alloc_count;
+            stats.alloc_bytes += entry.alloc_bytes;
+        }
+    }
+
+    if show_all {
+        for (fn_id, name) in frame_data.fn_names.iter().enumerate() {
+            stats_map.entry(fn_id).or_insert_with(|| JsonFnAgg {
+                name: name.clone(),
+                cpu_self_ns: if has_cpu { Some(0) } else { None },
+                ..Default::default()
+            });
+        }
+    }
+
+    let mut entries: Vec<JsonFnAgg> = stats_map.into_values().collect();
+    if !show_all {
+        entries.retain(|e| e.calls > 0);
+    }
+    entries.sort_by(|a, b| b.self_ns.cmp(&a.self_ns));
+
+    let json_entries: Vec<JsonFnEntry> = entries
+        .iter()
+        .map(|e| JsonFnEntry {
+            name: e.name.clone(),
+            self_ms: e.self_ns as f64 / 1_000_000.0,
+            cpu_self_ms: e.cpu_self_ns.map(|ns| ns as f64 / 1_000_000.0),
+            calls: e.calls,
+            alloc_count: e.alloc_count,
+            alloc_bytes: e.alloc_bytes,
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&json_entries).expect("JSON serialization should not fail")
+}
+
+/// Structured JSON entry for a diff comparison.
+#[derive(serde::Serialize)]
+pub struct JsonDiffEntry {
+    pub name: String,
+    pub self_ms_a: f64,
+    pub self_ms_b: f64,
+    pub delta_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_pct: Option<f64>,
+    pub calls_a: u64,
+    pub calls_b: u64,
+}
+
+/// Serialize a diff between two runs as a JSON array.
+///
+/// Each entry contains the function name, self time from each run,
+/// the absolute delta, and the percentage change (null when the base is zero).
+pub fn diff_runs_json(a: &Run, b: &Run) -> String {
+    let a_map: HashMap<&str, &FnEntry> = a.functions.iter().map(|f| (f.name.as_str(), f)).collect();
+    let b_map: HashMap<&str, &FnEntry> = b.functions.iter().map(|f| (f.name.as_str(), f)).collect();
+
+    let mut names: Vec<&str> = a_map.keys().chain(b_map.keys()).copied().collect();
+    names.sort_unstable();
+    names.dedup();
+    names.sort_by(|na, nb| {
+        let delta_a = (b_map.get(na).map_or(0.0, |e| e.self_ms)
+            - a_map.get(na).map_or(0.0, |e| e.self_ms))
+        .abs();
+        let delta_b = (b_map.get(nb).map_or(0.0, |e| e.self_ms)
+            - a_map.get(nb).map_or(0.0, |e| e.self_ms))
+        .abs();
+        delta_b
+            .partial_cmp(&delta_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let json_entries: Vec<JsonDiffEntry> = names
+        .iter()
+        .map(|name| {
+            let self_a = a_map.get(name).map_or(0.0, |e| e.self_ms);
+            let self_b = b_map.get(name).map_or(0.0, |e| e.self_ms);
+            let delta = self_b - self_a;
+            let delta_pct = if self_a > 0.0 {
+                Some(delta / self_a * 100.0)
+            } else {
+                None
+            };
+            JsonDiffEntry {
+                name: name.to_string(),
+                self_ms_a: self_a,
+                self_ms_b: self_b,
+                delta_ms: delta,
+                delta_pct,
+                calls_a: a_map.get(name).map_or(0, |e| e.calls),
+                calls_b: b_map.get(name).map_or(0, |e| e.calls),
+            }
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&json_entries).expect("JSON serialization should not fail")
+}
+
 /// Show the delta between two runs, comparing functions by name.
 ///
 /// `label_a` and `label_b` are used as column headers (e.g. tag names or file stems).

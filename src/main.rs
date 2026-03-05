@@ -12,10 +12,11 @@ use piano::build::{
 };
 use piano::error::{Error, io_context};
 use piano::report::{
-    diff_runs, find_latest_run_file, find_ndjson_by_run_id, format_frames_table,
-    format_per_thread_tables, format_table, format_table_with_frames, load_latest_run,
-    load_latest_runs_per_thread, load_ndjson, load_run, load_run_by_id, load_tagged_run,
-    load_two_latest_runs, relative_time, resolve_tag, reverse_resolve_tag, save_tag,
+    diff_runs, diff_runs_json, find_latest_run_file, find_ndjson_by_run_id, format_frames_table,
+    format_json, format_json_with_frames, format_per_thread_tables, format_table,
+    format_table_with_frames, load_latest_run, load_latest_runs_per_thread, load_ndjson, load_run,
+    load_run_by_id, load_tagged_run, load_two_latest_runs, relative_time, resolve_tag,
+    reverse_resolve_tag, save_tag,
 };
 use piano::resolve::{ResolveResult, SkippedFunction, TargetSpec, resolve_targets};
 use piano::rewrite::{
@@ -109,6 +110,10 @@ enum Commands {
         #[arg(long)]
         frames: bool,
 
+        /// Output structured JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+
         /// Show per-thread breakdown instead of aggregated view.
         #[arg(long)]
         threads: bool,
@@ -138,6 +143,10 @@ enum Commands {
         #[arg(long)]
         frames: bool,
 
+        /// Output structured JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+
         /// Show per-thread breakdown instead of aggregated view.
         #[arg(long)]
         threads: bool,
@@ -148,6 +157,10 @@ enum Commands {
         a: Option<PathBuf>,
         /// Second run (path or tag).
         b: Option<PathBuf>,
+
+        /// Output structured JSON instead of a table.
+        #[arg(long)]
+        json: bool,
     },
     /// Tag the latest run, or list existing tags (no args).
     Tag {
@@ -173,6 +186,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             opts,
             all,
             frames,
+            json,
             threads,
             ignore_exit_code,
             duration,
@@ -182,6 +196,7 @@ fn run(cli: Cli) -> Result<(), Error> {
             &project_root,
             all,
             frames,
+            json,
             threads,
             ignore_exit_code,
             duration,
@@ -191,9 +206,10 @@ fn run(cli: Cli) -> Result<(), Error> {
             run,
             all,
             frames,
+            json,
             threads,
-        } => cmd_report(run, all, frames, threads, &project_root),
-        Commands::Diff { a, b } => cmd_diff(a, b, &project_root),
+        } => cmd_report(run, all, frames, json, threads, &project_root),
+        Commands::Diff { a, b, json } => cmd_diff(a, b, json, &project_root),
         Commands::Tag { name } => cmd_tag(name, &project_root),
     }
 }
@@ -572,6 +588,7 @@ fn cmd_profile(
     project_root: &Option<PathBuf>,
     show_all: bool,
     frames: bool,
+    json: bool,
     threads: bool,
     ignore_exit_code: bool,
     duration: Option<u64>,
@@ -612,7 +629,7 @@ fn cmd_profile(
     }
 
     eprintln!("--- profiling report ---");
-    let report_result = match cmd_report(None, show_all, frames, threads, project_root) {
+    let report_result = match cmd_report(None, show_all, frames, json, threads, project_root) {
         Ok(()) => Ok(()),
         Err(Error::NoRuns) if !status.success() && !ignore_exit_code => {
             // Program failed and produced no data. The program's own error
@@ -651,6 +668,7 @@ fn cmd_report(
     run_path: Option<PathBuf>,
     show_all: bool,
     frames: bool,
+    json: bool,
     threads: bool,
     project_root: &Option<PathBuf>,
 ) -> Result<(), Error> {
@@ -673,7 +691,11 @@ fn cmd_report(
                         },
                         other => other,
                     })?;
-                    anstream::print!("{}", format_table(&run, show_all));
+                    if json {
+                        println!("{}", format_json(&run, show_all));
+                    } else {
+                        anstream::print!("{}", format_table(&run, show_all));
+                    }
                     return Ok(());
                 }
             }
@@ -690,7 +712,9 @@ fn cmd_report(
         && path.extension().and_then(|e| e.to_str()) == Some("ndjson")
     {
         let (_run, frame_data) = load_ndjson(path)?;
-        if frames {
+        if json {
+            println!("{}", format_json_with_frames(&frame_data, show_all));
+        } else if frames {
             anstream::print!("{}", format_frames_table(&frame_data));
         } else {
             anstream::print!("{}", format_table_with_frames(&frame_data, show_all));
@@ -714,7 +738,11 @@ fn cmd_report(
             load_latest_run(&dir)?
         }
     };
-    anstream::print!("{}", format_table(&run, show_all));
+    if json {
+        println!("{}", format_json(&run, show_all));
+    } else {
+        anstream::print!("{}", format_table(&run, show_all));
+    }
     Ok(())
 }
 
@@ -734,6 +762,7 @@ fn diff_label(arg: &Path) -> String {
 fn cmd_diff(
     a: Option<PathBuf>,
     b: Option<PathBuf>,
+    json: bool,
     project_root: &Option<PathBuf>,
 ) -> Result<(), Error> {
     match (a, b) {
@@ -742,18 +771,25 @@ fn cmd_diff(
             let label_b = diff_label(&b);
             let run_a = resolve_run_arg(&a, project_root)?;
             let run_b = resolve_run_arg(&b, project_root)?;
-            anstream::print!("{}", diff_runs(&run_a, &run_b, &label_a, &label_b));
+            if json {
+                println!("{}", diff_runs_json(&run_a, &run_b));
+            } else {
+                anstream::print!("{}", diff_runs(&run_a, &run_b, &label_a, &label_b));
+            }
         }
         (None, None) => {
             let runs_dir = default_runs_dir(project_root)?;
             let tags_dir = default_tags_dir(project_root).ok();
             let (previous, latest) = load_two_latest_runs(&runs_dir)?;
 
-            let label_a = resolve_diff_label(&tags_dir, &previous, &runs_dir, "previous");
-            let label_b = resolve_diff_label(&tags_dir, &latest, &runs_dir, "latest");
-            eprintln!("comparing: {label_a} vs {label_b}");
-
-            anstream::print!("{}", diff_runs(&previous, &latest, &label_a, &label_b));
+            if json {
+                println!("{}", diff_runs_json(&previous, &latest));
+            } else {
+                let label_a = resolve_diff_label(&tags_dir, &previous, &runs_dir, "previous");
+                let label_b = resolve_diff_label(&tags_dir, &latest, &runs_dir, "latest");
+                eprintln!("comparing: {label_a} vs {label_b}");
+                anstream::print!("{}", diff_runs(&previous, &latest, &label_a, &label_b));
+            }
         }
         _ => {
             return Err(Error::DiffArgCount);
