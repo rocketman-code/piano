@@ -97,3 +97,23 @@ jobs:
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Run mutation testing on changed runtime files
+        run: |
+          if git diff origin/main --name-only -- piano-runtime/src/ | grep -q .; then
+            cargo mutants --package piano-runtime --in-diff <(git diff origin/main -- piano-runtime/src/) --jobs 4 --timeout 120
+          else
+            echo "No piano-runtime/src/ changes, skipping mutation testing"
+          fi
