@@ -67,6 +67,7 @@ Narrow instrumentation to specific functions, files, or modules:
 
 ```
 $ piano build --fn parse                     # functions matching "parse"
+$ piano build --fn parse --exact             # only functions named exactly "parse"
 $ piano build --fn "Parser::parse"           # specific impl method
 $ piano build --file src/lexer.rs            # all functions in a file
 $ piano build --mod resolver                 # all functions in a module
