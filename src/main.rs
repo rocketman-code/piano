@@ -528,10 +528,14 @@ fn cmd_profile(
     eprintln!();
     let report_result = match cmd_report(None, show_all, frames, project_root) {
         Ok(()) => Ok(()),
-        Err(Error::NoRuns) if !status.success() => {
+        Err(Error::NoRuns) if !status.success() && !ignore_exit_code => {
             // Program failed and produced no data. The program's own error
             // output is the primary affordance (UX principle 6). Suppress
             // Piano's NoRuns to avoid cascading errors.
+            //
+            // When --ignore-exit-code is set, the user explicitly asked to
+            // continue despite non-zero exit -- NoRuns should surface as
+            // NoDataWritten so they know profiling failed.
             Ok(())
         }
         Err(Error::NoRuns) if total_fns == 0 => {
