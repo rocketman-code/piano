@@ -119,3 +119,151 @@ pub fn extract_json_u64(s: &str, prefix: &str) -> Option<u64> {
         .unwrap_or(s.len() - start);
     s[start..start + end].parse().ok()
 }
+
+// ---------------------------------------------------------------------------
+// Seed infrastructure: pre-compile dependencies once, share across tests
+// ---------------------------------------------------------------------------
+
+use std::sync::OnceLock;
+
+/// Cached seed build artifacts for dep pre-population.
+pub struct SeedArtifacts {
+    _dir: tempfile::TempDir,
+    /// Path to {tempdir}/seed/target/piano
+    pub target_piano: PathBuf,
+}
+
+/// Return a seed with pre-compiled tokio + piano-runtime artifacts.
+pub fn tokio_seed() -> &'static SeedArtifacts {
+    static SEED: OnceLock<SeedArtifacts> = OnceLock::new();
+    SEED.get_or_init(|| {
+        build_seed(
+            "tokio-seed",
+            r#"[package]
+name = "tokio-seed"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tokio-seed"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+"#,
+            "async fn seed_fn() -> u64 { 1 }\n#[tokio::main]\nasync fn main() { seed_fn().await; }\n",
+            &["--fn", "seed_fn", "--fn", "main"],
+        )
+    })
+}
+
+/// Return a seed with pre-compiled rayon + piano-runtime artifacts.
+pub fn rayon_seed() -> &'static SeedArtifacts {
+    static SEED: OnceLock<SeedArtifacts> = OnceLock::new();
+    SEED.get_or_init(|| {
+        build_seed(
+            "rayon-seed",
+            r#"[package]
+name = "rayon-seed"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rayon-seed"
+path = "src/main.rs"
+
+[dependencies]
+rayon = "1"
+"#,
+            "fn seed_fn() { }\nfn main() { seed_fn(); }\n",
+            &["--fn", "seed_fn", "--fn", "main"],
+        )
+    })
+}
+
+/// Return a seed with pre-compiled piano-runtime only (no external deps).
+pub fn mini_seed() -> &'static SeedArtifacts {
+    static SEED: OnceLock<SeedArtifacts> = OnceLock::new();
+    SEED.get_or_init(|| {
+        build_seed(
+            "mini-seed",
+            r#"[package]
+name = "mini-seed"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mini-seed"
+path = "src/main.rs"
+"#,
+            "fn seed_fn() { }\nfn main() { seed_fn(); }\n",
+            &["--fn", "seed_fn", "--fn", "main"],
+        )
+    })
+}
+
+fn build_seed(name: &str, cargo_toml: &str, main_rs: &str, piano_args: &[&str]) -> SeedArtifacts {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().expect("create seed tempdir");
+    let project = dir.path().join(name);
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(project.join("Cargo.toml"), cargo_toml).unwrap();
+    std::fs::write(project.join("src/main.rs"), main_rs).unwrap();
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let mut cmd = Command::new(piano_bin);
+    cmd.args(["build"])
+        .args(piano_args)
+        .arg("--project")
+        .arg(&project)
+        .arg("--runtime-path")
+        .arg(&runtime_path);
+
+    let output = cmd.output().expect("failed to run piano build for seed");
+    assert!(
+        output.status.success(),
+        "seed build failed for {name}:\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+
+    SeedArtifacts {
+        target_piano: project.join("target/piano"),
+        _dir: dir,
+    }
+}
+
+/// Copy pre-compiled dep artifacts from a seed into a test project's
+/// target/piano/ directory. Uses `cp -Rp` to preserve timestamps
+/// (critical for cargo fingerprint validity).
+pub fn prepopulate_deps(project_dir: &std::path::Path, seed: &SeedArtifacts) {
+    use std::process::Command;
+
+    let dst = project_dir.join("target/piano");
+    std::fs::create_dir_all(dst.join("release")).unwrap();
+
+    let src_release = seed.target_piano.join("release");
+    let dst_release = dst.join("release");
+
+    for dir_name in ["deps", ".fingerprint", "build"] {
+        let src = src_release.join(dir_name);
+        if src.exists() {
+            let status = Command::new("cp")
+                .arg("-Rp")
+                .arg(&src)
+                .arg(dst_release.join(dir_name))
+                .status()
+                .expect("cp -Rp failed");
+            assert!(status.success(), "cp -Rp failed for {dir_name}");
+        }
+    }
+
+    let rustc_info = seed.target_piano.join(".rustc_info.json");
+    if rustc_info.exists() {
+        std::fs::copy(&rustc_info, dst.join(".rustc_info.json")).unwrap();
+    }
+}
