@@ -187,12 +187,9 @@ fn stream_frame_to_writer(state: &mut StreamState, buf: &[FrameFnSummary]) {
 }
 
 /// Push a frame into the thread-local in-memory buffer (fallback path).
-fn push_to_frames(buf: &[FrameFnSummary]) {
+fn push_to_frames(buf: Vec<FrameFnSummary>) {
     FRAMES.with(|frames| {
-        frames
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(buf.to_vec());
+        frames.lock().unwrap_or_else(|e| e.into_inner()).push(buf);
     });
 }
 
@@ -201,7 +198,7 @@ fn push_to_frames(buf: &[FrameFnSummary]) {
 /// When streaming is enabled (init() was called), writes one NDJSON line
 /// per frame to the global stream file. When not enabled (tests), pushes
 /// to the thread-local FRAMES vec as before.
-fn stream_frame(buf: &[FrameFnSummary]) {
+fn stream_frame(buf: Vec<FrameFnSummary>) {
     if !STREAMING_ENABLED.load(Ordering::Relaxed) {
         push_to_frames(buf);
         return;
@@ -236,7 +233,7 @@ fn stream_frame(buf: &[FrameFnSummary]) {
     }
 
     if let Some(ref mut s) = *state {
-        stream_frame_to_writer(s, buf);
+        stream_frame_to_writer(s, &buf);
     }
 }
 
@@ -875,12 +872,10 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         }
         if unpack_depth(entry.packed) == 0 {
             FRAME_BUFFER.with(|buf| {
-                let b = buf.borrow();
-                if !b.is_empty() {
-                    stream_frame(&b);
+                let taken = std::mem::take(&mut *buf.borrow_mut());
+                if !taken.is_empty() {
+                    stream_frame(taken);
                 }
-                drop(b);
-                buf.borrow_mut().clear();
             });
         }
     });
@@ -1031,21 +1026,17 @@ pub fn collect_invocations() -> Vec<InvocationRecord> {
 
 /// Collect frame data from ALL threads via the global THREAD_FRAMES registry.
 ///
-/// Same pattern as `collect_all()` for THREAD_RECORDS -- clones Arc handles
-/// under the global lock, then drops the lock before iterating per-thread
-/// frames.
+/// Iterates per-thread frame Arcs under the registry lock, collecting all
+/// completed frames.
 ///
 /// No `flush_records_buf()` call is needed here: FRAMES is populated at
 /// depth-0 boundaries -- the same point where RECORDS_BUF is flushed into
 /// RECORDS. By the time a frame appears in FRAMES, its records have already
 /// been flushed.
 pub fn collect_frames() -> Vec<Vec<FrameFnSummary>> {
-    let arcs: Vec<ThreadFrameArc> = {
-        let registry = thread_frames().lock().unwrap_or_else(|e| e.into_inner());
-        registry.clone()
-    };
+    let registry = thread_frames().lock().unwrap_or_else(|e| e.into_inner());
     let mut all_frames = Vec::new();
-    for arc in &arcs {
+    for arc in registry.iter() {
         let frames = arc.lock().unwrap_or_else(|e| e.into_inner());
         all_frames.extend(frames.iter().cloned());
     }
@@ -1056,9 +1047,8 @@ pub fn collect_frames() -> Vec<Vec<FrameFnSummary>> {
 /// This is the primary collection method for cross-thread profiling — it
 /// captures data from thread-pool workers whose TLS destructors may never fire.
 ///
-/// Clones the Arc handles under the global lock, then drops the lock before
-/// iterating per-thread records. This avoids blocking new thread registrations
-/// while aggregation is in progress.
+/// Iterates per-thread records under the registry lock, merging FnAgg
+/// entries in-place.
 ///
 /// Note: `REGISTERED` (the set of known function names) is read from the
 /// calling thread's TLS only. Function names registered on other threads
@@ -1376,15 +1366,13 @@ pub fn shutdown_to(dir: &str) {
 /// Collect merged FnAgg records from all threads (raw aggregates, not FunctionRecord).
 ///
 /// Shared core for `collect_all()` and `flush()` — flushes the calling thread's
-/// buffer, clones thread Arcs, then merges FnAgg entries via linear scan.
+/// buffer, then iterates per-thread records under the registry lock, merging
+/// FnAgg entries via linear scan.
 fn collect_all_fnagg() -> Vec<FnAgg> {
     flush_records_buf();
-    let arcs: Vec<ThreadRecordArc> = {
-        let registry = thread_records().lock().unwrap_or_else(|e| e.into_inner());
-        registry.clone()
-    };
+    let registry = thread_records().lock().unwrap_or_else(|e| e.into_inner());
     let mut merged: Vec<FnAgg> = Vec::new();
-    for arc in &arcs {
+    for arc in registry.iter() {
         let records = arc.lock().unwrap_or_else(|e| e.into_inner());
         for entry in records.iter() {
             if let Some(dst) = merged.iter_mut().find(|e| std::ptr::eq(e.name, entry.name)) {
@@ -1589,12 +1577,10 @@ impl Drop for AdoptGuard {
             if unpack_depth(entry.packed) == 0 {
                 flush_records_buf();
                 FRAME_BUFFER.with(|buf| {
-                    let b = buf.borrow();
-                    if !b.is_empty() {
-                        stream_frame(&b);
+                    let taken = std::mem::take(&mut *buf.borrow_mut());
+                    if !taken.is_empty() {
+                        stream_frame(taken);
                     }
-                    drop(b);
-                    buf.borrow_mut().clear();
                 });
             }
 
