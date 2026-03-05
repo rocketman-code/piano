@@ -404,6 +404,59 @@ mod tests {
         assert!(records.iter().any(|r| r.name == "split_inner"));
     }
 
+    /// Verifies that cpu_accumulated_ns is correctly subtracted from cpu_now_ns
+    /// during the install phase. If `-` is mutated to `+` or `/`, the
+    /// cpu_start_ns would be wrong, causing CPU time to be grossly over- or
+    /// under-counted across yields.
+    #[cfg(feature = "cpu-time")]
+    #[test]
+    fn piano_future_cpu_time_across_yields() {
+        collector::reset();
+        run(async {
+            PianoFuture::new(async {
+                let _guard = collector::enter("cpu_yield");
+                collector::register("cpu_yield");
+
+                // Do some CPU work before yield
+                collector::burn_cpu(10_000);
+                tokio::task::yield_now().await;
+
+                // Do more CPU work after yield
+                collector::burn_cpu(10_000);
+                tokio::task::yield_now().await;
+
+                // Final burst
+                collector::burn_cpu(10_000);
+            })
+            .await;
+        });
+
+        let records = collector::collect_all();
+        let rec = records.iter().find(|r| r.name == "cpu_yield").unwrap();
+
+        // CPU time should reflect actual compute across all three bursts.
+        // burn_cpu(10_000) takes measurable CPU time. Total should be > 0.
+        assert!(
+            rec.cpu_self_ms > 0.0,
+            "cpu_self_ms should be positive after CPU work: got {:.3}ms",
+            rec.cpu_self_ms,
+        );
+
+        // If `-` were `+`, cpu_start_ns would be cpu_now + accumulated,
+        // which is far in the future. The elapsed CPU time would wrap to
+        // a huge value or be negative (saturated to 0).
+        // If `-` were `/`, cpu_start_ns would be cpu_now / accumulated
+        // which is near 0, making elapsed CPU time equal to cpu_now (~huge).
+        // Either way, the result would be wildly different from wall time.
+        // CPU time should not exceed wall time (it's a single thread).
+        assert!(
+            rec.cpu_self_ms < rec.total_ms * 2.0,
+            "cpu_self_ms ({:.3}) should not grossly exceed total_ms ({:.3}) -- arithmetic bug?",
+            rec.cpu_self_ms,
+            rec.total_ms,
+        );
+    }
+
     #[test]
     fn piano_future_drop_restores_stack_for_cancelled_guards() {
         // Verifies that PianoFuture::drop pushes saved_entries back onto
