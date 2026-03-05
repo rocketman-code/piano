@@ -130,10 +130,14 @@ pub(crate) fn calibrate_bias() {
         let mut samples = Vec::with_capacity(N);
         for _ in 0..N {
             let start = read();
-            // Optimization barrier: prevent the compiler from reordering or
-            // eliding the two read() calls. Uses volatile instead of
-            // core::hint::black_box which requires Rust 1.66+.
-            unsafe { core::ptr::read_volatile(&()) };
+            // Compiler barrier: prevents reordering or merging of the two
+            // read() calls. Emits no instructions but LLVM will not move
+            // memory operations across it. The read() calls use inline asm
+            // which already prevents reordering, but this guards against
+            // future changes. Note: the previous read_volatile(&()) was a
+            // no-op (ZST has no bytes to read, LLVM elides it entirely).
+            // black_box requires Rust 1.66+ (MSRV is 1.59).
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
             let end = read();
             samples.push(end.wrapping_sub(start));
         }
