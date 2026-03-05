@@ -127,6 +127,11 @@ struct StreamState {
 
 /// Global streaming file handle, lazily opened on first frame.
 ///
+/// All threads serialize frame writes through this single mutex. For typical
+/// profiling workloads (tens to hundreds of frame boundaries per second),
+/// contention is negligible. For rayon micro-benchmarks with thousands of
+/// short iterations per second, consider the overhead.
+///
 /// TESTING: Process-global. Tests that open or close the stream file must
 /// use `#[serial]` to avoid corrupting concurrent tests' output.
 static STREAM_FILE: SyncOnceCell<Mutex<Option<StreamState>>> = SyncOnceCell::new();
