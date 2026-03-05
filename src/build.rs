@@ -259,8 +259,10 @@ pub fn find_bin_entry_point(project_dir: &Path) -> Result<PathBuf, Error> {
     )))
 }
 
-/// Build the instrumented binary using `cargo build --release --message-format=json`.
+/// Build the instrumented binary using `cargo build --message-format=json`.
 /// Returns the path to the compiled executable.
+///
+/// When `release` is true, passes `--release` to cargo for an optimized build.
 ///
 /// When `package` is `Some`, passes `-p <name>` to cargo to build a specific
 /// workspace member (used when staging an entire workspace).
@@ -268,17 +270,20 @@ pub fn build_instrumented(
     staging_dir: &Path,
     target_dir: &Path,
     package: Option<&str>,
+    release: bool,
 ) -> Result<PathBuf, Error> {
     // Remove RUSTUP_TOOLCHAIN so the target project's rust-toolchain.toml
     // is respected. Without this, nested cargo invocations inherit the
     // parent's toolchain, ignoring the project's pinned version.
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
-        .arg("--release")
         .arg("--message-format=json")
         .env("CARGO_TARGET_DIR", target_dir)
         .env_remove("RUSTUP_TOOLCHAIN")
         .current_dir(staging_dir);
+    if release {
+        cmd.arg("--release");
+    }
     if let Some(pkg) = package {
         cmd.arg("-p").arg(pkg);
     }

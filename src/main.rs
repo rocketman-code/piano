@@ -68,6 +68,10 @@ struct BuildOpts {
     /// Show functions excluded from instrumentation and exit.
     #[arg(long)]
     list_skipped: bool,
+
+    /// Build with the release profile (optimized).
+    #[arg(long)]
+    release: bool,
 }
 
 #[derive(Subcommand)]
@@ -183,6 +187,7 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf, usize)>, E
         runtime_path,
         cpu_time,
         list_skipped,
+        release,
     } = opts;
 
     let project = match project {
@@ -393,7 +398,7 @@ fn build_project(opts: BuildOpts) -> Result<Option<(PathBuf, PathBuf, usize)>, E
     }
 
     // Build the instrumented binary.
-    let binary = build_instrumented(&staging, &target_dir, package_name.as_deref())?;
+    let binary = build_instrumented(&staging, &target_dir, package_name.as_deref(), release)?;
 
     Ok(Some((binary, runs_dir, total_fns)))
 }
@@ -423,42 +428,51 @@ fn is_binary_extension(ext: &std::ffi::OsStr) -> bool {
 
 fn find_latest_binary() -> Result<PathBuf, Error> {
     let project = find_project_root(&std::env::current_dir()?).map_err(|_| Error::NoBinary)?;
-    let dir = project.join("target/piano/release");
-    if !dir.is_dir() {
+    // Check both release and debug directories, pick the most recent binary.
+    let release_dir = project.join("target/piano/release");
+    let debug_dir = project.join("target/piano/debug");
+    let dirs: Vec<&PathBuf> = [&release_dir, &debug_dir]
+        .iter()
+        .filter(|d| d.is_dir())
+        .copied()
+        .collect();
+    if dirs.is_empty() {
         return Err(Error::NoBinary);
     }
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
-    for entry in std::fs::read_dir(&dir).map_err(io_context("read directory", &dir))? {
-        let entry = entry.map_err(io_context("read directory entry", &dir))?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        // Skip non-binary files by extension. On Unix, binaries have no extension.
-        // On Windows, binaries have .exe extension -- allow those through.
-        if let Some(ext) = path.extension() {
-            if !is_binary_extension(ext) {
+    for dir in &dirs {
+        for entry in std::fs::read_dir(dir).map_err(io_context("read directory", dir))? {
+            let entry = entry.map_err(io_context("read directory entry", dir))?;
+            let path = entry.path();
+            if !path.is_file() {
                 continue;
             }
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
+            // Skip non-binary files by extension. On Unix, binaries have no extension.
+            // On Windows, binaries have .exe extension -- allow those through.
+            if let Some(ext) = path.extension() {
+                if !is_binary_extension(ext) {
+                    continue;
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = entry
+                    .metadata()
+                    .map_err(io_context("read metadata", &path))?;
+                if meta.permissions().mode() & 0o111 == 0 {
+                    continue; // not executable
+                }
+            }
             let meta = entry
                 .metadata()
                 .map_err(io_context("read metadata", &path))?;
-            if meta.permissions().mode() & 0o111 == 0 {
-                continue; // not executable
+            let mtime = meta
+                .modified()
+                .map_err(io_context("read modified time", &path))?;
+            if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
+                best = Some((path, mtime));
             }
-        }
-        let meta = entry
-            .metadata()
-            .map_err(io_context("read metadata", &path))?;
-        let mtime = meta
-            .modified()
-            .map_err(io_context("read modified time", &path))?;
-        if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
-            best = Some((path, mtime));
         }
     }
     best.map(|(p, _)| p).ok_or(Error::NoBinary)
