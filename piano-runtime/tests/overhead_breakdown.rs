@@ -196,7 +196,11 @@ fn measure_mutex_lock_only() -> f64 {
 }
 
 /// FRAME_BUFFER push: RefCell<Vec<InvocationRecord>> push on every drop.
+/// Clears every DEPTH0_BOUNDARY entries to match real usage: the runtime
+/// clears FRAME_BUFFER at each depth-0 boundary (typically 1-5 entries).
 fn measure_frame_buffer_push() -> f64 {
+    const DEPTH0_BOUNDARY: u64 = 3;
+
     struct InvRecord {
         _name: &'static str,
         _start_ns: u64,
@@ -214,7 +218,7 @@ fn measure_frame_buffer_push() -> f64 {
     }
 
     let start = Instant::now();
-    for _ in 0..N {
+    for i in 0..N {
         BUF.with(|buf| {
             buf.borrow_mut().push(InvRecord {
                 _name: "test",
@@ -227,6 +231,9 @@ fn measure_frame_buffer_push() -> f64 {
                 _free_bytes: 0,
                 _depth: 0,
             });
+            if (i + 1) % DEPTH0_BOUNDARY == 0 {
+                buf.borrow_mut().clear();
+            }
         });
     }
     ns_per_call(start.elapsed())
@@ -363,6 +370,67 @@ fn measure_frame_aggregation() -> f64 {
         }
         let result: Vec<Summary> = map.into_values().collect();
         black_box(result);
+    }
+    ns_per_call(start.elapsed())
+}
+
+/// Frame aggregation: Vec linear scan with pointer identity, replicating
+/// what merge_into_frame_buf() does on every depth-0 drop.
+fn measure_frame_aggregation_vec() -> f64 {
+    struct InvRecord {
+        name: &'static str,
+        self_ns: u64,
+        alloc_count: u64,
+        alloc_bytes: u64,
+        free_count: u64,
+        free_bytes: u64,
+    }
+
+    struct Summary {
+        _name: &'static str,
+        _calls: u32,
+        _self_ns: u64,
+        _alloc_count: u64,
+        _alloc_bytes: u64,
+        _free_count: u64,
+        _free_bytes: u64,
+    }
+
+    // Single-entry frame (typical for flat loop)
+    let records = vec![InvRecord {
+        name: "test",
+        self_ns: 100,
+        alloc_count: 0,
+        alloc_bytes: 0,
+        free_count: 0,
+        free_bytes: 0,
+    }];
+
+    let start = Instant::now();
+    for _ in 0..N {
+        // Replicate merge_into_frame_buf: Vec linear scan with pointer identity
+        let mut buf: Vec<Summary> = Vec::new();
+        for rec in &records {
+            if let Some(entry) = buf.iter_mut().find(|e| std::ptr::eq(e._name, rec.name)) {
+                entry._calls += 1;
+                entry._self_ns += rec.self_ns;
+                entry._alloc_count += rec.alloc_count;
+                entry._alloc_bytes += rec.alloc_bytes;
+                entry._free_count += rec.free_count;
+                entry._free_bytes += rec.free_bytes;
+            } else {
+                buf.push(Summary {
+                    _name: rec.name,
+                    _calls: 1,
+                    _self_ns: rec.self_ns,
+                    _alloc_count: rec.alloc_count,
+                    _alloc_bytes: rec.alloc_bytes,
+                    _free_count: rec.free_count,
+                    _free_bytes: rec.free_bytes,
+                });
+            }
+        }
+        black_box(&buf);
     }
     ns_per_call(start.elapsed())
 }
@@ -573,6 +641,7 @@ fn overhead_breakdown() {
     let depth0 = measure_piano_depth0();
     let depth1 = measure_piano_depth1();
     let frame_agg = measure_frame_aggregation();
+    let frame_agg_vec = measure_frame_aggregation_vec();
     let drain = measure_drain_collect();
     let multi_tls = measure_multi_tls();
     let acc_save = measure_alloc_acc_save();
@@ -628,7 +697,16 @@ fn overhead_breakdown() {
     eprintln!();
     eprintln!(
         "  {:<45} {:>8.1}ns",
-        "HashMap alloc+insert+collect (agg frame)", frame_agg
+        "HashMap alloc+insert+collect (old agg)", frame_agg
+    );
+    eprintln!(
+        "  {:<45} {:>8.1}ns",
+        "Vec linear scan (current agg)", frame_agg_vec
+    );
+    eprintln!(
+        "  {:<45} {:>8.1}ns",
+        "HashMap vs Vec delta",
+        frame_agg - frame_agg_vec
     );
     eprintln!(
         "  {:<45} {:>8.1}ns",
