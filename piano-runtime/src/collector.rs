@@ -2706,7 +2706,11 @@ mod tests {
         // shutdown_impl_inner should try to write and fail, printing to stderr.
         // We can't easily capture stderr in a unit test, so instead verify
         // that the function does not panic and returns normally.
-        shutdown_impl_inner(&tmp);
+        let failed = shutdown_impl_inner(&tmp);
+        assert!(
+            failed,
+            "shutdown_impl_inner should return true when writes fail"
+        );
 
         // Clean up.
         let _ = std::fs::remove_file(&tmp);
