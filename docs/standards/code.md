@@ -41,7 +41,7 @@ Integration tests in `tests/`. Unit tests in source files (`#[cfg(test)]` module
 
 ### ci.yml (all PRs + push to main)
 
-Six jobs:
+Seven jobs:
 
 1. `fmt` (ubuntu-latest) -- `cargo fmt --check`
 2. `clippy` (ubuntu-latest) -- `cargo clippy --workspace --all-targets -- -D warnings`
@@ -49,6 +49,7 @@ Six jobs:
 4. `msrv` (ubuntu-latest) -- tests on Rust 1.88 (CLI MSRV) + installs 1.59 for runtime MSRV test
 5. `doc` (ubuntu-latest) -- `cargo doc --workspace --no-deps` with `-D warnings`
 6. `coverage` (ubuntu-latest) -- `cargo llvm-cov --workspace --features piano-runtime/cpu-time --lcov`, uploads to Codecov
+7. `test-hygiene` (ubuntu-latest) -- rejects `std::env::set_var` / `remove_var` in `piano-runtime/src/` to prevent flaky test regressions
 
 ### release.yml (release/* PRs only)
 
