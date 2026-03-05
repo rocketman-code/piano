@@ -620,6 +620,7 @@ fn merge_into_fnagg_vec(
 }
 
 /// Merge a single invocation into a Vec<FrameFnSummary> via linear scan on interned name pointer.
+#[allow(clippy::too_many_arguments)]
 fn merge_into_frame_buf(
     buf: &mut Vec<FrameFnSummary>,
     name: &'static str,
