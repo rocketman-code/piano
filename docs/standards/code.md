@@ -28,23 +28,14 @@ Integration tests in `tests/`. Unit tests in source files (`#[cfg(test)]` module
 
 - `e2e.rs` -- full pipeline: instrument, build, run, check output
 - `sample_crossval.rs` -- validate report output against known-good samples
-- `cross_thread.rs` -- multi-threaded instrumentation with fork/adopt
-- `cpu_time.rs` -- CPU time feature pipeline
-- `integration_frames.rs` -- per-frame NDJSON output
-- `alloc_threaded.rs` -- allocation tracking across threads
-- `async_alloc.rs` -- async-aware allocation tracking across .await points
-- `async_self_time.rs` -- async self-time measurement
-- `async_tokio.rs` -- async instrumentation with tokio runtime
+- `async_integration.rs` -- consolidated async tests (tokio, alloc, self-time, nested select, main return type)
+- `threaded_integration.rs` -- consolidated threaded tests (rayon alloc tracking, cross-thread instrumentation)
+- `minimal_integration.rs` -- consolidated minimal-dep tests (cfg-gated alloc, cpu time, custom bin path, exit in non-main, integration frames, strict lints, workspace member)
 - `macro_rules.rs` -- macro_rules! template instrumentation
 - `project_root.rs` -- project root detection
 - `run_cmd.rs` -- `piano run` command pipeline
 - `special_fns.rs` -- special function handling (const fn, unsafe fn, extern fn)
 - `msrv_compat.rs` -- runtime compiles on Rust 1.59
-- `strict_lints.rs` -- runtime compiles with strict warnings
-- `workspace_member.rs` -- workspace member instrumentation
-- `custom_bin_path.rs` -- non-default binary entry points
-- `async_main_return_type.rs` -- async main with return type pipeline
-- `exit_in_non_main.rs` -- process::exit in non-main function data capture
 
 ## CI
 
