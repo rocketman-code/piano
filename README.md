@@ -120,12 +120,12 @@ The runtime has zero external dependencies to avoid conflicts with your project.
 
 ## When to use something else
 
-`piano` adds ~61ns/call overhead on Apple Silicon and ~319ns/call on x86-64. You can narrow instrumentation with `--fn`, `--file`, or `--mod` to reduce this. For programs with millions of short function calls, a sampling profiler like `perf` or `cargo-flamegraph` will add less overhead. `piano` is a better fit when you want exact call counts, self-time breakdowns, or allocation tracking without configuring OS-level tooling.
+`piano` adds ~69ns/call overhead on Apple Silicon and ~303ns/call on x86-64. You can narrow instrumentation with `--fn`, `--file`, or `--mod` to reduce this. For programs with millions of short function calls, a sampling profiler like `perf` or `cargo-flamegraph` will add less overhead. `piano` is a better fit when you want exact call counts, self-time breakdowns, or allocation tracking without configuring OS-level tooling.
 
 ## Limitations
 
-- Timing bias per call: ~0.25ns Apple Silicon, ~13ns x86-64 Linux. Functions faster than the bias floor will show inflated times.
-- `const fn`, `unsafe fn`, and `extern fn` are skipped (use `--list-skipped` to see them)
+- Measurement bias is calibrated at startup; residual bias is ~0.3ns Apple Silicon, ~1.8ns x86-64. Functions faster than the residual floor will show inflated times.
+- `const fn`, `unsafe fn`, and `extern fn` are skipped (use `piano build --list-skipped` to see them)
 - Allocation tracking covers heap operations only (stack allocations are not tracked)
 - Binary crates only (no libraries)
 
