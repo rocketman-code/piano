@@ -47,6 +47,7 @@ fn run_command_builds_executes_and_reports() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("mini");
     create_mini_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -127,6 +128,7 @@ fn run_command_warns_on_nonzero_exit_code() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("exit-one");
     create_exit_one_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -156,6 +158,7 @@ fn run_command_ignore_exit_code_suppresses_warning() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("exit-one");
     create_exit_one_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -185,6 +188,7 @@ fn profile_suppresses_no_runs_error_on_nonzero_exit() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("exit-one");
     create_exit_one_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -223,6 +227,7 @@ fn profile_propagates_child_exit_code() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("exit-one");
     create_exit_one_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -256,6 +261,7 @@ fn profile_ignore_exit_code_returns_success() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("exit-one");
     create_exit_one_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -309,6 +315,7 @@ fn run_command_passes_args_after_separator() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("echo-args");
     create_echo_args_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -345,6 +352,7 @@ fn run_executes_last_built_binary() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("mini");
     create_mini_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -396,6 +404,7 @@ fn run_passes_args_via_separator() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("echo-args");
     create_echo_args_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -438,6 +447,7 @@ fn process_exit_preserves_profiling_data() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("exit-one");
     create_exit_one_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -526,6 +536,7 @@ fn profile_captures_data_on_panic() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("panic-test");
     create_panic_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
