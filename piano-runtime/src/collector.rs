@@ -28,7 +28,7 @@
 //! so that child thread elapsed time is correctly subtracted from the parent's
 //! self-time. `SpanContext` auto-finalizes on Drop.
 
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
@@ -439,6 +439,7 @@ pub struct InvocationRecord {
 }
 
 /// Entry on the thread-local timing stack.
+#[derive(Clone, Copy)]
 pub(crate) struct StackEntry {
     pub(crate) name: &'static str,
     pub(crate) children_ns: u64,
@@ -498,7 +499,69 @@ fn thread_frames() -> &'static Mutex<Vec<ThreadFrameArc>> {
 }
 
 thread_local! {
-    pub(crate) static STACK: RefCell<Vec<StackEntry>> = RefCell::new(Vec::new());
+    pub(crate) static STACK: UnsafeCell<Vec<StackEntry>> = UnsafeCell::new(Vec::new());
+    /// Debug-only borrow counter to detect reentrant STACK access (replaces
+    /// RefCell's runtime borrow checking at zero cost in release builds).
+    /// Positive = number of shared borrows, -1 = exclusive borrow.
+    #[cfg(debug_assertions)]
+    static STACK_BORROW_COUNT: Cell<isize> = Cell::new(0);
+}
+
+/// Access STACK with an exclusive (&mut) borrow, with debug-mode reentrance detection.
+///
+/// In debug builds, asserts that no other borrow is active (same guarantee RefCell
+/// provides, at zero cost in release). In release builds, compiles to a plain
+/// UnsafeCell::get dereference.
+///
+/// SAFETY contract: the closure `f` must not call any function that accesses STACK
+/// (enter, drop_cold, fork, adopt, reset, or PianoFuture::poll). All current call
+/// sites satisfy this — they do local Vec operations and return.
+#[inline(always)]
+pub(crate) fn with_stack_mut<R>(f: impl FnOnce(&mut Vec<StackEntry>) -> R) -> R {
+    STACK.with(|stack| {
+        #[cfg(debug_assertions)]
+        {
+            STACK_BORROW_COUNT.with(|c| {
+                assert!(
+                    c.get() == 0,
+                    "piano-runtime: reentrant STACK borrow detected (bug)"
+                );
+                c.set(-1);
+            });
+        }
+        let r = f(unsafe { &mut *stack.get() });
+        #[cfg(debug_assertions)]
+        {
+            STACK_BORROW_COUNT.with(|c| c.set(0));
+        }
+        r
+    })
+}
+
+/// Access STACK with a shared (&) borrow, with debug-mode reentrance detection.
+#[inline(always)]
+pub(crate) fn with_stack_ref<R>(f: impl FnOnce(&Vec<StackEntry>) -> R) -> R {
+    STACK.with(|stack| {
+        #[cfg(debug_assertions)]
+        {
+            STACK_BORROW_COUNT.with(|c| {
+                assert!(
+                    c.get() >= 0,
+                    "piano-runtime: reentrant STACK borrow detected (bug)"
+                );
+                c.set(c.get() + 1);
+            });
+        }
+        let r = f(unsafe { &*stack.get() });
+        #[cfg(debug_assertions)]
+        {
+            STACK_BORROW_COUNT.with(|c| c.set(c.get() - 1));
+        }
+        r
+    })
+}
+
+thread_local! {
     static RECORDS: Arc<Mutex<Vec<FnAgg>>> = {
         let arc = Arc::new(Mutex::new(Vec::new()));
         thread_records().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&arc));
@@ -722,8 +785,8 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         .try_with(|cell| cell.get())
         .unwrap_or_default();
 
-    STACK.with(|stack| {
-        let entry = match stack.borrow_mut().pop() {
+    with_stack_mut(|s| {
+        let entry = match s.pop() {
             Some(e) => e,
             None => {
                 eprintln!("piano-runtime: guard dropped without matching stack entry (bug)");
@@ -747,7 +810,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         #[cfg(feature = "cpu-time")]
         let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
 
-        if let Some(parent) = stack.borrow_mut().last_mut() {
+        if let Some(parent) = s.last_mut() {
             parent.children_ns += elapsed_ns;
             #[cfg(feature = "cpu-time")]
             {
@@ -804,7 +867,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         // but fork/adopt places an entry at depth 0 on worker threads,
         // pushing real functions to depth 1+. Flush when all remaining
         // stack entries are at depth 0 (all real work for this frame done).
-        let remaining_all_base = stack.borrow().iter().all(|e| unpack_depth(e.packed) == 0);
+        let remaining_all_base = s.iter().all(|e| unpack_depth(e.packed) == 0);
         let is_frame_boundary = unpack_depth(entry.packed) == 0 || remaining_all_base;
 
         if is_frame_boundary {
@@ -865,10 +928,10 @@ fn enter_cold(name: &'static str) {
     #[cfg(feature = "cpu-time")]
     let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
 
-    STACK.with(|stack| {
-        let depth = stack.borrow().len() as u16;
+    with_stack_mut(|s| {
+        let depth = s.len() as u16;
         let packed = pack_name_depth(name_id, depth);
-        stack.borrow_mut().push(StackEntry {
+        s.push(StackEntry {
             name,
             children_ns: 0,
             #[cfg(feature = "cpu-time")]
@@ -1013,7 +1076,7 @@ pub fn collect_all() -> Vec<FunctionRecord> {
 
 /// Clear all collected timing data for the current thread.
 pub fn reset() {
-    STACK.with(|stack| stack.borrow_mut().clear());
+    with_stack_mut(|s| s.clear());
     RECORDS_BUF.with(|buf| buf.borrow_mut().clear());
     RECORDS.with(|records| {
         records.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1475,8 +1538,8 @@ impl SpanContext {
                 .children_cpu_ns
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            STACK.with(|stack| {
-                if let Some(top) = stack.borrow_mut().last_mut() {
+            with_stack_mut(|s| {
+                if let Some(top) = s.last_mut() {
                     top.cpu_children_ns += children_cpu;
                 }
             });
@@ -1508,8 +1571,8 @@ impl Drop for AdoptGuard {
         // Restore the parent's saved alloc counters (same pattern as Guard::drop).
         // The adopted scope's alloc data isn't recorded into an InvocationRecord,
         // but the restore is necessary for correct nesting.
-        STACK.with(|stack| {
-            let entry = match stack.borrow_mut().pop() {
+        with_stack_mut(|s| {
+            let entry = match s.pop() {
                 Some(e) => e,
                 None => return,
             };
@@ -1555,9 +1618,8 @@ impl Drop for AdoptGuard {
 /// Returns `None` if the call stack is empty (no active span to fork from).
 /// Pass the returned context to child threads via `adopt()`.
 pub fn fork() -> Option<SpanContext> {
-    STACK.with(|stack| {
-        let stack = stack.borrow();
-        let top = stack.last()?;
+    with_stack_ref(|s| {
+        let top = s.last()?;
         Some(SpanContext {
             parent_name: top.name,
             #[cfg(feature = "cpu-time")]
@@ -1585,9 +1647,9 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
     #[cfg(feature = "cpu-time")]
     let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
 
-    STACK.with(|stack| {
-        let depth = stack.borrow().len() as u16;
-        stack.borrow_mut().push(StackEntry {
+    with_stack_mut(|s| {
+        let depth = s.len() as u16;
+        s.push(StackEntry {
             name: ctx.parent_name,
             children_ns: 0,
             #[cfg(feature = "cpu-time")]
@@ -3162,5 +3224,25 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn reentrant_stack_access_panics_in_debug() {
+        // Verify that the debug-mode borrow guard on STACK detects reentrant
+        // access. This ensures UnsafeCell usage stays sound even if someone
+        // accidentally introduces a nested STACK access.
+        reset();
+        let result = std::panic::catch_unwind(|| {
+            with_stack_mut(|_outer| {
+                // Attempt a nested access while the outer borrow is active.
+                // This should panic due to the STACK_BORROW_COUNT guard.
+                with_stack_ref(|_inner| {});
+            });
+        });
+        assert!(
+            result.is_err(),
+            "nested STACK access should panic in debug mode"
+        );
     }
 }
