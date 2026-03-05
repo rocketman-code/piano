@@ -2631,4 +2631,23 @@ fn main() {}
             "fallback negation should reference both predicates"
         );
     }
+
+    #[test]
+    fn mixed_cfg_gated_and_unconditional_allocator_returns_unconditional() {
+        let source = r#"
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC_LINUX: Jemalloc = Jemalloc;
+
+#[global_allocator]
+static ALLOC: System = System;
+
+fn main() {}
+"#;
+        let kind = detect_allocator_kind(source).unwrap();
+        assert!(
+            matches!(kind, AllocatorKind::Unconditional),
+            "unconditional allocator should take precedence over cfg-gated. Got: {kind:?}"
+        );
+    }
 }
