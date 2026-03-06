@@ -75,6 +75,10 @@ struct BuildOpts {
     /// Show functions excluded from instrumentation and exit.
     #[arg(long)]
     list_skipped: bool,
+
+    /// Profile channel throughput and backpressure.
+    #[arg(long)]
+    channels: bool,
 }
 
 #[derive(Subcommand)]
@@ -242,6 +246,7 @@ fn build_project(
         bin,
         cpu_time,
         list_skipped,
+        channels,
     } = opts;
 
     let project = match project {
@@ -361,18 +366,6 @@ fn build_project(
         None => staging.clone(),
     };
 
-    // Inject piano-runtime dependency.
-    let features: Vec<&str> = if cpu_time { vec!["cpu-time"] } else { vec![] };
-    match runtime_path {
-        Some(ref path) => {
-            let abs_path = std::fs::canonicalize(path).map_err(io_context("canonicalize", path))?;
-            inject_runtime_path_dependency(&member_staging, &abs_path, &features)?;
-        }
-        None => {
-            inject_runtime_dependency(&member_staging, env!("PIANO_RUNTIME_VERSION"), &features)?;
-        }
-    }
-
     // Rewrite each target file in staging.
     let instrument_macros = specs.is_empty();
     let mut all_concurrency: Vec<(String, String)> = Vec::new();
@@ -397,6 +390,54 @@ fn build_project(
 
         all_concurrency.extend(result.concurrency);
         std::fs::write(&staged_file, result.source).map_err(io_context("write", &staged_file))?;
+    }
+
+    // Channel rewriting (when --channels flag is set).
+    let mut features: Vec<&str> = if cpu_time { vec!["cpu-time"] } else { vec![] };
+    if channels {
+        use piano::channel_rewrite::rewrite_channels;
+        let mut detected_channel_crates: HashSet<String> = HashSet::new();
+        for target in &targets {
+            let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
+            let staged_file = member_staging.join("src").join(relative);
+            let display_path = format!("src/{}", relative.display());
+            let source =
+                std::fs::read_to_string(&staged_file).map_err(|source| Error::RunReadError {
+                    path: PathBuf::from(&display_path),
+                    source,
+                })?;
+            let ch_result =
+                rewrite_channels(&source, &display_path).map_err(|source| Error::ParseError {
+                    path: PathBuf::from(&display_path),
+                    source,
+                })?;
+            detected_channel_crates.extend(ch_result.detected_crates);
+            std::fs::write(&staged_file, ch_result.source)
+                .map_err(io_context("write", &staged_file))?;
+        }
+        if detected_channel_crates.contains("tokio") {
+            features.push("channels-tokio");
+        }
+        if detected_channel_crates.contains("crossbeam") {
+            features.push("channels-crossbeam");
+        }
+        if detected_channel_crates.contains("async_channel") {
+            features.push("channels-async");
+        }
+        if detected_channel_crates.contains("futures") {
+            features.push("channels-futures");
+        }
+    }
+
+    // Inject piano-runtime dependency (after channel detection to include channel features).
+    match runtime_path {
+        Some(ref path) => {
+            let abs_path = std::fs::canonicalize(path).map_err(io_context("canonicalize", path))?;
+            inject_runtime_path_dependency(&member_staging, &abs_path, &features)?;
+        }
+        None => {
+            inject_runtime_dependency(&member_staging, env!("PIANO_RUNTIME_VERSION"), &features)?;
+        }
     }
 
     // Warn if parallel code was detected without --cpu-time.
@@ -695,6 +736,12 @@ fn cmd_report(
                         println!("{}", format_json(&run, show_all));
                     } else {
                         anstream::print!("{}", format_table(&run, show_all));
+                        if !run.channels.is_empty() {
+                            anstream::print!(
+                                "{}",
+                                piano::report::format_channels_table(&run.channels)
+                            );
+                        }
                     }
                     return Ok(());
                 }
@@ -711,13 +758,16 @@ fn cmd_report(
     if let Some(path) = &resolved_path
         && path.extension().and_then(|e| e.to_str()) == Some("ndjson")
     {
-        let (_run, frame_data) = load_ndjson(path)?;
+        let (run, frame_data) = load_ndjson(path)?;
         if json {
             println!("{}", format_json_with_frames(&frame_data, show_all));
         } else if frames {
             anstream::print!("{}", format_frames_table(&frame_data));
         } else {
             anstream::print!("{}", format_table_with_frames(&frame_data, show_all));
+        }
+        if !run.channels.is_empty() {
+            anstream::print!("{}", piano::report::format_channels_table(&run.channels));
         }
         return Ok(());
     }
@@ -742,6 +792,9 @@ fn cmd_report(
         println!("{}", format_json(&run, show_all));
     } else {
         anstream::print!("{}", format_table(&run, show_all));
+        if !run.channels.is_empty() {
+            anstream::print!("{}", piano::report::format_channels_table(&run.channels));
+        }
     }
     Ok(())
 }

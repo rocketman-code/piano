@@ -17,13 +17,15 @@ pub enum RunFormat {
 }
 
 /// A single profiling run loaded from a JSON file written by piano-runtime.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 pub struct Run {
     #[serde(default)]
     pub run_id: Option<String>,
     #[serde(alias = "timestamp")]
     pub timestamp_ms: u128,
     pub functions: Vec<FnEntry>,
+    #[serde(default)]
+    pub channels: Vec<ChannelEntry>,
     /// The file format this run was loaded from (not serialized).
     #[serde(skip)]
     pub source_format: RunFormat,
@@ -43,6 +45,20 @@ pub struct FnEntry {
     pub alloc_count: u64,
     #[serde(default)]
     pub alloc_bytes: u64,
+}
+
+/// Channel profiling entry from NDJSON output.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ChannelEntry {
+    pub label: String,
+    pub kind: String,
+    pub sent: u64,
+    #[serde(alias = "recv")]
+    pub received: u64,
+    #[serde(alias = "max_q")]
+    pub max_queued: u64,
+    #[serde(alias = "type_sz")]
+    pub type_size: usize,
 }
 
 /// Per-frame data loaded from an NDJSON file.
@@ -118,6 +134,12 @@ struct NdjsonTrailer {
     functions: Vec<String>,
 }
 
+/// NDJSON channel data line.
+#[derive(serde::Deserialize)]
+struct NdjsonChannels {
+    channels: Vec<ChannelEntry>,
+}
+
 /// Read a profiling run from a JSON or NDJSON file on disk.
 pub fn load_run(path: &Path) -> Result<Run, Error> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -179,10 +201,17 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
     };
 
     let mut frames: Vec<Vec<FrameFnEntry>> = Vec::new();
+    let mut channels: Vec<ChannelEntry> = Vec::new();
     for line in frame_lines {
         let line = line.trim();
         if line.is_empty() {
             continue;
+        }
+        if line.contains("\"channels\"") {
+            if let Ok(ch) = serde_json::from_str::<NdjsonChannels>(line) {
+                channels = ch.channels;
+                continue;
+            }
         }
         let frame: NdjsonFrame = serde_json::from_str(line).map_err(|e| Error::InvalidRunData {
             path: path.to_path_buf(),
@@ -259,6 +288,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         run_id: header.run_id,
         timestamp_ms: header.timestamp_ms,
         functions,
+        channels,
         source_format: RunFormat::Ndjson,
     };
 
@@ -343,6 +373,49 @@ pub fn format_per_thread_tables(runs: &[Run], show_all: bool) -> String {
         out.push_str(&format!("{HEADER}--- Thread {} ---{HEADER:#}\n", i + 1));
         out.push_str(&format_table(run, show_all));
     }
+    out
+}
+
+/// Format channel profiling data as a text table.
+pub fn format_channels_table(channels: &[ChannelEntry]) -> String {
+    if channels.is_empty() {
+        return String::new();
+    }
+
+    fn format_bytes(bytes: u64) -> String {
+        if bytes < 1024 {
+            return format!("{bytes} B");
+        }
+        if bytes < 1024 * 1024 {
+            return format!("{:.1} KB", bytes as f64 / 1024.0);
+        }
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+
+    let mut out = String::new();
+    use std::fmt::Write;
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{HEADER}-- Channels {:->58}{HEADER:#}", "");
+    let _ = writeln!(
+        out,
+        "  {HEADER}{:<28} {:<14} {:>8} {:>8} {:>7} {:>9}{HEADER:#}",
+        "Label", "Kind", "Sent", "Recv", "Max Q", "Mem"
+    );
+
+    for ch in channels {
+        let mem = ch.max_queued * ch.type_size as u64;
+        let _ = writeln!(
+            out,
+            "  {:<28} {:<14} {:>8} {:>8} {:>7} {:>9}",
+            ch.label,
+            ch.kind,
+            ch.sent,
+            ch.received,
+            ch.max_queued,
+            format_bytes(mem)
+        );
+    }
+
     out
 }
 
@@ -570,6 +643,14 @@ fn truncate_label(label: &str, max_len: usize) -> String {
     }
 }
 
+/// Top-level JSON report containing functions and optional channel data.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct JsonReport {
+    pub functions: Vec<JsonFnEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<ChannelEntry>,
+}
+
 /// Structured JSON entry for a single function in a report.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct JsonFnEntry {
@@ -609,7 +690,12 @@ pub fn format_json(run: &Run, show_all: bool) -> String {
         })
         .collect();
 
-    serde_json::to_string_pretty(&json_entries).expect("JSON serialization should not fail")
+    let report = JsonReport {
+        functions: json_entries,
+        channels: run.channels.clone(),
+    };
+
+    serde_json::to_string_pretty(&report).expect("JSON serialization should not fail")
 }
 
 /// Accumulated per-function counters for JSON frame aggregation.
@@ -687,7 +773,12 @@ pub fn format_json_with_frames(frame_data: &FrameData, show_all: bool) -> String
         })
         .collect();
 
-    serde_json::to_string_pretty(&json_entries).expect("JSON serialization should not fail")
+    let report = JsonReport {
+        functions: json_entries,
+        channels: vec![],
+    };
+
+    serde_json::to_string_pretty(&report).expect("JSON serialization should not fail")
 }
 
 /// Structured JSON entry for a diff comparison.
@@ -913,6 +1004,7 @@ fn merge_runs(runs: &[&Run]) -> Run {
     let mut max_ts: u128 = 0;
     let mut run_id = None;
     let mut format = RunFormat::Json;
+    let mut channels: Vec<ChannelEntry> = Vec::new();
 
     for run in runs {
         max_ts = max_ts.max(run.timestamp_ms);
@@ -943,12 +1035,14 @@ fn merge_runs(runs: &[&Run]) -> Run {
             entry.alloc_count += f.alloc_count;
             entry.alloc_bytes += f.alloc_bytes;
         }
+        channels.extend(run.channels.iter().cloned());
     }
 
     Run {
         run_id,
         timestamp_ms: max_ts,
         functions: merged.into_values().collect(),
+        channels,
         source_format: format,
     }
 }
@@ -1225,6 +1319,7 @@ mod tests {
         let run = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![
                 FnEntry {
@@ -1257,6 +1352,7 @@ mod tests {
         let a = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "walk".into(),
@@ -1269,6 +1365,7 @@ mod tests {
         let b = Run {
             run_id: None,
             timestamp_ms: 2000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "walk".into(),
@@ -1464,6 +1561,7 @@ mod tests {
         let run = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![
                 FnEntry {
@@ -1509,6 +1607,7 @@ mod tests {
         let run = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "active".into(),
@@ -1782,6 +1881,7 @@ mod tests {
         let a = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "walk".into(),
@@ -1796,6 +1896,7 @@ mod tests {
         let b = Run {
             run_id: None,
             timestamp_ms: 2000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "walk".into(),
@@ -1821,6 +1922,7 @@ mod tests {
         let a = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "alloc_heavy".into(),
@@ -1835,6 +1937,7 @@ mod tests {
         let b = Run {
             run_id: None,
             timestamp_ms: 2000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "alloc_heavy".into(),
@@ -2037,6 +2140,7 @@ mod tests {
         let run = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "compute".into(),
@@ -2063,6 +2167,7 @@ mod tests {
         let run = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "compute".into(),
@@ -2110,6 +2215,7 @@ mod tests {
         let a = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2123,6 +2229,7 @@ mod tests {
         let b = Run {
             run_id: None,
             timestamp_ms: 2000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2204,6 +2311,7 @@ mod tests {
         let a = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2217,6 +2325,7 @@ mod tests {
         let b = Run {
             run_id: None,
             timestamp_ms: 2000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2251,6 +2360,7 @@ mod tests {
         let a = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2263,6 +2373,7 @@ mod tests {
         let b = Run {
             run_id: None,
             timestamp_ms: 2000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2284,6 +2395,7 @@ mod tests {
         let run = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![
                 FnEntry {
@@ -2479,6 +2591,7 @@ mod tests {
         let run_a = Run {
             run_id: Some("test_1".into()),
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2492,6 +2605,7 @@ mod tests {
         let run_b = Run {
             run_id: Some("test_1".into()),
             timestamp_ms: 1001,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2661,6 +2775,7 @@ mod tests {
         let run = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2682,6 +2797,7 @@ mod tests {
         let run = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2705,6 +2821,7 @@ mod tests {
         let run = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2821,6 +2938,7 @@ mod tests {
         let a = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2833,6 +2951,7 @@ mod tests {
         let b = Run {
             run_id: None,
             timestamp_ms: 2000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2866,6 +2985,7 @@ mod tests {
         let a = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2879,6 +2999,7 @@ mod tests {
         let b = Run {
             run_id: None,
             timestamp_ms: 2000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![FnEntry {
                 name: "work".into(),
@@ -2912,12 +3033,14 @@ mod tests {
         let a = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![entry()],
         };
         let b = Run {
             run_id: None,
             timestamp_ms: 2000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![entry()],
         };
@@ -2946,12 +3069,14 @@ mod tests {
         let a = Run {
             run_id: None,
             timestamp_ms: 1000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![entry()],
         };
         let b = Run {
             run_id: None,
             timestamp_ms: 2000,
+            channels: vec![],
             source_format: RunFormat::default(),
             functions: vec![entry()],
         };
@@ -3229,14 +3354,15 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            channels: vec![],
         };
         let json = format_json(&run, false);
-        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name, "slow");
-        assert!((entries[0].self_ms - 15.0).abs() < f64::EPSILON);
-        assert_eq!(entries[0].calls, 2);
-        assert_eq!(entries[1].name, "fast");
+        let report: JsonReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report.functions.len(), 2);
+        assert_eq!(report.functions[0].name, "slow");
+        assert!((report.functions[0].self_ms - 15.0).abs() < f64::EPSILON);
+        assert_eq!(report.functions[0].calls, 2);
+        assert_eq!(report.functions[1].name, "fast");
     }
 
     #[test]
@@ -3259,15 +3385,16 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            channels: vec![],
         };
         let json = format_json(&run, false);
-        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "called");
+        let report: JsonReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report.functions.len(), 1);
+        assert_eq!(report.functions[0].name, "called");
 
         let json_all = format_json(&run, true);
-        let entries_all: Vec<JsonFnEntry> = serde_json::from_str(&json_all).unwrap();
-        assert_eq!(entries_all.len(), 2);
+        let report_all: JsonReport = serde_json::from_str(&json_all).unwrap();
+        assert_eq!(report_all.functions.len(), 2);
     }
 
     #[test]
@@ -3285,12 +3412,66 @@ mod tests {
                 alloc_bytes: 1024,
                 ..Default::default()
             }],
+            channels: vec![],
         };
         let json = format_json(&run, false);
-        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
-        assert_eq!(entries[0].cpu_self_ms, Some(8.5));
-        assert_eq!(entries[0].alloc_count, 42);
-        assert_eq!(entries[0].alloc_bytes, 1024);
+        let report: JsonReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report.functions[0].cpu_self_ms, Some(8.5));
+        assert_eq!(report.functions[0].alloc_count, 42);
+        assert_eq!(report.functions[0].alloc_bytes, 1024);
+    }
+
+    #[test]
+    fn format_json_includes_channels() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "main".into(),
+                calls: 1,
+                self_ms: 5.0,
+                ..Default::default()
+            }],
+            channels: vec![ChannelEntry {
+                label: "src/main.rs:10".into(),
+                kind: "bounded(10)".into(),
+                sent: 100,
+                received: 95,
+                max_queued: 8,
+                type_size: 64,
+            }],
+        };
+        let json = format_json(&run, false);
+        let report: JsonReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report.functions.len(), 1);
+        assert_eq!(report.channels.len(), 1);
+        assert_eq!(report.channels[0].label, "src/main.rs:10");
+        assert_eq!(report.channels[0].sent, 100);
+        assert_eq!(report.channels[0].received, 95);
+        assert_eq!(report.channels[0].max_queued, 8);
+    }
+
+    #[test]
+    fn format_json_omits_empty_channels() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "main".into(),
+                calls: 1,
+                self_ms: 5.0,
+                ..Default::default()
+            }],
+            channels: vec![],
+        };
+        let json = format_json(&run, false);
+        // When channels is empty, the key should be absent from the JSON
+        assert!(!json.contains("channels"));
+        // But it should still deserialize correctly
+        let report: JsonReport = serde_json::from_str(&json).unwrap();
+        assert!(report.channels.is_empty());
     }
 
     #[test]
@@ -3333,18 +3514,18 @@ mod tests {
             ],
         };
         let json = format_json_with_frames(&frame_data, false);
-        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
-        assert_eq!(entries.len(), 2);
+        let report: JsonReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report.functions.len(), 2);
         // alpha: 5ms + 7ms = 12ms, sorted first
-        assert_eq!(entries[0].name, "alpha");
-        assert!((entries[0].self_ms - 12.0).abs() < f64::EPSILON);
-        assert_eq!(entries[0].calls, 5);
-        assert_eq!(entries[0].alloc_count, 25);
-        assert_eq!(entries[0].alloc_bytes, 500);
+        assert_eq!(report.functions[0].name, "alpha");
+        assert!((report.functions[0].self_ms - 12.0).abs() < f64::EPSILON);
+        assert_eq!(report.functions[0].calls, 5);
+        assert_eq!(report.functions[0].alloc_count, 25);
+        assert_eq!(report.functions[0].alloc_bytes, 500);
         // beta: 3ms
-        assert_eq!(entries[1].name, "beta");
-        assert!((entries[1].self_ms - 3.0).abs() < f64::EPSILON);
-        assert_eq!(entries[1].cpu_self_ms, None);
+        assert_eq!(report.functions[1].name, "beta");
+        assert!((report.functions[1].self_ms - 3.0).abs() < f64::EPSILON);
+        assert_eq!(report.functions[1].cpu_self_ms, None);
     }
 
     #[test]
@@ -3363,8 +3544,8 @@ mod tests {
             }]],
         };
         let json = format_json_with_frames(&frame_data, false);
-        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
-        assert_eq!(entries[0].cpu_self_ms, Some(8.0));
+        let report: JsonReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report.functions[0].cpu_self_ms, Some(8.0));
     }
 
     #[test]
@@ -3383,12 +3564,12 @@ mod tests {
             }]],
         };
         let json = format_json_with_frames(&frame_data, false);
-        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
-        assert_eq!(entries.len(), 1);
+        let report: JsonReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report.functions.len(), 1);
 
         let json_all = format_json_with_frames(&frame_data, true);
-        let entries_all: Vec<JsonFnEntry> = serde_json::from_str(&json_all).unwrap();
-        assert_eq!(entries_all.len(), 2);
+        let report_all: JsonReport = serde_json::from_str(&json_all).unwrap();
+        assert_eq!(report_all.functions.len(), 2);
     }
 
     #[test]
@@ -3403,6 +3584,7 @@ mod tests {
                 self_ms: 20.0,
                 ..Default::default()
             }],
+            channels: vec![],
         };
         let run_b = Run {
             run_id: None,
@@ -3414,6 +3596,7 @@ mod tests {
                 self_ms: 25.0,
                 ..Default::default()
             }],
+            channels: vec![],
         };
         let json = diff_runs_json(&run_a, &run_b);
         let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
@@ -3434,6 +3617,7 @@ mod tests {
             timestamp_ms: 1000,
             source_format: RunFormat::default(),
             functions: vec![],
+            channels: vec![],
         };
         let run_b = Run {
             run_id: None,
@@ -3445,6 +3629,7 @@ mod tests {
                 self_ms: 5.0,
                 ..Default::default()
             }],
+            channels: vec![],
         };
         let json = diff_runs_json(&run_a, &run_b);
         let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
@@ -3452,5 +3637,51 @@ mod tests {
         assert_eq!(entries[0].name, "new_fn");
         assert!((entries[0].self_ms_a).abs() < f64::EPSILON);
         assert!(entries[0].delta_pct.is_none());
+    }
+
+    #[test]
+    fn parse_ndjson_with_channels() {
+        let ndjson = r#"{"format_version":4,"run_id":"test","timestamp_ms":1000}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":5000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+{"channels":[{"label":"src/main.rs:10","kind":"bounded(10)","sent":100,"recv":98,"max_q":10,"type_sz":64}]}
+{"functions":["work"]}
+"#;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.ndjson");
+        fs::write(&path, ndjson).unwrap();
+        let (run, _frames) = load_ndjson(&path).unwrap();
+        assert_eq!(run.channels.len(), 1);
+        assert_eq!(run.channels[0].label, "src/main.rs:10");
+        assert_eq!(run.channels[0].sent, 100);
+        assert_eq!(run.channels[0].received, 98);
+        assert_eq!(run.channels[0].max_queued, 10);
+        assert_eq!(run.channels[0].type_size, 64);
+    }
+
+    #[test]
+    fn format_channel_table() {
+        let channels = vec![
+            ChannelEntry {
+                label: "src/main.rs:10".into(),
+                kind: "bounded(10)".into(),
+                sent: 1000,
+                received: 998,
+                max_queued: 10,
+                type_size: 64,
+            },
+            ChannelEntry {
+                label: "src/worker.rs:15".into(),
+                kind: "unbounded".into(),
+                sent: 5000,
+                received: 5000,
+                max_queued: 3,
+                type_size: 64,
+            },
+        ];
+        let table = format_channels_table(&channels);
+        assert!(table.contains("src/main.rs:10"));
+        assert!(table.contains("bounded(10)"));
+        assert!(table.contains("1000"));
+        assert!(table.contains("640 B")); // 10 * 64
     }
 }
