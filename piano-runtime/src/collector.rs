@@ -166,7 +166,11 @@ fn open_stream_file(dir: &std::path::Path) -> std::io::Result<StreamState> {
 /// Write a frame to an already-locked StreamState.
 fn stream_frame_to_writer(state: &mut StreamState, buf: &[FrameFnSummary]) {
     let frame_idx = state.frame_count;
-    let _ = write!(state.file, "{{\"frame\":{frame_idx},\"fns\":[");
+    let tid = THREAD_INDEX.with(|c| c.get());
+    let _ = write!(
+        state.file,
+        "{{\"frame\":{frame_idx},\"tid\":{tid},\"fns\":["
+    );
     for (i, entry) in buf.iter().enumerate() {
         if i > 0 {
             let _ = write!(state.file, ",");
@@ -497,11 +501,15 @@ fn thread_records() -> &'static Mutex<Vec<ThreadRecordArc>> {
 
 /// Global registry of per-thread frame storage.
 /// Each thread registers its Arc on first depth-0 frame push. collect_frames() iterates all Arcs.
-static THREAD_FRAMES: SyncOnceCell<Mutex<Vec<ThreadFrameArc>>> = SyncOnceCell::new();
+static THREAD_FRAMES: SyncOnceCell<Mutex<Vec<(usize, ThreadFrameArc)>>> = SyncOnceCell::new();
 
-fn thread_frames() -> &'static Mutex<Vec<ThreadFrameArc>> {
+fn thread_frames() -> &'static Mutex<Vec<(usize, ThreadFrameArc)>> {
     THREAD_FRAMES.get_or_init(|| Mutex::new(Vec::new()))
 }
+
+/// Monotonic counter assigning a unique index to each thread that registers
+/// with the profiling runtime. Thread 0 is the first thread to access TLS.
+static NEXT_THREAD_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     pub(crate) static STACK: UnsafeCell<Vec<StackEntry>> = UnsafeCell::new(Vec::new());
@@ -567,6 +575,10 @@ pub(crate) fn with_stack_ref<R>(f: impl FnOnce(&Vec<StackEntry>) -> R) -> R {
 }
 
 thread_local! {
+    /// Sequential thread index for this thread, assigned on first TLS access.
+    static THREAD_INDEX: Cell<usize> = Cell::new(
+        NEXT_THREAD_INDEX.fetch_add(1, Ordering::Relaxed)
+    );
     static RECORDS: Arc<Mutex<Vec<FnAgg>>> = {
         let arc = Arc::new(Mutex::new(Vec::new()));
         thread_records().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&arc));
@@ -581,7 +593,8 @@ thread_local! {
     /// collect_frames() can iterate all threads, same pattern as RECORDS/THREAD_RECORDS.
     static FRAMES: Arc<Mutex<Vec<Vec<FrameFnSummary>>>> = {
         let arc = Arc::new(Mutex::new(Vec::new()));
-        thread_frames().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&arc));
+        let tid = THREAD_INDEX.with(|c| c.get());
+        thread_frames().lock().unwrap_or_else(|e| e.into_inner()).push((tid, Arc::clone(&arc)));
         arc
     };
     /// Fast local buffer for FnAgg entries. Avoids the Mutex lock on RECORDS
@@ -1207,14 +1220,27 @@ pub fn collect_invocations() -> Vec<InvocationRecord> {
 /// depth-0 boundaries -- the same point where RECORDS_BUF is flushed into
 /// RECORDS. By the time a frame appears in FRAMES, its records have already
 /// been flushed.
-pub fn collect_frames() -> Vec<Vec<FrameFnSummary>> {
+/// Collect frame data from ALL threads, preserving thread identity.
+pub fn collect_frames_with_tid() -> Vec<(usize, Vec<FrameFnSummary>)> {
     let registry = thread_frames().lock().unwrap_or_else(|e| e.into_inner());
     let mut all_frames = Vec::new();
-    for arc in registry.iter() {
+    for (tid, arc) in registry.iter() {
         let frames = arc.lock().unwrap_or_else(|e| e.into_inner());
-        all_frames.extend(frames.iter().cloned());
+        for frame in frames.iter() {
+            all_frames.push((*tid, frame.clone()));
+        }
     }
     all_frames
+}
+
+/// Collect frame data from ALL threads (without thread identity).
+///
+/// Backward-compatible wrapper around `collect_frames_with_tid()`.
+pub fn collect_frames() -> Vec<Vec<FrameFnSummary>> {
+    collect_frames_with_tid()
+        .into_iter()
+        .map(|(_, frame)| frame)
+        .collect()
 }
 
 /// Collect records from ALL threads via the global registry.
@@ -1275,11 +1301,13 @@ pub fn reset_all() {
     // Clear every thread's frame Arc.
     let frame_arcs: Vec<ThreadFrameArc> = {
         let registry = thread_frames().lock().unwrap_or_else(|e| e.into_inner());
-        registry.clone()
+        registry.iter().map(|(_, arc)| arc.clone()).collect()
     };
     for arc in &frame_arcs {
         arc.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
+    // Reset the thread index counter so new threads start from 0.
+    NEXT_THREAD_INDEX.store(0, Ordering::Relaxed);
     // Clear the calling thread's local state.
     reset();
 }
@@ -1352,7 +1380,7 @@ fn dirs_fallback() -> Option<PathBuf> {
 /// Line 1: header with metadata and function name table.
 /// Lines 2+: one line per frame with per-function summaries.
 fn write_ndjson(
-    frames: &[Vec<FrameFnSummary>],
+    frames: &[(usize, Vec<FrameFnSummary>)],
     fn_names: &[&str],
     path: &std::path::Path,
 ) -> std::io::Result<()> {
@@ -1377,8 +1405,8 @@ fn write_ndjson(
         fn_names.iter().enumerate().map(|(i, &n)| (n, i)).collect();
 
     // One line per frame
-    for (frame_idx, frame) in frames.iter().enumerate() {
-        write!(f, "{{\"frame\":{frame_idx},\"fns\":[")?;
+    for (frame_idx, (tid, frame)) in frames.iter().enumerate() {
+        write!(f, "{{\"frame\":{frame_idx},\"tid\":{tid},\"fns\":[")?;
         for (i, s) in frame.iter().enumerate() {
             if i > 0 {
                 write!(f, ",")?;
@@ -1456,7 +1484,7 @@ pub fn flush() {
 /// other threads' frames here. Only the local thread's state is cleared via
 /// `reset()`. Other threads' frames persist for the final `shutdown()` write.
 fn flush_impl(dir: &std::path::Path) {
-    let mut frames = collect_frames();
+    let mut frames = collect_frames_with_tid();
 
     // Synthesize from aggregates if no frames exist (same as shutdown_impl_inner).
     if frames.is_empty() {
@@ -1464,12 +1492,12 @@ fn flush_impl(dir: &std::path::Path) {
         if agg.is_empty() {
             return;
         }
-        frames.push(synthesize_frame_from_agg(&agg));
+        frames.push((0, synthesize_frame_from_agg(&agg)));
     }
 
     let mut seen = HashSet::new();
     let mut fn_names: Vec<&str> = Vec::new();
-    for frame in &frames {
+    for (_, frame) in &frames {
         for s in frame {
             if seen.insert(s.name) {
                 fn_names.push(s.name);
@@ -1625,10 +1653,10 @@ fn shutdown_impl_inner(dir: &std::path::Path) -> bool {
             flush_records_buf();
             let agg = collect_all_fnagg();
             if !agg.is_empty() {
-                let frames = vec![synthesize_frame_from_agg(&agg)];
+                let frames = vec![(0, synthesize_frame_from_agg(&agg))];
                 let mut seen = HashSet::new();
                 let mut fn_names: Vec<&str> = Vec::new();
-                for frame in &frames {
+                for (_, frame) in &frames {
                     for s in frame {
                         if seen.insert(s.name) {
                             fn_names.push(s.name);
@@ -1648,17 +1676,17 @@ fn shutdown_impl_inner(dir: &std::path::Path) -> bool {
     } else {
         // Non-streaming path (tests, no init() call) -- existing behavior
         let ts = timestamp_ms();
-        let mut frames = collect_frames();
+        let mut frames = collect_frames_with_tid();
         if frames.is_empty() {
             let agg = collect_all_fnagg();
             if !agg.is_empty() {
-                frames.push(synthesize_frame_from_agg(&agg));
+                frames.push((0, synthesize_frame_from_agg(&agg)));
             }
         }
         if !frames.is_empty() {
             let mut seen = HashSet::new();
             let mut fn_names: Vec<&str> = Vec::new();
-            for frame in &frames {
+            for (_, frame) in &frames {
                 for s in frame {
                     if seen.insert(s.name) {
                         fn_names.push(s.name);
@@ -3850,30 +3878,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         let fn_names = vec!["ndjson_fn_a", "ndjson_fn_b"];
-        let frames = vec![vec![
-            FrameFnSummary {
-                name: "ndjson_fn_a",
-                calls: 1,
-                self_ns: 100,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns: 0,
-                alloc_count: 0,
-                alloc_bytes: 0,
-                free_count: 0,
-                free_bytes: 0,
-            },
-            FrameFnSummary {
-                name: "ndjson_fn_b",
-                calls: 2,
-                self_ns: 200,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns: 0,
-                alloc_count: 0,
-                alloc_bytes: 0,
-                free_count: 0,
-                free_bytes: 0,
-            },
-        ]];
+        let frames = vec![(
+            0,
+            vec![
+                FrameFnSummary {
+                    name: "ndjson_fn_a",
+                    calls: 1,
+                    self_ns: 100,
+                    #[cfg(feature = "cpu-time")]
+                    cpu_self_ns: 0,
+                    alloc_count: 0,
+                    alloc_bytes: 0,
+                    free_count: 0,
+                    free_bytes: 0,
+                },
+                FrameFnSummary {
+                    name: "ndjson_fn_b",
+                    calls: 2,
+                    self_ns: 200,
+                    #[cfg(feature = "cpu-time")]
+                    cpu_self_ns: 0,
+                    alloc_count: 0,
+                    alloc_bytes: 0,
+                    free_count: 0,
+                    free_bytes: 0,
+                },
+            ],
+        )];
 
         let path = tmp.join("test.ndjson");
         write_ndjson(&frames, &fn_names, &path).unwrap();
