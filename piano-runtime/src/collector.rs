@@ -978,7 +978,8 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         });
 
         let raw_ticks = end_tsc.wrapping_sub(guard.start_tsc);
-        let corrected_ticks = raw_ticks.saturating_sub(crate::tsc::bias_ticks());
+        let bias = crate::tsc::bias_ticks();
+        let corrected_ticks = raw_ticks.saturating_sub(bias);
         let elapsed_ns = crate::tsc::ticks_to_ns(corrected_ticks);
         let children_ns = entry.children_ns;
         let self_ns = elapsed_ns.saturating_sub(children_ns);
@@ -987,6 +988,20 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         let cpu_elapsed_ns = cpu_end_ns.saturating_sub(entry.cpu_start_ns);
         #[cfg(feature = "cpu-time")]
         let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
+
+        // Temporary diagnostic: capture TSC state when wall time is zero.
+        #[cfg(test)]
+        if elapsed_ns == 0 {
+            *DIAG_DROP.lock().unwrap_or_else(|e| e.into_inner()) = Some(DiagDrop {
+                start_tsc: guard.start_tsc,
+                end_tsc,
+                raw_ticks,
+                bias,
+                corrected_ticks,
+                numer: crate::tsc::diag_numer(),
+                denom: crate::tsc::diag_denom(),
+            });
+        }
 
         if let Some(parent) = s.last_mut() {
             parent.children_ns += elapsed_ns;
@@ -1864,6 +1879,46 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
         #[cfg(feature = "cpu-time")]
         ctx_children_cpu_ns: Arc::clone(&ctx.children_cpu_ns),
     }
+}
+
+// Temporary diagnostic for CI investigation: captures TSC state when
+// drop_cold produces elapsed_ns == 0, so the assertion message can
+// include raw values that explain WHY wall time was zero.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct DiagDrop {
+    pub start_tsc: u64,
+    pub end_tsc: u64,
+    pub raw_ticks: u64,
+    pub bias: u64,
+    pub corrected_ticks: u64,
+    pub numer: u64,
+    pub denom: u64,
+}
+
+#[cfg(test)]
+impl core::fmt::Display for DiagDrop {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "start_tsc={} end_tsc={} raw_ticks={} bias={} corrected={} NUMER={} DENOM={}",
+            self.start_tsc,
+            self.end_tsc,
+            self.raw_ticks,
+            self.bias,
+            self.corrected_ticks,
+            self.numer,
+            self.denom,
+        )
+    }
+}
+
+#[cfg(test)]
+static DIAG_DROP: std::sync::Mutex<Option<DiagDrop>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn take_diag_drop() -> Option<DiagDrop> {
+    DIAG_DROP.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 /// CPU-bound workload for testing: hash a buffer `iterations` times.

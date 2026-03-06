@@ -184,6 +184,16 @@ pub(crate) fn bias_ticks() -> u64 {
     BIAS_TICKS.load(Ordering::Relaxed)
 }
 
+/// Diagnostic accessors for TSC calibration state (test only).
+#[cfg(test)]
+pub(crate) fn diag_numer() -> u64 {
+    NUMER.load(Ordering::Relaxed)
+}
+#[cfg(test)]
+pub(crate) fn diag_denom() -> u64 {
+    DENOM.load(Ordering::Relaxed)
+}
+
 fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         let t = b;

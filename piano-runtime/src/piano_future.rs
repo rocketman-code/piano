@@ -202,11 +202,16 @@ mod tests {
         let records = collector::collect_all();
         let outer = records.iter().find(|r| r.name == "pf_outer").unwrap();
         let inner = records.iter().find(|r| r.name == "pf_inner").unwrap();
+        let diag = collector::take_diag_drop()
+            .map(|d| format!(" | {d}"))
+            .unwrap_or_default();
         // Inner's total_ms should be ~50ms
         assert!(
             inner.total_ms > 40.0,
-            "inner total_ms too low: {}",
-            inner.total_ms
+            "inner total_ms too low: {} (self_ms={}, calls={}){diag}",
+            inner.total_ms,
+            inner.self_ms,
+            inner.calls,
         );
         // Outer's self_ms should NOT include inner's ~50ms
         assert!(
@@ -420,6 +425,9 @@ mod tests {
 
         let records = collector::collect_all();
         let rec = records.iter().find(|r| r.name == "cpu_yield").unwrap();
+        let diag = collector::take_diag_drop()
+            .map(|d| format!(" | {d}"))
+            .unwrap_or_default();
 
         // CPU time should reflect actual compute across all three bursts.
         // burn_cpu(10_000) takes measurable CPU time. Total should be > 0.
@@ -438,7 +446,7 @@ mod tests {
         // CPU time should not exceed wall time (it's a single thread).
         assert!(
             rec.cpu_self_ms < rec.total_ms * 2.0,
-            "cpu_self_ms ({:.3}) should not grossly exceed total_ms ({:.3}) -- arithmetic bug?",
+            "cpu_self_ms ({:.3}) should not grossly exceed total_ms ({:.3}) -- arithmetic bug?{diag}",
             rec.cpu_self_ms,
             rec.total_ms,
         );
