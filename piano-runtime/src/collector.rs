@@ -589,6 +589,66 @@ thread_local! {
     static RECORDS_BUF: RefCell<Vec<FnAgg>> = RefCell::new(Vec::new());
 }
 
+/// Sentinel whose Drop drains thread-local buffers into their Arc-backed
+/// global registries. On platforms where TLS destructors run before atexit
+/// handlers (glibc >= 2.18, macOS), this preserves buffered data that the
+/// atexit handler can then collect from the global registries.
+///
+/// Destruction order: the initializer force-touches RECORDS_BUF, RECORDS,
+/// FRAME_BUFFER, and FRAMES so their destructors are registered first.
+/// Reverse-order destruction means this guard is destroyed first, while
+/// all dependencies are still alive.
+struct TlsFlushGuard;
+
+impl Drop for TlsFlushGuard {
+    fn drop(&mut self) {
+        // Drain RECORDS_BUF -> RECORDS Arc (survives via THREAD_RECORDS).
+        let _ = RECORDS_BUF.try_with(|buf| {
+            let mut buf = buf.borrow_mut();
+            if buf.is_empty() {
+                return;
+            }
+            let _ = RECORDS.try_with(|records| {
+                let mut recs = records.lock().unwrap_or_else(|e| e.into_inner());
+                for local in buf.drain(..) {
+                    if let Some(entry) = recs.iter_mut().find(|e| std::ptr::eq(e.name, local.name))
+                    {
+                        entry.absorb(&local);
+                    } else {
+                        recs.push(local);
+                    }
+                }
+            });
+        });
+        // Drain FRAME_BUFFER -> FRAMES Arc (survives via THREAD_FRAMES).
+        let _ = FRAME_BUFFER.try_with(|buf| {
+            let mut b = buf.borrow_mut();
+            if b.is_empty() {
+                return;
+            }
+            let _ = FRAMES.try_with(|frames| {
+                frames
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(std::mem::take(&mut *b));
+            });
+        });
+    }
+}
+
+thread_local! {
+    /// Initialized after dependency TLS to guarantee it is destroyed first.
+    /// See `TlsFlushGuard` doc comment for the destruction order contract.
+    static TLS_FLUSH_GUARD: TlsFlushGuard = {
+        // Force-init dependencies so their destructors register before ours.
+        RECORDS_BUF.with(|_| ());
+        RECORDS.with(|_| ());
+        FRAME_BUFFER.with(|_| ());
+        FRAMES.with(|_| ());
+        TlsFlushGuard
+    };
+}
+
 /// Merge a single invocation into a Vec<FnAgg> via linear scan on interned name pointer.
 fn merge_into_fnagg_vec(
     buf: &mut Vec<FnAgg>,
@@ -660,12 +720,15 @@ fn merge_into_frame_buf(
 /// Drain RECORDS_BUF into the Mutex-guarded RECORDS.
 /// Called at depth-0 boundaries and before reading RECORDS.
 fn flush_records_buf() {
-    RECORDS_BUF.with(|buf| {
+    // try_with: if TLS is already destroyed (process::exit on glibc/macOS),
+    // skip gracefully. The TlsFlushGuard already drained buffers into the
+    // Arc-backed global registries during TLS destruction.
+    let _ = RECORDS_BUF.try_with(|buf| {
         let mut buf = buf.borrow_mut();
         if buf.is_empty() {
             return;
         }
-        RECORDS.with(|records| {
+        let _ = RECORDS.try_with(|records| {
             let mut recs = records.lock().unwrap_or_else(|e| e.into_inner());
             for local in buf.drain(..) {
                 if let Some(entry) = recs.iter_mut().find(|e| std::ptr::eq(e.name, local.name)) {
@@ -1013,6 +1076,11 @@ impl Drop for Guard {
 fn enter_cold(name: &'static str) {
     let _ = epoch();
 
+    // Ensure the TLS flush guard is registered on this thread so that
+    // on process::exit(), buffers are drained into global Arcs before
+    // TLS destruction completes and the atexit handler fires.
+    TLS_FLUSH_GUARD.with(|_| ());
+
     let name_id = intern_name(name);
 
     let saved_alloc = crate::alloc::ALLOC_COUNTERS
@@ -1291,22 +1359,14 @@ fn write_ndjson(
     let ts = timestamp_ms();
     let run_id = run_id();
 
-    // Header line: metadata + function name table
+    // v4 header: metadata only (no functions — those go in the trailer)
     write!(
         f,
-        "{{\"format_version\":3,\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts}"
+        "{{\"format_version\":4,\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts}"
     )?;
     #[cfg(feature = "cpu-time")]
     write!(f, ",\"has_cpu_time\":true")?;
-    write!(f, ",\"functions\":[")?;
-    for (i, name) in fn_names.iter().enumerate() {
-        if i > 0 {
-            write!(f, ",")?;
-        }
-        let name = name.replace('\\', "\\\\").replace('"', "\\\"");
-        write!(f, "\"{name}\"")?;
-    }
-    writeln!(f, "]}}")?;
+    writeln!(f, "}}")?;
 
     // Build index for O(1) fn_id lookup
     let fn_id_map: HashMap<&str, usize> =
@@ -1331,6 +1391,18 @@ fn write_ndjson(
         }
         writeln!(f, "]}}")?;
     }
+
+    // v4 trailer: function name table
+    write!(f, "{{\"functions\":[")?;
+    for (i, name) in fn_names.iter().enumerate() {
+        if i > 0 {
+            write!(f, ",")?;
+        }
+        let name = name.replace('\\', "\\\\").replace('"', "\\\"");
+        write!(f, "\"{name}\"")?;
+    }
+    writeln!(f, "]}}")?;
+
     Ok(())
 }
 
@@ -2331,14 +2403,20 @@ mod tests {
         let content = std::fs::read_to_string(files[0].path()).unwrap();
         let lines: Vec<&str> = content.lines().collect();
 
-        // First line is header
-        assert!(lines[0].contains("\"format_version\":3"));
-        assert!(lines[0].contains("\"functions\""));
+        // First line is v4 header (no functions — those are in the trailer)
+        assert!(lines[0].contains("\"format_version\":4"));
+        assert!(!lines[0].contains("\"functions\""));
 
-        // Remaining lines are frames
-        assert!(lines.len() >= 3, "header + 2 frames, got {}", lines.len());
+        // header + 2 frames + trailer = 4 lines
+        assert!(
+            lines.len() >= 4,
+            "header + 2 frames + trailer, got {}",
+            lines.len()
+        );
         assert!(lines[1].contains("\"frame\":0"));
         assert!(lines[2].contains("\"frame\":1"));
+        // Last line is trailer with function names
+        assert!(lines.last().unwrap().contains("\"functions\""));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -3799,11 +3877,16 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
 
-        // Header line: functions array should have comma between names, not before first.
+        // v4: header has no functions array; trailer (last line) has it.
         let header = lines[0];
         assert!(
-            header.contains("\"functions\":[\"ndjson_fn_a\",\"ndjson_fn_b\"]"),
-            "functions array should have proper comma separation: {header}"
+            !header.contains("\"functions\""),
+            "v4 header should not contain functions: {header}"
+        );
+        let trailer = *lines.last().unwrap();
+        assert!(
+            trailer.contains("\"functions\":[\"ndjson_fn_a\",\"ndjson_fn_b\"]"),
+            "trailer functions array should have proper comma separation: {trailer}"
         );
 
         // Frame line: fns array should have comma between entries, not before first.
