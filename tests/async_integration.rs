@@ -758,3 +758,100 @@ fn async_tokio_pipeline() {
         "output should contain instrumented async function 'orchestrate'. Got:\n{content}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Channel profiling end-to-end
+// ---------------------------------------------------------------------------
+
+fn create_channel_profiling_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "channel-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "channel-test"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"
+fn main() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        for i in 0u32..10 {
+            tx.send(i).await.unwrap();
+        }
+        drop(tx);
+        while let Some(_msg) = rx.recv().await {}
+    });
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn channel_profiling_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("channel-test");
+    create_channel_profiling_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::tokio_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["profile", "--channels", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano profile");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano profile --channels failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    // Verify the report mentions channels.
+    assert!(
+        stdout.contains("Channels") || stderr.contains("Channels"),
+        "Output should contain channel section:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Verify NDJSON file contains channel data.
+    let runs_dir = project_dir.join("target/piano/runs");
+    let ndjson_files: Vec<_> = fs::read_dir(&runs_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+        .collect();
+    assert!(!ndjson_files.is_empty(), "Expected NDJSON output files");
+
+    let content = fs::read_to_string(ndjson_files[0].path()).unwrap();
+    assert!(
+        content.contains("\"channels\""),
+        "NDJSON should have channel data"
+    );
+    assert!(content.contains("\"sent\":10"), "Should record 10 sends");
+    assert!(content.contains("\"recv\":10"), "Should record 10 receives");
+}
