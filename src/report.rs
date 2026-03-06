@@ -62,8 +62,10 @@ struct FnAgg {
 }
 
 /// Per-function entry within a single frame.
+#[derive(Clone, Copy)]
 pub struct FrameFnEntry {
     pub fn_id: usize,
+    pub tid: Option<usize>,
     pub calls: u64,
     pub self_ns: u64,
     pub cpu_self_ns: Option<u64>,
@@ -91,6 +93,8 @@ struct NdjsonHeader {
 struct NdjsonFrame {
     #[serde(rename = "frame")]
     _frame: usize,
+    #[serde(default)]
+    tid: Option<usize>,
     fns: Vec<NdjsonFnEntry>,
 }
 
@@ -188,11 +192,13 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
             path: path.to_path_buf(),
             reason: format!("invalid NDJSON frame: {e}"),
         })?;
+        let tid = frame.tid;
         let entries: Vec<FrameFnEntry> = frame
             .fns
             .into_iter()
             .map(|f| FrameFnEntry {
                 fn_id: f.id,
+                tid,
                 calls: f.calls,
                 self_ns: f.self_ns,
                 cpu_self_ns: f.csn,
@@ -342,6 +348,67 @@ pub fn format_per_thread_tables(runs: &[Run], show_all: bool) -> String {
         }
         out.push_str(&format!("{HEADER}--- Thread {} ---{HEADER:#}\n", i + 1));
         out.push_str(&format_table(run, show_all));
+    }
+    out
+}
+
+/// Group frame data by thread ID, returning a sorted Vec of (tid, FrameData).
+fn group_frames_by_tid(frame_data: &FrameData) -> Vec<(usize, FrameData)> {
+    let mut by_thread: HashMap<usize, Vec<Vec<FrameFnEntry>>> = HashMap::new();
+    for frame in &frame_data.frames {
+        let tid = frame.first().and_then(|e| e.tid).unwrap_or(0);
+        by_thread.entry(tid).or_default().push(frame.to_vec());
+    }
+    let mut threads: Vec<(usize, FrameData)> = by_thread
+        .into_iter()
+        .map(|(tid, frames)| {
+            (
+                tid,
+                FrameData {
+                    fn_names: frame_data.fn_names.clone(),
+                    frames,
+                },
+            )
+        })
+        .collect();
+    threads.sort_by_key(|(tid, _)| *tid);
+    threads
+}
+
+/// Per-thread JSON entry.
+#[derive(serde::Serialize)]
+struct JsonThreadEntry {
+    thread: usize,
+    functions: Vec<JsonFnEntry>,
+}
+
+/// Serialize per-thread aggregated data as a JSON array.
+pub fn format_per_thread_json(frame_data: &FrameData, show_all: bool) -> String {
+    let threads = group_frames_by_tid(frame_data);
+    let entries: Vec<JsonThreadEntry> = threads
+        .into_iter()
+        .map(|(tid, thread_frames)| {
+            let functions = aggregate_frames_to_json_entries(&thread_frames, show_all);
+            JsonThreadEntry {
+                thread: tid,
+                functions,
+            }
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&entries).expect("JSON serialization should not fail")
+}
+
+/// Format per-thread breakdown tables from frame data.
+pub fn format_per_thread_tables_from_frames(frame_data: &FrameData, show_all: bool) -> String {
+    let threads = group_frames_by_tid(frame_data);
+    let mut out = String::new();
+    for (i, (tid, thread_frames)) in threads.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("{HEADER}--- Thread {tid} ---{HEADER:#}\n"));
+        out.push_str(&format_table_with_frames(thread_frames, show_all));
     }
     out
 }
@@ -623,11 +690,11 @@ struct JsonFnAgg {
     alloc_bytes: u64,
 }
 
-/// Serialize frame-aggregated data as a JSON array of function entries.
+/// Aggregate per-frame data into per-function `JsonFnEntry` totals.
 ///
-/// Aggregates per-frame data into per-function totals, matching the summary
-/// table structure. Self time is converted from nanoseconds to milliseconds.
-pub fn format_json_with_frames(frame_data: &FrameData, show_all: bool) -> String {
+/// This is the shared logic behind `format_json_with_frames` (which serializes
+/// the result) and `format_per_thread_json` (which nests the entries by thread).
+fn aggregate_frames_to_json_entries(frame_data: &FrameData, show_all: bool) -> Vec<JsonFnEntry> {
     let has_cpu = frame_data
         .frames
         .iter()
@@ -675,7 +742,7 @@ pub fn format_json_with_frames(frame_data: &FrameData, show_all: bool) -> String
     }
     entries.sort_by(|a, b| b.self_ns.cmp(&a.self_ns));
 
-    let json_entries: Vec<JsonFnEntry> = entries
+    entries
         .iter()
         .map(|e| JsonFnEntry {
             name: e.name.clone(),
@@ -685,8 +752,15 @@ pub fn format_json_with_frames(frame_data: &FrameData, show_all: bool) -> String
             alloc_count: e.alloc_count,
             alloc_bytes: e.alloc_bytes,
         })
-        .collect();
+        .collect()
+}
 
+/// Serialize frame-aggregated data as a JSON array of function entries.
+///
+/// Aggregates per-frame data into per-function totals, matching the summary
+/// table structure. Self time is converted from nanoseconds to milliseconds.
+pub fn format_json_with_frames(frame_data: &FrameData, show_all: bool) -> String {
+    let json_entries = aggregate_frames_to_json_entries(frame_data, show_all);
     serde_json::to_string_pretty(&json_entries).expect("JSON serialization should not fail")
 }
 
@@ -1798,6 +1872,7 @@ mod tests {
                 vec![
                     FrameFnEntry {
                         fn_id: 0,
+                        tid: None,
                         calls: 1,
                         self_ns: 2_000_000,
                         cpu_self_ns: None,
@@ -1808,6 +1883,7 @@ mod tests {
                     },
                     FrameFnEntry {
                         fn_id: 1,
+                        tid: None,
                         calls: 1,
                         self_ns: 1_000_000,
                         cpu_self_ns: None,
@@ -1820,6 +1896,7 @@ mod tests {
                 vec![
                     FrameFnEntry {
                         fn_id: 0,
+                        tid: None,
                         calls: 1,
                         self_ns: 8_000_000,
                         cpu_self_ns: None,
@@ -1830,6 +1907,7 @@ mod tests {
                     },
                     FrameFnEntry {
                         fn_id: 1,
+                        tid: None,
                         calls: 1,
                         self_ns: 1_100_000,
                         cpu_self_ns: None,
@@ -1948,6 +2026,7 @@ mod tests {
                 vec![
                     FrameFnEntry {
                         fn_id: 0,
+                        tid: None,
                         calls: 1,
                         self_ns: 2_000_000,
                         cpu_self_ns: None,
@@ -1958,6 +2037,7 @@ mod tests {
                     },
                     FrameFnEntry {
                         fn_id: 1,
+                        tid: None,
                         calls: 1,
                         self_ns: 1_000_000,
                         cpu_self_ns: None,
@@ -1970,6 +2050,7 @@ mod tests {
                 vec![
                     FrameFnEntry {
                         fn_id: 0,
+                        tid: None,
                         calls: 1,
                         self_ns: 2_100_000,
                         cpu_self_ns: None,
@@ -1980,6 +2061,7 @@ mod tests {
                     },
                     FrameFnEntry {
                         fn_id: 1,
+                        tid: None,
                         calls: 1,
                         self_ns: 1_000_000,
                         cpu_self_ns: None,
@@ -1993,6 +2075,7 @@ mod tests {
                 vec![
                     FrameFnEntry {
                         fn_id: 0,
+                        tid: None,
                         calls: 1,
                         self_ns: 12_000_000,
                         cpu_self_ns: None,
@@ -2003,6 +2086,7 @@ mod tests {
                     },
                     FrameFnEntry {
                         fn_id: 1,
+                        tid: None,
                         calls: 1,
                         self_ns: 1_100_000,
                         cpu_self_ns: None,
@@ -2056,6 +2140,7 @@ mod tests {
             fn_names: vec!["update".into(), "unused".into()],
             frames: vec![vec![FrameFnEntry {
                 fn_id: 0,
+                tid: None,
                 calls: 1,
                 self_ns: 1_000_000,
                 cpu_self_ns: None,
@@ -2096,6 +2181,7 @@ mod tests {
             fn_names: vec![long_name.into()],
             frames: vec![vec![FrameFnEntry {
                 fn_id: 0,
+                tid: None,
                 calls: 1,
                 self_ns: 1_000_000,
                 cpu_self_ns: None,
@@ -2165,6 +2251,7 @@ mod tests {
             fn_names: vec!["compute".into()],
             frames: vec![vec![FrameFnEntry {
                 fn_id: 0,
+                tid: None,
                 calls: 1,
                 self_ns: 5_000_000,
                 cpu_self_ns: Some(4_000_000),
@@ -2409,6 +2496,7 @@ mod tests {
             fn_names: vec!["active".into(), "unused".into()],
             frames: vec![vec![FrameFnEntry {
                 fn_id: 0,
+                tid: None,
                 calls: 1,
                 self_ns: 5_000_000,
                 cpu_self_ns: Some(4_000_000),
@@ -2447,6 +2535,7 @@ mod tests {
             fn_names: vec!["update".into()],
             frames: vec![vec![FrameFnEntry {
                 fn_id: 0,
+                tid: None,
                 calls: 1,
                 self_ns: 2_000_000,
                 cpu_self_ns: None,
@@ -2693,6 +2782,7 @@ mod tests {
             fn_names: vec!["work".into()],
             frames: vec![vec![FrameFnEntry {
                 fn_id: 0,
+                tid: None,
                 calls: 1,
                 self_ns: 5_000_000,
                 cpu_self_ns: None,
@@ -2717,6 +2807,7 @@ mod tests {
             fn_names: vec!["work".into()],
             frames: vec![vec![FrameFnEntry {
                 fn_id: 0,
+                tid: None,
                 calls: 1,
                 self_ns: 5_000_000,
                 cpu_self_ns: Some(4_000_000),
@@ -2819,6 +2910,7 @@ mod tests {
                 vec![
                     FrameFnEntry {
                         fn_id: 0,
+                        tid: None,
                         calls: 1,
                         self_ns: 5_000_000,
                         cpu_self_ns: None,
@@ -2829,6 +2921,7 @@ mod tests {
                     },
                     FrameFnEntry {
                         fn_id: 1,
+                        tid: None,
                         calls: 1,
                         self_ns: 2_000_000,
                         cpu_self_ns: None,
@@ -2840,6 +2933,7 @@ mod tests {
                     // worker_fn only appears in frame 0
                     FrameFnEntry {
                         fn_id: 2,
+                        tid: None,
                         calls: 50,
                         self_ns: 3_000_000,
                         cpu_self_ns: None,
@@ -2852,6 +2946,7 @@ mod tests {
                 vec![
                     FrameFnEntry {
                         fn_id: 0,
+                        tid: None,
                         calls: 1,
                         self_ns: 4_000_000,
                         cpu_self_ns: None,
@@ -2862,6 +2957,7 @@ mod tests {
                     },
                     FrameFnEntry {
                         fn_id: 1,
+                        tid: None,
                         calls: 1,
                         self_ns: 2_500_000,
                         cpu_self_ns: None,
@@ -3381,6 +3477,7 @@ mod tests {
                 vec![
                     FrameFnEntry {
                         fn_id: 0,
+                        tid: None,
                         calls: 2,
                         self_ns: 5_000_000,
                         cpu_self_ns: None,
@@ -3391,6 +3488,7 @@ mod tests {
                     },
                     FrameFnEntry {
                         fn_id: 1,
+                        tid: None,
                         calls: 1,
                         self_ns: 3_000_000,
                         cpu_self_ns: None,
@@ -3402,6 +3500,7 @@ mod tests {
                 ],
                 vec![FrameFnEntry {
                     fn_id: 0,
+                    tid: None,
                     calls: 3,
                     self_ns: 7_000_000,
                     cpu_self_ns: None,
@@ -3433,6 +3532,7 @@ mod tests {
             fn_names: vec!["work".into()],
             frames: vec![vec![FrameFnEntry {
                 fn_id: 0,
+                tid: None,
                 calls: 1,
                 self_ns: 10_000_000,
                 cpu_self_ns: Some(8_000_000),
@@ -3453,6 +3553,7 @@ mod tests {
             fn_names: vec!["called".into(), "uncalled".into()],
             frames: vec![vec![FrameFnEntry {
                 fn_id: 0,
+                tid: None,
                 calls: 1,
                 self_ns: 1_000_000,
                 cpu_self_ns: None,
@@ -3542,6 +3643,7 @@ mod tests {
                 vec![
                     FrameFnEntry {
                         fn_id: 0,
+                        tid: None,
                         calls: 3,
                         self_ns: 5_000_000,
                         cpu_self_ns: None,
@@ -3552,6 +3654,7 @@ mod tests {
                     },
                     FrameFnEntry {
                         fn_id: 1,
+                        tid: None,
                         calls: 1,
                         self_ns: 2_000_000,
                         cpu_self_ns: None,
@@ -3563,6 +3666,7 @@ mod tests {
                 ],
                 vec![FrameFnEntry {
                     fn_id: 0,
+                    tid: None,
                     calls: 2,
                     self_ns: 3_000_000,
                     cpu_self_ns: None,
@@ -3596,5 +3700,101 @@ mod tests {
         assert_eq!(fns.len(), 1);
         assert_eq!(fns[0]["name"], "alpha");
         assert_eq!(fns[0]["self_ms"], 3.0);
+    }
+
+    #[test]
+    fn load_ndjson_with_tid() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tid.ndjson");
+        fs::write(
+            &path,
+            r#"{"format_version":4,"run_id":"tid_test","timestamp_ms":1000}
+{"frame":0,"tid":0,"fns":[{"id":0,"calls":3,"self_ns":5000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+{"frame":1,"tid":1,"fns":[{"id":0,"calls":2,"self_ns":3000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+{"frame":2,"tid":0,"fns":[{"id":1,"calls":1,"self_ns":1000,"ac":0,"ab":0,"fc":0,"fb":0}]}
+{"functions":["alpha","beta"]}
+"#,
+        )
+        .unwrap();
+        let (_run, frame_data) = load_ndjson(&path).unwrap();
+        assert_eq!(frame_data.frames.len(), 3);
+        assert_eq!(frame_data.frames[0][0].tid, Some(0));
+        assert_eq!(frame_data.frames[2][0].tid, Some(0));
+        assert_eq!(frame_data.frames[1][0].tid, Some(1));
+    }
+
+    #[test]
+    fn load_ndjson_without_tid_defaults_to_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("no_tid.ndjson");
+        fs::write(
+            &path,
+            r#"{"format_version":4,"run_id":"old","timestamp_ms":1000}
+{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":100,"ac":0,"ab":0,"fc":0,"fb":0}]}
+{"functions":["foo"]}
+"#,
+        )
+        .unwrap();
+        let (_run, frame_data) = load_ndjson(&path).unwrap();
+        assert_eq!(frame_data.frames[0][0].tid, None);
+    }
+
+    #[test]
+    fn format_per_thread_json_output() {
+        let frame_data = FrameData {
+            fn_names: vec!["alpha".into(), "beta".into()],
+            frames: vec![
+                vec![FrameFnEntry {
+                    fn_id: 0,
+                    tid: Some(0),
+                    calls: 3,
+                    self_ns: 5_000_000,
+                    cpu_self_ns: None,
+                    alloc_count: 0,
+                    alloc_bytes: 0,
+                    free_count: 0,
+                    free_bytes: 0,
+                }],
+                vec![FrameFnEntry {
+                    fn_id: 1,
+                    tid: Some(1),
+                    calls: 1,
+                    self_ns: 2_000_000,
+                    cpu_self_ns: None,
+                    alloc_count: 0,
+                    alloc_bytes: 0,
+                    free_count: 0,
+                    free_bytes: 0,
+                }],
+                vec![FrameFnEntry {
+                    fn_id: 0,
+                    tid: Some(0),
+                    calls: 2,
+                    self_ns: 3_000_000,
+                    cpu_self_ns: None,
+                    alloc_count: 0,
+                    alloc_bytes: 0,
+                    free_count: 0,
+                    free_bytes: 0,
+                }],
+            ],
+        };
+
+        let json_str = format_per_thread_json(&frame_data, false);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed.len(), 2, "should have 2 threads");
+        assert_eq!(parsed[0]["thread"], 0);
+        assert_eq!(parsed[1]["thread"], 1);
+
+        // Thread 0: alpha has 5 calls, 8ms total self
+        let fns = parsed[0]["functions"].as_array().unwrap();
+        assert_eq!(fns[0]["name"], "alpha");
+        assert_eq!(fns[0]["calls"], 5);
+        assert!((fns[0]["self_ms"].as_f64().unwrap() - 8.0).abs() < 0.01);
+
+        // Thread 1: beta has 1 call, 2ms
+        let fns = parsed[1]["functions"].as_array().unwrap();
+        assert_eq!(fns[0]["name"], "beta");
+        assert_eq!(fns[0]["calls"], 1);
     }
 }

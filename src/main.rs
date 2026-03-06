@@ -14,10 +14,10 @@ use piano::error::{Error, io_context};
 use piano::report::{
     diff_runs, diff_runs_json, find_latest_run_file, find_latest_run_file_since,
     find_ndjson_by_run_id, format_frames_json, format_frames_table, format_json,
-    format_json_with_frames, format_per_thread_tables, format_table, format_table_with_frames,
-    load_latest_run, load_latest_runs_per_thread, load_ndjson, load_run, load_run_by_id,
-    load_tagged_run, load_two_latest_runs, relative_time, resolve_tag, reverse_resolve_tag,
-    save_tag,
+    format_json_with_frames, format_per_thread_json, format_per_thread_tables,
+    format_per_thread_tables_from_frames, format_table, format_table_with_frames, load_latest_run,
+    load_latest_runs_per_thread, load_ndjson, load_run, load_run_by_id, load_tagged_run,
+    load_two_latest_runs, relative_time, resolve_tag, reverse_resolve_tag, save_tag,
 };
 use piano::resolve::{ResolveResult, SkippedFunction, TargetSpec, resolve_targets};
 use piano::rewrite::{
@@ -742,7 +742,29 @@ fn cmd_report(
         && path.extension().and_then(|e| e.to_str()) == Some("ndjson")
     {
         let (_run, frame_data) = load_ndjson(path)?;
-        if json && frames {
+
+        let has_tid = frame_data
+            .frames
+            .iter()
+            .any(|f| f.iter().any(|e| e.tid.is_some()));
+
+        if threads && !has_tid {
+            eprintln!(
+                "warning: --threads requires per-thread data; this file predates thread tracking"
+            );
+            eprintln!("warning: showing aggregated view instead");
+        }
+
+        if threads && has_tid {
+            if json {
+                println!("{}", format_per_thread_json(&frame_data, show_all));
+            } else {
+                anstream::print!(
+                    "{}",
+                    format_per_thread_tables_from_frames(&frame_data, show_all)
+                );
+            }
+        } else if json && frames {
             println!("{}", format_frames_json(&frame_data, show_all));
         } else if json {
             println!("{}", format_json_with_frames(&frame_data, show_all));
