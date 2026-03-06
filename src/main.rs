@@ -12,11 +12,11 @@ use piano::build::{
 };
 use piano::error::{Error, io_context};
 use piano::report::{
-    diff_runs, diff_runs_json, find_latest_run_file, find_ndjson_by_run_id, format_frames_table,
-    format_json, format_json_with_frames, format_per_thread_tables, format_table,
-    format_table_with_frames, load_latest_run, load_latest_runs_per_thread, load_ndjson, load_run,
-    load_run_by_id, load_tagged_run, load_two_latest_runs, relative_time, resolve_tag,
-    reverse_resolve_tag, save_tag,
+    diff_runs, diff_runs_json, find_latest_run_file, find_latest_run_file_since,
+    find_ndjson_by_run_id, format_frames_table, format_json, format_json_with_frames,
+    format_per_thread_tables, format_table, format_table_with_frames, load_latest_run,
+    load_latest_runs_per_thread, load_ndjson, load_run, load_run_by_id, load_tagged_run,
+    load_two_latest_runs, relative_time, resolve_tag, reverse_resolve_tag, save_tag,
 };
 use piano::resolve::{ResolveResult, SkippedFunction, TargetSpec, resolve_targets};
 use piano::rewrite::{
@@ -604,6 +604,11 @@ fn cmd_profile(
     eprintln!("built: {display_name}");
     eprintln!("--- program output ---");
 
+    let profile_start_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
     let timeout = duration.map(Duration::from_secs);
     let status = run_child(&binary, &args, timeout)?;
 
@@ -626,6 +631,20 @@ fn cmd_profile(
     if std::env::var_os("PIANO_RUNS_DIR").is_none() {
         // SAFETY: single-threaded CLI at this point — no concurrent env reads.
         unsafe { std::env::set_var("PIANO_RUNS_DIR", &runs_dir) };
+    }
+
+    // Guard against stale data: if no run file was written during THIS run,
+    // don't let cmd_report pick up a file from a previous run.
+    let effective_runs_dir = default_runs_dir(project_root)?;
+    if find_latest_run_file_since(&effective_runs_dir, profile_start_ms)?.is_none() {
+        if !status.success() && !ignore_exit_code {
+            // Program failed, no data -- suppress (UX principle 6).
+            return Ok(());
+        }
+        if total_fns == 0 {
+            return Err(Error::NoFunctionsInstrumented);
+        }
+        return Err(Error::NoDataWritten(effective_runs_dir));
     }
 
     eprintln!("--- profiling report ---");

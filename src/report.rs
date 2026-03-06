@@ -1170,6 +1170,25 @@ pub fn find_latest_run_file(runs_dir: &Path) -> Result<Option<PathBuf>, Error> {
     Ok(all_files.into_iter().next_back())
 }
 
+/// Like `find_latest_run_file`, but only returns files whose timestamp stem
+/// is >= `since_ms`. Prevents reading stale data from a previous run when
+/// the runtime crashed without writing new data.
+pub fn find_latest_run_file_since(
+    runs_dir: &Path,
+    since_ms: u128,
+) -> Result<Option<PathBuf>, Error> {
+    let all_files = collect_run_files(runs_dir)?;
+    Ok(all_files
+        .into_iter()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u128>().ok())
+                .is_some_and(|ts| ts >= since_ms)
+        })
+        .next_back())
+}
+
 /// Format a SystemTime as a relative duration string ("N sec/min/hours/days ago").
 pub fn relative_time(t: std::time::SystemTime) -> String {
     let elapsed = t.elapsed().unwrap_or_default();
