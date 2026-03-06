@@ -1858,6 +1858,7 @@ mod tests {
     use std::thread;
 
     #[test]
+    #[serial]
     fn flush_writes_valid_output_to_env_dir() {
         reset();
         {
@@ -1897,6 +1898,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn flush_to_writes_to_explicit_dir() {
         reset();
         {
@@ -1947,6 +1949,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn single_function_timing() {
         reset();
         {
@@ -1960,6 +1963,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn nested_function_self_time() {
         reset();
         {
@@ -1998,6 +2002,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn self_time_numerical_precision() {
         reset();
         {
@@ -2033,6 +2038,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn call_count_tracking() {
         reset();
         for _ in 0..5 {
@@ -2045,6 +2051,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn reset_clears_state() {
         reset();
         {
@@ -2061,6 +2068,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn collect_sorts_by_self_time_descending() {
         reset();
         {
@@ -2098,6 +2106,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn registered_but_uncalled_functions_appear_with_zero_calls() {
         reset();
         register("never_called");
@@ -2122,6 +2131,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn output_contains_run_id() {
         reset();
         {
@@ -2170,6 +2180,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn deep_nesting_100_levels() {
         reset();
 
@@ -2206,12 +2217,14 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn fork_returns_none_with_empty_stack() {
         reset();
         assert!(fork().is_none(), "fork should return None with empty stack");
     }
 
     #[test]
+    #[serial]
     fn fork_adopt_propagates_child_time_to_parent() {
         reset();
         {
@@ -2257,6 +2270,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn adopt_without_child_work_adds_minimal_overhead() {
         reset();
         {
@@ -2280,6 +2294,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn multiple_children_accumulate_in_parent() {
         reset();
         {
@@ -2309,6 +2324,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn invocation_records_capture_depth() {
         reset();
         {
@@ -2327,6 +2343,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cross_thread_fork_adopt_propagates() {
         reset();
         {
@@ -2363,6 +2380,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn write_ndjson_format() {
         reset();
         for _ in 0..2 {
@@ -2408,6 +2426,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn frame_boundary_aggregation() {
         reset();
         // Simulate 3 frames: depth-0 function called 3 times
@@ -2435,6 +2454,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn non_frame_workload_still_collects() {
         reset();
         // All calls at depth 0 but no "frame" structure
@@ -2491,6 +2511,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn span_context_auto_finalizes_on_drop() {
         reset();
         {
@@ -2524,6 +2545,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn shutdown_writes_ndjson_with_all_thread_data() {
         reset();
         std::thread::scope(|s| {
@@ -2564,6 +2586,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn fork_adopt_does_not_inflate_reported_times() {
         // Verify that fork/adopt overhead is NOT attributed to any function.
         // Only instrumented functions (via enter()) should appear in output.
@@ -2638,6 +2661,7 @@ mod tests {
 
     #[cfg(feature = "cpu-time")]
     #[test]
+    #[serial]
     fn cpu_time_propagated_across_threads_via_adopt() {
         reset();
         {
@@ -2684,6 +2708,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn fork_adopt_does_not_subtract_wall_time_from_parent() {
         // Wall time should NOT be subtracted cross-thread.
         // Parent wall self = elapsed - same-thread children only.
@@ -2725,6 +2750,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
+    #[serial]
     fn async_guard_same_thread() {
         reset();
         {
@@ -2870,6 +2896,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn shutdown_impl_reports_write_errors_to_stderr() {
         reset();
         // Produce some data so shutdown_impl_inner has something to write.
@@ -2896,6 +2923,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn records_aggregate_in_flight() {
         reset();
         for _ in 0..10_000 {
@@ -2918,6 +2946,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn frame_buffer_aggregates_in_flight() {
         reset();
         {
@@ -2966,6 +2995,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn stream_writes_valid_v4_ndjson() {
         reset();
         let tmp = std::env::temp_dir().join(format!("piano_stream_{}", std::process::id()));
@@ -3113,6 +3143,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn shutdown_streaming_writes_trailer() {
         // Test that the streaming shutdown path produces a complete v4 file.
         //
@@ -3170,6 +3201,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn stream_frame_field_values_round_trip() {
         let tmp = std::env::temp_dir().join(format!("piano_rt_roundtrip_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3240,6 +3272,7 @@ mod tests {
     // simple flag check tested indirectly via integration tests.
 
     #[test]
+    #[serial]
     fn synthesize_frame_from_agg_precision() {
         reset();
 
@@ -3288,6 +3321,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn double_flush_idempotency() {
         reset();
         {
@@ -3313,6 +3347,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn trailer_fn_id_round_trip() {
         let tmp = std::env::temp_dir().join(format!("piano_trailer_rt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3410,6 +3445,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[cfg(debug_assertions)]
     fn reentrant_stack_access_panics_in_debug() {
         // Verify that the debug-mode borrow guard on STACK detects reentrant
@@ -3585,6 +3621,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
+    #[serial]
     fn drop_cold_parent_children_ns_accumulates() {
         // Kills: collector.rs:915 replace += with -= and *= in drop_cold
         // When an inner function drops, its elapsed time must be ADDED to
@@ -3622,6 +3659,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
+    #[serial]
     fn drop_cold_frame_boundary_with_adopt_context() {
         // Kills: collector.rs:968 replace == with !=
         //        collector.rs:969 replace || with && and == with !=
@@ -3677,6 +3715,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
+    #[serial]
     fn stream_frame_to_writer_comma_separation() {
         // Kills: collector.rs:171 replace > with ==/</>=
         // With 2+ entries, commas should separate them. With 1 entry, no comma.
@@ -3766,6 +3805,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn write_stream_trailer_comma_separation() {
         // Kills: collector.rs:253 replace > with >=
         // Verifies commas between function names in the trailer.
@@ -3803,6 +3843,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn write_ndjson_comma_separation() {
         // Kills: collector.rs:1303 and 1319 replace > with ==/</>=
         let tmp = std::env::temp_dir().join(format!("piano_ndjson_comma_{}", std::process::id()));
@@ -4021,6 +4062,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
+    #[serial]
     fn shutdown_impl_inner_returns_false_on_success() {
         // Kills: collector.rs:1546, 1551, 1578 delete ! in shutdown_impl_inner
         // A successful write should return false (no failure).
