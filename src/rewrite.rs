@@ -74,6 +74,91 @@ const SCOPE_FUNCTIONS: &[&str] = &["scope", "scope_fifo"];
 /// SpanContext stays on the parent thread.
 const FORK_INJECTION_TRIGGERS: &[&str] = &["scope", "scope_fifo", "join"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FutureReturnKind {
+    ImplFuture,
+    PinBoxDynFuture,
+    KnownAlias,
+}
+
+fn returns_future(sig: &syn::Signature) -> Option<FutureReturnKind> {
+    let syn::ReturnType::Type(_, ty) = &sig.output else {
+        return None;
+    };
+    returns_future_ty(ty)
+}
+
+fn returns_future_ty(ty: &syn::Type) -> Option<FutureReturnKind> {
+    match ty {
+        syn::Type::ImplTrait(impl_trait) => {
+            if has_future_bound(&impl_trait.bounds) {
+                Some(FutureReturnKind::ImplFuture)
+            } else {
+                None
+            }
+        }
+        syn::Type::Path(type_path) => {
+            let last = type_path.path.segments.last()?;
+            let ident = last.ident.to_string();
+            match ident.as_str() {
+                "Pin" => check_pin_box_dyn_future(last),
+                "BoxFuture" | "LocalBoxFuture" => Some(FutureReturnKind::KnownAlias),
+                _ => None,
+            }
+        }
+        syn::Type::Paren(paren) => returns_future_ty(&paren.elem),
+        _ => None,
+    }
+}
+
+fn has_future_bound(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::token::Plus>,
+) -> bool {
+    bounds.iter().any(|bound| {
+        if let syn::TypeParamBound::Trait(trait_bound) = bound {
+            is_future_path(&trait_bound.path)
+        } else {
+            false
+        }
+    })
+}
+
+fn is_future_path(path: &syn::Path) -> bool {
+    path.segments
+        .last()
+        .is_some_and(|seg| seg.ident == "Future")
+}
+
+fn check_pin_box_dyn_future(pin_seg: &syn::PathSegment) -> Option<FutureReturnKind> {
+    let inner_ty = first_type_arg(pin_seg)?;
+    if let syn::Type::Path(type_path) = inner_ty {
+        let last = type_path.path.segments.last()?;
+        if last.ident == "Box" {
+            let box_inner = first_type_arg(last)?;
+            if let syn::Type::TraitObject(trait_obj) = box_inner {
+                if has_future_bound(&trait_obj.bounds) {
+                    return Some(FutureReturnKind::PinBoxDynFuture);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn first_type_arg(seg: &syn::PathSegment) -> Option<&syn::Type> {
+    if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+        args.args.iter().find_map(|arg| {
+            if let syn::GenericArgument::Type(ty) = arg {
+                Some(ty)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    }
+}
+
 struct Instrumenter {
     targets: HashSet<String>,
     instrument_macros: bool,
@@ -84,10 +169,20 @@ struct Instrumenter {
 }
 
 impl Instrumenter {
-    fn inject_guard(&mut self, block: &mut syn::Block, name: &str, is_async: bool) {
+    fn inject_guard(&mut self, block: &mut syn::Block, name: &str, sig: &syn::Signature) {
         if !self.targets.contains(name) {
             return;
         }
+        let is_async = sig.asyncness.is_some();
+
+        // For non-async functions returning futures, wrap only the trailing expression.
+        if !is_async {
+            if let Some(kind) = returns_future(sig) {
+                self.inject_future_return_guard(block, name, sig, kind);
+                return;
+            }
+        }
+
         let guard_stmt: syn::Stmt = syn::parse_quote! {
             let __piano_guard = piano_runtime::enter(#name);
         };
@@ -140,6 +235,122 @@ impl Instrumenter {
             block.stmts = vec![syn::Stmt::Expr(wrapper_expr, None)];
         }
     }
+
+    /// Wrap the trailing expression of a future-returning function in `PianoFuture`.
+    ///
+    /// For `-> impl Future<Output = T>`: wraps in `PianoFuture::new(async move { guard; expr.await })`.
+    /// For `-> Pin<Box<dyn Future<...>>>` / `BoxFuture`: additionally wraps in `Box::pin(...)`.
+    ///
+    /// Preceding statements (setup code) are preserved in the outer (sync) scope.
+    /// The timing guard lives only inside the async block so it measures poll time,
+    /// not construction time.
+    fn inject_future_return_guard(
+        &mut self,
+        block: &mut syn::Block,
+        name: &str,
+        sig: &syn::Signature,
+        kind: FutureReturnKind,
+    ) {
+        // Split: preceding stmts stay in place, trailing expr gets wrapped.
+        let Some(syn::Stmt::Expr(trailing_expr, None)) = block.stmts.last().cloned() else {
+            // No trailing expression -- fall back to sync guard.
+            let guard_stmt: syn::Stmt = syn::parse_quote! {
+                let __piano_guard = piano_runtime::enter(#name);
+            };
+            block.stmts.insert(0, guard_stmt);
+            return;
+        };
+
+        // Remove the trailing expression (we'll replace it).
+        block.stmts.pop();
+
+        // Extract the return type once for PinBoxDynFuture/KnownAlias (used by
+        // both the ReturnWrapper and trailing-expression wrapping below).
+        let boxed_return_type = if matches!(
+            kind,
+            FutureReturnKind::PinBoxDynFuture | FutureReturnKind::KnownAlias
+        ) {
+            let ty = match &sig.output {
+                syn::ReturnType::Type(_, ty) => ty.as_ref().clone(),
+                _ => unreachable!("returns_future already checked this"),
+            };
+            Some(ty)
+        } else {
+            None
+        };
+
+        // For boxed-future returns, wrap early `return` expressions too.
+        if let Some(return_type) = &boxed_return_type {
+            let mut wrapper = ReturnWrapper {
+                name: name.to_string(),
+                return_type: return_type.clone(),
+            };
+            for stmt in &mut block.stmts {
+                wrapper.visit_stmt_mut(stmt);
+            }
+        }
+
+        let wrapped: syn::Expr = match kind {
+            FutureReturnKind::ImplFuture => {
+                syn::parse_quote! {
+                    piano_runtime::PianoFuture::new(async move {
+                        let __piano_guard = piano_runtime::enter(#name);
+                        (#trailing_expr).await
+                    })
+                }
+            }
+            FutureReturnKind::PinBoxDynFuture | FutureReturnKind::KnownAlias => {
+                let return_type = boxed_return_type
+                    .as_ref()
+                    .expect("boxed_return_type is Some for PinBoxDynFuture/KnownAlias");
+                syn::parse_quote! {
+                    Box::pin(piano_runtime::PianoFuture::new(async move {
+                        let __piano_guard = piano_runtime::enter(#name);
+                        let __piano_inner: #return_type = #trailing_expr;
+                        __piano_inner.await
+                    }))
+                }
+            }
+        };
+
+        block.stmts.push(syn::Stmt::Expr(wrapped, None));
+    }
+}
+
+/// Wraps function-level `return <expr>` in future-returning functions so that
+/// early return paths are also instrumented with PianoFuture.
+struct ReturnWrapper {
+    name: String,
+    return_type: syn::Type,
+}
+
+impl VisitMut for ReturnWrapper {
+    fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+        match expr {
+            // Boundaries: return inside these is NOT our function's return.
+            syn::Expr::Closure(_) | syn::Expr::Async(_) => return,
+            syn::Expr::Return(ret) => {
+                if let Some(inner) = ret.expr.take() {
+                    let name = &self.name;
+                    let return_type = &self.return_type;
+                    let wrapped: syn::Expr = syn::parse_quote! {
+                        Box::pin(piano_runtime::PianoFuture::new(async move {
+                            let __piano_guard = piano_runtime::enter(#name);
+                            let __piano_inner: #return_type = #inner;
+                            __piano_inner.await
+                        }))
+                    };
+                    ret.expr = Some(Box::new(wrapped));
+                }
+                return;
+            }
+            _ => {}
+        }
+        syn::visit_mut::visit_expr_mut(self, expr);
+    }
+
+    fn visit_item_fn_mut(&mut self, _node: &mut syn::ItemFn) {}
+    fn visit_impl_item_fn_mut(&mut self, _node: &mut syn::ImplItemFn) {}
 }
 
 /// Find the first concurrency pattern in a block and return its name.
@@ -915,8 +1126,7 @@ impl VisitMut for Instrumenter {
     fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
         if is_instrumentable(&node.sig) {
             let name = node.sig.ident.to_string();
-            let is_async = node.sig.asyncness.is_some();
-            self.inject_guard(&mut node.block, &name, is_async);
+            self.inject_guard(&mut node.block, &name, &node.sig);
         }
         syn::visit_mut::visit_item_fn_mut(self, node);
     }
@@ -936,8 +1146,7 @@ impl VisitMut for Instrumenter {
                 Some(ty) => format!("{ty}::{method}"),
                 None => method,
             };
-            let is_async = node.sig.asyncness.is_some();
-            self.inject_guard(&mut node.block, &qualified, is_async);
+            self.inject_guard(&mut node.block, &qualified, &node.sig);
         }
         syn::visit_mut::visit_impl_item_fn_mut(self, node);
     }
@@ -958,8 +1167,7 @@ impl VisitMut for Instrumenter {
                     Some(trait_name) => format!("{trait_name}::{method}"),
                     None => method,
                 };
-                let is_async = node.sig.asyncness.is_some();
-                self.inject_guard(block, &qualified, is_async);
+                self.inject_guard(block, &qualified, &node.sig);
             }
         }
         syn::visit_mut::visit_trait_item_fn_mut(self, node);
@@ -2803,6 +3011,465 @@ fn main() {}
         assert!(
             matches!(kind, AllocatorKind::Unconditional),
             "unconditional allocator should take precedence over cfg-gated. Got: {kind:?}"
+        );
+    }
+
+    #[test]
+    fn returns_future_detects_impl_future() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn foo() -> impl Future<Output = i32>
+        };
+        assert_eq!(returns_future(&sig), Some(FutureReturnKind::ImplFuture));
+    }
+
+    #[test]
+    fn returns_future_detects_impl_future_with_send() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn foo() -> impl Future<Output = i32> + Send
+        };
+        assert_eq!(returns_future(&sig), Some(FutureReturnKind::ImplFuture));
+    }
+
+    #[test]
+    fn returns_future_detects_impl_future_with_lifetime() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn foo(s: &str) -> impl Future<Output = usize> + '_
+        };
+        assert_eq!(returns_future(&sig), Some(FutureReturnKind::ImplFuture));
+    }
+
+    #[test]
+    fn returns_future_detects_pin_box_dyn_future() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn foo() -> Pin<Box<dyn Future<Output = i32>>>
+        };
+        assert_eq!(
+            returns_future(&sig),
+            Some(FutureReturnKind::PinBoxDynFuture)
+        );
+    }
+
+    #[test]
+    fn returns_future_detects_pin_box_dyn_future_send() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn foo() -> Pin<Box<dyn Future<Output = i32> + Send>>
+        };
+        assert_eq!(
+            returns_future(&sig),
+            Some(FutureReturnKind::PinBoxDynFuture)
+        );
+    }
+
+    #[test]
+    fn returns_future_detects_box_future_alias() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn foo() -> BoxFuture<'static, i32>
+        };
+        assert_eq!(returns_future(&sig), Some(FutureReturnKind::KnownAlias));
+    }
+
+    #[test]
+    fn returns_future_detects_local_box_future_alias() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn foo() -> LocalBoxFuture<'_, i32>
+        };
+        assert_eq!(returns_future(&sig), Some(FutureReturnKind::KnownAlias));
+    }
+
+    #[test]
+    fn returns_future_rejects_plain_type() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn foo() -> i32
+        };
+        assert_eq!(returns_future(&sig), None);
+    }
+
+    #[test]
+    fn returns_future_rejects_result_of_future() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn foo() -> Result<impl Future<Output = i32>, Error>
+        };
+        assert_eq!(returns_future(&sig), None);
+    }
+
+    #[test]
+    fn returns_future_rejects_no_return_type() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn foo()
+        };
+        assert_eq!(returns_future(&sig), None);
+    }
+
+    #[test]
+    fn returns_future_rejects_string_return() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn foo() -> String
+        };
+        assert_eq!(returns_future(&sig), None);
+    }
+
+    #[test]
+    fn returns_future_detects_fully_qualified_future() {
+        let sig: syn::Signature = syn::parse_quote! {
+            fn foo() -> impl std::future::Future<Output = i32>
+        };
+        assert_eq!(returns_future(&sig), Some(FutureReturnKind::ImplFuture));
+    }
+
+    #[test]
+    fn instruments_impl_future_fn() {
+        let source = r#"
+use std::future::Future;
+
+fn fetch() -> impl Future<Output = String> {
+    async { "data".to_string() }
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert!(
+            result.source.contains("piano_runtime::PianoFuture::new"),
+            "impl Future fn should be wrapped in PianoFuture. Got:\n{}",
+            result.source,
+        );
+        assert!(
+            result.source.contains("piano_runtime::enter(\"fetch\")"),
+            "guard should be inside PianoFuture wrapper. Got:\n{}",
+            result.source,
+        );
+        assert!(
+            result.source.contains(".await"),
+            "trailing expression should be awaited inside async block. Got:\n{}",
+            result.source,
+        );
+    }
+
+    #[test]
+    fn impl_future_preserves_setup_stmts() {
+        let source = r#"
+use std::future::Future;
+
+fn fetch(x: i32) -> impl Future<Output = i32> {
+    let doubled = x * 2;
+    async move { doubled }
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        let setup_pos = result.source.find("let doubled").unwrap();
+        let piano_pos = result.source.find("PianoFuture::new").unwrap();
+        assert!(
+            setup_pos < piano_pos,
+            "setup stmt should precede PianoFuture wrapping. Got:\n{}",
+            result.source,
+        );
+    }
+
+    #[test]
+    fn impl_future_no_sync_guard() {
+        let source = r#"
+use std::future::Future;
+
+fn fetch() -> impl Future<Output = String> {
+    async { "data".to_string() }
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        let count = result.source.matches("piano_runtime::enter").count();
+        assert_eq!(
+            count, 1,
+            "should have exactly one enter() call (inside PianoFuture). Got {} in:\n{}",
+            count, result.source,
+        );
+    }
+
+    #[test]
+    fn impl_future_delegation() {
+        let source = r#"
+use std::future::Future;
+
+async fn helper() -> i32 { 42 }
+
+fn delegator() -> impl Future<Output = i32> {
+    helper()
+}
+"#;
+        let targets: HashSet<String> = ["delegator".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert!(
+            result.source.contains("piano_runtime::PianoFuture::new"),
+            "delegation should be wrapped in PianoFuture. Got:\n{}",
+            result.source,
+        );
+    }
+
+    #[test]
+    fn impl_future_with_send_bound() {
+        let source = r#"
+use std::future::Future;
+
+fn fetch() -> impl Future<Output = String> + Send {
+    async { "data".to_string() }
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert!(
+            result.source.contains("piano_runtime::PianoFuture::new"),
+            "impl Future + Send should be wrapped in PianoFuture. Got:\n{}",
+            result.source,
+        );
+    }
+
+    #[test]
+    fn instruments_pin_box_dyn_future_fn() {
+        let source = r#"
+use std::future::Future;
+use std::pin::Pin;
+
+fn fetch() -> Pin<Box<dyn Future<Output = String> + Send>> {
+    Box::pin(async { "data".to_string() })
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert!(
+            result.source.contains("piano_runtime::PianoFuture::new"),
+            "Pin<Box<dyn Future>> fn should be wrapped in PianoFuture. Got:\n{}",
+            result.source,
+        );
+        assert!(
+            result.source.contains("Box::pin"),
+            "should re-box the PianoFuture for Pin<Box<dyn Future>> return. Got:\n{}",
+            result.source,
+        );
+        assert!(
+            result.source.contains("__piano_inner"),
+            "should use type-annotated binding for coercion. Got:\n{}",
+            result.source,
+        );
+    }
+
+    #[test]
+    fn instruments_box_future_alias() {
+        let source = r#"
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+use std::future::Future;
+use std::pin::Pin;
+
+fn fetch() -> BoxFuture<'static, String> {
+    Box::pin(async { "data".to_string() })
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert!(
+            result.source.contains("piano_runtime::PianoFuture::new"),
+            "BoxFuture alias fn should be wrapped in PianoFuture. Got:\n{}",
+            result.source,
+        );
+    }
+
+    #[test]
+    fn impl_future_impl_method() {
+        let source = r#"
+use std::future::Future;
+
+struct Client;
+
+impl Client {
+    fn fetch(&self) -> impl Future<Output = String> + '_ {
+        async move { "data".to_string() }
+    }
+}
+"#;
+        let targets: HashSet<String> = ["Client::fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert!(
+            result.source.contains("piano_runtime::PianoFuture::new"),
+            "impl method returning impl Future should be wrapped. Got:\n{}",
+            result.source,
+        );
+        assert!(
+            result
+                .source
+                .contains("piano_runtime::enter(\"Client::fetch\")"),
+            "guard should use qualified name. Got:\n{}",
+            result.source,
+        );
+    }
+
+    #[test]
+    fn impl_future_trait_default_method() {
+        let source = r#"
+use std::future::Future;
+
+trait Service {
+    fn call(&self) -> impl Future<Output = String> {
+        async { "ok".to_string() }
+    }
+}
+"#;
+        let targets: HashSet<String> = ["Service::call".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert!(
+            result.source.contains("piano_runtime::PianoFuture::new"),
+            "trait default method returning impl Future should be wrapped. Got:\n{}",
+            result.source,
+        );
+    }
+
+    #[test]
+    fn sync_fn_unchanged_after_refactor() {
+        let source = r#"
+fn compute(x: u64) -> u64 {
+    x * 2
+}
+"#;
+        let targets: HashSet<String> = ["compute".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        assert!(
+            result.source.contains("piano_runtime::enter(\"compute\")"),
+            "sync fn should still get sync guard. Got:\n{}",
+            result.source,
+        );
+        assert!(
+            !result.source.contains("PianoFuture"),
+            "sync fn should NOT get PianoFuture. Got:\n{}",
+            result.source,
+        );
+    }
+
+    #[test]
+    fn pin_box_dyn_future_early_return_is_wrapped() {
+        let source = r#"
+use std::future::Future;
+use std::pin::Pin;
+
+fn fetch(flag: bool) -> Pin<Box<dyn Future<Output = String> + Send>> {
+    if flag {
+        return Box::pin(async { "early".to_string() });
+    }
+    Box::pin(async { "normal".to_string() })
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        let piano_count = result
+            .source
+            .matches("piano_runtime::PianoFuture::new")
+            .count();
+        assert_eq!(
+            piano_count, 2,
+            "both early return and trailing expr should be wrapped in PianoFuture. Got {} in:\n{}",
+            piano_count, result.source,
+        );
+    }
+
+    #[test]
+    fn return_inside_closure_not_wrapped() {
+        let source = r#"
+use std::future::Future;
+
+fn fetch(items: Vec<i32>) -> impl Future<Output = Vec<i32>> {
+    let filtered: Vec<i32> = items.into_iter().filter(|x| {
+        if *x < 0 { return false; }
+        true
+    }).collect();
+    async move { filtered }
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        let piano_count = result
+            .source
+            .matches("piano_runtime::PianoFuture::new")
+            .count();
+        assert_eq!(
+            piano_count, 1,
+            "closure return should not be wrapped. Got {} in:\n{}",
+            piano_count, result.source,
+        );
+    }
+
+    #[test]
+    fn return_inside_async_block_not_wrapped() {
+        let source = r#"
+use std::future::Future;
+use std::pin::Pin;
+
+fn fetch() -> Pin<Box<dyn Future<Output = i32> + Send>> {
+    Box::pin(async {
+        if true { return 42; }
+        0
+    })
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        let piano_count = result
+            .source
+            .matches("piano_runtime::PianoFuture::new")
+            .count();
+        assert_eq!(
+            piano_count, 1,
+            "return inside async block should not be wrapped. Got {} in:\n{}",
+            piano_count, result.source,
+        );
+    }
+
+    #[test]
+    fn impl_future_early_return_not_wrapped() {
+        // Known limitation: for `-> impl Future`, early returns are not wrapped
+        // in PianoFuture. Only the trailing expression is instrumented. This is
+        // because wrapping would change the concrete return type, potentially
+        // causing compilation errors when different return paths produce
+        // different opaque types.
+        let source = r#"
+use std::future::Future;
+
+fn fetch(flag: bool) -> impl Future<Output = String> {
+    if flag {
+        return async { "early".to_string() };
+    }
+    async { "normal".to_string() }
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+        let piano_count = result
+            .source
+            .matches("piano_runtime::PianoFuture::new")
+            .count();
+        assert_eq!(
+            piano_count, 1,
+            "only trailing expr should be wrapped (early return is a known gap). Got {} in:\n{}",
+            piano_count, result.source,
+        );
+    }
+
+    #[test]
+    fn impl_future_no_trailing_expr_falls_back_to_sync_guard() {
+        let source = r#"
+use std::future::Future;
+
+fn foo() -> impl Future<Output = ()> {
+    return async {};
+}
+"#;
+        let targets: HashSet<String> = ["foo".to_string()].into();
+        let result = instrument_source(source, &targets, false).unwrap();
+
+        assert!(
+            result.source.contains("piano_runtime::enter(\"foo\")"),
+            "should fall back to sync guard when no trailing expression. Got:\n{}",
+            result.source,
+        );
+        assert!(
+            !result.source.contains("PianoFuture"),
+            "should NOT wrap in PianoFuture when no trailing expression. Got:\n{}",
+            result.source,
         );
     }
 }
