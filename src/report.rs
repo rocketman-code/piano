@@ -690,6 +690,67 @@ pub fn format_json_with_frames(frame_data: &FrameData, show_all: bool) -> String
     serde_json::to_string_pretty(&json_entries).expect("JSON serialization should not fail")
 }
 
+/// Per-frame JSON entry for --frames --json output.
+#[derive(serde::Serialize)]
+struct JsonFrameEntry {
+    frame: usize,
+    functions: Vec<JsonFnEntry>,
+}
+
+/// Serialize frame-level data as a JSON array of per-frame objects.
+///
+/// Each frame contains its 1-based index and a list of function entries
+/// with timing and allocation data. Functions are sorted by self time
+/// descending within each frame.
+pub fn format_frames_json(frame_data: &FrameData, show_all: bool) -> String {
+    let has_cpu = frame_data
+        .frames
+        .iter()
+        .any(|f| f.iter().any(|e| e.cpu_self_ns.is_some()));
+
+    let json_frames: Vec<JsonFrameEntry> = frame_data
+        .frames
+        .iter()
+        .enumerate()
+        .map(|(i, frame)| {
+            let mut fns: Vec<JsonFnEntry> = frame
+                .iter()
+                .filter(|e| show_all || e.calls > 0)
+                .map(|e| {
+                    let name = frame_data
+                        .fn_names
+                        .get(e.fn_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("<fn_{}>", e.fn_id));
+                    JsonFnEntry {
+                        name,
+                        self_ms: e.self_ns as f64 / 1_000_000.0,
+                        cpu_self_ms: if has_cpu {
+                            Some(e.cpu_self_ns.unwrap_or(0) as f64 / 1_000_000.0)
+                        } else {
+                            None
+                        },
+                        calls: e.calls,
+                        alloc_count: e.alloc_count,
+                        alloc_bytes: e.alloc_bytes,
+                    }
+                })
+                .collect();
+            fns.sort_by(|a, b| {
+                b.self_ms
+                    .partial_cmp(&a.self_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            JsonFrameEntry {
+                frame: i + 1,
+                functions: fns,
+            }
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&json_frames).expect("JSON serialization should not fail")
+}
+
 /// Structured JSON entry for a diff comparison.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct JsonDiffEntry {
@@ -3471,5 +3532,69 @@ mod tests {
         assert_eq!(entries[0].name, "new_fn");
         assert!((entries[0].self_ms_a).abs() < f64::EPSILON);
         assert!(entries[0].delta_pct.is_none());
+    }
+
+    #[test]
+    fn format_frames_json_output() {
+        let frame_data = FrameData {
+            fn_names: vec!["alpha".into(), "beta".into()],
+            frames: vec![
+                vec![
+                    FrameFnEntry {
+                        fn_id: 0,
+                        calls: 3,
+                        self_ns: 5_000_000,
+                        cpu_self_ns: None,
+                        alloc_count: 10,
+                        alloc_bytes: 4096,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                    FrameFnEntry {
+                        fn_id: 1,
+                        calls: 1,
+                        self_ns: 2_000_000,
+                        cpu_self_ns: None,
+                        alloc_count: 0,
+                        alloc_bytes: 0,
+                        free_count: 0,
+                        free_bytes: 0,
+                    },
+                ],
+                vec![FrameFnEntry {
+                    fn_id: 0,
+                    calls: 2,
+                    self_ns: 3_000_000,
+                    cpu_self_ns: None,
+                    alloc_count: 5,
+                    alloc_bytes: 2048,
+                    free_count: 0,
+                    free_bytes: 0,
+                }],
+            ],
+        };
+
+        let json_str = format_frames_json(&frame_data, false);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed.len(), 2, "should have 2 frames");
+
+        // Frame 1 has both functions
+        assert_eq!(parsed[0]["frame"], 1);
+        let fns = parsed[0]["functions"].as_array().unwrap();
+        assert_eq!(fns.len(), 2);
+        // Sorted by self_ms descending: alpha (5ms) before beta (2ms)
+        assert_eq!(fns[0]["name"], "alpha");
+        assert_eq!(fns[0]["self_ms"], 5.0);
+        assert_eq!(fns[0]["calls"], 3);
+        assert_eq!(fns[0]["alloc_count"], 10);
+        assert_eq!(fns[0]["alloc_bytes"], 4096);
+        assert_eq!(fns[1]["name"], "beta");
+
+        // Frame 2 has only alpha
+        assert_eq!(parsed[1]["frame"], 2);
+        let fns = parsed[1]["functions"].as_array().unwrap();
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0]["name"], "alpha");
+        assert_eq!(fns[0]["self_ms"], 3.0);
     }
 }
