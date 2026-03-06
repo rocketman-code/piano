@@ -5,6 +5,8 @@ use core::task::{Context, Poll};
 use crate::alloc::{AllocSnapshot, ALLOC_COUNTERS};
 #[cfg(test)]
 use crate::collector::with_stack_ref;
+#[cfg(feature = "poll-tracking")]
+use crate::collector::{lookup_name, unpack_name_id};
 use crate::collector::{with_stack_mut, StackEntry};
 
 /// Future wrapper that carries the profiling call stack inside the future's
@@ -14,11 +16,21 @@ use crate::collector::{with_stack_mut, StackEntry};
 /// eliminating the need for phantom-based migration repair.
 pub struct PianoFuture<F> {
     inner: F,
+    #[cfg(feature = "poll-tracking")]
+    poll_finalizer: crate::collector::PollFinalizer,
     saved_entries: Vec<StackEntry>,
     base_depth: Option<usize>,
     alloc_carry: AllocSnapshot,
     #[cfg(feature = "cpu-time")]
     cpu_accumulated_ns: u64,
+    #[cfg(feature = "poll-tracking")]
+    poll_count: u64,
+    #[cfg(feature = "poll-tracking")]
+    total_poll_ticks: u64,
+    #[cfg(feature = "poll-tracking")]
+    max_poll_ticks: u64,
+    #[cfg(feature = "poll-tracking")]
+    fn_name: Option<&'static str>,
 }
 
 impl<F: Future> PianoFuture<F> {
@@ -28,11 +40,21 @@ impl<F: Future> PianoFuture<F> {
     pub fn new(inner: F) -> Self {
         Self {
             inner,
+            #[cfg(feature = "poll-tracking")]
+            poll_finalizer: crate::collector::PollFinalizer::new(),
             saved_entries: Vec::new(),
             base_depth: None,
             alloc_carry: AllocSnapshot::new(),
             #[cfg(feature = "cpu-time")]
             cpu_accumulated_ns: 0,
+            #[cfg(feature = "poll-tracking")]
+            poll_count: 0,
+            #[cfg(feature = "poll-tracking")]
+            total_poll_ticks: 0,
+            #[cfg(feature = "poll-tracking")]
+            max_poll_ticks: 0,
+            #[cfg(feature = "poll-tracking")]
+            fn_name: None,
         }
     }
 }
@@ -45,6 +67,13 @@ impl<F: Future> Future for PianoFuture<F> {
         // !Unpin). All other fields (Vec, Option, AllocSnapshot, u64) are
         // Unpin and accessed via &mut. We never move `inner` out of self.
         let this = unsafe { self.get_unchecked_mut() };
+
+        #[cfg(feature = "poll-tracking")]
+        let poll_start = crate::tsc::read();
+        #[cfg(feature = "poll-tracking")]
+        {
+            this.poll_count += 1;
+        }
 
         // --- Install phase ---
 
@@ -106,7 +135,27 @@ impl<F: Future> Future for PianoFuture<F> {
             this.saved_entries.clear();
             this.saved_entries.extend_from_slice(&s[base..]);
             s.truncate(base);
+
+            #[cfg(feature = "poll-tracking")]
+            {
+                if this.fn_name.is_none() {
+                    this.fn_name = this
+                        .saved_entries
+                        .first()
+                        .map(|e| lookup_name(unpack_name_id(e.packed)));
+                }
+            }
         });
+
+        #[cfg(feature = "poll-tracking")]
+        {
+            let poll_end = crate::tsc::read();
+            let delta = poll_end.wrapping_sub(poll_start);
+            this.total_poll_ticks = this.total_poll_ticks.wrapping_add(delta);
+            if delta > this.max_poll_ticks {
+                this.max_poll_ticks = delta;
+            }
+        }
 
         result
     }
@@ -124,6 +173,15 @@ impl<F> Drop for PianoFuture<F> {
                 s.extend_from_slice(&self.saved_entries);
                 self.saved_entries.clear();
             });
+        }
+        #[cfg(feature = "poll-tracking")]
+        {
+            self.poll_finalizer.arm(
+                self.fn_name,
+                self.poll_count,
+                self.total_poll_ticks,
+                self.max_poll_ticks,
+            );
         }
     }
 }
@@ -281,6 +339,54 @@ mod tests {
         assert!(records.iter().any(|r| r.name == "pf_winner"));
         // The STACK should be clean after completion.
         with_stack_ref(|s| assert_eq!(s.len(), 0));
+    }
+
+    #[cfg(feature = "poll-tracking")]
+    #[test]
+    fn piano_future_poll_count_with_yields() {
+        collector::reset();
+        run(async {
+            PianoFuture::new(async {
+                let _guard = collector::enter("pf_polls");
+                collector::register("pf_polls");
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        });
+        // After completion, poll metrics should be in RECORDS_BUF.
+        // collect_all merges THREAD_RECORDS; poll data flows through FnAgg.
+        let records = collector::collect_all();
+        let rec = records.iter().find(|r| r.name == "pf_polls").unwrap();
+        assert_eq!(rec.calls, 1);
+        // poll_count = 6 (5 yields + 1 final Ready)
+        let agg = collector::collect_all_fnagg();
+        let poll_agg = agg.iter().find(|e| e.name == "pf_polls").unwrap();
+        assert_eq!(
+            poll_agg.total_polls, 6,
+            "expected 6 polls (5 yields + 1 Ready), got {}",
+            poll_agg.total_polls
+        );
+        // total_poll_ticks should be nonzero (sum of 6 poll durations).
+        assert!(
+            poll_agg.total_poll_ticks > 0,
+            "total_poll_ticks should be nonzero, got {}",
+            poll_agg.total_poll_ticks
+        );
+        // max_poll_ticks should be <= total (can't exceed the sum).
+        assert!(
+            poll_agg.max_poll_ticks <= poll_agg.total_poll_ticks,
+            "max_poll_ticks ({}) should not exceed total_poll_ticks ({})",
+            poll_agg.max_poll_ticks,
+            poll_agg.total_poll_ticks
+        );
+        // max_poll_ticks should be nonzero (at least one poll had nonzero duration).
+        assert!(
+            poll_agg.max_poll_ticks > 0,
+            "max_poll_ticks should be nonzero, got {}",
+            poll_agg.max_poll_ticks
+        );
     }
 
     #[test]
