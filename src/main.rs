@@ -537,9 +537,14 @@ fn run_child(
     binary: &Path,
     args: &[String],
     timeout: Option<Duration>,
+    suppress_stdout: bool,
 ) -> Result<process::ExitStatus, Error> {
-    let mut child = process::Command::new(binary)
-        .args(args)
+    let mut cmd = process::Command::new(binary);
+    cmd.args(args);
+    if suppress_stdout {
+        cmd.stdout(process::Stdio::null());
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| Error::RunFailed(format!("failed to run {}: {e}", binary.display())))?;
 
@@ -577,7 +582,7 @@ fn cmd_run(
     eprintln!("--- program output ---");
 
     let timeout = duration.map(Duration::from_secs);
-    let status = run_child(&binary, &args, timeout)?;
+    let status = run_child(&binary, &args, timeout, false)?;
 
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -610,7 +615,7 @@ fn cmd_profile(
         .as_millis();
 
     let timeout = duration.map(Duration::from_secs);
-    let status = run_child(&binary, &args, timeout)?;
+    let status = run_child(&binary, &args, timeout, json)?;
 
     if !status.success() && !ignore_exit_code {
         if let Some(code) = status.code() {
