@@ -3292,12 +3292,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // NOTE: The streaming fallback path (STREAMING_ENABLED=true but no stream
-    // file opened) is not tested directly because setting STREAMING_ENABLED
-    // globally races with parallel tests' guard drops. The aggregate-synthesis
-    // logic is the same as the non-streaming path, already covered by
-    // shutdown_writes_ndjson_with_all_thread_data. The streaming gate is a
-    // simple flag check tested indirectly via integration tests.
+    // The streaming fallback path (STREAMING_ENABLED=true but no stream file
+    // opened) is tested by shutdown_streaming_synthesizes_frame_from_agg_when_no_stream_opened
+    // using #[serial] to avoid global flag races.
 
     #[test]
     #[serial]
@@ -4109,6 +4106,101 @@ mod tests {
             !failed,
             "shutdown_impl_inner should return false on successful write"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[serial]
+    fn shutdown_synthesizes_frame_from_agg_when_no_frames_exist() {
+        // Kills: delete ! in `if !agg.is_empty()` inside shutdown_impl_inner.
+        // Simulates process::exit mid-function: RECORDS has data but FRAMES
+        // is empty. shutdown_impl_inner should synthesize a frame from
+        // aggregates and write an NDJSON file.
+        reset_all();
+
+        // Directly inject an FnAgg into RECORDS (bypassing drop_cold, which
+        // would also commit a frame). This mirrors what happens when
+        // TlsFlushGuard::drop drains RECORDS_BUF on process::exit while a
+        // function is still on the stack.
+        RECORDS.with(|records| {
+            records.lock().unwrap().push(FnAgg {
+                name: "mid_exit_fn",
+                calls: 1,
+                total_ms: 5.0,
+                self_ms: 5.0,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 5_000_000,
+            });
+        });
+
+        // Verify precondition: frames are empty, agg is non-empty.
+        assert!(
+            collect_frames().is_empty(),
+            "precondition: no frames should exist"
+        );
+        let agg = collect_all_fnagg();
+        assert!(!agg.is_empty(), "precondition: aggregate data should exist");
+
+        let tmp = std::env::temp_dir().join(format!("piano_synth_frame_{}", timestamp_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let failed = shutdown_impl_inner(&tmp);
+        assert!(!failed, "shutdown should succeed");
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("ndjson"))
+            .collect();
+        assert!(
+            !files.is_empty(),
+            "shutdown should write an NDJSON file when agg data exists but no frames"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[serial]
+    fn shutdown_streaming_synthesizes_frame_from_agg_when_no_stream_opened() {
+        // Kills: delete ! in `if !agg.is_empty()` in the streaming branch
+        // of shutdown_impl_inner. Same scenario as the non-streaming test
+        // but with STREAMING_ENABLED=true and no stream file opened.
+        reset_all();
+
+        // Inject aggregate data without committing any frames.
+        RECORDS.with(|records| {
+            records.lock().unwrap().push(FnAgg {
+                name: "streaming_mid_exit_fn",
+                calls: 1,
+                total_ms: 3.0,
+                self_ms: 3.0,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 3_000_000,
+            });
+        });
+
+        // Enable streaming without opening a stream file.
+        STREAMING_ENABLED.store(true, Ordering::SeqCst);
+
+        let tmp = std::env::temp_dir().join(format!("piano_stream_synth_{}", timestamp_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let failed = shutdown_impl_inner(&tmp);
+
+        // Restore before assertions so cleanup runs even on failure.
+        STREAMING_ENABLED.store(false, Ordering::SeqCst);
+
+        assert!(!failed, "shutdown should succeed");
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("ndjson"))
+            .collect();
+        assert!(
+            !files.is_empty(),
+            "streaming shutdown should write NDJSON when agg data exists but no stream file"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
