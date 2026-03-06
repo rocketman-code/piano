@@ -692,3 +692,141 @@ fn run_errors_when_no_binary_exists() {
         "error should mention piano build, got: {stderr}"
     );
 }
+
+/// Project that does real work then sleeps for 60 seconds, giving time to
+/// send signals or let --duration expire before the child exits on its own.
+fn create_sleeping_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "sleeper"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "sleeper"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"fn main() {
+    let result = work();
+    println!("result: {result}");
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+fn work() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..1000 {
+        sum += i;
+    }
+    sum
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn duration_stop_exits_zero_with_no_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("sleeper");
+    create_sleeping_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let runs_dir = tmp.path().join("runs");
+
+    let output = Command::new(piano_bin)
+        .args(["profile", "--fn", "work", "--duration", "2", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run piano profile with --duration");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano profile --duration should exit 0, got: {:?}\nstderr: {stderr}\nstdout: {stdout}",
+        output.status.code()
+    );
+
+    assert!(
+        !stderr.contains("warning:"),
+        "should NOT print a warning for --duration stop, got: {stderr}"
+    );
+
+    assert!(
+        stdout.contains("work"),
+        "report should contain 'work' function, got: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_terminates_child_and_produces_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("sleeper");
+    create_sleeping_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let runs_dir = tmp.path().join("runs");
+
+    let child = Command::new(piano_bin)
+        .args(["profile", "--fn", "work", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn piano profile");
+
+    // Wait long enough for the build + child startup, then send SIGINT.
+    std::thread::sleep(std::time::Duration::from_secs(10));
+
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for piano profile");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano profile after SIGINT should exit 0, got: {:?}\nstderr: {stderr}\nstdout: {stdout}",
+        output.status.code()
+    );
+
+    assert!(
+        !stderr.contains("warning:"),
+        "should NOT print a warning after SIGINT, got: {stderr}"
+    );
+
+    assert!(
+        stdout.contains("work"),
+        "report should contain 'work' function, got: {stdout}"
+    );
+}
