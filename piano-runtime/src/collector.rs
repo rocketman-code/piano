@@ -154,6 +154,8 @@ fn open_stream_file(dir: &std::path::Path) -> std::io::Result<StreamState> {
     )?;
     #[cfg(feature = "cpu-time")]
     write!(file, ",\"has_cpu_time\":true")?;
+    #[cfg(feature = "poll-tracking")]
+    write!(file, ",\"has_poll_tracking\":true")?;
     writeln!(file, "}}")?;
 
     Ok(StreamState {
@@ -257,7 +259,30 @@ fn write_stream_trailer(state: &mut StreamState) -> std::io::Result<()> {
         let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
         write!(state.file, "\"{escaped}\"")?;
     }
-    writeln!(state.file, "]}}")?;
+    write!(state.file, "]")?;
+    #[cfg(feature = "poll-tracking")]
+    {
+        let agg = collect_all_fnagg();
+        let poll_entries: Vec<_> = agg.iter().filter(|e| e.total_polls > 0).collect();
+        if !poll_entries.is_empty() {
+            write!(state.file, ",\"polls\":[")?;
+            for (i, entry) in poll_entries.iter().enumerate() {
+                if i > 0 {
+                    write!(state.file, ",")?;
+                }
+                let fn_id = intern_name(entry.name);
+                let tpt_ns = crate::tsc::ticks_to_ns(entry.total_poll_ticks);
+                let mpt_ns = crate::tsc::ticks_to_ns(entry.max_poll_ticks);
+                write!(
+                    state.file,
+                    "{{\"id\":{},\"pc\":{},\"tpt\":{},\"mpt\":{}}}",
+                    fn_id, entry.total_polls, tpt_ns, mpt_ns
+                )?;
+            }
+            write!(state.file, "]")?;
+        }
+    }
+    writeln!(state.file, "}}")?;
     state.file.flush()?;
     Ok(())
 }
@@ -462,13 +487,19 @@ pub(crate) struct StackEntry {
 /// memory growth: instead of storing one record per invocation, we merge into
 /// one entry per unique function name via linear scan with pointer identity.
 #[derive(Clone)]
-struct FnAgg {
-    name: &'static str,
-    calls: u64,
-    total_ms: f64,
-    self_ms: f64,
+pub(crate) struct FnAgg {
+    pub(crate) name: &'static str,
+    pub(crate) calls: u64,
+    pub(crate) total_ms: f64,
+    pub(crate) self_ms: f64,
     #[cfg(feature = "cpu-time")]
-    cpu_self_ns: u64,
+    pub(crate) cpu_self_ns: u64,
+    #[cfg(feature = "poll-tracking")]
+    pub(crate) total_polls: u64,
+    #[cfg(feature = "poll-tracking")]
+    pub(crate) total_poll_ticks: u64,
+    #[cfg(feature = "poll-tracking")]
+    pub(crate) max_poll_ticks: u64,
 }
 
 impl FnAgg {
@@ -480,6 +511,14 @@ impl FnAgg {
         #[cfg(feature = "cpu-time")]
         {
             self.cpu_self_ns += other.cpu_self_ns;
+        }
+        #[cfg(feature = "poll-tracking")]
+        {
+            self.total_polls += other.total_polls;
+            self.total_poll_ticks += other.total_poll_ticks;
+            if other.max_poll_ticks > self.max_poll_ticks {
+                self.max_poll_ticks = other.max_poll_ticks;
+            }
         }
     }
 }
@@ -589,6 +628,59 @@ thread_local! {
     static RECORDS_BUF: RefCell<Vec<FnAgg>> = RefCell::new(Vec::new());
 }
 
+/// Deferred writer for poll tracking metrics. Placed after `inner` in
+/// PianoFuture's field order so it drops after Guards have written to
+/// RECORDS_BUF (RFC 1857: fields drop in declaration order).
+#[cfg(feature = "poll-tracking")]
+pub(crate) struct PollFinalizer {
+    name: Option<&'static str>,
+    poll_count: u64,
+    total_poll_ticks: u64,
+    max_poll_ticks: u64,
+}
+
+#[cfg(feature = "poll-tracking")]
+impl PollFinalizer {
+    pub(crate) fn new() -> Self {
+        Self {
+            name: None,
+            poll_count: 0,
+            total_poll_ticks: 0,
+            max_poll_ticks: 0,
+        }
+    }
+
+    pub(crate) fn arm(
+        &mut self,
+        name: Option<&'static str>,
+        poll_count: u64,
+        total_poll_ticks: u64,
+        max_poll_ticks: u64,
+    ) {
+        self.name = name;
+        self.poll_count = poll_count;
+        self.total_poll_ticks = total_poll_ticks;
+        self.max_poll_ticks = max_poll_ticks;
+    }
+}
+
+#[cfg(feature = "poll-tracking")]
+impl Drop for PollFinalizer {
+    fn drop(&mut self) {
+        if let Some(name) = self.name {
+            let _ = RECORDS_BUF.try_with(|buf| {
+                merge_poll_metrics(
+                    &mut buf.borrow_mut(),
+                    name,
+                    self.poll_count,
+                    self.total_poll_ticks,
+                    self.max_poll_ticks,
+                );
+            });
+        }
+    }
+}
+
 /// Merge a single invocation into a Vec<FnAgg> via linear scan on interned name pointer.
 fn merge_into_fnagg_vec(
     buf: &mut Vec<FnAgg>,
@@ -615,6 +707,43 @@ fn merge_into_fnagg_vec(
             self_ms,
             #[cfg(feature = "cpu-time")]
             cpu_self_ns,
+            #[cfg(feature = "poll-tracking")]
+            total_polls: 0,
+            #[cfg(feature = "poll-tracking")]
+            total_poll_ticks: 0,
+            #[cfg(feature = "poll-tracking")]
+            max_poll_ticks: 0,
+        });
+    }
+}
+
+/// Merge poll tracking metrics into the FnAgg buffer.
+/// Finds existing entry by pointer identity or creates a poll-only entry.
+#[cfg(feature = "poll-tracking")]
+fn merge_poll_metrics(
+    buf: &mut Vec<FnAgg>,
+    name: &'static str,
+    poll_count: u64,
+    total_poll_ticks: u64,
+    max_poll_ticks: u64,
+) {
+    if let Some(entry) = buf.iter_mut().find(|e| std::ptr::eq(e.name, name)) {
+        entry.total_polls += poll_count;
+        entry.total_poll_ticks += total_poll_ticks;
+        if max_poll_ticks > entry.max_poll_ticks {
+            entry.max_poll_ticks = max_poll_ticks;
+        }
+    } else {
+        buf.push(FnAgg {
+            name,
+            calls: 0,
+            total_ms: 0.0,
+            self_ms: 0.0,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 0,
+            total_polls: poll_count,
+            total_poll_ticks,
+            max_poll_ticks,
         });
     }
 }
@@ -1298,6 +1427,8 @@ fn write_ndjson(
     )?;
     #[cfg(feature = "cpu-time")]
     write!(f, ",\"has_cpu_time\":true")?;
+    #[cfg(feature = "poll-tracking")]
+    write!(f, ",\"has_poll_tracking\":true")?;
     write!(f, ",\"functions\":[")?;
     for (i, name) in fn_names.iter().enumerate() {
         if i > 0 {
@@ -1330,6 +1461,28 @@ fn write_ndjson(
             write!(f, "}}")?;
         }
         writeln!(f, "]}}")?;
+    }
+    #[cfg(feature = "poll-tracking")]
+    {
+        let agg = collect_all_fnagg();
+        let poll_entries: Vec<_> = agg.iter().filter(|e| e.total_polls > 0).collect();
+        if !poll_entries.is_empty() {
+            write!(f, "{{\"polls\":[")?;
+            for (i, entry) in poll_entries.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ",")?;
+                }
+                let fn_id = fn_id_map.get(entry.name).copied().unwrap_or(0);
+                let tpt_ns = crate::tsc::ticks_to_ns(entry.total_poll_ticks);
+                let mpt_ns = crate::tsc::ticks_to_ns(entry.max_poll_ticks);
+                write!(
+                    f,
+                    "{{\"id\":{},\"pc\":{},\"tpt\":{},\"mpt\":{}}}",
+                    fn_id, entry.total_polls, tpt_ns, mpt_ns
+                )?;
+            }
+            writeln!(f, "]}}")?;
+        }
     }
     Ok(())
 }
@@ -1474,7 +1627,7 @@ pub fn shutdown_to(dir: &Path) {
 /// Shared core for `collect_all()` and `flush()` — flushes the calling thread's
 /// buffer, then iterates per-thread records under the registry lock, merging
 /// FnAgg entries via linear scan.
-fn collect_all_fnagg() -> Vec<FnAgg> {
+pub(crate) fn collect_all_fnagg() -> Vec<FnAgg> {
     flush_records_buf();
     let registry = thread_records().lock().unwrap_or_else(|e| e.into_inner());
     let mut merged: Vec<FnAgg> = Vec::new();
@@ -2094,6 +2247,12 @@ mod tests {
             self_ms: 0.0, // already clamped by merge_into_fnagg_vec
             #[cfg(feature = "cpu-time")]
             cpu_self_ns: 0,
+            #[cfg(feature = "poll-tracking")]
+            total_polls: 0,
+            #[cfg(feature = "poll-tracking")]
+            total_poll_ticks: 0,
+            #[cfg(feature = "poll-tracking")]
+            max_poll_ticks: 0,
         }];
         let result = aggregate(&agg, &[]);
         assert_eq!(result.len(), 1);
@@ -3202,6 +3361,12 @@ mod tests {
                 self_ms: 75.5,
                 #[cfg(feature = "cpu-time")]
                 cpu_self_ns: 50_000_000,
+                #[cfg(feature = "poll-tracking")]
+                total_polls: 0,
+                #[cfg(feature = "poll-tracking")]
+                total_poll_ticks: 0,
+                #[cfg(feature = "poll-tracking")]
+                max_poll_ticks: 0,
             },
             FnAgg {
                 name: "synth_fn_b",
@@ -3210,6 +3375,12 @@ mod tests {
                 self_ms: 10.0,
                 #[cfg(feature = "cpu-time")]
                 cpu_self_ns: 8_000_000,
+                #[cfg(feature = "poll-tracking")]
+                total_polls: 0,
+                #[cfg(feature = "poll-tracking")]
+                total_poll_ticks: 0,
+                #[cfg(feature = "poll-tracking")]
+                max_poll_ticks: 0,
             },
         ];
 
@@ -3362,6 +3533,283 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(feature = "poll-tracking")]
+    #[test]
+    fn ndjson_trailer_contains_poll_data() {
+        reset();
+        let tmp = std::env::temp_dir().join(format!("piano_poll_trailer_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Run an async function with yields to generate poll data
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            crate::PianoFuture::new(async {
+                let _guard = enter("poll_trailer_fn");
+                register("poll_trailer_fn");
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        });
+
+        // Write NDJSON via shutdown path
+        shutdown_to(tmp.as_path());
+
+        // Read the NDJSON file
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        assert_eq!(files.len(), 1, "expected one ndjson file");
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+
+        // Header should have has_poll_tracking
+        assert!(
+            lines[0].contains("\"has_poll_tracking\":true"),
+            "header should indicate poll tracking: {}",
+            lines[0]
+        );
+
+        // Last line should contain "polls" array
+        let trailer = *lines.last().unwrap();
+        assert!(
+            trailer.contains("\"polls\":["),
+            "trailer should contain polls array: {trailer}"
+        );
+        // poll_count should be 4 (3 yields + 1 Ready)
+        assert!(
+            trailer.contains("\"pc\":4"),
+            "trailer should have pc:4: {trailer}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "poll-tracking")]
+    #[test]
+    fn merge_poll_metrics_creates_entry() {
+        let mut buf: Vec<FnAgg> = Vec::new();
+        merge_poll_metrics(&mut buf, "poll_fn", 10, 500, 80);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0].total_polls, 10);
+        assert_eq!(buf[0].total_poll_ticks, 500);
+        assert_eq!(buf[0].max_poll_ticks, 80);
+        assert_eq!(buf[0].calls, 0); // poll-only entry
+    }
+
+    #[cfg(feature = "poll-tracking")]
+    #[test]
+    fn merge_poll_metrics_updates_existing() {
+        let mut buf: Vec<FnAgg> = Vec::new();
+        let name: &'static str = "poll_fn";
+        // Simulate Guard having written first
+        merge_into_fnagg_vec(
+            &mut buf,
+            name,
+            1000,
+            200,
+            #[cfg(feature = "cpu-time")]
+            0,
+        );
+        assert_eq!(buf[0].calls, 1);
+        // Now merge poll metrics
+        merge_poll_metrics(&mut buf, name, 5, 300, 60);
+        assert_eq!(buf[0].calls, 1); // unchanged
+        assert_eq!(buf[0].total_polls, 5);
+        assert_eq!(buf[0].total_poll_ticks, 300);
+        assert_eq!(buf[0].max_poll_ticks, 60);
+    }
+
+    #[cfg(feature = "poll-tracking")]
+    #[test]
+    fn fnagg_absorb_merges_poll_fields() {
+        let mut a = FnAgg {
+            name: "test",
+            calls: 1,
+            total_ms: 10.0,
+            self_ms: 5.0,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 0,
+            total_polls: 10,
+            total_poll_ticks: 100,
+            max_poll_ticks: 20,
+        };
+        let b = FnAgg {
+            name: "test",
+            calls: 0,
+            total_ms: 0.0,
+            self_ms: 0.0,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 0,
+            total_polls: 5,
+            total_poll_ticks: 80,
+            max_poll_ticks: 30,
+        };
+        a.absorb(&b);
+        assert_eq!(a.total_polls, 15);
+        assert_eq!(a.total_poll_ticks, 180);
+        assert_eq!(a.max_poll_ticks, 30); // max of 20 and 30
+    }
+
+    #[cfg(feature = "poll-tracking")]
+    #[test]
+    fn write_stream_trailer_includes_poll_data() {
+        // Kills mutants on the poll serialization path in write_stream_trailer
+        // (collector.rs lines 266-280): filtering, comma separation, JSON fields.
+        let tmp = std::env::temp_dir().join(format!("piano_trailer_poll_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Inject 2 poll entries to exercise comma separation between entries.
+        let poll_a: &'static str = "trailer_poll_a";
+        let poll_b: &'static str = "trailer_poll_b";
+        {
+            let mut fin = PollFinalizer::new();
+            fin.arm(Some(poll_a), 7, 420, 90);
+        }
+        {
+            let mut fin = PollFinalizer::new();
+            fin.arm(Some(poll_b), 3, 200, 50);
+        }
+
+        let mut state = open_stream_file(&tmp).unwrap();
+        write_stream_trailer(&mut state).unwrap();
+        drop(state);
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let trailer = content.lines().last().unwrap();
+
+        assert!(
+            trailer.contains("\"polls\":[{"),
+            "polls array should start with [{{ not [,{{: {trailer}"
+        );
+        assert!(
+            trailer.contains("\"pc\":7"),
+            "trailer should contain first poll count: {trailer}"
+        );
+        assert!(
+            trailer.contains("\"pc\":3"),
+            "trailer should contain second poll count: {trailer}"
+        );
+        // With 2 entries, there must be a comma between them.
+        assert!(
+            trailer.contains("},{"),
+            "trailer should have comma between poll entries: {trailer}"
+        );
+        // No zero-poll entries should appear (filter must exclude total_polls == 0).
+        assert!(
+            !trailer.contains("\"pc\":0"),
+            "trailer should not contain entries with zero polls: {trailer}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "poll-tracking")]
+    #[test]
+    fn write_ndjson_includes_poll_data() {
+        // Kills mutants on the poll serialization path in write_ndjson
+        // (collector.rs lines 1466-1480): filtering, comma separation, JSON fields.
+        let tmp = std::env::temp_dir().join(format!("piano_ndjson_poll_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Inject 2 poll entries to exercise comma separation between entries.
+        let poll_a: &'static str = "ndjson_poll_a";
+        let poll_b: &'static str = "ndjson_poll_b";
+        {
+            let mut fin = PollFinalizer::new();
+            fin.arm(Some(poll_a), 12, 800, 150);
+        }
+        {
+            let mut fin = PollFinalizer::new();
+            fin.arm(Some(poll_b), 4, 300, 70);
+        }
+
+        let fn_names = vec!["ndjson_poll_a", "ndjson_poll_b"];
+        let frames = vec![vec![
+            FrameFnSummary {
+                name: "ndjson_poll_a",
+                calls: 1,
+                self_ns: 100,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 0,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            },
+            FrameFnSummary {
+                name: "ndjson_poll_b",
+                calls: 2,
+                self_ns: 200,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 0,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            },
+        ]];
+
+        let path = tmp.join("test.ndjson");
+        write_ndjson(&frames, &fn_names, &path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Header should indicate poll tracking is available.
+        assert!(
+            lines[0].contains("\"has_poll_tracking\":true"),
+            "header should have poll tracking flag: {}",
+            lines[0]
+        );
+
+        // Last line should be the polls line with 2 entries.
+        let polls_line = lines.last().unwrap();
+        assert!(
+            polls_line.contains("\"polls\":[{"),
+            "polls array should start with [{{ not [,{{: {polls_line}"
+        );
+        assert!(
+            polls_line.contains("\"pc\":12"),
+            "polls line should contain first poll count: {polls_line}"
+        );
+        assert!(
+            polls_line.contains("\"pc\":4"),
+            "polls line should contain second poll count: {polls_line}"
+        );
+        // With 2 entries, there must be a comma between them.
+        assert!(
+            polls_line.contains("},{"),
+            "polls line should have comma between entries: {polls_line}"
+        );
+        assert!(
+            polls_line.contains("\"mpt\":150"),
+            "polls line should contain max_poll_ticks: {polls_line}"
+        );
+        // No zero-poll entries should appear (filter must exclude total_polls == 0).
+        assert!(
+            !polls_line.contains("\"pc\":0"),
+            "polls line should not contain entries with zero polls: {polls_line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     #[serial]
     #[cfg(debug_assertions)]
@@ -3413,6 +3861,12 @@ mod tests {
             self_ms: 5.0,
             #[cfg(feature = "cpu-time")]
             cpu_self_ns: 100,
+            #[cfg(feature = "poll-tracking")]
+            total_polls: 0,
+            #[cfg(feature = "poll-tracking")]
+            total_poll_ticks: 0,
+            #[cfg(feature = "poll-tracking")]
+            max_poll_ticks: 0,
         };
         let src = FnAgg {
             name: "f",
@@ -3421,6 +3875,12 @@ mod tests {
             self_ms: 3.0,
             #[cfg(feature = "cpu-time")]
             cpu_self_ns: 50,
+            #[cfg(feature = "poll-tracking")]
+            total_polls: 0,
+            #[cfg(feature = "poll-tracking")]
+            total_poll_ticks: 0,
+            #[cfg(feature = "poll-tracking")]
+            max_poll_ticks: 0,
         };
         dst.absorb(&src);
         assert_eq!(dst.calls, 5, "calls: 3 + 2 = 5");

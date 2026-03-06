@@ -30,6 +30,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --features piano-runtime/cpu-time -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features piano-runtime/poll-tracking -- -D warnings
 
   test:
     runs-on: ${{ matrix.os }}
@@ -44,6 +45,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo test --workspace --features piano-runtime/cpu-time
+      - run: cargo test --workspace --features piano-runtime/poll-tracking
 
   msrv:
     runs-on: ubuntu-latest
@@ -115,7 +117,7 @@ jobs:
       - name: Run mutation testing on changed runtime files
         run: |
           if git diff origin/main --name-only -- piano-runtime/src/ | grep -q .; then
-            cargo mutants --package piano-runtime --in-diff <(git diff origin/main -- piano-runtime/src/) --jobs 4 --timeout 120
+            cargo mutants --package piano-runtime --in-diff <(git diff origin/main -- piano-runtime/src/) --jobs 4 --timeout 120 --features piano-runtime/poll-tracking
           else
             echo "No piano-runtime/src/ changes, skipping mutation testing"
           fi

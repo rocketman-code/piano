@@ -45,10 +45,19 @@ pub struct FnEntry {
     pub alloc_bytes: u64,
 }
 
+/// Per-function poll tracking data from the NDJSON trailer.
+pub struct PollEntry {
+    pub fn_id: usize,
+    pub poll_count: u64,
+    pub total_poll_ns: u64,
+    pub max_poll_ns: u64,
+}
+
 /// Per-frame data loaded from an NDJSON file.
 pub struct FrameData {
     pub fn_names: Vec<String>,
     pub frames: Vec<Vec<FrameFnEntry>>,
+    pub poll_data: Option<Vec<PollEntry>>,
 }
 
 /// Accumulated per-function counters across all frames (used during NDJSON aggregation).
@@ -84,6 +93,9 @@ struct NdjsonHeader {
     functions: Vec<String>,
     #[serde(default)]
     has_cpu_time: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    has_poll_tracking: bool,
 }
 
 /// NDJSON frame line.
@@ -116,6 +128,25 @@ struct NdjsonFnEntry {
 #[derive(serde::Deserialize)]
 struct NdjsonTrailer {
     functions: Vec<String>,
+    #[serde(default)]
+    polls: Vec<NdjsonPollEntry>,
+}
+
+/// Poll tracking entry in the NDJSON trailer.
+#[derive(serde::Deserialize)]
+struct NdjsonPollEntry {
+    id: usize,
+    pc: u64,
+    #[serde(default)]
+    tpt: u64,
+    #[serde(default)]
+    mpt: u64,
+}
+
+/// Standalone polls line (v3 format: polls are in a separate line, not in the trailer).
+#[derive(serde::Deserialize)]
+struct NdjsonPollsLine {
+    polls: Vec<NdjsonPollEntry>,
 }
 
 /// Read a profiling run from a JSON or NDJSON file on disk.
@@ -154,11 +185,27 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         })?;
 
     // Determine v3 vs v4 format and identify frame lines.
-    // v3: function names in header, all remaining lines are frames.
-    // v4: header.functions is empty; last non-empty line may be a trailer with names.
+    // v3: function names in header, all remaining lines are frames (+ optional polls line).
+    // v4: header.functions is empty; last non-empty line may be a trailer with names + polls.
+    let mut poll_entries: Vec<NdjsonPollEntry> = Vec::new();
     let (fn_names, frame_lines): (Vec<String>, &[&str]) = if !header.functions.is_empty() {
-        // v3: names in header, everything after header is frames.
-        (header.functions, &all_lines[1..])
+        // v3: names in header, remaining lines are frames + optional polls line.
+        let body = &all_lines[1..];
+        // Check if the last non-empty line is a polls line (not a frame).
+        let last_non_empty = body.iter().rposition(|l| !l.trim().is_empty());
+        let frame_end = match last_non_empty {
+            Some(idx) => {
+                let candidate = body[idx].trim();
+                if let Ok(polls_line) = serde_json::from_str::<NdjsonPollsLine>(candidate) {
+                    poll_entries = polls_line.polls;
+                    idx
+                } else {
+                    body.len()
+                }
+            }
+            None => body.len(),
+        };
+        (header.functions, &body[..frame_end])
     } else {
         // v4: check the last non-empty line for a trailer.
         let body = &all_lines[1..];
@@ -167,7 +214,10 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
             Some(idx) => {
                 let candidate = body[idx].trim();
                 match serde_json::from_str::<NdjsonTrailer>(candidate) {
-                    Ok(trailer) => (trailer.functions, &body[..idx]),
+                    Ok(trailer) => {
+                        poll_entries = trailer.polls;
+                        (trailer.functions, &body[..idx])
+                    }
                     Err(_) => {
                         // No valid trailer -- generate placeholder names after parsing frames.
                         (Vec::new(), body)
@@ -262,7 +312,27 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData), Error> {
         source_format: RunFormat::Ndjson,
     };
 
-    let frame_data = FrameData { fn_names, frames };
+    let poll_data = if poll_entries.is_empty() {
+        None
+    } else {
+        Some(
+            poll_entries
+                .iter()
+                .map(|p| PollEntry {
+                    fn_id: p.id,
+                    poll_count: p.pc,
+                    total_poll_ns: p.tpt,
+                    max_poll_ns: p.mpt,
+                })
+                .collect(),
+        )
+    };
+
+    let frame_data = FrameData {
+        fn_names,
+        frames,
+        poll_data,
+    };
 
     Ok((run, frame_data))
 }
@@ -352,6 +422,7 @@ pub fn format_per_thread_tables(runs: &[Run], show_all: bool) -> String {
 /// Footer: hidden-function count when applicable.
 pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> String {
     struct FnStats {
+        fn_id: usize,
         name: String,
         total_calls: u64,
         total_self_ns: u64,
@@ -365,11 +436,19 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
         .iter()
         .any(|f| f.iter().any(|e| e.cpu_self_ns.is_some()));
 
+    let poll_map: HashMap<usize, &PollEntry> = frame_data
+        .poll_data
+        .as_ref()
+        .map(|polls| polls.iter().map(|p| (p.fn_id, p)).collect())
+        .unwrap_or_default();
+    let has_polls = !poll_map.is_empty();
+
     let mut stats_map: HashMap<usize, FnStats> = HashMap::new();
     for frame in &frame_data.frames {
         for entry in frame {
             let fn_id = entry.fn_id;
             let stats = stats_map.entry(fn_id).or_insert_with(|| FnStats {
+                fn_id,
                 name: frame_data
                     .fn_names
                     .get(fn_id)
@@ -395,6 +474,7 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
     if show_all {
         for (fn_id, name) in frame_data.fn_names.iter().enumerate() {
             stats_map.entry(fn_id).or_insert_with(|| FnStats {
+                fn_id,
                 name: name.clone(),
                 total_calls: 0,
                 total_self_ns: 0,
@@ -413,38 +493,55 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
     entries.sort_by(|a, b| b.total_self_ns.cmp(&a.total_self_ns));
 
     let mut out = String::new();
+
+    // Build header
+    let mut header = format!("{:<40} {:>10}", "Function", "Self");
     if has_cpu {
-        out.push_str(&format!(
-            "{HEADER}{:<40} {:>10} {:>10} {:>8} {:>8} {:>12}{HEADER:#}\n",
-            "Function", "Self", "CPU", "Calls", "Allocs", "Alloc Bytes"
-        ));
-        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(93)));
-    } else {
-        out.push_str(&format!(
-            "{HEADER}{:<40} {:>10} {:>8} {:>8} {:>12}{HEADER:#}\n",
-            "Function", "Self", "Calls", "Allocs", "Alloc Bytes"
-        ));
-        out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(82)));
+        header.push_str(&format!(" {:>10}", "CPU"));
     }
+    header.push_str(&format!(
+        " {:>8} {:>8} {:>12}",
+        "Calls", "Allocs", "Alloc Bytes"
+    ));
+    if has_polls {
+        header.push_str(&format!(
+            " {:>8} {:>10} {:>10}",
+            "Polls", "Poll Time", "Max Poll"
+        ));
+    }
+    let width = header.len();
+    out.push_str(&format!("{HEADER}{header}{HEADER:#}\n"));
+    out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(width)));
 
     for e in &entries {
         let self_str = format_ns(e.total_self_ns);
         let bytes_str = format_bytes(e.total_alloc_bytes);
+        let mut row = format!("{:<40} {:>10}", e.name, self_str);
         if has_cpu {
             let cpu_str = match e.total_cpu_self_ns {
                 Some(ns) => format_ns(ns),
                 None => format!("{:>10}", "-"),
             };
-            out.push_str(&format!(
-                "{:<40} {:>10} {:>10} {:>8} {:>8} {:>12}\n",
-                e.name, self_str, cpu_str, e.total_calls, e.total_allocs, bytes_str
-            ));
-        } else {
-            out.push_str(&format!(
-                "{:<40} {:>10} {:>8} {:>8} {:>12}\n",
-                e.name, self_str, e.total_calls, e.total_allocs, bytes_str
-            ));
+            row.push_str(&format!(" {cpu_str:>10}"));
         }
+        row.push_str(&format!(
+            " {:>8} {:>8} {:>12}",
+            e.total_calls, e.total_allocs, bytes_str
+        ));
+        if has_polls {
+            if let Some(p) = poll_map.get(&e.fn_id).filter(|p| p.poll_count > 0) {
+                let poll_time_str = format_ns(p.total_poll_ns);
+                let max_poll_str = format_ns(p.max_poll_ns);
+                row.push_str(&format!(
+                    " {:>8} {:>10} {:>10}",
+                    p.poll_count, poll_time_str, max_poll_str
+                ));
+            } else {
+                row.push_str(&format!(" {:>8} {:>10} {:>10}", "-", "-", "-"));
+            }
+        }
+        out.push_str(&row);
+        out.push('\n');
     }
 
     let hidden = total_count - entries.len();
@@ -580,6 +677,12 @@ pub struct JsonFnEntry {
     pub calls: u64,
     pub alloc_count: u64,
     pub alloc_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_poll_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_poll_ms: Option<f64>,
 }
 
 /// Serialize a `Run` as a JSON array of function entries.
@@ -606,6 +709,9 @@ pub fn format_json(run: &Run, show_all: bool) -> String {
             calls: e.calls,
             alloc_count: e.alloc_count,
             alloc_bytes: e.alloc_bytes,
+            poll_count: None,
+            total_poll_ms: None,
+            max_poll_ms: None,
         })
         .collect();
 
@@ -615,6 +721,7 @@ pub fn format_json(run: &Run, show_all: bool) -> String {
 /// Accumulated per-function counters for JSON frame aggregation.
 #[derive(Default)]
 struct JsonFnAgg {
+    fn_id: usize,
     name: String,
     calls: u64,
     self_ns: u64,
@@ -644,6 +751,7 @@ pub fn format_json_with_frames(frame_data: &FrameData, show_all: bool) -> String
                     .cloned()
                     .unwrap_or_else(|| format!("<fn_{fn_id}>"));
                 JsonFnAgg {
+                    fn_id,
                     name,
                     cpu_self_ns: if has_cpu { Some(0) } else { None },
                     ..Default::default()
@@ -662,12 +770,19 @@ pub fn format_json_with_frames(frame_data: &FrameData, show_all: bool) -> String
     if show_all {
         for (fn_id, name) in frame_data.fn_names.iter().enumerate() {
             stats_map.entry(fn_id).or_insert_with(|| JsonFnAgg {
+                fn_id,
                 name: name.clone(),
                 cpu_self_ns: if has_cpu { Some(0) } else { None },
                 ..Default::default()
             });
         }
     }
+
+    let poll_map: HashMap<usize, &PollEntry> = frame_data
+        .poll_data
+        .as_ref()
+        .map(|polls| polls.iter().map(|p| (p.fn_id, p)).collect())
+        .unwrap_or_default();
 
     let mut entries: Vec<JsonFnAgg> = stats_map.into_values().collect();
     if !show_all {
@@ -677,13 +792,19 @@ pub fn format_json_with_frames(frame_data: &FrameData, show_all: bool) -> String
 
     let json_entries: Vec<JsonFnEntry> = entries
         .iter()
-        .map(|e| JsonFnEntry {
-            name: e.name.clone(),
-            self_ms: e.self_ns as f64 / 1_000_000.0,
-            cpu_self_ms: e.cpu_self_ns.map(|ns| ns as f64 / 1_000_000.0),
-            calls: e.calls,
-            alloc_count: e.alloc_count,
-            alloc_bytes: e.alloc_bytes,
+        .map(|e| {
+            let poll = poll_map.get(&e.fn_id);
+            JsonFnEntry {
+                name: e.name.clone(),
+                self_ms: e.self_ns as f64 / 1_000_000.0,
+                cpu_self_ms: e.cpu_self_ns.map(|ns| ns as f64 / 1_000_000.0),
+                calls: e.calls,
+                alloc_count: e.alloc_count,
+                alloc_bytes: e.alloc_bytes,
+                poll_count: poll.map(|p| p.poll_count),
+                total_poll_ms: poll.map(|p| p.total_poll_ns as f64 / 1_000_000.0),
+                max_poll_ms: poll.map(|p| p.max_poll_ns as f64 / 1_000_000.0),
+            }
         })
         .collect();
 
@@ -1711,6 +1832,50 @@ mod tests {
     }
 
     #[test]
+    fn format_table_with_frames_shows_poll_data() {
+        let frame_data = FrameData {
+            fn_names: vec!["async_fn".into()],
+            frames: vec![vec![FrameFnEntry {
+                fn_id: 0,
+                calls: 1,
+                self_ns: 5_000_000,
+                cpu_self_ns: None,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            }]],
+            poll_data: Some(vec![PollEntry {
+                fn_id: 0,
+                poll_count: 42,
+                total_poll_ns: 100_000,
+                max_poll_ns: 5_000,
+            }]),
+        };
+        let table = format_table_with_frames(&frame_data, false);
+        assert!(table.contains("Polls"), "table should have Polls column");
+        assert!(
+            table.contains("Poll Time"),
+            "table should have Poll Time column"
+        );
+        assert!(
+            table.contains("Max Poll"),
+            "table should have Max Poll column"
+        );
+        assert!(table.contains("42"), "table should show poll count 42");
+        // total_poll_ns = 100_000 -> format_ns should produce "100.0us"
+        assert!(
+            table.contains("100.0us"),
+            "table should show total poll time: {table}"
+        );
+        // max_poll_ns = 5_000 -> format_ns should produce "5.0us"
+        assert!(
+            table.contains("5.0us"),
+            "table should show max poll time: {table}"
+        );
+    }
+
+    #[test]
     fn format_table_with_frames_shows_allocs() {
         let frame_data = FrameData {
             fn_names: vec!["update".into(), "physics".into()],
@@ -1760,6 +1925,7 @@ mod tests {
                     },
                 ],
             ],
+            poll_data: None,
         };
         let table = format_table_with_frames(&frame_data, true);
         assert!(!table.contains("p50"), "should not have p50 column");
@@ -1933,6 +2099,7 @@ mod tests {
                     },
                 ],
             ],
+            poll_data: None,
         };
         let table = format_frames_table(&frame_data);
         assert!(table.contains("Frame"), "should have Frame column header");
@@ -1984,6 +2151,7 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
+            poll_data: None,
         };
         // Default (show_all=false) should hide "unused"
         let table = format_table_with_frames(&frame_data, false);
@@ -2024,6 +2192,7 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
+            poll_data: None,
         };
         let table = format_table_with_frames(&frame_data, false);
         assert!(
@@ -2093,6 +2262,7 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
+            poll_data: None,
         };
         let table = format_table_with_frames(&frame_data, false);
         assert!(
@@ -2337,6 +2507,7 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
+            poll_data: None,
         };
         // Without --all: hides unused, shows CPU.
         let table = format_table_with_frames(&frame_data, false);
@@ -2375,6 +2546,7 @@ mod tests {
                 free_count: 3,
                 free_bytes: 512,
             }]],
+            poll_data: None,
         };
         let table = format_table_with_frames(&frame_data, false);
         assert!(
@@ -2621,6 +2793,7 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
+            poll_data: None,
         };
         let table = format_table_with_frames(&frame_data, false);
         let self_pos = table.find("Self").expect("Self header missing");
@@ -2645,6 +2818,7 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
+            poll_data: None,
         };
         let table = format_table_with_frames(&frame_data, false);
         let self_pos = table.find("Self").expect("Self header missing");
@@ -2793,6 +2967,7 @@ mod tests {
                     // worker_fn absent from frame 1
                 ],
             ],
+            poll_data: None,
         };
 
         let table = format_table_with_frames(&frame_data, false);
@@ -3331,6 +3506,7 @@ mod tests {
                     free_bytes: 0,
                 }],
             ],
+            poll_data: None,
         };
         let json = format_json_with_frames(&frame_data, false);
         let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
@@ -3361,6 +3537,7 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
+            poll_data: None,
         };
         let json = format_json_with_frames(&frame_data, false);
         let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
@@ -3381,6 +3558,7 @@ mod tests {
                 free_count: 0,
                 free_bytes: 0,
             }]],
+            poll_data: None,
         };
         let json = format_json_with_frames(&frame_data, false);
         let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
@@ -3389,6 +3567,85 @@ mod tests {
         let json_all = format_json_with_frames(&frame_data, true);
         let entries_all: Vec<JsonFnEntry> = serde_json::from_str(&json_all).unwrap();
         assert_eq!(entries_all.len(), 2);
+    }
+
+    #[test]
+    fn format_json_with_frames_includes_poll_data() {
+        let frame_data = FrameData {
+            fn_names: vec!["async_fn".into(), "sync_fn".into()],
+            frames: vec![vec![
+                FrameFnEntry {
+                    fn_id: 0,
+                    calls: 1,
+                    self_ns: 5_000_000,
+                    cpu_self_ns: None,
+                    alloc_count: 0,
+                    alloc_bytes: 0,
+                    free_count: 0,
+                    free_bytes: 0,
+                },
+                FrameFnEntry {
+                    fn_id: 1,
+                    calls: 1,
+                    self_ns: 3_000_000,
+                    cpu_self_ns: None,
+                    alloc_count: 0,
+                    alloc_bytes: 0,
+                    free_count: 0,
+                    free_bytes: 0,
+                },
+            ]],
+            poll_data: Some(vec![PollEntry {
+                fn_id: 0,
+                poll_count: 42,
+                total_poll_ns: 2_000_000,
+                max_poll_ns: 500_000,
+            }]),
+        };
+        let json = format_json_with_frames(&frame_data, false);
+        let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // async_fn has poll data (sorted first: 5ms > 3ms).
+        assert_eq!(entries[0].name, "async_fn");
+        assert_eq!(entries[0].poll_count, Some(42));
+        assert!((entries[0].total_poll_ms.unwrap() - 2.0).abs() < f64::EPSILON);
+        assert!((entries[0].max_poll_ms.unwrap() - 0.5).abs() < f64::EPSILON);
+
+        // sync_fn has no poll data -- fields should be absent.
+        assert_eq!(entries[1].name, "sync_fn");
+        assert_eq!(entries[1].poll_count, None);
+        assert_eq!(entries[1].total_poll_ms, None);
+        assert_eq!(entries[1].max_poll_ms, None);
+    }
+
+    #[test]
+    fn format_json_with_frames_omits_poll_fields_when_no_poll_data() {
+        let frame_data = FrameData {
+            fn_names: vec!["work".into()],
+            frames: vec![vec![FrameFnEntry {
+                fn_id: 0,
+                calls: 1,
+                self_ns: 1_000_000,
+                cpu_self_ns: None,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            }]],
+            poll_data: None,
+        };
+        let json = format_json_with_frames(&frame_data, false);
+        // Poll fields should not appear in the JSON output at all.
+        assert!(!json.contains("poll_count"), "poll_count should be absent");
+        assert!(
+            !json.contains("total_poll_ms"),
+            "total_poll_ms should be absent"
+        );
+        assert!(
+            !json.contains("max_poll_ms"),
+            "max_poll_ms should be absent"
+        );
     }
 
     #[test]

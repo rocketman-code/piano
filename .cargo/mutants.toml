@@ -1,0 +1,11 @@
+# Unkillable: `>` vs `>=` on max_poll_ticks comparisons.
+# Assigning the same value to itself (when new == current) is a no-op,
+# so no test can distinguish `>` from `>=`. Semantically equivalent.
+exclude_re = [
+    # FnAgg::absorb -- max_poll_ticks > entry.max_poll_ticks
+    "replace > with >= in FnAgg::absorb",
+    # merge_poll_metrics -- max_poll_ticks > entry.max_poll_ticks
+    "replace > with >= in merge_poll_metrics",
+    # PianoFuture::poll -- delta > self.max_poll_ticks
+    "replace > with >= in <impl Future for PianoFuture",
+]

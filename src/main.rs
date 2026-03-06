@@ -72,6 +72,10 @@ struct BuildOpts {
     #[arg(long)]
     cpu_time: bool,
 
+    /// Track per-future poll count and duration for async functions.
+    #[arg(long)]
+    poll_tracking: bool,
+
     /// Show functions excluded from instrumentation and exit.
     #[arg(long)]
     list_skipped: bool,
@@ -241,6 +245,7 @@ fn build_project(
         runtime_path,
         bin,
         cpu_time,
+        poll_tracking,
         list_skipped,
     } = opts;
 
@@ -362,7 +367,13 @@ fn build_project(
     };
 
     // Inject piano-runtime dependency.
-    let features: Vec<&str> = if cpu_time { vec!["cpu-time"] } else { vec![] };
+    let mut features: Vec<&str> = Vec::new();
+    if cpu_time {
+        features.push("cpu-time");
+    }
+    if poll_tracking {
+        features.push("poll-tracking");
+    }
     match runtime_path {
         Some(ref path) => {
             let abs_path = std::fs::canonicalize(path).map_err(io_context("canonicalize", path))?;
