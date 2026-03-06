@@ -150,6 +150,34 @@ mod tests {
             .block_on(f)
     }
 
+    /// Stress test: run PianoFuture with a yielding Guard in a tight loop
+    /// to surface intermittent total_ms==0 failures seen on CI.
+    #[test]
+    fn piano_future_total_ms_stress() {
+        for i in 0..200 {
+            collector::reset();
+            run(async {
+                PianoFuture::new(async {
+                    let _guard = collector::enter("stress");
+                    collector::register("stress");
+                    tokio::task::yield_now().await;
+                })
+                .await;
+            });
+            let records = collector::collect_all();
+            let rec = records.iter().find(|r| r.name == "stress").unwrap();
+            let diag = collector::take_diag_drop()
+                .map(|d| format!(" | {d}"))
+                .unwrap_or_default();
+            assert!(
+                rec.total_ms > 0.0,
+                "iteration {i}: total_ms=0 self_ms={} calls={}{diag}",
+                rec.self_ms,
+                rec.calls,
+            );
+        }
+    }
+
     #[test]
     fn piano_future_basic_enter_drop() {
         collector::reset();
