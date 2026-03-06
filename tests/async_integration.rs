@@ -243,6 +243,56 @@ async fn main() {
     .unwrap();
 }
 
+fn create_impl_future_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "impl-future-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "impl-future-test"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+"#,
+    )
+    .unwrap();
+
+    // foo() returns impl Future with 80ms sleep -- foo does the work.
+    // bar() is async fn that just awaits foo() -- bar does no work.
+    // If instrumentation is correct: foo.self_ns >> bar.self_ns.
+    // If broken (old behavior): foo.self_ns ~= 0, bar.self_ns absorbs 80ms.
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"use std::future::Future;
+use tokio::time::{sleep, Duration};
+
+fn foo() -> impl Future<Output = ()> {
+    async {
+        sleep(Duration::from_millis(80)).await;
+    }
+}
+
+async fn bar() {
+    foo().await;
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() {
+    for _ in 0..3 {
+        bar().await;
+    }
+}
+"#,
+    )
+    .unwrap();
+}
+
 /// Create a small tokio project with async functions.
 fn create_async_project(dir: &Path) {
     fs::create_dir_all(dir.join("src")).unwrap();
@@ -756,5 +806,88 @@ fn async_tokio_pipeline() {
     assert!(
         content.contains("orchestrate"),
         "output should contain instrumented async function 'orchestrate'. Got:\n{content}"
+    );
+}
+
+#[test]
+fn impl_future_self_time_attribution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("impl-future-test");
+    create_impl_future_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::tokio_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let build = Command::new(piano_bin)
+        .args([
+            "build",
+            "--fn",
+            "foo",
+            "--fn",
+            "bar",
+            "--fn",
+            "main",
+            "--project",
+        ])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    let stdout = String::from_utf8_lossy(&build.stdout);
+    assert!(
+        build.status.success(),
+        "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let binary_path = stdout.trim();
+    assert!(
+        Path::new(binary_path).exists(),
+        "built binary should exist at: {binary_path}"
+    );
+
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let run = Command::new(binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run.status.success(),
+        "instrumented binary failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+    let stats = common::aggregate_ndjson(&content);
+
+    assert!(
+        stats.contains_key("foo"),
+        "output should contain foo. Got:\n{content}"
+    );
+    assert!(
+        stats.contains_key("bar"),
+        "output should contain bar. Got:\n{content}"
+    );
+
+    let foo = stats.get("foo").unwrap();
+    let bar = stats.get("bar").unwrap();
+
+    // foo does the work (80ms sleep x3 calls). bar does nothing.
+    // foo.self_ns must be greater than bar.self_ns.
+    assert!(
+        foo.self_ns > bar.self_ns,
+        "foo.self_ns ({}) must be > bar.self_ns ({}) -- \
+         foo does the 80ms sleep, bar just awaits foo",
+        foo.self_ns,
+        bar.self_ns,
     );
 }
