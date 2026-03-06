@@ -660,6 +660,7 @@ dependencies = [
  "anstyle",
  "clap",
  "ignore",
+ "libc",
  "prettyplease",
  "proc-macro2",
  "proptest",

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -528,49 +529,126 @@ fn find_latest_binary(project_root: &Option<PathBuf>) -> Result<PathBuf, Error> 
     best.map(|(p, _)| p).ok_or(Error::NoBinary)
 }
 
+/// Why the child process stopped.
+enum StopReason {
+    /// Child exited on its own (normal exit or crash).
+    Normal,
+    /// The `--duration` timeout expired and we sent SIGTERM.
+    Duration,
+    /// User pressed Ctrl-C and we forwarded SIGTERM to the child.
+    Interrupted,
+}
+
+/// Result of running a child process, including why it stopped.
+struct ChildOutcome {
+    status: process::ExitStatus,
+    stop_reason: StopReason,
+}
+
+static CHILD_PID: AtomicU32 = AtomicU32::new(0);
+static DURATION_EXPIRED: AtomicBool = AtomicBool::new(false);
+static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
+
 /// Spawn a child process, optionally killing it after a timeout.
 ///
 /// When `timeout` is `Some`, a background thread sleeps for the given duration
-/// then sends SIGTERM (Unix) or kills (Windows) the child. The existing
+/// then sends SIGTERM to the child (Unix only; Windows is not yet supported). The existing
 /// signal handler in the instrumented binary flushes profiling data on SIGTERM,
 /// so this composes cleanly with signal recovery.
+///
+/// On Unix, a SIGINT handler forwards SIGTERM to the child so that Ctrl-C
+/// triggers graceful shutdown instead of orphaning the child. The handler
+/// uses `SA_RESETHAND` so a second Ctrl-C force-kills the parent.
 fn run_child(
     binary: &Path,
     args: &[String],
     timeout: Option<Duration>,
     suppress_stdout: bool,
-) -> Result<process::ExitStatus, Error> {
+) -> Result<ChildOutcome, Error> {
+    // Reset flags from any previous invocation.
+    DURATION_EXPIRED.store(false, Ordering::SeqCst);
+    SIGINT_RECEIVED.store(false, Ordering::SeqCst);
+
     let mut cmd = process::Command::new(binary);
     cmd.args(args);
     if suppress_stdout {
         cmd.stdout(process::Stdio::null());
     }
+    // Install SIGINT handler that forwards SIGTERM to the child.
+    // Installed before spawn so no Ctrl-C gap can orphan the child.
+    // The handler guards `pid == 0` so it is safe before the child exists.
+    #[cfg(unix)]
+    {
+        extern "C" fn sigint_handler(_sig: i32) {
+            SIGINT_RECEIVED.store(true, Ordering::SeqCst);
+            let pid = CHILD_PID.load(Ordering::SeqCst);
+            if pid != 0 {
+                // SAFETY: sending a signal to a known PID is safe.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+            }
+        }
+
+        unsafe {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = sigint_handler as *const () as usize;
+            act.sa_flags = libc::SA_RESETHAND;
+            libc::sigaction(libc::SIGINT, &act, std::ptr::null_mut());
+        }
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| Error::RunFailed(format!("failed to run {}: {e}", binary.display())))?;
 
+    CHILD_PID.store(child.id(), Ordering::SeqCst);
+
     if let Some(dur) = timeout {
-        let child_id = child.id();
         eprintln!("will stop after {} second(s)", dur.as_secs());
         std::thread::spawn(move || {
             std::thread::sleep(dur);
+            DURATION_EXPIRED.store(true, Ordering::SeqCst);
             #[cfg(unix)]
             {
-                // SAFETY: sending a signal to a known PID is safe.
-                unsafe {
-                    libc::kill(child_id as libc::pid_t, libc::SIGTERM);
+                let pid = CHILD_PID.load(Ordering::SeqCst);
+                if pid != 0 {
+                    // SAFETY: sending a signal to a known PID is safe.
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    }
                 }
             }
-            #[cfg(not(unix))]
-            {
-                let _ = child_id;
-            }
+            // TODO: Windows --duration kill is not implemented.
         });
     }
 
-    child
+    let status = child
         .wait()
-        .map_err(|e| Error::RunFailed(format!("failed to wait for {}: {e}", binary.display())))
+        .map_err(|e| Error::RunFailed(format!("failed to wait for {}: {e}", binary.display())))?;
+
+    let stop_reason = if DURATION_EXPIRED.load(Ordering::SeqCst) {
+        StopReason::Duration
+    } else if SIGINT_RECEIVED.load(Ordering::SeqCst) {
+        StopReason::Interrupted
+    } else {
+        StopReason::Normal
+    };
+
+    CHILD_PID.store(0, Ordering::SeqCst);
+
+    // Restore default SIGINT handler for the rest of the process lifetime.
+    #[cfg(unix)]
+    unsafe {
+        let mut act: libc::sigaction = std::mem::zeroed();
+        act.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(libc::SIGINT, &act, std::ptr::null_mut());
+    }
+
+    Ok(ChildOutcome {
+        status,
+        stop_reason,
+    })
 }
 
 fn cmd_run(
@@ -583,9 +661,13 @@ fn cmd_run(
     eprintln!("--- program output ---");
 
     let timeout = duration.map(Duration::from_secs);
-    let status = run_child(&binary, &args, timeout, false)?;
+    let outcome = run_child(&binary, &args, timeout, false)?;
 
-    std::process::exit(status.code().unwrap_or(1));
+    match outcome.stop_reason {
+        StopReason::Duration => std::process::exit(0),
+        StopReason::Interrupted => std::process::exit(130),
+        StopReason::Normal => std::process::exit(outcome.status.code().unwrap_or(1)),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -616,10 +698,14 @@ fn cmd_profile(
         .as_millis();
 
     let timeout = duration.map(Duration::from_secs);
-    let status = run_child(&binary, &args, timeout, json)?;
+    let outcome = run_child(&binary, &args, timeout, json)?;
+    let intentional_stop = matches!(
+        outcome.stop_reason,
+        StopReason::Duration | StopReason::Interrupted
+    );
 
-    if !status.success() && !ignore_exit_code {
-        if let Some(code) = status.code() {
+    if !outcome.status.success() && !ignore_exit_code && !intentional_stop {
+        if let Some(code) = outcome.status.code() {
             eprintln!(
                 "warning: program exited with code {code} — profiling results may be incomplete"
             );
@@ -643,7 +729,7 @@ fn cmd_profile(
     // don't let cmd_report pick up a file from a previous run.
     let effective_runs_dir = default_runs_dir(project_root)?;
     if find_latest_run_file_since(&effective_runs_dir, profile_start_ms)?.is_none() {
-        if !status.success() && !ignore_exit_code {
+        if !outcome.status.success() && !ignore_exit_code && !intentional_stop {
             // Program failed, no data -- suppress (UX principle 6).
             return Ok(());
         }
@@ -656,7 +742,9 @@ fn cmd_profile(
     eprintln!("--- profiling report ---");
     let report_result = match cmd_report(None, show_all, frames, json, threads, project_root) {
         Ok(()) => Ok(()),
-        Err(Error::NoRuns) if !status.success() && !ignore_exit_code => {
+        Err(Error::NoRuns)
+            if !outcome.status.success() && !ignore_exit_code && !intentional_stop =>
+        {
             // Program failed and produced no data. The program's own error
             // output is the primary affordance (UX principle 6). Suppress
             // Piano's NoRuns to avoid cascading errors.
@@ -682,8 +770,8 @@ fn cmd_profile(
 
     report_result?;
 
-    if !status.success() && !ignore_exit_code {
-        std::process::exit(status.code().unwrap_or(1));
+    if !outcome.status.success() && !ignore_exit_code && !intentional_stop {
+        std::process::exit(outcome.status.code().unwrap_or(1));
     }
 
     Ok(())
