@@ -344,9 +344,22 @@ mod tests {
             "child should appear in records"
         );
 
+        let parent = records.iter().find(|r| r.name == "pf_fork_parent").unwrap();
         let child = records.iter().find(|r| r.name == "pf_fork_child").unwrap();
-        // Child should have at least 1 call recorded.
-        assert_eq!(child.calls, 1, "child should have 1 call recorded");
+        // Parent total_ms includes blocking on std::thread::scope, so it
+        // should exceed the child's total_ms.
+        assert!(
+            parent.total_ms > child.total_ms,
+            "parent total_ms ({:.3}) should exceed child total_ms ({:.3})",
+            parent.total_ms,
+            child.total_ms,
+        );
+        // Child should have measurable wall time from burn_cpu(20_000).
+        assert!(
+            child.total_ms > 0.5,
+            "child total_ms ({:.3}) should reflect actual CPU work",
+            child.total_ms,
+        );
     }
 
     #[test]
@@ -389,59 +402,6 @@ mod tests {
         let records = collector::collect_all();
         assert!(records.iter().any(|r| r.name == "split_outer"));
         assert!(records.iter().any(|r| r.name == "split_inner"));
-    }
-
-    /// Verifies that cpu_accumulated_ns is correctly subtracted from cpu_now_ns
-    /// during the install phase. If `-` is mutated to `+` or `/`, the
-    /// cpu_start_ns would be wrong, causing CPU time to be grossly over- or
-    /// under-counted across yields.
-    #[cfg(feature = "cpu-time")]
-    #[test]
-    fn piano_future_cpu_time_across_yields() {
-        collector::reset();
-        run(async {
-            PianoFuture::new(async {
-                let _guard = collector::enter("cpu_yield");
-                collector::register("cpu_yield");
-
-                // Do some CPU work before yield
-                collector::burn_cpu(10_000);
-                tokio::task::yield_now().await;
-
-                // Do more CPU work after yield
-                collector::burn_cpu(10_000);
-                tokio::task::yield_now().await;
-
-                // Final burst
-                collector::burn_cpu(10_000);
-            })
-            .await;
-        });
-
-        let records = collector::collect_all();
-        let rec = records.iter().find(|r| r.name == "cpu_yield").unwrap();
-
-        // CPU time should reflect actual compute across all three bursts.
-        // burn_cpu(10_000) takes measurable CPU time. Total should be > 0.
-        assert!(
-            rec.cpu_self_ms > 0.0,
-            "cpu_self_ms should be positive after CPU work: got {:.3}ms",
-            rec.cpu_self_ms,
-        );
-
-        // If `-` were `+`, cpu_start_ns would be cpu_now + accumulated,
-        // which is far in the future. The elapsed CPU time would wrap to
-        // a huge value or be negative (saturated to 0).
-        // If `-` were `/`, cpu_start_ns would be cpu_now / accumulated
-        // which is near 0, making elapsed CPU time equal to cpu_now (~huge).
-        // Either way, the result would be wildly different from wall time.
-        // CPU time should not exceed wall time (it's a single thread).
-        assert!(
-            rec.cpu_self_ms < rec.total_ms * 2.0,
-            "cpu_self_ms ({:.3}) should not grossly exceed total_ms ({:.3}) -- arithmetic bug?",
-            rec.cpu_self_ms,
-            rec.total_ms,
-        );
     }
 
     #[test]

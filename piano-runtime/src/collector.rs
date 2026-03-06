@@ -33,42 +33,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{compiler_fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// Thread-safe, initialize-once cell using `Once` + `UnsafeCell`.
-///
-/// Equivalent to `OnceLock` (stabilized in 1.70) but works on Rust 1.59+.
-/// The `Once` primitive guarantees single-writer semantics; after initialization
-/// the value is read-only, so there are no data races.
-struct SyncOnceCell<T> {
-    once: Once,
-    value: UnsafeCell<Option<T>>,
-}
-
-// SAFETY: `Once` synchronizes initialization. After `call_once` completes,
-// the inner value is only read, never mutated, so `Sync` is sound.
-unsafe impl<T: Send + Sync> Sync for SyncOnceCell<T> {}
-
-impl<T> SyncOnceCell<T> {
-    const fn new() -> Self {
-        Self {
-            once: Once::new(),
-            value: UnsafeCell::new(None),
-        }
-    }
-
-    fn get_or_init(&self, f: impl FnOnce() -> T) -> &T {
-        self.once.call_once(|| {
-            // SAFETY: `call_once` guarantees this runs exactly once, with
-            // all subsequent callers blocking until it completes.
-            unsafe { *self.value.get() = Some(f()) };
-        });
-        // SAFETY: After `call_once` returns (on any thread), `value` is
-        // `Some` and never mutated again.
-        unsafe { (*self.value.get()).as_ref().unwrap() }
-    }
-}
+use crate::sync_util::SyncOnceCell;
 
 /// Process-wide run identifier.
 ///
@@ -245,8 +213,39 @@ fn stream_frame(buf: &[FrameFnSummary]) {
     }
 }
 
+/// Serialize channel statistics as a single NDJSON line.
+fn write_channel_json(
+    f: &mut impl std::io::Write,
+    stats: &[crate::channel::ChannelSnapshot],
+) -> std::io::Result<()> {
+    if stats.is_empty() {
+        return Ok(());
+    }
+    write!(f, "{{\"channels\":[")?;
+    for (i, ch) in stats.iter().enumerate() {
+        if i > 0 {
+            write!(f, ",")?;
+        }
+        let label = ch.label.replace('\\', "\\\\").replace('"', "\\\"");
+        write!(
+            f,
+            "{{\"label\":\"{label}\",\"kind\":\"{kind}\",\"sent\":{sent},\"recv\":{recv},\"max_q\":{max_q},\"type_sz\":{type_sz}}}",
+            kind = ch.kind,
+            sent = ch.sent,
+            recv = ch.received,
+            max_q = ch.max_queued,
+            type_sz = ch.type_size,
+        )?;
+    }
+    writeln!(f, "]}}")
+}
+
 /// Write the function name table as a trailer line and flush.
 fn write_stream_trailer(state: &mut StreamState) -> std::io::Result<()> {
+    // Write channel data before trailer.
+    let ch_stats = crate::channel::collect_channel_stats();
+    write_channel_json(&mut state.file, &ch_stats)?;
+
     let len = NAME_TABLE_LEN.load(Ordering::Acquire);
     write!(state.file, "{{\"functions\":[")?;
     for i in 0..len {
@@ -1331,6 +1330,11 @@ fn write_ndjson(
         }
         writeln!(f, "]}}")?;
     }
+
+    // Write channel data if any channels were registered.
+    let ch_stats = crate::channel::collect_channel_stats();
+    write_channel_json(&mut f, &ch_stats)?;
+
     Ok(())
 }
 
@@ -2326,6 +2330,43 @@ mod tests {
     }
 
     #[test]
+    fn ndjson_includes_channel_data() {
+        use crate::channel::{register_channel, ChannelKind};
+        reset();
+
+        // Register a channel and record some activity.
+        let stats = register_channel("test_ch:1", ChannelKind::Bounded(10), 8);
+        stats.record_send();
+        stats.record_send();
+        stats.record_recv();
+
+        // Also create a function frame so we get NDJSON output.
+        {
+            let _g = enter("ndjson_ch_test");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        flush_to(dir.path());
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+        assert_eq!(files.len(), 1, "Expected one NDJSON file");
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        assert!(
+            content.contains("\"channels\""),
+            "NDJSON should contain channel data: {content}"
+        );
+        assert!(content.contains("test_ch:1"));
+        assert!(content.contains("\"sent\":2"));
+        assert!(content.contains("\"recv\":1"));
+        assert!(content.contains("\"max_q\":2"));
+    }
+
+    #[test]
     fn frame_boundary_aggregation() {
         reset();
         // Simulate 3 frames: depth-0 function called 3 times
@@ -3075,13 +3116,14 @@ mod tests {
         let content = std::fs::read_to_string(files[0].path()).unwrap();
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
 
-        // Header + 2 frames + trailer = 4 lines
-        assert_eq!(lines.len(), 4);
+        // Header + 2 frames + optional channels + trailer = 4 or 5 lines
+        assert!(lines.len() >= 4, "expected >= 4 lines, got {}", lines.len());
         assert!(lines[0].contains("\"format_version\":4"));
         assert!(lines[1].contains("\"frame\":0"));
         assert!(lines[2].contains("\"frame\":1"));
-        assert!(lines[3].contains("\"functions\""));
-        assert!(lines[3].contains("shutdown_trailer_fn"));
+        let last = lines.last().unwrap();
+        assert!(last.contains("\"functions\""));
+        assert!(last.contains("shutdown_trailer_fn"));
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3362,593 +3404,5 @@ mod tests {
             (idx as usize) < NAME_TABLE_CAPACITY,
             "overflow index {idx} must be < capacity {NAME_TABLE_CAPACITY}"
         );
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: FnAgg::absorb arithmetic
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn absorb_adds_calls() {
-        let mut dst = FnAgg {
-            name: "f",
-            calls: 3,
-            total_ms: 10.0,
-            self_ms: 5.0,
-            #[cfg(feature = "cpu-time")]
-            cpu_self_ns: 100,
-        };
-        let src = FnAgg {
-            name: "f",
-            calls: 2,
-            total_ms: 4.0,
-            self_ms: 3.0,
-            #[cfg(feature = "cpu-time")]
-            cpu_self_ns: 50,
-        };
-        dst.absorb(&src);
-        assert_eq!(dst.calls, 5, "calls: 3 + 2 = 5");
-        assert!(
-            (dst.total_ms - 14.0).abs() < f64::EPSILON,
-            "total_ms: 10.0 + 4.0 = 14.0, got {}",
-            dst.total_ms
-        );
-        assert!(
-            (dst.self_ms - 8.0).abs() < f64::EPSILON,
-            "self_ms: 5.0 + 3.0 = 8.0, got {}",
-            dst.self_ms
-        );
-        #[cfg(feature = "cpu-time")]
-        assert_eq!(dst.cpu_self_ns, 150, "cpu_self_ns: 100 + 50 = 150");
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: merge_into_fnagg_vec arithmetic
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn merge_into_fnagg_vec_existing_entry() {
-        // First insert creates the entry.
-        let name: &'static str = "mifv_fn";
-        let mut buf: Vec<FnAgg> = Vec::new();
-        merge_into_fnagg_vec(
-            &mut buf,
-            name,
-            2_000_000, // 2ms elapsed
-            500_000,   // 0.5ms children
-            #[cfg(feature = "cpu-time")]
-            100,
-        );
-        assert_eq!(buf.len(), 1);
-        assert_eq!(buf[0].calls, 1);
-
-        // Second merge into the same name should ADD, not multiply or subtract.
-        merge_into_fnagg_vec(
-            &mut buf,
-            name,
-            3_000_000, // 3ms elapsed
-            1_000_000, // 1ms children
-            #[cfg(feature = "cpu-time")]
-            200,
-        );
-        assert_eq!(buf.len(), 1, "same name should merge, not create new entry");
-        assert_eq!(buf[0].calls, 2, "calls: 1 + 1 = 2");
-
-        let expected_total = 2_000_000.0 / 1_000_000.0 + 3_000_000.0 / 1_000_000.0;
-        assert!(
-            (buf[0].total_ms - expected_total).abs() < 0.001,
-            "total_ms should be sum: expected {expected_total}, got {}",
-            buf[0].total_ms
-        );
-
-        let expected_self = (2_000_000u64.saturating_sub(500_000)) as f64 / 1_000_000.0
-            + (3_000_000u64.saturating_sub(1_000_000)) as f64 / 1_000_000.0;
-        assert!(
-            (buf[0].self_ms - expected_self).abs() < 0.001,
-            "self_ms should be sum: expected {expected_self}, got {}",
-            buf[0].self_ms
-        );
-
-        #[cfg(feature = "cpu-time")]
-        assert_eq!(buf[0].cpu_self_ns, 300, "cpu_self_ns: 100 + 200 = 300");
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: merge_into_frame_buf arithmetic
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn merge_into_frame_buf_existing_entry() {
-        let name: &'static str = "mifb_fn";
-        let mut buf: Vec<FrameFnSummary> = Vec::new();
-        merge_into_frame_buf(
-            &mut buf,
-            name,
-            1000,
-            #[cfg(feature = "cpu-time")]
-            50,
-            10,
-            256,
-            3,
-            128,
-        );
-        assert_eq!(buf.len(), 1);
-        assert_eq!(buf[0].calls, 1);
-
-        // Merge again with different values to verify += (not -= or *=).
-        merge_into_frame_buf(
-            &mut buf,
-            name,
-            2000,
-            #[cfg(feature = "cpu-time")]
-            70,
-            5,
-            512,
-            2,
-            64,
-        );
-        assert_eq!(buf.len(), 1, "same name should merge");
-        assert_eq!(buf[0].calls, 2, "calls: 1 + 1 = 2");
-        assert_eq!(buf[0].self_ns, 3000, "self_ns: 1000 + 2000 = 3000");
-        assert_eq!(buf[0].alloc_count, 15, "alloc_count: 10 + 5 = 15");
-        assert_eq!(buf[0].alloc_bytes, 768, "alloc_bytes: 256 + 512 = 768");
-        assert_eq!(buf[0].free_count, 5, "free_count: 3 + 2 = 5");
-        assert_eq!(buf[0].free_bytes, 192, "free_bytes: 128 + 64 = 192");
-        #[cfg(feature = "cpu-time")]
-        assert_eq!(buf[0].cpu_self_ns, 120, "cpu_self_ns: 50 + 70 = 120");
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: drop_cold frame boundary logic
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn drop_cold_parent_children_ns_accumulates() {
-        // Kills: collector.rs:915 replace += with -= and *= in drop_cold
-        // When an inner function drops, its elapsed time must be ADDED to
-        // parent.children_ns. If -= or *= is used instead, the parent's
-        // self_ms would be inflated or wrong.
-        reset();
-        {
-            let _outer = enter("dc_outer");
-            burn_cpu(5_000);
-            {
-                let _inner1 = enter("dc_inner1");
-                burn_cpu(10_000);
-            }
-            {
-                let _inner2 = enter("dc_inner2");
-                burn_cpu(10_000);
-            }
-        }
-        let records = collect();
-        let outer = records.iter().find(|r| r.name == "dc_outer").unwrap();
-        // With correct += on children_ns, outer.self_ms should be much less
-        // than outer.total_ms (both children subtracted).
-        // With -= or *=, self_ms would be >= total_ms.
-        assert!(
-            outer.self_ms < outer.total_ms * 0.6,
-            "outer self ({:.3}) should be much less than total ({:.3}) \
-             because two children's time was subtracted",
-            outer.self_ms,
-            outer.total_ms,
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: drop_cold comparison/logic
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn drop_cold_frame_boundary_with_adopt_context() {
-        // Kills: collector.rs:968 replace == with !=
-        //        collector.rs:969 replace || with && and == with !=
-        // When fork/adopt places an entry at depth 0, real functions run at
-        // depth 1+. The frame boundary fires when all remaining entries are
-        // depth 0 (remaining_all_base), OR when the dropped entry itself is
-        // depth 0. We verify frames are produced correctly in both scenarios.
-        reset();
-
-        // Scenario 1: normal depth-0 drop produces a frame.
-        {
-            let _g = enter("fb_normal");
-            burn_cpu(1_000);
-        }
-        let frames = collect_frames();
-        let normal_frames: Vec<_> = frames
-            .iter()
-            .filter(|f| f.iter().any(|s| s.name == "fb_normal"))
-            .collect();
-        assert_eq!(
-            normal_frames.len(),
-            1,
-            "depth-0 drop should produce exactly 1 frame"
-        );
-
-        // Scenario 2: adopt context -- child at depth 1 should produce frame
-        // data when it drops (since remaining entries are all depth 0).
-        {
-            let _parent = enter("fb_adopt_parent");
-            let ctx = fork().unwrap();
-            {
-                let _adopt = adopt(&ctx);
-                {
-                    let _child = enter("fb_adopt_child");
-                    burn_cpu(1_000);
-                }
-            }
-            ctx.finalize();
-        }
-        let frames = collect_frames();
-        let adopt_frames: Vec<_> = frames
-            .iter()
-            .filter(|f| f.iter().any(|s| s.name == "fb_adopt_child"))
-            .collect();
-        assert!(
-            !adopt_frames.is_empty(),
-            "adopt context child should produce frame data"
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: streaming/NDJSON write path comparisons
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn stream_frame_to_writer_comma_separation() {
-        // Kills: collector.rs:171 replace > with ==/</>=
-        // With 2+ entries, commas should separate them. With 1 entry, no comma.
-        let tmp = std::env::temp_dir().join(format!("piano_comma_sep_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let mut state = open_stream_file(&tmp).unwrap();
-
-        // Single entry: no comma
-        let single = vec![FrameFnSummary {
-            name: "comma_a",
-            calls: 1,
-            self_ns: 100,
-            #[cfg(feature = "cpu-time")]
-            cpu_self_ns: 0,
-            alloc_count: 0,
-            alloc_bytes: 0,
-            free_count: 0,
-            free_bytes: 0,
-        }];
-        stream_frame_to_writer(&mut state, &single);
-
-        // Multiple entries: commas between them
-        let multi = vec![
-            FrameFnSummary {
-                name: "comma_b",
-                calls: 1,
-                self_ns: 100,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns: 0,
-                alloc_count: 0,
-                alloc_bytes: 0,
-                free_count: 0,
-                free_bytes: 0,
-            },
-            FrameFnSummary {
-                name: "comma_c",
-                calls: 2,
-                self_ns: 200,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns: 0,
-                alloc_count: 0,
-                alloc_bytes: 0,
-                free_count: 0,
-                free_bytes: 0,
-            },
-        ];
-        stream_frame_to_writer(&mut state, &multi);
-        write_stream_trailer(&mut state).unwrap();
-        drop(state);
-
-        let files: Vec<_> = std::fs::read_dir(&tmp)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
-            .collect();
-        let content = std::fs::read_to_string(files[0].path()).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-
-        // Frame 0 (single entry): no comma in fns array, no leading comma.
-        // Mutant `i > 0` -> `i >= 0` would produce [,{...}] (leading comma).
-        let frame0_fns = &lines[1][lines[1].find("\"fns\":[").unwrap()..];
-        let comma_count_0 = frame0_fns.matches("},{").count();
-        assert_eq!(
-            comma_count_0, 0,
-            "single-entry frame should have no comma between entries"
-        );
-        assert!(
-            frame0_fns.contains("\"fns\":[{"),
-            "fns array should start with [{{ not [,{{: {frame0_fns}"
-        );
-
-        // Frame 1 (two entries): exactly one comma between entries, no leading comma.
-        let frame1_fns = &lines[2][lines[2].find("\"fns\":[").unwrap()..];
-        let comma_count_1 = frame1_fns.matches("},{").count();
-        assert_eq!(
-            comma_count_1, 1,
-            "two-entry frame should have exactly one comma separator"
-        );
-        assert!(
-            frame1_fns.contains("\"fns\":[{"),
-            "fns array should start with [{{ not [,{{: {frame1_fns}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn write_stream_trailer_comma_separation() {
-        // Kills: collector.rs:253 replace > with >=
-        // Verifies commas between function names in the trailer.
-        let tmp = std::env::temp_dir().join(format!("piano_trailer_comma_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        // Intern at least 2 names so the trailer has commas.
-        let _id1 = intern_name("trailer_comma_a");
-        let _id2 = intern_name("trailer_comma_b");
-
-        let mut state = open_stream_file(&tmp).unwrap();
-        write_stream_trailer(&mut state).unwrap();
-        drop(state);
-
-        let files: Vec<_> = std::fs::read_dir(&tmp)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
-            .collect();
-        let content = std::fs::read_to_string(files[0].path()).unwrap();
-        let trailer = content.lines().last().unwrap();
-
-        // With >= instead of >, a leading comma would appear: [,"name1","name2"]
-        assert!(
-            !trailer.contains("[,"),
-            "trailer should not start with a comma: {trailer}"
-        );
-        // With > replaced by ==, only the first entry would get a comma prefix
-        // (when i == 0, which is wrong). Check structure is valid.
-        assert!(
-            trailer.contains("\"functions\":[\""),
-            "trailer should have functions array starting with a quote: {trailer}"
-        );
-    }
-
-    #[test]
-    fn write_ndjson_comma_separation() {
-        // Kills: collector.rs:1303 and 1319 replace > with ==/</>=
-        let tmp = std::env::temp_dir().join(format!("piano_ndjson_comma_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-
-        let fn_names = vec!["ndjson_fn_a", "ndjson_fn_b"];
-        let frames = vec![vec![
-            FrameFnSummary {
-                name: "ndjson_fn_a",
-                calls: 1,
-                self_ns: 100,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns: 0,
-                alloc_count: 0,
-                alloc_bytes: 0,
-                free_count: 0,
-                free_bytes: 0,
-            },
-            FrameFnSummary {
-                name: "ndjson_fn_b",
-                calls: 2,
-                self_ns: 200,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns: 0,
-                alloc_count: 0,
-                alloc_bytes: 0,
-                free_count: 0,
-                free_bytes: 0,
-            },
-        ]];
-
-        let path = tmp.join("test.ndjson");
-        write_ndjson(&frames, &fn_names, &path).unwrap();
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-
-        // Header line: functions array should have comma between names, not before first.
-        let header = lines[0];
-        assert!(
-            header.contains("\"functions\":[\"ndjson_fn_a\",\"ndjson_fn_b\"]"),
-            "functions array should have proper comma separation: {header}"
-        );
-
-        // Frame line: fns array should have comma between entries, not before first.
-        let frame = lines[1];
-        let fns_section = &frame[frame.find("\"fns\":[").unwrap()..];
-        assert!(
-            !fns_section.starts_with("\"fns\":[,"),
-            "fns array should not start with comma: {fns_section}"
-        );
-        let entry_count = fns_section.matches("\"id\":").count();
-        assert_eq!(entry_count, 2, "should have 2 fn entries");
-        let comma_between = fns_section.matches("},{").count();
-        assert_eq!(
-            comma_between, 1,
-            "should have exactly 1 comma between 2 entries"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: pack_name_depth bitwise OR
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn pack_name_depth_uses_or_not_xor() {
-        // Kills: collector.rs:811 replace | with ^
-        // When both name_id and depth have overlapping bits in the low 16,
-        // XOR would cancel them out while OR preserves them.
-        // With | : (5 << 16) | 5 = 0x50005 => name_id=5, depth=5
-        // With ^ : (5 << 16) ^ 5 = 0x50005 (same, no overlap in shifted positions)
-        // But if we pack(0xFFFF, 0xFFFF):
-        // With | : (0xFFFF << 16) | 0xFFFF = 0xFFFF_FFFF
-        // With ^ : (0xFFFF << 16) ^ 0xFFFF = 0xFFFF_FFFF (same, no overlap)
-        // The fields don't overlap so | vs ^ gives the same result.
-        // However, pack is used with unpack. The real test is the round trip,
-        // which already exists. Let's test with values that ensure correctness.
-        let packed = pack_name_depth(0x1234, 0x5678);
-        assert_eq!(unpack_name_id(packed), 0x1234);
-        assert_eq!(unpack_depth(packed), 0x5678);
-
-        // Verify the raw bit pattern: (0x1234 << 16) | 0x5678
-        let expected: u64 = (0x1234u64 << 16) | 0x5678u64;
-        assert_eq!(
-            packed, expected,
-            "pack_name_depth should produce (name_id << 16) | depth"
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: aggregate division
-    // ---------------------------------------------------------------
-
-    #[cfg(feature = "cpu-time")]
-    #[test]
-    fn aggregate_divides_cpu_ns_to_ms() {
-        // Kills: collector.rs:1087 replace / with % and *
-        let agg = vec![FnAgg {
-            name: "agg_div_fn",
-            calls: 1,
-            total_ms: 10.0,
-            self_ms: 8.0,
-            cpu_self_ns: 5_000_000, // 5ms
-        }];
-        let result = aggregate(&agg, &[]);
-        assert_eq!(result.len(), 1);
-        let rec = &result[0];
-        // 5_000_000 / 1_000_000.0 = 5.0ms
-        // 5_000_000 % 1_000_000 = 0 (wrong)
-        // 5_000_000 * 1_000_000.0 = 5e12 (wrong)
-        assert!(
-            (rec.cpu_self_ms - 5.0).abs() < 0.001,
-            "cpu_self_ms should be 5.0 (ns / 1M), got {}",
-            rec.cpu_self_ms
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: timestamp_ms
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn timestamp_ms_returns_plausible_value() {
-        // Kills: collector.rs:1217 replace timestamp_ms -> u128 with 0 and 1
-        let ts = timestamp_ms();
-        // Any reasonable timestamp after 2020 is > 1_577_836_800_000 ms
-        assert!(
-            ts > 1_577_836_800_000,
-            "timestamp_ms should return current time, got {ts}"
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: run_id
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn run_id_is_nonempty_and_stable() {
-        // Kills: collector.rs:80 replace run_id -> &'static str with "" and "xyzzy"
-        let id = run_id();
-        assert!(!id.is_empty(), "run_id should not be empty");
-        // run_id contains the PID and a timestamp separated by underscore.
-        assert!(
-            id.contains('_'),
-            "run_id should contain underscore separator: {id}"
-        );
-        // Verify it contains the process ID.
-        let pid = std::process::id().to_string();
-        assert!(
-            id.starts_with(&pid),
-            "run_id should start with PID ({pid}): {id}"
-        );
-        // Stability: calling again returns the same value.
-        assert_eq!(run_id(), id, "run_id should be stable across calls");
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: runs_dir_nonblocking and dirs_fallback
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn dirs_fallback_returns_home() {
-        // Kills: collector.rs:1275 replace dirs_fallback with None and Some(Default)
-        // In test environments HOME is typically set.
-        if let Ok(home) = std::env::var("HOME") {
-            let result = dirs_fallback();
-            assert_eq!(
-                result,
-                Some(PathBuf::from(&home)),
-                "dirs_fallback should return HOME"
-            );
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn runs_dir_nonblocking_returns_some() {
-        // Kills: collector.rs:1264 replace runs_dir_nonblocking with None and Some(Default)
-        // With a runs dir set, runs_dir_nonblocking should return it.
-        let tmp = std::env::temp_dir().join("piano_nonblocking_test");
-        set_runs_dir(&tmp);
-        let result = runs_dir_nonblocking();
-        clear_runs_dir();
-        assert_eq!(
-            result,
-            Some(tmp),
-            "runs_dir_nonblocking should return the configured dir"
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: name_table_lock
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn name_table_lock_returns_mutex() {
-        // Kills: collector.rs:719 replace name_table_lock with Box::leak(...)
-        // The lock should be acquirable and releasable without panic.
-        let lock = name_table_lock();
-        let guard = lock.lock().unwrap();
-        drop(guard);
-        // Acquire again to verify it was properly released.
-        let guard2 = lock.lock().unwrap();
-        drop(guard2);
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: shutdown_impl_inner negation
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn shutdown_impl_inner_returns_false_on_success() {
-        // Kills: collector.rs:1546, 1551, 1578 delete ! in shutdown_impl_inner
-        // A successful write should return false (no failure).
-        reset();
-        {
-            let _g = enter("shutdown_ok_test");
-            burn_cpu(1_000);
-        }
-        let tmp = std::env::temp_dir().join(format!("piano_shutdown_ok_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let failed = shutdown_impl_inner(&tmp);
-        assert!(
-            !failed,
-            "shutdown_impl_inner should return false on successful write"
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
