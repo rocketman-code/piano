@@ -601,6 +601,10 @@ thread_local! {
 struct TlsFlushGuard;
 
 impl Drop for TlsFlushGuard {
+    // Skipped by cargo-mutants (see mutants.toml). Only exercised during TLS
+    // destruction via process::exit(); tested by tests/process_exit.rs at the
+    // workspace level, but not reachable from piano-runtime unit tests because
+    // process::exit() would kill the test runner.
     fn drop(&mut self) {
         // Drain RECORDS_BUF -> RECORDS Arc (survives via THREAD_RECORDS).
         let _ = RECORDS_BUF.try_with(|buf| {

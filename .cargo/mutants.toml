@@ -1,0 +1,8 @@
+# cargo-mutants configuration
+# https://mutants.rs/config.html
+
+# TlsFlushGuard::drop is only exercised during TLS destruction via
+# process::exit(). Tested by tests/process_exit.rs at the workspace level,
+# but cargo-mutants scopes to --package piano-runtime where no test can
+# trigger TLS destruction without killing the test runner.
+exclude_re = ["<impl Drop for TlsFlushGuard>::drop"]
