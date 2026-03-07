@@ -8,6 +8,21 @@
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` (documentation must compile cleanly, enforced in CI)
 - Idiomatic Rust: prefer stdlib patterns (iterators, if-let chains, Result propagation with `?`) over manual indexing or `process::exit` (except at the CLI boundary in `main.rs`)
 
+## Module Organization
+
+A module should have one clear responsibility. When a developer opens a file, they should be able to state its purpose in one sentence without using "and."
+
+- Recommended: <=2,000 lines per file (including inline tests)
+- Hard limit: 3,000 lines -- never exceed without justification
+
+When a file grows past 2,000 lines, look for natural responsibility seams to split. Cohesive files (single tightly-coupled concern) can stay above 2,000 if splitting would create more coupling than it resolves.
+
+When splitting `foo.rs` into `foo/mod.rs` + child modules:
+- Tests travel with their production code into submodules (inline `#[cfg(test)]` blocks)
+- mod.rs holds shared types, re-exports, and the tightly coupled core
+- Child modules declared as `pub(crate) mod` (not private `mod`) so sibling modules can access re-exports
+- Items re-exported via lib.rs must be `pub` in the child module (not `pub(crate)`)
+
 ## Testing
 
 Integration tests in `tests/`. Unit tests in source files (`#[cfg(test)]` modules) for parsing, formatting, and internal logic.
