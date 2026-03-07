@@ -585,8 +585,8 @@ fn flush_records_buf() {
 
 /// RAII timing guard. Records elapsed time on drop.
 ///
-/// 16 bytes: fits in two registers on both x86_64 (rax+rdx) and
-/// aarch64 (x0+x1), eliminating all memory stores from the
+/// 8 bytes: fits in one register on both x86_64 (rax) and
+/// aarch64 (x0), eliminating all memory stores from the
 /// measurement window.
 ///
 /// Uses a raw hardware counter (`rdtsc` / `cntvct_el0`) instead of
