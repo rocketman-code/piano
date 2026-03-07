@@ -169,7 +169,7 @@ fn main() {
 "#;
 
     let targets: HashSet<String> = HashSet::new();
-    let result = piano::rewrite::instrument_source(source, &targets, true)
+    let result = piano::rewrite::instrument_source(source, &targets, true, "")
         .expect("instrument_source should succeed");
 
     // The instrumented source must parse as valid Rust.

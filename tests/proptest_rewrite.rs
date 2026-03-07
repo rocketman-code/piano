@@ -251,7 +251,7 @@ proptest! {
             return Ok(());
         }
         let targets: HashSet<String> = names.iter().cloned().collect();
-        let result = instrument_source(&source, &targets, false)
+        let result = instrument_source(&source, &targets, false, "")
             .expect("instrument_source should succeed on valid Rust input");
         // Core invariant: output must be parseable Rust.
         let parse = syn::parse_str::<syn::File>(&result.source);
@@ -270,7 +270,7 @@ proptest! {
             return Ok(());
         }
         let targets: HashSet<String> = names.iter().cloned().collect();
-        let result = instrument_source(&source, &targets, false)
+        let result = instrument_source(&source, &targets, false, "")
             .expect("instrument_source should succeed on valid Rust input");
         for name in &instrumentable {
             let guard_pattern = format!("piano_runtime::enter(\"{name}\")");
@@ -300,7 +300,7 @@ proptest! {
             return Ok(());
         }
         let targets: HashSet<String> = names.iter().cloned().collect();
-        let result = instrument_source(&source, &targets, false)
+        let result = instrument_source(&source, &targets, false, "")
             .expect("instrument_source should succeed on valid Rust input");
         prop_assert!(
             result.source.contains("PianoFuture"),
@@ -320,7 +320,7 @@ proptest! {
         }
         // Target only the first function, check the rest are untouched.
         let targets: HashSet<String> = [names[0].clone()].into();
-        let result = instrument_source(&source, &targets, false)
+        let result = instrument_source(&source, &targets, false, "")
             .expect("instrument_source should succeed on valid Rust input");
         for name in &names[1..] {
             let guard_pattern = format!("piano_runtime::enter(\"{name}\")");
@@ -350,7 +350,7 @@ proptest! {
             return Ok(());
         }
         let targets: HashSet<String> = names.iter().cloned().collect();
-        let result = instrument_source(&source, &targets, false)
+        let result = instrument_source(&source, &targets, false, "")
             .expect("instrument_source should succeed on valid Rust input");
         for name in &skipped {
             let guard_pattern = format!("piano_runtime::enter(\"{name}\")");
