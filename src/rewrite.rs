@@ -1108,7 +1108,9 @@ fn inject_fn_guards_in_tokens(
             if !is_metavar_name {
                 let method_str = match &fm.name_tokens[0] {
                     proc_macro2::TokenTree::Ident(ident) => ident.to_string(),
-                    _ => unreachable!(),
+                    _ => unreachable!(
+                        "match_fn_pattern guarantees name_tokens[0] is Ident for literal names"
+                    ),
                 };
                 let qualified = match impl_type {
                     Some(MacroImplType::Literal(ty)) => {
