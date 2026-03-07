@@ -116,7 +116,7 @@ jobs:
       - name: Run mutation testing on changed runtime files
         run: |
           if git diff origin/main --name-only -- piano-runtime/src/ | grep -q .; then
-            cargo mutants --package piano-runtime --in-diff <(git diff origin/main -- piano-runtime/src/) --jobs 4 --timeout 120 --features _test_internals
+            cargo mutants --package piano-runtime --in-diff <(git diff origin/main -- piano-runtime/src/) --jobs 4 --timeout 120 --features _test_internals,cpu-time
           else
             echo "No piano-runtime/src/ changes, skipping mutation testing"
           fi

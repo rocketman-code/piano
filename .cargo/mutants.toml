@@ -26,7 +26,7 @@ exclude_re = [
     # timing ratios that are too coarse for mutation testing (tightening
     # thresholds causes CI flakiness). Tested via cpu_time_propagated_across_
     # threads_via_adopt with wide margins.
-    "in SpanContext::apply_children",
+    "SpanContext::apply_children",
     "replace \\+= with \\*= in <impl Drop for AdoptGuard>::drop",
     # AdoptGuard depth-0 flush is backed up by TlsFlushGuard (drains
     # FRAME_BUFFER on thread exit). Both paths tested; mutating one still
