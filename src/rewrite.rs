@@ -51,7 +51,9 @@ pub fn instrument_source(
     // so we reset it to empty when this path is taken.
     let (final_source, final_map) = if instrument_macros {
         let mut rewritten_file: syn::File = syn::parse_str(&rewritten)?;
-        let mut macro_visitor = MacroInstrumenter;
+        let mut macro_visitor = MacroInstrumenter {
+            module_prefix: module_prefix.to_string(),
+        };
         macro_visitor.visit_file_mut(&mut rewritten_file);
         (prettyplease::unparse(&rewritten_file), SourceMap::default())
     } else {
@@ -867,7 +869,7 @@ fn is_macro_rules(item: &syn::ItemMacro) -> bool {
 
 /// Top-level entry: scan a macro_rules! token stream for rule arms and
 /// instrument any fn items found in each arm's template body.
-fn instrument_macro_tokens(tokens: &mut proc_macro2::TokenStream) {
+fn instrument_macro_tokens(tokens: &mut proc_macro2::TokenStream, module_prefix: &str) {
     let mut tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
     let len = tts.len();
     let mut i = 0;
@@ -883,7 +885,7 @@ fn instrument_macro_tokens(tokens: &mut proc_macro2::TokenStream) {
                     // Templates can use brace, paren, or bracket delimiters.
                     let mut inner: Vec<proc_macro2::TokenTree> =
                         group.stream().into_iter().collect();
-                    inject_fn_guards_in_tokens(&mut inner, None);
+                    inject_fn_guards_in_tokens(&mut inner, None, module_prefix);
                     let new_stream: proc_macro2::TokenStream = inner.into_iter().collect();
                     let mut new_group = proc_macro2::Group::new(group.delimiter(), new_stream);
                     new_group.set_span(group.span());
@@ -1071,6 +1073,7 @@ fn detect_impl_type(tokens: &[proc_macro2::TokenTree], brace_idx: usize) -> Opti
 fn inject_fn_guards_in_tokens(
     tokens: &mut [proc_macro2::TokenTree],
     impl_type: Option<&MacroImplType>,
+    module_prefix: &str,
 ) {
     let mut i = 0;
     while i < tokens.len() {
@@ -1084,7 +1087,7 @@ fn inject_fn_guards_in_tokens(
         if let Some(fm) = match_fn_pattern(tokens, i) {
             let body_idx = fm.body_index;
             // Build the guard token stream for this function name.
-            let guard = make_guard_tokens(&fm.name_tokens, impl_type);
+            let guard = make_guard_tokens(&fm.name_tokens, impl_type, module_prefix);
             let guard_tts: Vec<proc_macro2::TokenTree> = guard.into_iter().collect();
 
             // Inject guard tokens at the start of the body brace group.
@@ -1110,7 +1113,7 @@ fn inject_fn_guards_in_tokens(
                     let recurse_impl = detected.as_ref().or(impl_type);
                     let mut inner: Vec<proc_macro2::TokenTree> =
                         group.stream().into_iter().collect();
-                    inject_fn_guards_in_tokens(&mut inner, recurse_impl);
+                    inject_fn_guards_in_tokens(&mut inner, recurse_impl, module_prefix);
                     let new_stream: proc_macro2::TokenStream = inner.into_iter().collect();
                     let mut new_group =
                         proc_macro2::Group::new(proc_macro2::Delimiter::Brace, new_stream);
@@ -1434,6 +1437,18 @@ fn build_enter_guard(enter_arg_stream: proc_macro2::TokenStream) -> proc_macro2:
     .collect()
 }
 
+/// Prepend `"prefix::", ` to a concat! argument list when module_prefix is non-empty.
+fn prepend_module_prefix_tokens(tts: &mut Vec<proc_macro2::TokenTree>, module_prefix: &str) {
+    if !module_prefix.is_empty() {
+        let prefix_with_sep = format!("{module_prefix}::");
+        tts.extend(quote! { #prefix_with_sep });
+        tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+            ',',
+            proc_macro2::Spacing::Alone,
+        )));
+    }
+}
+
 /// Build the guard statement tokens for a function name, optionally qualified
 /// with the enclosing impl type.
 ///
@@ -1451,6 +1466,7 @@ fn build_enter_guard(enter_arg_stream: proc_macro2::TokenStream) -> proc_macro2:
 fn make_guard_tokens(
     name_tokens: &[proc_macro2::TokenTree],
     impl_type: Option<&MacroImplType>,
+    module_prefix: &str,
 ) -> proc_macro2::TokenStream {
     let is_name_metavar = name_tokens.len() == 2
         && matches!(&name_tokens[0], proc_macro2::TokenTree::Punct(p) if p.as_char() == '$');
@@ -1464,7 +1480,8 @@ fn make_guard_tokens(
                     "match_fn_pattern guarantees name_tokens[0] is Ident for literal names"
                 ),
             };
-            let qualified = format!("{type_name}::{method_name}");
+            let qualified =
+                crate::resolve::qualify(module_prefix, &format!("{type_name}::{method_name}"));
             quote! {
                 let __piano_guard = piano_runtime::enter(#qualified);
             }
@@ -1480,10 +1497,11 @@ fn make_guard_tokens(
             let stringify_call = build_stringify_call(ty_ident);
             let separator: proc_macro2::TokenStream = quote! { "::" };
             let method_lit: proc_macro2::TokenStream = quote! { #method_name };
-            // Build: concat!(stringify!($ty), "::", "method")
+            // Build: concat!("prefix::", stringify!($ty), "::", "method")
             let span = proc_macro2::Span::call_site();
             let concat_inner: proc_macro2::TokenStream = {
                 let mut tts = Vec::new();
+                prepend_module_prefix_tokens(&mut tts, module_prefix);
                 tts.extend(stringify_call);
                 tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
                     ',',
@@ -1514,7 +1532,8 @@ fn make_guard_tokens(
         }
         // Literal type + metavar name: concat!("Type::", stringify!($name))
         (Some(MacroImplType::Literal(type_name)), true) => {
-            let prefix = format!("{type_name}::");
+            let qualified_type = crate::resolve::qualify(module_prefix, type_name);
+            let prefix = format!("{qualified_type}::");
             let stringify_call = build_stringify_call(&name_tokens[1]);
             let prefix_lit: proc_macro2::TokenStream = quote! { #prefix };
             let span = proc_macro2::Span::call_site();
@@ -1551,6 +1570,7 @@ fn make_guard_tokens(
             let span = proc_macro2::Span::call_site();
             let concat_inner: proc_macro2::TokenStream = {
                 let mut tts = Vec::new();
+                prepend_module_prefix_tokens(&mut tts, module_prefix);
                 tts.extend(ty_stringify);
                 tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
                     ',',
@@ -1579,10 +1599,34 @@ fn make_guard_tokens(
             .collect();
             build_enter_guard(concat_call)
         }
-        // No impl type, metavar name: stringify!($name)
+        // No impl type, metavar name: stringify!($name) or concat!("prefix::", stringify!($name))
         (None, true) => {
             let stringify_call = build_stringify_call(&name_tokens[1]);
-            build_enter_guard(stringify_call)
+            if module_prefix.is_empty() {
+                build_enter_guard(stringify_call)
+            } else {
+                let span = proc_macro2::Span::call_site();
+                let concat_inner: proc_macro2::TokenStream = {
+                    let mut tts = Vec::new();
+                    prepend_module_prefix_tokens(&mut tts, module_prefix);
+                    tts.extend(stringify_call);
+                    tts.into_iter().collect()
+                };
+                let concat_call: proc_macro2::TokenStream = vec![
+                    proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("concat", span)),
+                    proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                        '!',
+                        proc_macro2::Spacing::Alone,
+                    )),
+                    proc_macro2::TokenTree::Group(proc_macro2::Group::new(
+                        proc_macro2::Delimiter::Parenthesis,
+                        concat_inner,
+                    )),
+                ]
+                .into_iter()
+                .collect();
+                build_enter_guard(concat_call)
+            }
         }
         // No impl type, literal name: "name"
         (None, false) => {
@@ -1592,8 +1636,9 @@ fn make_guard_tokens(
                     "match_fn_pattern guarantees name_tokens[0] is Ident for literal names"
                 ),
             };
+            let qualified = crate::resolve::qualify(module_prefix, &name_str);
             quote! {
-                let __piano_guard = piano_runtime::enter(#name_str);
+                let __piano_guard = piano_runtime::enter(#qualified);
             }
         }
     }
@@ -1653,12 +1698,14 @@ impl<'s> Visit<'s> for InjectionCollector<'s> {
 
 /// Separate VisitMut that only handles macro_rules! instrumentation.
 /// Kept as VisitMut because macro instrumentation modifies token streams directly.
-struct MacroInstrumenter;
+struct MacroInstrumenter {
+    module_prefix: String,
+}
 
 impl VisitMut for MacroInstrumenter {
     fn visit_item_macro_mut(&mut self, node: &mut syn::ItemMacro) {
         if is_macro_rules(node) {
-            instrument_macro_tokens(&mut node.mac.tokens);
+            instrument_macro_tokens(&mut node.mac.tokens, &self.module_prefix);
         }
         syn::visit_mut::visit_item_macro_mut(self, node);
     }
@@ -4281,6 +4328,48 @@ fn process_all(data: &[i32]) {
             result.concurrency.first().map(|(name, _)| name.as_str()),
             Some("worker::process_all"),
             "concurrency info should use qualified name",
+        );
+    }
+
+    #[test]
+    fn module_prefix_qualifies_macro_fn_name() {
+        let source = r#"
+macro_rules! make_impl {
+    () => {
+        impl Handler {
+            fn validate() { }
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true, "api")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains(r#"piano_runtime::enter("api::Handler::validate")"#),
+            "macro fn should use module prefix. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn module_prefix_qualifies_macro_top_level_fn() {
+        let source = r#"
+macro_rules! make_fn {
+    () => {
+        fn process() { }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true, "worker")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains(r#"piano_runtime::enter("worker::process")"#),
+            "top-level macro fn should use module prefix. Got:\n{result}"
         );
     }
 }
