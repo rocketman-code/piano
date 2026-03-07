@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -25,6 +25,7 @@ use piano::rewrite::{
     detect_allocator_kind, inject_global_allocator, inject_registrations, inject_shutdown,
     instrument_source,
 };
+use piano::source_map::SourceMap;
 
 #[derive(Parser)]
 #[command(
@@ -378,6 +379,7 @@ fn build_project(
     // Rewrite each target file in staging.
     let instrument_macros = specs.is_empty();
     let mut all_concurrency: Vec<(String, String)> = Vec::new();
+    let mut source_maps: HashMap<PathBuf, SourceMap> = HashMap::new();
     for target in &targets {
         let target_set: HashSet<String> = target.functions.iter().cloned().collect();
         let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
@@ -392,12 +394,13 @@ fn build_project(
         let result =
             instrument_source(&source, &target_set, instrument_macros).map_err(|source| {
                 Error::ParseError {
-                    path: display_path,
+                    path: display_path.clone(),
                     source,
                 }
             })?;
 
         all_concurrency.extend(result.concurrency);
+        source_maps.insert(display_path, result.source_map);
         std::fs::write(&staged_file, result.source).map_err(io_context("write", &staged_file))?;
     }
 
@@ -426,33 +429,47 @@ fn build_project(
                 path: bin_entry.clone(),
                 source,
             })?;
-        let rewritten = inject_registrations(&main_source, &all_fn_names).map_err(|source| {
-            Error::ParseError {
-                path: bin_entry.clone(),
-                source,
-            }
-        })?;
+        let (rewritten, reg_map) =
+            inject_registrations(&main_source, &all_fn_names).map_err(|source| {
+                Error::ParseError {
+                    path: bin_entry.clone(),
+                    source,
+                }
+            })?;
 
         // Inject global allocator for allocation tracking.
         let alloc_kind = detect_allocator_kind(&rewritten).map_err(|source| Error::ParseError {
             path: bin_entry.clone(),
             source,
         })?;
-        let rewritten = inject_global_allocator(&rewritten, alloc_kind).map_err(|source| {
-            Error::ParseError {
-                path: bin_entry.clone(),
-                source,
-            }
-        })?;
+        let (rewritten, alloc_map) =
+            inject_global_allocator(&rewritten, alloc_kind).map_err(|source| {
+                Error::ParseError {
+                    path: bin_entry.clone(),
+                    source,
+                }
+            })?;
 
         let runs_dir_str = runs_dir.to_string_lossy().to_string();
-        let rewritten = inject_shutdown(&rewritten, Some(&runs_dir_str)).map_err(|source| {
-            Error::ParseError {
-                path: bin_entry.clone(),
-                source,
-            }
-        })?;
+        let (rewritten, shutdown_map) =
+            inject_shutdown(&rewritten, Some(&runs_dir_str)).map_err(|source| {
+                Error::ParseError {
+                    path: bin_entry.clone(),
+                    source,
+                }
+            })?;
         std::fs::write(&main_file, rewritten).map_err(io_context("write", &main_file))?;
+
+        // Merge registration/allocator/shutdown source maps into the bin
+        // entry's map. Each step's map was computed relative to its input
+        // (which already contains prior injections), so the line numbers
+        // are in shifted coordinates. Merging gives approximate remapping
+        // -- exact for guard injections, close enough for the few lines
+        // added by registration/allocator/shutdown boilerplate.
+        let entry_map = source_maps.entry(bin_entry.clone()).or_default();
+        entry_map.merge(reg_map);
+        entry_map.merge(alloc_map);
+        entry_map.merge(shutdown_map);
     }
 
     // Build the instrumented binary.
@@ -461,6 +478,7 @@ fn build_project(
         &target_dir,
         package_name.as_deref(),
         bin.as_deref(),
+        &source_maps,
     )?;
 
     Ok(Some((binary, runs_dir, total_fns)))

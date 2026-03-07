@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 
 use ignore::WalkBuilder;
 use toml_edit::DocumentMut;
 
 use crate::error::{Error, io_context};
+use crate::source_map::SourceMap;
 
 /// Copy the user's project into a staging directory, respecting .gitignore
 /// and skipping the `target/` directory.
@@ -162,6 +165,87 @@ fn extract_rendered_errors(json_output: &str) -> Vec<String> {
         .collect()
 }
 
+static SPAN_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r" --> ([^:]+):(\d+):(\d+)").unwrap());
+static GUTTER_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^(\s*)(\d+)( \|)").unwrap());
+
+/// Remap line numbers in a rendered rustc error using the provided source maps.
+///
+/// Processes line-by-line: `-->` lines set the current file context, and
+/// subsequent gutter lines (`N |`) use that file's source map for remapping.
+fn remap_rendered_error(rendered: &str, file_maps: &HashMap<PathBuf, SourceMap>) -> String {
+    let mut lines = Vec::new();
+    let mut current_map: Option<&SourceMap> = None;
+
+    for line in rendered.lines() {
+        if let Some(caps) = SPAN_RE.captures(line) {
+            let file = &caps[1];
+            let line_num: u32 = caps[2].parse().unwrap_or(0);
+            let col = &caps[3];
+            let map = file_maps.get(Path::new(file));
+            current_map = map;
+            if let Some(m) = map {
+                let remapped = m.remap_line(line_num).unwrap_or(line_num);
+                lines.push(
+                    SPAN_RE
+                        .replace(line, format!(" --> {file}:{remapped}:{col}"))
+                        .into_owned(),
+                );
+            } else {
+                lines.push(line.to_string());
+            }
+        } else if let Some(caps) = GUTTER_RE.captures(line) {
+            if let Some(map) = current_map {
+                let spaces = &caps[1];
+                let line_num: u32 = caps[2].parse().unwrap_or(0);
+                let suffix = &caps[3];
+                let remapped = map.remap_line(line_num).unwrap_or(line_num);
+                let width = caps[2].len();
+                let rest = &line[caps[0].len()..];
+                lines.push(format!("{spaces}{remapped:>width$}{suffix}{rest}"));
+            } else {
+                lines.push(line.to_string());
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    let mut result = lines.join("\n");
+    // Preserve trailing newline if the original had one.
+    if rendered.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+/// Remove lines referencing piano internals from rendered error output.
+fn filter_piano_internals(rendered: &str) -> String {
+    let mut filtered = Vec::new();
+    let mut skip_annotations = false;
+
+    for line in rendered.lines() {
+        if line.contains("piano_runtime::")
+            || line.contains("__piano_guard")
+            || line.contains("__piano_ctx")
+            || line.contains("_PIANO_ALLOC")
+        {
+            skip_annotations = true;
+            continue;
+        }
+        if skip_annotations {
+            let trimmed = line.trim();
+            if trimmed.starts_with('|') || trimmed.starts_with("...") {
+                continue;
+            }
+            skip_annotations = false;
+        }
+        filtered.push(line);
+    }
+    filtered.join("\n")
+}
+
 /// Find the workspace root for a project directory.
 ///
 /// Walks up from `project_dir` looking for the nearest parent `Cargo.toml`
@@ -261,9 +345,16 @@ pub fn find_bin_entry_point(project_dir: &Path, bin_name: Option<&str>) -> Resul
             }
         }
     } else if let Some(target) = bin_name {
-        return Err(Error::BuildFailed(format!(
-            "no [[bin]] entry named '{target}' in Cargo.toml"
-        )));
+        let pkg_name = doc
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str());
+        if pkg_name != Some(target) {
+            return Err(Error::BuildFailed(format!(
+                "no binary target named '{target}' in Cargo.toml"
+            )));
+        }
+        // Name matches package -- fall through to src/main.rs check below.
     }
 
     // Cargo default: src/main.rs
@@ -309,6 +400,7 @@ pub fn build_instrumented(
     target_dir: &Path,
     package: Option<&str>,
     bin: Option<&str>,
+    source_maps: &HashMap<PathBuf, SourceMap>,
 ) -> Result<PathBuf, Error> {
     // Remove RUSTUP_TOOLCHAIN so the target project's rust-toolchain.toml
     // is respected. Without this, nested cargo invocations inherit the
@@ -335,7 +427,12 @@ pub fn build_instrumented(
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::BuildFailed(stderr.into_owned()));
         }
-        return Err(Error::BuildFailed(rendered.join("")));
+        let mut error_text = rendered.join("");
+        if !source_maps.is_empty() {
+            error_text = remap_rendered_error(&error_text, source_maps);
+            error_text = filter_piano_internals(&error_text);
+        }
+        return Err(Error::BuildFailed(error_text));
     }
 
     // Parse JSON lines to find the last compiler-artifact with an executable.
@@ -735,7 +832,7 @@ path = "src/server.rs"
     }
 
     #[test]
-    fn find_bin_entry_point_named_no_bin_section() {
+    fn find_bin_entry_point_implicit_binary_matches_package_name() {
         let tmp = TempDir::new().unwrap();
         let toml = r#"[package]
 name = "demo"
@@ -744,11 +841,27 @@ version = "0.1.0"
         create_file(tmp.path(), "Cargo.toml", toml);
         create_file(tmp.path(), "src/main.rs", "fn main() {}");
 
-        let result = find_bin_entry_point(tmp.path(), Some("mybin"));
+        // --bin demo should work: matches [package].name and src/main.rs exists
+        let result = find_bin_entry_point(tmp.path(), Some("demo")).unwrap();
+        assert_eq!(result, PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn find_bin_entry_point_implicit_binary_wrong_name() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"[package]
+name = "demo"
+version = "0.1.0"
+"#;
+        create_file(tmp.path(), "Cargo.toml", toml);
+        create_file(tmp.path(), "src/main.rs", "fn main() {}");
+
+        // --bin othername should fail: doesn't match package name
+        let result = find_bin_entry_point(tmp.path(), Some("othername"));
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("no [[bin]] entry named 'mybin'"),
+            err_msg.contains("no binary target named 'othername'"),
             "unexpected error: {err_msg}"
         );
     }
@@ -769,6 +882,40 @@ version = "0.1.0"
         assert!(
             err_msg.contains("could not find binary entry point"),
             "unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn remap_rendered_error_line_numbers() {
+        let rendered = "error[E0308]: mismatched types\n --> src/main.rs:7:18\n  |\n7 |     let x: i32 = \"hello\";\n  |                  ^^^^^^^ expected `i32`, found `&str`\n";
+        let mut file_maps = std::collections::HashMap::new();
+        let mut map = crate::source_map::SourceMap::new();
+        map.record(1, 2);
+        file_maps.insert(PathBuf::from("src/main.rs"), map);
+
+        let result = remap_rendered_error(rendered, &file_maps);
+        assert!(result.contains("--> src/main.rs:5:18"), "got: {result}");
+        assert!(
+            result.contains("5 |"),
+            "gutter should be remapped: {result}"
+        );
+    }
+
+    #[test]
+    fn filter_piano_internals_from_errors() {
+        let rendered = "error[E0308]: mismatched types\n --> src/main.rs:5:10\n  |\n3 |     let __piano_guard = piano_runtime::enter(\"foo\");\n  |         -------------- this is of type `Guard`\n4 |     let x: i32 = \"hello\";\n  |                  ^^^^^^^ expected `i32`, found `&str`\n";
+        let result = filter_piano_internals(rendered);
+        assert!(
+            !result.contains("piano_runtime"),
+            "should filter piano_runtime: {result}"
+        );
+        assert!(
+            !result.contains("__piano_guard"),
+            "should filter __piano_guard: {result}"
+        );
+        assert!(
+            result.contains("expected `i32`"),
+            "should keep user error: {result}"
         );
     }
 }
