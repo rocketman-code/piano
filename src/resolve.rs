@@ -535,6 +535,42 @@ fn build_suggestion_hint(specs: &[TargetSpec], seen_names: &[String]) -> String 
     }
 }
 
+/// Derive a Rust module path prefix from a file path relative to `src/`.
+///
+/// - `main.rs` / `lib.rs` -> `""` (crate root)
+/// - `mod.rs` -> parent directory components (e.g., `db/mod.rs` -> `"db"`)
+/// - other -> parent components + file stem (e.g., `db/query.rs` -> `"db::query"`)
+pub fn module_prefix(relative: &Path) -> String {
+    let stem = relative.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+
+    let parent_components: Vec<&str> = relative
+        .parent()
+        .map(|p| {
+            p.components()
+                .map(|c| c.as_os_str().to_str().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if stem == "main" || stem == "lib" || stem == "mod" {
+        parent_components.join("::")
+    } else {
+        let mut parts = parent_components;
+        parts.push(stem);
+        parts.join("::")
+    }
+}
+
+/// Qualify a function name with a module prefix. Returns the name unchanged
+/// if the prefix is empty.
+pub fn qualify(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}::{name}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1165,6 +1201,55 @@ mod tests {
         assert!(
             hint.is_empty(),
             "hint should be empty when no --fn specs are present, got: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn module_prefix_crate_roots() {
+        assert_eq!(module_prefix(Path::new("main.rs")), "");
+        assert_eq!(module_prefix(Path::new("lib.rs")), "");
+    }
+
+    #[test]
+    fn module_prefix_simple_files() {
+        assert_eq!(module_prefix(Path::new("db.rs")), "db");
+        assert_eq!(module_prefix(Path::new("utils.rs")), "utils");
+    }
+
+    #[test]
+    fn module_prefix_mod_rs() {
+        assert_eq!(module_prefix(Path::new("db/mod.rs")), "db");
+        assert_eq!(
+            module_prefix(Path::new("api/handlers/mod.rs")),
+            "api::handlers"
+        );
+    }
+
+    #[test]
+    fn module_prefix_nested_files() {
+        assert_eq!(module_prefix(Path::new("db/query.rs")), "db::query");
+        assert_eq!(
+            module_prefix(Path::new("api/handlers/user.rs")),
+            "api::handlers::user"
+        );
+    }
+
+    #[test]
+    fn qualify_with_empty_prefix() {
+        assert_eq!(qualify("", "walk"), "walk");
+        assert_eq!(qualify("", "Walker::walk"), "Walker::walk");
+    }
+
+    #[test]
+    fn qualify_with_module_prefix() {
+        assert_eq!(qualify("db", "execute"), "db::execute");
+        assert_eq!(
+            qualify("db::query", "validate_input"),
+            "db::query::validate_input"
+        );
+        assert_eq!(
+            qualify("api", "Handler::validate_input"),
+            "api::Handler::validate_input"
         );
     }
 }
