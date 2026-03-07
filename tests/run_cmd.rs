@@ -747,7 +747,7 @@ fn duration_stop_exits_zero_with_no_warning() {
     let runs_dir = tmp.path().join("runs");
 
     let output = Command::new(piano_bin)
-        .args(["profile", "--fn", "work", "--duration", "2", "--project"])
+        .args(["profile", "--fn", "work", "--duration", "5", "--project"])
         .arg(&project_dir)
         .arg("--runtime-path")
         .arg(&runtime_path)
