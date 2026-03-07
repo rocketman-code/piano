@@ -121,4 +121,15 @@ fn process_exit_produces_valid_profiling_data() {
         stats["work"].calls >= 1,
         "work() should have been called at least once"
     );
+
+    // In-flight function: main's guard never drops because process::exit(1)
+    // fires before main returns. The TlsFlushGuard should recover it.
+    assert!(
+        stats.contains_key("main"),
+        "in-flight function 'main' should be recovered on process::exit, got: {stats:?}"
+    );
+    assert!(
+        stats["main"].calls >= 1,
+        "main() should have been called at least once"
+    );
 }
