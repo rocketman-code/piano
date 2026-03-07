@@ -903,6 +903,24 @@ version = "0.1.0"
     }
 
     #[test]
+    fn find_bin_entry_point_src_bin_shadows_package_name() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"[package]
+name = "demo"
+version = "0.1.0"
+"#;
+        create_file(tmp.path(), "Cargo.toml", toml);
+        create_file(tmp.path(), "src/main.rs", "fn main() {}");
+        create_file(tmp.path(), "src/bin/demo.rs", "fn main() {}");
+
+        // When --bin name matches both a src/bin/ file and the package name,
+        // src/bin/ takes precedence. This matches Cargo's auto-discovery rules:
+        // explicit bin targets shadow the implicit package-name binary.
+        let result = find_bin_entry_point(tmp.path(), Some("demo")).unwrap();
+        assert_eq!(result, PathBuf::from("src/bin/demo.rs"));
+    }
+
+    #[test]
     fn find_bin_entry_point_errors_when_no_entry_found() {
         let tmp = TempDir::new().unwrap();
         let toml = r#"[package]
