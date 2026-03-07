@@ -1137,4 +1137,57 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn parse_duration_zero() {
+        let err = parse_duration_secs("0").unwrap_err();
+        assert_eq!(err, "duration cannot be zero");
+    }
+
+    #[test]
+    fn parse_duration_negative() {
+        let err = parse_duration_secs("-1").unwrap_err();
+        assert_eq!(err, "duration cannot be negative");
+    }
+
+    #[test]
+    fn parse_duration_nan() {
+        let err = parse_duration_secs("nan").unwrap_err();
+        assert_eq!(err, "invalid duration");
+    }
+
+    #[test]
+    fn parse_duration_inf() {
+        let err = parse_duration_secs("inf").unwrap_err();
+        assert_eq!(err, "invalid duration");
+    }
+
+    #[test]
+    fn parse_duration_neg_inf() {
+        let err = parse_duration_secs("-inf").unwrap_err();
+        assert_eq!(err, "invalid duration");
+    }
+
+    #[test]
+    fn parse_duration_too_large() {
+        let err = parse_duration_secs("1e300").unwrap_err();
+        assert_eq!(err, "duration is too large");
+    }
+
+    #[test]
+    fn parse_duration_negative_zero() {
+        let err = parse_duration_secs("-0.0").unwrap_err();
+        assert_eq!(err, "duration cannot be zero");
+    }
+
+    #[test]
+    fn parse_duration_valid_fractional() {
+        let secs = parse_duration_secs("0.5").unwrap();
+        assert_eq!(secs, 0.5);
+    }
+
+    #[test]
+    fn parse_duration_invalid_string() {
+        assert!(parse_duration_secs("abc").is_err());
+    }
 }
