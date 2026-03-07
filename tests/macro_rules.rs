@@ -188,3 +188,35 @@ fn main() {
         result.source
     );
 }
+
+#[test]
+fn macro_literal_fn_gets_registered() {
+    let source = r#"
+macro_rules! setup {
+    () => {
+        fn initialize() {
+            start();
+        }
+    };
+}
+setup!();
+fn main() {}
+"#;
+    let targets: HashSet<String> = HashSet::new();
+    let result = piano::rewrite::instrument_source(source, &targets, true, "")
+        .expect("instrument_source should succeed");
+
+    assert!(
+        result.macro_fn_names.contains(&"initialize".to_string()),
+        "literal fn name should be collected. Got: {:?}",
+        result.macro_fn_names,
+    );
+
+    let (registered_source, _map) =
+        piano::rewrite::inject_registrations(&result.source, &result.macro_fn_names)
+            .expect("inject_registrations should succeed");
+    assert!(
+        registered_source.contains(r#"piano_runtime::register("initialize")"#),
+        "literal macro fn should get register() call. Got:\n{registered_source}"
+    );
+}

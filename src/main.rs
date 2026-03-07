@@ -382,6 +382,7 @@ fn build_project(
     let instrument_macros = specs.is_empty();
     let mut all_concurrency: Vec<(String, String)> = Vec::new();
     let mut source_maps: HashMap<PathBuf, SourceMap> = HashMap::new();
+    let mut macro_fn_names: Vec<String> = Vec::new();
     for target in &targets {
         let target_set: HashSet<String> = target.functions.iter().cloned().collect();
         let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
@@ -402,6 +403,7 @@ fn build_project(
         )?;
 
         all_concurrency.extend(result.concurrency);
+        macro_fn_names.extend(result.macro_fn_names);
         source_maps.insert(display_path, result.source_map);
         std::fs::write(&staged_file, result.source).map_err(io_context("write", &staged_file))?;
     }
@@ -422,13 +424,14 @@ fn build_project(
     let runs_dir = target_dir.join("runs");
     std::fs::create_dir_all(&runs_dir).map_err(io_context("create directory", &runs_dir))?;
     {
-        let all_fn_names: Vec<String> = targets
+        let mut all_fn_names: Vec<String> = targets
             .iter()
             .flat_map(|t| {
                 let prefix = module_prefix(t.file.strip_prefix(&src_dir).unwrap_or(&t.file));
                 t.functions.iter().map(move |f| qualify(&prefix, f))
             })
             .collect();
+        all_fn_names.extend(macro_fn_names);
         let main_source =
             std::fs::read_to_string(&main_file).map_err(|source| Error::RunReadError {
                 path: bin_entry.clone(),
