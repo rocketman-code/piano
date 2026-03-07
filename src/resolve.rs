@@ -547,7 +547,7 @@ pub fn module_prefix(relative: &Path) -> String {
         .parent()
         .map(|p| {
             p.components()
-                .map(|c| c.as_os_str().to_str().unwrap())
+                .map(|c| c.as_os_str().to_str().unwrap_or("_"))
                 .collect()
         })
         .unwrap_or_default();
@@ -1232,6 +1232,17 @@ mod tests {
             module_prefix(Path::new("api/handlers/user.rs")),
             "api::handlers::user"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn module_prefix_non_utf8_component() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let bad = OsStr::from_bytes(b"\x80");
+        let path: std::path::PathBuf = [bad, OsStr::new("query.rs")].iter().collect();
+        assert_eq!(module_prefix(&path), "_::query");
     }
 
     #[test]
