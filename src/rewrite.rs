@@ -3642,6 +3642,61 @@ fn main() {}
     }
 
     #[test]
+    fn macro_impl_metavar_type_uses_concat_stringify() {
+        let source = r#"
+macro_rules! make_impl {
+    ($ty:ident) => {
+        impl $ty {
+            fn process() {
+                work();
+            }
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
+        // concat!(stringify!($ty), "::", "process") — prettyplease may reformat spacing.
+        assert!(
+            result.contains("concat") && result.contains("stringify") && result.contains("process"),
+            "method in impl $ty should use concat+stringify. Got:\n{result}"
+        );
+        // Must NOT contain the bare unqualified name.
+        assert!(
+            !result.contains(r#"piano_runtime::enter("process")"#),
+            "should not have bare unqualified name. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn macro_impl_metavar_type_and_metavar_name() {
+        let source = r#"
+macro_rules! make_impl {
+    ($ty:ident, $method:ident) => {
+        impl $ty {
+            fn $method() {
+                work();
+            }
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
+        // Both type and method are metavars — should use concat!(stringify!($ty), "::", stringify!($method)).
+        assert!(
+            result.contains("concat") && result.contains("stringify"),
+            "both metavar type+name should use concat+stringify. Got:\n{result}"
+        );
+    }
+
+    #[test]
     fn multiple_cfg_fallback_negates_all_predicates() {
         let src = r#"
             #[cfg(target_os = "linux")]
