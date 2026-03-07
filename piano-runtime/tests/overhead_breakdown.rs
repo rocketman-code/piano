@@ -249,9 +249,31 @@ fn measure_atomic_bool_load() -> f64 {
     ns_per_call(start.elapsed())
 }
 
-/// u128 arithmetic: replicates elapsed_ns() tick-to-ns conversion (old path).
+/// Fixed-point multiply: current ticks_to_ns conversion.
+/// 2 atomic loads + u128 multiply + shift (umulh on aarch64).
+fn measure_elapsed_ns_fixpoint() -> f64 {
+    // Q=41, M=ceil(2 * 2^64 / 3) for ratio 125/3
+    static QUOTIENT: AtomicU64 = AtomicU64::new(41);
+    static MULTIPLIER: AtomicU64 = AtomicU64::new(12297829382473034411);
+
+    let start_tsc: u64 = 1_000_000;
+    let end_tsc: u64 = 1_003_000;
+
+    let start = Instant::now();
+    for _ in 0..N {
+        let ticks = end_tsc.wrapping_sub(start_tsc);
+        let q = QUOTIENT.load(Ordering::Relaxed);
+        let m = MULTIPLIER.load(Ordering::Relaxed);
+        let hi = ((ticks as u128 * m as u128) >> 64) as u64;
+        let ns = ticks.wrapping_mul(q).wrapping_add(hi);
+        black_box(ns);
+    }
+    ns_per_call(start.elapsed())
+}
+
+/// u128 division: previous ticks_to_ns conversion (for reference).
 /// 2 atomic loads + u128 multiply + u128 divide (calls ___udivti3).
-fn measure_elapsed_ns_u128() -> f64 {
+fn measure_elapsed_ns_u128_div() -> f64 {
     static NUMER: AtomicU64 = AtomicU64::new(125);
     static DENOM: AtomicU64 = AtomicU64::new(3);
 
@@ -264,26 +286,6 @@ fn measure_elapsed_ns_u128() -> f64 {
         let n = NUMER.load(Ordering::Relaxed);
         let d = DENOM.load(Ordering::Relaxed);
         let ns = (ticks as u128 * n as u128 / d as u128) as u64;
-        black_box(ns);
-    }
-    ns_per_call(start.elapsed())
-}
-
-/// u64 arithmetic: optimized elapsed_ns() tick-to-ns conversion.
-/// 2 atomic loads + u64 wrapping_mul + u64 divide (native udiv).
-fn measure_elapsed_ns_u64() -> f64 {
-    static NUMER: AtomicU64 = AtomicU64::new(125);
-    static DENOM: AtomicU64 = AtomicU64::new(3);
-
-    let start_tsc: u64 = 1_000_000;
-    let end_tsc: u64 = 1_003_000;
-
-    let start = Instant::now();
-    for _ in 0..N {
-        let ticks = end_tsc.wrapping_sub(start_tsc);
-        let n = NUMER.load(Ordering::Relaxed);
-        let d = DENOM.load(Ordering::Relaxed);
-        let ns = ticks.wrapping_mul(n) / d;
         black_box(ns);
     }
     ns_per_call(start.elapsed())
@@ -522,8 +524,8 @@ fn overhead_breakdown() {
     let mutex_only = measure_mutex_lock_only();
     let frame_buf = measure_frame_buffer_push();
     let atomic = measure_atomic_bool_load();
-    let math_u128 = measure_elapsed_ns_u128();
-    let math_u64 = measure_elapsed_ns_u64();
+    let math_fixpoint = measure_elapsed_ns_fixpoint();
+    let math_u128_div = measure_elapsed_ns_u128_div();
     let depth0 = measure_piano_depth0();
     let depth1 = measure_piano_depth1();
     let frame_agg = measure_frame_aggregation();
@@ -563,16 +565,16 @@ fn overhead_breakdown() {
     );
     eprintln!(
         "  {:<45} {:>8.1}ns",
-        "u128 math (___udivti3 path)", math_u128
+        "fixed-point multiply (umulh path)", math_fixpoint
     );
     eprintln!(
         "  {:<45} {:>8.1}ns",
-        "u64 math (native udiv path)", math_u64
+        "u128 division (___udivti3, reference)", math_u128_div
     );
     eprintln!(
         "  {:<45} {:>8.1}ns",
-        "u128 vs u64 delta",
-        math_u128 - math_u64
+        "fixpoint vs u128-div delta",
+        math_fixpoint - math_u128_div
     );
     eprintln!();
     eprintln!("--- Depth-0 Aggregation Path ---");
