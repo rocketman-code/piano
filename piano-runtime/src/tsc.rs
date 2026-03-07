@@ -84,7 +84,7 @@ pub fn read() -> u64 {
 /// Convert a raw tick count to nanoseconds using the calibrated ratio.
 ///
 /// Uses fixed-point multiplication: `ticks * Q + (ticks * M >> 64)`.
-/// The `u128 * u128 >> 64` compiles to `umulh` on aarch64 (1 instruction)
+/// The `u64 * u64 >> 64` compiles to `umulh` on aarch64 (1 instruction)
 /// and `mulq` on x86_64, replacing the previous `___udivti3` software
 /// division (~2 ns -> ~0.4 ns on M4 Pro).
 #[inline(always)]
@@ -110,6 +110,24 @@ pub fn elapsed_ns(start: u64, end: u64) -> u64 {
 #[inline]
 pub fn ticks_to_epoch_ns(ticks: u64, epoch_tsc: u64) -> u64 {
     ticks_to_ns(ticks.wrapping_sub(epoch_tsc))
+}
+
+/// Compute `ceil(remainder * 2^64 / divisor)` as a u64.
+///
+/// Returns the fixed-point multiplier M for the remainder term of the
+/// tick-to-nanosecond decomposition. Returns 0 when remainder is 0.
+fn compute_multiplier(remainder: u64, divisor: u64) -> u64 {
+    if remainder == 0 {
+        return 0;
+    }
+    let product = (remainder as u128) << 64;
+    let div = product / divisor as u128;
+    let rem = product % divisor as u128;
+    if rem > 0 {
+        (div + 1) as u64
+    } else {
+        div as u64
+    }
 }
 
 /// Calibrate the tick-to-nanosecond ratio. Called once from `epoch()`.
@@ -153,19 +171,7 @@ pub fn calibrate() {
         // Decompose: ns = ticks * Q + (ticks * M >> 64)
         let q = wall_ns / tsc_ticks;
         let r = wall_ns % tsc_ticks;
-        let m = if r == 0 {
-            0u64
-        } else {
-            // ceil(r * 2^64 / tsc_ticks)
-            let product = (r as u128) << 64;
-            let div = product / tsc_ticks as u128;
-            let rem = product % tsc_ticks as u128;
-            if rem > 0 {
-                (div + 1) as u64
-            } else {
-                div as u64
-            }
-        };
+        let m = compute_multiplier(r, tsc_ticks);
 
         QUOTIENT.store(q, Ordering::Release);
         MULTIPLIER.store(m, Ordering::Release);
@@ -249,18 +255,7 @@ pub fn store_ratio(numer: u64, denom: u64) {
     }
     let q = numer / denom;
     let r = numer % denom;
-    let m = if r == 0 {
-        0u64
-    } else {
-        let product = (r as u128) << 64;
-        let div = product / denom as u128;
-        let rem = product % denom as u128;
-        if rem > 0 {
-            (div + 1) as u64
-        } else {
-            div as u64
-        }
-    };
+    let m = compute_multiplier(r, denom);
     QUOTIENT.store(q, Ordering::Release);
     MULTIPLIER.store(m, Ordering::Release);
 }
