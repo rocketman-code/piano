@@ -51,7 +51,7 @@ static BIAS_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Read the hardware cycle counter. Single inline instruction on both
 /// x86_64 (`rdtsc`) and aarch64 (`mrs cntvct_el0`).
 #[inline(always)]
-pub(crate) fn read() -> u64 {
+pub fn read() -> u64 {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::x86_64::_rdtsc()
@@ -76,7 +76,7 @@ pub(crate) fn read() -> u64 {
 
 /// Convert a raw tick count to nanoseconds using the calibrated ratio.
 #[inline(always)]
-pub(crate) fn ticks_to_ns(ticks: u64) -> u64 {
+pub fn ticks_to_ns(ticks: u64) -> u64 {
     let n = NUMER.load(Ordering::Relaxed);
     let d = DENOM.load(Ordering::Relaxed);
     if d == 0 {
@@ -86,16 +86,16 @@ pub(crate) fn ticks_to_ns(ticks: u64) -> u64 {
 }
 
 /// Convert a tick delta to nanoseconds using the calibrated ratio.
-#[cfg(any(test, feature = "_test_internals"))]
+#[cfg(feature = "_test_internals")]
 #[inline(always)]
-pub(crate) fn elapsed_ns(start: u64, end: u64) -> u64 {
+pub fn elapsed_ns(start: u64, end: u64) -> u64 {
     ticks_to_ns(end.wrapping_sub(start))
 }
 
 /// Convert a tick value to nanoseconds-since-epoch for absolute timestamps.
 #[cfg(any(test, feature = "_test_internals"))]
 #[inline]
-pub(crate) fn ticks_to_epoch_ns(ticks: u64, epoch_tsc: u64) -> u64 {
+pub fn ticks_to_epoch_ns(ticks: u64, epoch_tsc: u64) -> u64 {
     ticks_to_ns(ticks.wrapping_sub(epoch_tsc))
 }
 
@@ -103,7 +103,7 @@ pub(crate) fn ticks_to_epoch_ns(ticks: u64, epoch_tsc: u64) -> u64 {
 ///
 /// Measures how many ticks elapse in a known wall-clock interval using
 /// `Instant` as the reference. The calibration spin is brief (~1ms).
-pub(crate) fn calibrate() {
+pub fn calibrate() {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         // Fallback: read() already returns nanoseconds
@@ -144,7 +144,7 @@ pub(crate) fn calibrate() {
 /// Calibrate the measurement bias (cost of a TSC read pair in ticks).
 /// Uses trimmed mean (2% trim) for robustness against VM preemption outliers.
 /// Called once from `epoch()` after `calibrate()`.
-pub(crate) fn calibrate_bias() {
+pub fn calibrate_bias() {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         // Fallback: read() returns nanoseconds directly, no hardware bias.
@@ -180,18 +180,46 @@ pub(crate) fn calibrate_bias() {
 
 /// Return the calibrated bias in raw ticks.
 #[inline(always)]
-pub(crate) fn bias_ticks() -> u64 {
+pub fn bias_ticks() -> u64 {
     BIAS_TICKS.load(Ordering::Relaxed)
 }
 
-/// Diagnostic accessors for TSC calibration state (test only).
-#[cfg(test)]
-pub(crate) fn diag_numer() -> u64 {
+/// Load/store accessors for TSC calibration state (test only).
+///
+/// Used by unit-test diagnostics and by the `tsc_internals` integration
+/// test (which runs in a separate binary to avoid corrupting globals
+/// visible to other in-process tests).
+#[cfg(any(test, feature = "_test_internals"))]
+pub fn load_numer() -> u64 {
     NUMER.load(Ordering::Relaxed)
 }
-#[cfg(test)]
-pub(crate) fn diag_denom() -> u64 {
+#[cfg(any(test, feature = "_test_internals"))]
+pub fn load_denom() -> u64 {
     DENOM.load(Ordering::Relaxed)
+}
+#[cfg(feature = "_test_internals")]
+pub fn store_numer(val: u64) {
+    NUMER.store(val, Ordering::Release);
+}
+#[cfg(feature = "_test_internals")]
+pub fn store_denom(val: u64) {
+    DENOM.store(val, Ordering::Release);
+}
+#[cfg(feature = "_test_internals")]
+pub fn store_bias_ticks(val: u64) {
+    BIAS_TICKS.store(val, Ordering::Release);
+}
+#[cfg(feature = "_test_internals")]
+pub fn load_bias_ticks() -> u64 {
+    BIAS_TICKS.load(Ordering::Relaxed)
+}
+#[cfg(feature = "_test_internals")]
+pub fn store_epoch_tsc(val: u64) {
+    EPOCH_TSC.store(val, Ordering::Release);
+}
+#[cfg(feature = "_test_internals")]
+pub fn load_epoch_tsc() -> u64 {
+    EPOCH_TSC.load(Ordering::Relaxed)
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {
@@ -212,19 +240,18 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// The TSC value captured at epoch. Stored alongside the Instant epoch.
 static EPOCH_TSC: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn set_epoch_tsc(val: u64) {
+pub fn set_epoch_tsc(val: u64) {
     EPOCH_TSC.store(val, Ordering::Release);
 }
 
 #[cfg(any(test, feature = "_test_internals"))]
-pub(crate) fn epoch_tsc() -> u64 {
+pub fn epoch_tsc() -> u64 {
     EPOCH_TSC.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     #[test]
     fn gcd_normal_cases() {
@@ -251,361 +278,7 @@ mod tests {
         assert_eq!(g, 1);
     }
 
-    #[test]
-    #[serial]
-    fn elapsed_ns_with_zero_denom_does_not_panic() {
-        // If DENOM were zero (e.g., broken TSC), elapsed_ns must not panic.
-        // Temporarily store 0 in DENOM, call elapsed_ns, then restore.
-        let saved_n = NUMER.load(Ordering::Relaxed);
-        let saved_d = DENOM.load(Ordering::Relaxed);
-
-        NUMER.store(1, Ordering::Release);
-        DENOM.store(0, Ordering::Release);
-
-        // Must not panic -- should return 0 for zero denominator
-        let result = elapsed_ns(0, 1000);
-        assert_eq!(result, 0);
-
-        NUMER.store(saved_n, Ordering::Release);
-        DENOM.store(saved_d, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn ticks_to_ns_uses_calibrated_ratio() {
-        let saved_n = NUMER.load(Ordering::Relaxed);
-        let saved_d = DENOM.load(Ordering::Relaxed);
-
-        // 1000 ticks * (3/2) = 1500 ns
-        NUMER.store(3, Ordering::Release);
-        DENOM.store(2, Ordering::Release);
-
-        assert_eq!(ticks_to_ns(1000), 1500);
-        assert_eq!(ticks_to_ns(0), 0);
-
-        NUMER.store(saved_n, Ordering::Release);
-        DENOM.store(saved_d, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn ticks_to_ns_zero_denom_returns_zero() {
-        let saved_n = NUMER.load(Ordering::Relaxed);
-        let saved_d = DENOM.load(Ordering::Relaxed);
-
-        NUMER.store(1, Ordering::Release);
-        DENOM.store(0, Ordering::Release);
-
-        assert_eq!(ticks_to_ns(1000), 0);
-
-        NUMER.store(saved_n, Ordering::Release);
-        DENOM.store(saved_d, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn elapsed_ns_delegates_to_ticks_to_ns() {
-        let saved_n = NUMER.load(Ordering::Relaxed);
-        let saved_d = DENOM.load(Ordering::Relaxed);
-
-        NUMER.store(1, Ordering::Release);
-        DENOM.store(1, Ordering::Release);
-
-        assert_eq!(elapsed_ns(10, 110), ticks_to_ns(100));
-
-        NUMER.store(saved_n, Ordering::Release);
-        DENOM.store(saved_d, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn ticks_to_epoch_ns_returns_correct_value() {
-        // ticks_to_epoch_ns(ticks, epoch_tsc) = ticks_to_ns(ticks - epoch_tsc)
-        // With ratio 1:1, ticks=1000, epoch=100 -> 900
-        let saved_n = NUMER.load(Ordering::Relaxed);
-        let saved_d = DENOM.load(Ordering::Relaxed);
-
-        NUMER.store(1, Ordering::Release);
-        DENOM.store(1, Ordering::Release);
-
-        let result = ticks_to_epoch_ns(1000, 100);
-        assert_eq!(result, 900);
-
-        // With ratio 3:2, ticks=1000, epoch=100 -> (900 * 3 / 2) = 1350
-        NUMER.store(3, Ordering::Release);
-        DENOM.store(2, Ordering::Release);
-
-        let result = ticks_to_epoch_ns(1000, 100);
-        assert_eq!(result, 1350);
-
-        // Verify it does not return 0 or 1 for meaningful inputs
-        assert!(
-            result > 1,
-            "ticks_to_epoch_ns must return meaningful value, not 0 or 1"
-        );
-
-        NUMER.store(saved_n, Ordering::Release);
-        DENOM.store(saved_d, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn calibrate_sets_nonzero_ratio() {
-        // Save originals
-        let saved_n = NUMER.load(Ordering::Relaxed);
-        let saved_d = DENOM.load(Ordering::Relaxed);
-
-        // Zero out to detect that calibrate() actually stores values
-        NUMER.store(0, Ordering::Release);
-        DENOM.store(0, Ordering::Release);
-
-        calibrate();
-
-        let n = NUMER.load(Ordering::Relaxed);
-        let d = DENOM.load(Ordering::Relaxed);
-
-        // calibrate() must store nonzero values
-        assert!(n > 0, "NUMER must be nonzero after calibrate()");
-        assert!(d > 0, "DENOM must be nonzero after calibrate()");
-
-        // The ratio n/d should be reasonable (not inverted by * instead of /).
-        // On real hardware, TSC runs at GHz speeds so ~2ms calibration
-        // yields millions of ticks. The ratio ns/ticks should be < 100
-        // (even a 24MHz counter gives ~41 ns/tick).
-        // If the mutation `/ -> *` were applied, the ratio would be astronomical.
-        let ratio = n as f64 / d as f64;
-        assert!(
-            ratio < 1000.0,
-            "calibrated ratio {ratio} is unreasonably large (possible * instead of /)"
-        );
-        assert!(
-            ratio > 0.001,
-            "calibrated ratio {ratio} is unreasonably small"
-        );
-
-        // Restore
-        NUMER.store(saved_n, Ordering::Release);
-        DENOM.store(saved_d, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn calibrate_spins_for_target_duration() {
-        // calibrate() must spin until wall_start.elapsed() >= target (2ms).
-        // If the comparison `<` is mutated to `==` or `>`, the loop body
-        // executes zero times or exits immediately, producing a near-zero
-        // tsc_ticks which hits the tsc_ticks==0 guard and stores 1:1 ratio.
-        //
-        // On real hardware with a GHz+ counter, 2ms of spinning produces
-        // a ratio significantly different from 1:1. We verify that by
-        // checking that at least one of NUMER or DENOM differs from 1.
-        let saved_n = NUMER.load(Ordering::Relaxed);
-        let saved_d = DENOM.load(Ordering::Relaxed);
-
-        calibrate();
-
-        let n = NUMER.load(Ordering::Relaxed);
-        let d = DENOM.load(Ordering::Relaxed);
-
-        // On x86_64/aarch64, a proper calibration never gives exactly 1:1
-        // because the TSC frequency differs from 1 GHz.
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        assert!(
-            n != 1 || d != 1,
-            "calibrate() produced 1:1 ratio -- loop likely did not spin (< mutated?)"
-        );
-
-        NUMER.store(saved_n, Ordering::Release);
-        DENOM.store(saved_d, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn calibrate_loop_spins_long_enough_for_accurate_ratio() {
-        // If `<` in `while elapsed < target` is mutated to `>` or `<=`,
-        // the loop either never spins (>) or spins one extra iteration (<=).
-        // With `>`, wall_ns and tsc_ticks are near-zero, producing a ratio
-        // that yields wildly wrong results for real durations.
-        // With `<=`, the test might still pass since it spins at least 2ms,
-        // but `<=` would spin one extra check after hitting exactly 2ms --
-        // still producing a valid calibration. That's semantically equivalent.
-        //
-        // To kill `>`: verify that a known TSC delta converts to approximately
-        // the correct wall time. If calibration didn't spin, the ratio is garbage.
-        let saved_n = NUMER.load(Ordering::Relaxed);
-        let saved_d = DENOM.load(Ordering::Relaxed);
-
-        calibrate();
-
-        // Measure 10ms of wall time and verify TSC-based conversion is close.
-        let tsc_before = read();
-        let wall_before = std::time::Instant::now();
-        let target = std::time::Duration::from_millis(10);
-        while wall_before.elapsed() < target {}
-        let tsc_after = read();
-        let wall_actual_ns = wall_before.elapsed().as_nanos() as u64;
-
-        let tsc_delta = tsc_after.wrapping_sub(tsc_before);
-        let converted_ns = ticks_to_ns(tsc_delta);
-
-        // Should be within 50% of wall time. If calibration used `>` (no spin),
-        // the ratio would be orders of magnitude off.
-        let ratio = converted_ns as f64 / wall_actual_ns as f64;
-        assert!(
-            ratio > 0.5 && ratio < 2.0,
-            "TSC-to-ns conversion ratio {ratio:.3} is too far from 1.0 \
-             (calibration likely didn't spin: converted={converted_ns}ns, wall={wall_actual_ns}ns)"
-        );
-
-        NUMER.store(saved_n, Ordering::Release);
-        DENOM.store(saved_d, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn calibrate_uses_division_not_multiplication() {
-        // The GCD simplification does: NUMER = wall_ns / g, DENOM = tsc_ticks / g
-        // If `/` is mutated to `*`, both values balloon to huge numbers.
-        // ticks_to_ns would then overflow or produce wildly wrong results.
-        let saved_n = NUMER.load(Ordering::Relaxed);
-        let saved_d = DENOM.load(Ordering::Relaxed);
-
-        calibrate();
-
-        let n = NUMER.load(Ordering::Relaxed);
-        let d = DENOM.load(Ordering::Relaxed);
-
-        // After GCD simplification, both values should be reasonable.
-        // wall_ns for 2ms ~ 2_000_000; tsc_ticks ~ millions.
-        // After dividing by GCD, values should be well under 10M.
-        // If `*` were used instead, values would be in the trillions.
-        assert!(
-            n < 100_000_000,
-            "NUMER {n} is too large (division replaced with multiplication?)"
-        );
-        assert!(
-            d < 100_000_000,
-            "DENOM {d} is too large (division replaced with multiplication?)"
-        );
-
-        NUMER.store(saved_n, Ordering::Release);
-        DENOM.store(saved_d, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn calibrate_bias_stores_nonzero_value() {
-        // calibrate_bias() must store a nonzero value in BIAS_TICKS.
-        // If mutated to `()`, BIAS_TICKS remains at its prior value.
-        let saved = BIAS_TICKS.load(Ordering::Relaxed);
-
-        // First ensure calibration is done (bias needs read() to work)
-        calibrate();
-
-        // Set to a sentinel to detect that calibrate_bias actually writes
-        BIAS_TICKS.store(u64::MAX, Ordering::Release);
-
-        calibrate_bias();
-
-        let bias = BIAS_TICKS.load(Ordering::Relaxed);
-
-        // calibrate_bias must have written something other than our sentinel.
-        // On aarch64 Apple Silicon, bias can legitimately be 0 (counter read
-        // is extremely cheap), so we only check that the store happened.
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        assert_ne!(bias, u64::MAX, "calibrate_bias() did not write BIAS_TICKS");
-
-        BIAS_TICKS.store(saved, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn calibrate_bias_uses_correct_arithmetic() {
-        // calibrate_bias computes: trim = N/50, trimmed = samples[trim..N-trim],
-        // sum / trimmed.len(). If `/` is mutated to `%`, the mean calculation
-        // breaks: N%50 = 0 (10000%50=0) so trim=0 and trimmed=full range,
-        // but more critically sum%len produces garbage.
-        //
-        // We verify the stored bias is in a reasonable range.
-        let saved = BIAS_TICKS.load(Ordering::Relaxed);
-        calibrate();
-        calibrate_bias();
-
-        let bias = BIAS_TICKS.load(Ordering::Relaxed);
-
-        // Bias should be small: typically 10-100 ticks on real hardware.
-        // If `/ -> %` were applied to the mean calculation, the result
-        // would be the remainder of sum/len which is < len (9600), but
-        // could also be 0 if sum is exactly divisible.
-        // More importantly, N/50 = 200 with division, but N%50 = 0 with
-        // modulo, so the trim range would be samples[0..10000] (untrimmed).
-        // The combination of both `%` mutations produces unstable results.
-        //
-        // On real hardware, bias is typically under 500 ticks.
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        assert!(
-            bias < 10_000,
-            "bias {bias} is unreasonably large (arithmetic mutation?)"
-        );
-
-        BIAS_TICKS.store(saved, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn bias_ticks_returns_stored_value() {
-        // bias_ticks() loads BIAS_TICKS. If replaced with 0 or 1, this fails.
-        let saved = BIAS_TICKS.load(Ordering::Relaxed);
-
-        BIAS_TICKS.store(42, Ordering::Release);
-        assert_eq!(bias_ticks(), 42, "bias_ticks() must return stored value");
-
-        BIAS_TICKS.store(9999, Ordering::Release);
-        assert_eq!(bias_ticks(), 9999, "bias_ticks() must return stored value");
-
-        // Verify it does not return constants 0 or 1
-        assert_ne!(bias_ticks(), 0);
-        assert_ne!(bias_ticks(), 1);
-
-        BIAS_TICKS.store(saved, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn set_epoch_tsc_stores_value() {
-        // set_epoch_tsc must actually store. If replaced with `()`, EPOCH_TSC
-        // remains unchanged.
-        let saved = EPOCH_TSC.load(Ordering::Relaxed);
-
-        set_epoch_tsc(12345);
-        assert_eq!(
-            EPOCH_TSC.load(Ordering::Relaxed),
-            12345,
-            "set_epoch_tsc() must store the value"
-        );
-
-        set_epoch_tsc(0);
-        assert_eq!(EPOCH_TSC.load(Ordering::Relaxed), 0);
-
-        EPOCH_TSC.store(saved, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
-    fn epoch_tsc_returns_stored_value() {
-        // epoch_tsc() loads EPOCH_TSC. If replaced with 0 or 1, this fails.
-        let saved = EPOCH_TSC.load(Ordering::Relaxed);
-
-        EPOCH_TSC.store(777, Ordering::Release);
-        assert_eq!(epoch_tsc(), 777, "epoch_tsc() must return stored value");
-
-        EPOCH_TSC.store(123456, Ordering::Release);
-        assert_eq!(epoch_tsc(), 123456);
-
-        // Verify it does not return constants 0 or 1
-        assert_ne!(epoch_tsc(), 0);
-        assert_ne!(epoch_tsc(), 1);
-
-        EPOCH_TSC.store(saved, Ordering::Release);
-    }
+    // Tests that mutate global TSC state (NUMER, DENOM, BIAS_TICKS, EPOCH_TSC)
+    // live in tests/tsc_internals.rs -- a separate binary that cannot corrupt
+    // globals visible to other in-process unit tests. See #441.
 }

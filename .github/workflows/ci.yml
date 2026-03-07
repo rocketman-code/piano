@@ -44,6 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo test --workspace --features piano-runtime/cpu-time
+      - run: cargo test -p piano-runtime --features piano-runtime/_test_internals --test tsc_internals
 
   msrv:
     runs-on: ubuntu-latest

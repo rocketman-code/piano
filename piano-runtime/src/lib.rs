@@ -6,6 +6,10 @@ mod alloc;
 mod collector;
 mod cpu_clock;
 mod piano_future;
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
+pub mod tsc;
+#[cfg(not(feature = "_test_internals"))]
 mod tsc;
 
 // User-facing API: visible in docs

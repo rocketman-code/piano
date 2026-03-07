@@ -998,8 +998,8 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                 raw_ticks,
                 bias,
                 corrected_ticks,
-                numer: crate::tsc::diag_numer(),
-                denom: crate::tsc::diag_denom(),
+                numer: crate::tsc::load_numer(),
+                denom: crate::tsc::load_denom(),
             });
         }
 
