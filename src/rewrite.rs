@@ -883,7 +883,7 @@ fn instrument_macro_tokens(tokens: &mut proc_macro2::TokenStream) {
                     // Templates can use brace, paren, or bracket delimiters.
                     let mut inner: Vec<proc_macro2::TokenTree> =
                         group.stream().into_iter().collect();
-                    inject_fn_guards_in_tokens(&mut inner);
+                    inject_fn_guards_in_tokens(&mut inner, None);
                     let new_stream: proc_macro2::TokenStream = inner.into_iter().collect();
                     let mut new_group = proc_macro2::Group::new(group.delimiter(), new_stream);
                     new_group.set_span(group.span());
@@ -916,10 +916,157 @@ fn is_fat_arrow(tokens: &[proc_macro2::TokenTree], i: usize) -> bool {
     )
 }
 
+/// Whether the impl block's Self type is a literal identifier or a metavar.
+enum MacroImplType {
+    /// A literal type name, e.g. `impl Cruncher { ... }`.
+    Literal(String),
+    /// A metavar type, e.g. `impl $ty { ... }`.
+    Metavar(proc_macro2::TokenTree),
+}
+
+/// Scan backward from position `brace_idx` to detect whether a brace group
+/// is the body of an `impl Type { ... }` block. Handles:
+///   - `impl Foo { ... }` -> Literal("Foo")
+///   - `impl $ty { ... }` -> Metavar(ty_ident)
+///   - `impl<T> Foo<T> { ... }` -> Literal("Foo")
+///   - `impl Trait for Foo { ... }` -> Literal("Foo")
+///   - `impl $trait for $ty { ... }` -> Metavar(ty_ident)
+///   - `impl<T> Trait<T> for Foo<T> { ... }` -> Literal("Foo")
+fn detect_impl_type(tokens: &[proc_macro2::TokenTree], brace_idx: usize) -> Option<MacroImplType> {
+    if brace_idx == 0 {
+        return None;
+    }
+
+    let mut pos = brace_idx - 1;
+
+    // Skip trailing generic group: `Foo<T> { ... }` — skip the `<T>`.
+    if let proc_macro2::TokenTree::Group(g) = &tokens[pos] {
+        if g.delimiter() == proc_macro2::Delimiter::None {
+            // proc_macro2 may parse `<T>` as an invisible-delimited group
+            if pos == 0 {
+                return None;
+            }
+            pos -= 1;
+        }
+    }
+
+    // The type name is now at `pos`. It's either an Ident or a metavar ($ident).
+    let (type_result, type_start) = match &tokens[pos] {
+        proc_macro2::TokenTree::Ident(ident) => {
+            // Check if this ident is preceded by `$` (metavar).
+            if pos > 0 {
+                if let proc_macro2::TokenTree::Punct(p) = &tokens[pos - 1] {
+                    if p.as_char() == '$' {
+                        (MacroImplType::Metavar(tokens[pos].clone()), pos - 1)
+                    } else {
+                        (MacroImplType::Literal(ident.to_string()), pos)
+                    }
+                } else {
+                    (MacroImplType::Literal(ident.to_string()), pos)
+                }
+            } else {
+                (MacroImplType::Literal(ident.to_string()), pos)
+            }
+        }
+        _ => return None,
+    };
+
+    // Now scan backward from type_start to find `impl`.
+    // Possible patterns before the type:
+    //   `impl`                     (direct impl)
+    //   `impl<T>`                  (generic impl)
+    //   `impl Trait for`           (trait impl)
+    //   `impl<T> Trait<T> for`     (generic trait impl)
+    //   `impl $trait for`          (metavar trait impl)
+    if type_start == 0 {
+        return None;
+    }
+
+    let mut scan = type_start - 1;
+
+    // Check for `for` keyword — indicates trait impl.
+    if is_ident(tokens, scan, "for") {
+        // This is `impl [Trait] for Type { ... }`.
+        // We already have the type — just verify `impl` is somewhere before `for`.
+        if scan == 0 {
+            return None;
+        }
+        scan -= 1;
+
+        // Skip the trait name (and optional trailing generic group).
+        // Trait could be: Ident, Ident<T>, $trait ($ Ident), $trait<T>.
+        if let proc_macro2::TokenTree::Group(g) = &tokens[scan] {
+            if g.delimiter() == proc_macro2::Delimiter::None {
+                if scan == 0 {
+                    return None;
+                }
+                scan -= 1;
+            }
+        }
+
+        // Now at trait name ident.
+        match &tokens[scan] {
+            proc_macro2::TokenTree::Ident(_) => {
+                // Check if preceded by $ (metavar trait).
+                if scan > 0 {
+                    if let proc_macro2::TokenTree::Punct(p) = &tokens[scan - 1] {
+                        if p.as_char() == '$' {
+                            scan -= 1; // skip the $
+                        }
+                    }
+                }
+            }
+            _ => return None,
+        }
+
+        if scan == 0 {
+            return None;
+        }
+        scan -= 1;
+
+        // Skip optional generic params on impl: `impl<T>`.
+        if let proc_macro2::TokenTree::Group(g) = &tokens[scan] {
+            if g.delimiter() == proc_macro2::Delimiter::None {
+                if scan == 0 {
+                    return None;
+                }
+                scan -= 1;
+            }
+        }
+
+        // Must be `impl`.
+        if is_ident(tokens, scan, "impl") {
+            return Some(type_result);
+        }
+        return None;
+    }
+
+    // No `for` — this is a direct impl: `impl [<T>] Type { ... }`.
+    // Skip optional generic params on impl.
+    if let proc_macro2::TokenTree::Group(g) = &tokens[scan] {
+        if g.delimiter() == proc_macro2::Delimiter::None {
+            if scan == 0 {
+                return None;
+            }
+            scan -= 1;
+        }
+    }
+
+    // Must be `impl`.
+    if is_ident(tokens, scan, "impl") {
+        return Some(type_result);
+    }
+
+    None
+}
+
 /// Scan a flat token vector for fn patterns and inject guards into each
 /// matched function body. Recurses into brace groups to handle fn items
 /// inside impl blocks within macro templates.
-fn inject_fn_guards_in_tokens(tokens: &mut [proc_macro2::TokenTree]) {
+fn inject_fn_guards_in_tokens(
+    tokens: &mut [proc_macro2::TokenTree],
+    impl_type: Option<&MacroImplType>,
+) {
     let mut i = 0;
     while i < tokens.len() {
         // Skip non-instrumentable fn definitions (const fn, unsafe fn, extern fn)
@@ -932,7 +1079,7 @@ fn inject_fn_guards_in_tokens(tokens: &mut [proc_macro2::TokenTree]) {
         if let Some(fm) = match_fn_pattern(tokens, i) {
             let body_idx = fm.body_index;
             // Build the guard token stream for this function name.
-            let guard = make_guard_tokens(&fm.name_tokens);
+            let guard = make_guard_tokens(&fm.name_tokens, impl_type);
             let guard_tts: Vec<proc_macro2::TokenTree> = guard.into_iter().collect();
 
             // Inject guard tokens at the start of the body brace group.
@@ -954,9 +1101,11 @@ fn inject_fn_guards_in_tokens(tokens: &mut [proc_macro2::TokenTree]) {
             // Recurse into brace groups (handles fn inside impl blocks, etc.).
             if let proc_macro2::TokenTree::Group(ref group) = tokens[i] {
                 if group.delimiter() == proc_macro2::Delimiter::Brace {
+                    let detected = detect_impl_type(tokens, i);
+                    let recurse_impl = detected.as_ref().or(impl_type);
                     let mut inner: Vec<proc_macro2::TokenTree> =
                         group.stream().into_iter().collect();
-                    inject_fn_guards_in_tokens(&mut inner);
+                    inject_fn_guards_in_tokens(&mut inner, recurse_impl);
                     let new_stream: proc_macro2::TokenStream = inner.into_iter().collect();
                     let mut new_group =
                         proc_macro2::Group::new(proc_macro2::Delimiter::Brace, new_stream);
@@ -1239,88 +1388,208 @@ fn is_non_rust_extern(tokens: &[proc_macro2::TokenTree], i: usize) -> bool {
     true
 }
 
-/// Build the guard statement tokens for a function name.
+/// Build a `stringify!($metavar)` token stream. `quote!` cannot emit `$`
+/// tokens, so we construct manually.
+fn build_stringify_call(metavar_ident: &proc_macro2::TokenTree) -> proc_macro2::TokenStream {
+    let span = proc_macro2::Span::call_site();
+    let dollar = proc_macro2::Punct::new('$', proc_macro2::Spacing::Alone);
+    let inner: proc_macro2::TokenStream =
+        vec![proc_macro2::TokenTree::Punct(dollar), metavar_ident.clone()]
+            .into_iter()
+            .collect();
+    vec![
+        proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("stringify", span)),
+        proc_macro2::TokenTree::Punct(proc_macro2::Punct::new('!', proc_macro2::Spacing::Alone)),
+        proc_macro2::TokenTree::Group(proc_macro2::Group::new(
+            proc_macro2::Delimiter::Parenthesis,
+            inner,
+        )),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Build the full `let __piano_guard = piano_runtime::enter(ARG);` statement,
+/// where `enter_arg_stream` is the token stream to place inside the parens.
+fn build_enter_guard(enter_arg_stream: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    let span = proc_macro2::Span::call_site();
+    let enter_arg = proc_macro2::Group::new(proc_macro2::Delimiter::Parenthesis, enter_arg_stream);
+    vec![
+        proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("let", span)),
+        proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("__piano_guard", span)),
+        proc_macro2::TokenTree::Punct(proc_macro2::Punct::new('=', proc_macro2::Spacing::Alone)),
+        proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("piano_runtime", span)),
+        proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(':', proc_macro2::Spacing::Joint)),
+        proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(':', proc_macro2::Spacing::Alone)),
+        proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("enter", span)),
+        proc_macro2::TokenTree::Group(enter_arg),
+        proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(';', proc_macro2::Spacing::Alone)),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Build the guard statement tokens for a function name, optionally qualified
+/// with the enclosing impl type.
 ///
-/// For a literal name like `initialize`:
-///   `let __piano_guard = piano_runtime::enter("initialize");`
+/// For a literal name like `initialize` in `impl Cruncher`:
+///   `let __piano_guard = piano_runtime::enter("Cruncher::initialize");`
 ///
 /// For a metavar name like `$name`:
 ///   `let __piano_guard = piano_runtime::enter(stringify!($name));`
-fn make_guard_tokens(name_tokens: &[proc_macro2::TokenTree]) -> proc_macro2::TokenStream {
-    let is_metavar = name_tokens.len() == 2
+///
+/// For a literal name in `impl $ty`:
+///   `let __piano_guard = piano_runtime::enter(concat!(stringify!($ty), "::", "method"));`
+///
+/// For a metavar name in `impl $ty`:
+///   `let __piano_guard = piano_runtime::enter(concat!(stringify!($ty), "::", stringify!($name)));`
+fn make_guard_tokens(
+    name_tokens: &[proc_macro2::TokenTree],
+    impl_type: Option<&MacroImplType>,
+) -> proc_macro2::TokenStream {
+    let is_name_metavar = name_tokens.len() == 2
         && matches!(&name_tokens[0], proc_macro2::TokenTree::Punct(p) if p.as_char() == '$');
 
-    if is_metavar {
-        // For metavar names, we need to build:
-        //   let __piano_guard = piano_runtime::enter(stringify!($name));
-        // We construct the tokens manually because `quote!` doesn't emit `$`.
-        let dollar = proc_macro2::Punct::new('$', proc_macro2::Spacing::Alone);
-        let metavar_ident = name_tokens[1].clone();
-
-        // Build: stringify!($name)
-        let stringify_inner: proc_macro2::TokenStream =
-            vec![proc_macro2::TokenTree::Punct(dollar), metavar_ident]
-                .into_iter()
-                .collect();
-        // Build the full statement using manual token construction
-        // (quote! cannot emit raw $ tokens for macro metavariables).
-        let stringify_call: proc_macro2::TokenStream = {
+    match (impl_type, is_name_metavar) {
+        // Literal type + literal name: "Type::method"
+        (Some(MacroImplType::Literal(type_name)), false) => {
+            let method_name = match &name_tokens[0] {
+                proc_macro2::TokenTree::Ident(ident) => ident.to_string(),
+                _ => unreachable!(
+                    "match_fn_pattern guarantees name_tokens[0] is Ident for literal names"
+                ),
+            };
+            let qualified = format!("{type_name}::{method_name}");
+            quote! {
+                let __piano_guard = piano_runtime::enter(#qualified);
+            }
+        }
+        // Metavar type + literal name: concat!(stringify!($ty), "::", "method")
+        (Some(MacroImplType::Metavar(ty_ident)), false) => {
+            let method_name = match &name_tokens[0] {
+                proc_macro2::TokenTree::Ident(ident) => ident.to_string(),
+                _ => unreachable!(
+                    "match_fn_pattern guarantees name_tokens[0] is Ident for literal names"
+                ),
+            };
+            let stringify_call = build_stringify_call(ty_ident);
+            let separator: proc_macro2::TokenStream = quote! { "::" };
+            let method_lit: proc_macro2::TokenStream = quote! { #method_name };
+            // Build: concat!(stringify!($ty), "::", "method")
             let span = proc_macro2::Span::call_site();
-            vec![
-                proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("stringify", span)),
+            let concat_inner: proc_macro2::TokenStream = {
+                let mut tts = Vec::new();
+                tts.extend(stringify_call);
+                tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                    ',',
+                    proc_macro2::Spacing::Alone,
+                )));
+                tts.extend(separator);
+                tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                    ',',
+                    proc_macro2::Spacing::Alone,
+                )));
+                tts.extend(method_lit);
+                tts.into_iter().collect()
+            };
+            let concat_call: proc_macro2::TokenStream = vec![
+                proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("concat", span)),
                 proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
                     '!',
                     proc_macro2::Spacing::Alone,
                 )),
                 proc_macro2::TokenTree::Group(proc_macro2::Group::new(
                     proc_macro2::Delimiter::Parenthesis,
-                    stringify_inner,
+                    concat_inner,
                 )),
             ]
             .into_iter()
-            .collect()
-        };
-
-        // Build: let __piano_guard = piano_runtime::enter(stringify!($name));
-        let enter_arg =
-            proc_macro2::Group::new(proc_macro2::Delimiter::Parenthesis, stringify_call);
-
-        let span = proc_macro2::Span::call_site();
-        vec![
-            proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("let", span)),
-            proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("__piano_guard", span)),
-            proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                '=',
-                proc_macro2::Spacing::Alone,
-            )),
-            proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("piano_runtime", span)),
-            proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                ':',
-                proc_macro2::Spacing::Joint,
-            )),
-            proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                ':',
-                proc_macro2::Spacing::Alone,
-            )),
-            proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("enter", span)),
-            proc_macro2::TokenTree::Group(enter_arg),
-            proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                ';',
-                proc_macro2::Spacing::Alone,
-            )),
-        ]
-        .into_iter()
-        .collect()
-    } else {
-        // Literal name — use quote! for cleaner generation.
-        let name_str = match &name_tokens[0] {
-            proc_macro2::TokenTree::Ident(ident) => ident.to_string(),
-            _ => unreachable!(
-                "match_fn_pattern guarantees name_tokens[0] is Ident for literal names"
-            ),
-        };
-        quote! {
-            let __piano_guard = piano_runtime::enter(#name_str);
+            .collect();
+            build_enter_guard(concat_call)
+        }
+        // Literal type + metavar name: concat!("Type::", stringify!($name))
+        (Some(MacroImplType::Literal(type_name)), true) => {
+            let prefix = format!("{type_name}::");
+            let stringify_call = build_stringify_call(&name_tokens[1]);
+            let prefix_lit: proc_macro2::TokenStream = quote! { #prefix };
+            let span = proc_macro2::Span::call_site();
+            let concat_inner: proc_macro2::TokenStream = {
+                let mut tts = Vec::new();
+                tts.extend(prefix_lit);
+                tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                    ',',
+                    proc_macro2::Spacing::Alone,
+                )));
+                tts.extend(stringify_call);
+                tts.into_iter().collect()
+            };
+            let concat_call: proc_macro2::TokenStream = vec![
+                proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("concat", span)),
+                proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                    '!',
+                    proc_macro2::Spacing::Alone,
+                )),
+                proc_macro2::TokenTree::Group(proc_macro2::Group::new(
+                    proc_macro2::Delimiter::Parenthesis,
+                    concat_inner,
+                )),
+            ]
+            .into_iter()
+            .collect();
+            build_enter_guard(concat_call)
+        }
+        // Metavar type + metavar name: concat!(stringify!($ty), "::", stringify!($name))
+        (Some(MacroImplType::Metavar(ty_ident)), true) => {
+            let ty_stringify = build_stringify_call(ty_ident);
+            let name_stringify = build_stringify_call(&name_tokens[1]);
+            let separator: proc_macro2::TokenStream = quote! { "::" };
+            let span = proc_macro2::Span::call_site();
+            let concat_inner: proc_macro2::TokenStream = {
+                let mut tts = Vec::new();
+                tts.extend(ty_stringify);
+                tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                    ',',
+                    proc_macro2::Spacing::Alone,
+                )));
+                tts.extend(separator);
+                tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                    ',',
+                    proc_macro2::Spacing::Alone,
+                )));
+                tts.extend(name_stringify);
+                tts.into_iter().collect()
+            };
+            let concat_call: proc_macro2::TokenStream = vec![
+                proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("concat", span)),
+                proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
+                    '!',
+                    proc_macro2::Spacing::Alone,
+                )),
+                proc_macro2::TokenTree::Group(proc_macro2::Group::new(
+                    proc_macro2::Delimiter::Parenthesis,
+                    concat_inner,
+                )),
+            ]
+            .into_iter()
+            .collect();
+            build_enter_guard(concat_call)
+        }
+        // No impl type, metavar name: stringify!($name)
+        (None, true) => {
+            let stringify_call = build_stringify_call(&name_tokens[1]);
+            build_enter_guard(stringify_call)
+        }
+        // No impl type, literal name: "name"
+        (None, false) => {
+            let name_str = match &name_tokens[0] {
+                proc_macro2::TokenTree::Ident(ident) => ident.to_string(),
+                _ => unreachable!(
+                    "match_fn_pattern guarantees name_tokens[0] is Ident for literal names"
+                ),
+            };
+            quote! {
+                let __piano_guard = piano_runtime::enter(#name_str);
+            }
         }
     }
 }
@@ -3264,8 +3533,82 @@ fn main() {}
             .source;
 
         assert!(
-            result.contains(r#"piano_runtime::enter("process")"#),
-            "fn inside impl block in macro should be instrumented. Got:\n{result}"
+            result.contains("concat") && result.contains("stringify") && result.contains("process"),
+            "fn inside impl $ty block should be qualified via concat!(stringify!($ty), ...). Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn macro_impl_literal_type_qualifies_method_name() {
+        let source = r#"
+macro_rules! make_impl {
+    () => {
+        impl Cruncher {
+            fn process() {
+                work();
+            }
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains(r#"piano_runtime::enter("Cruncher::process")"#),
+            "method in impl with literal type should be qualified. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn macro_impl_multiple_methods_all_qualified() {
+        let source = r#"
+macro_rules! make_impl {
+    () => {
+        impl Cruncher {
+            fn new() -> Self { Self }
+            pub fn crunch_small() -> u64 { 42 }
+            pub fn crunch_large() -> u64 { 999 }
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
+        for method in &["new", "crunch_small", "crunch_large"] {
+            assert!(
+                result.contains(&format!(r#"piano_runtime::enter("Cruncher::{method}")"#)),
+                "method '{method}' should be qualified as Cruncher::{method}. Got:\n{result}"
+            );
+        }
+    }
+
+    #[test]
+    fn macro_impl_trait_for_type_uses_type_name() {
+        let source = r#"
+macro_rules! make_impl {
+    () => {
+        impl Display for Cruncher {
+            fn fmt() {
+                work();
+            }
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains(r#"piano_runtime::enter("Cruncher::fmt")"#),
+            "impl Trait for Type should qualify with Type, not Trait. Got:\n{result}"
         );
     }
 
