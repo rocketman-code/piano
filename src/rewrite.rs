@@ -27,6 +27,7 @@ pub fn instrument_source(
     source: &str,
     targets: &HashSet<String>,
     instrument_macros: bool,
+    module_prefix: &str,
 ) -> Result<InstrumentResult, syn::Error> {
     let file: syn::File = syn::parse_str(source)?;
 
@@ -38,6 +39,7 @@ pub fn instrument_source(
         current_impl: None,
         current_trait: None,
         concurrency: Vec::new(),
+        module_prefix: module_prefix.to_string(),
     };
     collector.visit_file(&file);
 
@@ -207,13 +209,19 @@ struct InjectionCollector<'s> {
     current_trait: Option<String>,
     /// Collected concurrency info: (function_name, pattern_name).
     concurrency: Vec<(String, String)>,
+    module_prefix: String,
 }
 
 impl<'s> InjectionCollector<'s> {
+    fn qualify_name(&self, name: &str) -> String {
+        crate::resolve::qualify(&self.module_prefix, name)
+    }
+
     fn collect_guard(&mut self, block: &syn::Block, name: &str, sig: &syn::Signature) {
         if !self.targets.contains(name) {
             return;
         }
+        let guard_name = self.qualify_name(name);
         let is_async = sig.asyncness.is_some();
 
         // For non-async functions returning futures, wrap only the trailing expression.
@@ -229,7 +237,7 @@ impl<'s> InjectionCollector<'s> {
 
         // Check for concurrency patterns.
         if let Some(pattern) = find_concurrency_pattern(block) {
-            self.concurrency.push((name.to_string(), pattern));
+            self.concurrency.push((guard_name.clone(), pattern));
 
             if is_async {
                 // Async + concurrency: wrap entire body in PianoFuture with
@@ -241,7 +249,7 @@ impl<'s> InjectionCollector<'s> {
                     open_byte,
                     format!(
                         "\npiano_runtime::PianoFuture::new(async move {{\
-                         \n    let __piano_guard = piano_runtime::enter({name:?});\
+                         \n    let __piano_guard = piano_runtime::enter({guard_name:?});\
                          \n    let __piano_ctx_owned = piano_runtime::fork();\
                          \n    let __piano_ctx = __piano_ctx_owned.as_ref();"
                     ),
@@ -262,7 +270,7 @@ impl<'s> InjectionCollector<'s> {
                 self.injector.insert(
                     open_byte,
                     format!(
-                        "\n    let __piano_guard = piano_runtime::enter({name:?});\
+                        "\n    let __piano_guard = piano_runtime::enter({guard_name:?});\
                          \n    let __piano_ctx_owned = piano_runtime::fork();\
                          \n    let __piano_ctx = __piano_ctx_owned.as_ref();"
                     ),
@@ -290,7 +298,7 @@ impl<'s> InjectionCollector<'s> {
                 open_byte,
                 format!(
                     "\npiano_runtime::PianoFuture::new(async move {{\
-                     \n    let __piano_guard = piano_runtime::enter({name:?});"
+                     \n    let __piano_guard = piano_runtime::enter({guard_name:?});"
                 ),
             );
             self.injector.insert(close_byte, "\n}).await\n");
@@ -298,7 +306,7 @@ impl<'s> InjectionCollector<'s> {
             // Sync function: just inject guard.
             self.injector.insert(
                 open_byte,
-                format!("\n    let __piano_guard = piano_runtime::enter({name:?});"),
+                format!("\n    let __piano_guard = piano_runtime::enter({guard_name:?});"),
             );
         }
     }
@@ -311,6 +319,8 @@ impl<'s> InjectionCollector<'s> {
         sig: &syn::Signature,
         kind: FutureReturnKind,
     ) {
+        let guard_name = self.qualify_name(name);
+
         // Find trailing expression.
         let Some(syn::Stmt::Expr(trailing_expr, None)) = block.stmts.last() else {
             // No trailing expression -- fall back to sync guard.
@@ -318,7 +328,7 @@ impl<'s> InjectionCollector<'s> {
             let open_byte = line_col_to_byte(self.source, open_pos) + 1;
             self.injector.insert(
                 open_byte,
-                format!("\n    let __piano_guard = piano_runtime::enter({name:?});"),
+                format!("\n    let __piano_guard = piano_runtime::enter({guard_name:?});"),
             );
             return;
         };
@@ -333,7 +343,7 @@ impl<'s> InjectionCollector<'s> {
                     trailing_start,
                     format!(
                         "piano_runtime::PianoFuture::new(async move {{\
-                         \n        let __piano_guard = piano_runtime::enter({name:?});\
+                         \n        let __piano_guard = piano_runtime::enter({guard_name:?});\
                          \n        ("
                     ),
                 );
@@ -346,13 +356,13 @@ impl<'s> InjectionCollector<'s> {
                 };
 
                 // For boxed-future returns, wrap early `return` expressions too.
-                self.collect_return_wrappers(block, name, &return_type);
+                self.collect_return_wrappers(block, &guard_name, &return_type);
 
                 self.injector.insert(
                     trailing_start,
                     format!(
                         "Box::pin(piano_runtime::PianoFuture::new(async move {{\
-                         \n        let __piano_guard = piano_runtime::enter({name:?});\
+                         \n        let __piano_guard = piano_runtime::enter({guard_name:?});\
                          \n        let __piano_inner: {return_type} = "
                     ),
                 );
@@ -1791,7 +1801,9 @@ fn other() {
 }
 "#;
         let targets: HashSet<String> = ["walk".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("piano_runtime::enter(\"walk\")"),
@@ -1815,7 +1827,9 @@ impl Walker {
 }
 "#;
         let targets: HashSet<String> = ["Walker::walk".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("piano_runtime::enter(\"Walker::walk\")"),
@@ -1831,7 +1845,9 @@ fn compute(x: i32, y: i32) -> i32 {
 }
 "#;
         let targets: HashSet<String> = ["compute".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("fn compute(x: i32, y: i32) -> i32"),
@@ -1852,7 +1868,9 @@ fn b() {}
 fn c() {}
 "#;
         let targets: HashSet<String> = ["a".to_string(), "c".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("piano_runtime::enter(\"a\")"),
@@ -2237,7 +2255,9 @@ fn process_all(items: &[Item]) -> Vec<Result> {
 }
 "#;
         let targets: HashSet<String> = ["process_all".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("piano_runtime::enter(\"process_all\")"),
@@ -2263,7 +2283,7 @@ fn do_work() {
 }
 "#;
         let targets: HashSet<String> = ["do_work".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
             !result.source.contains("piano_runtime::fork()"),
@@ -2301,7 +2321,7 @@ fn mixed() {
 }
 "#;
         let targets: HashSet<String> = ["mixed".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
 
         // Fork should be injected (rayon::scope triggers it)
         assert!(
@@ -2336,7 +2356,7 @@ fn do_work() {
 }
 "#;
         let targets: HashSet<String> = ["do_work".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
             !result.source.contains("piano_runtime::fork()"),
@@ -2353,7 +2373,7 @@ fn do_work() {
 }
 "#;
         let targets: HashSet<String> = ["do_work".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
             result.concurrency.is_empty(),
@@ -2374,7 +2394,7 @@ fn do_work() {
 }
 "#;
         let targets: HashSet<String> = ["do_work".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
             !result.source.contains("piano_runtime::fork()"),
@@ -2414,7 +2434,7 @@ fn work() {
 }
 "#;
         let targets: HashSet<String> = ["work".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
             !result.source.contains("piano_runtime::fork()"),
@@ -2449,7 +2469,9 @@ fn parallel_work() {
 }
 "#;
         let targets: HashSet<String> = ["parallel_work".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("piano_runtime::fork()"),
@@ -2477,7 +2499,9 @@ fn concurrent_discover() {
 }
 "#;
         let targets: HashSet<String> = ["concurrent_discover".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("piano_runtime::fork()"),
@@ -2510,7 +2534,9 @@ fn work() {
 }
 "#;
         let targets: HashSet<String> = ["work".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("piano_runtime::fork()"),
@@ -2540,7 +2566,9 @@ fn work(kind: Kind) {
 }
 "#;
         let targets: HashSet<String> = ["work".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("piano_runtime::fork()"),
@@ -2569,7 +2597,9 @@ fn work() {
 }
 "#;
         let targets: HashSet<String> = ["work".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("piano_runtime::fork()"),
@@ -2609,7 +2639,9 @@ fn work(items: &[Item]) {
 }
 "#;
         let targets: HashSet<String> = ["work".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         // Count adopt injections: outer for_each closure + 5 inner par_iter closures
         // (if-branch, else-branch, for-body, match-arm-A, match-arm-B)
@@ -2631,7 +2663,9 @@ fn not_targeted() {
 }
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         assert!(
             !result.contains("piano_runtime::fork()"),
@@ -2649,7 +2683,7 @@ fn process_all(items: &[Item]) -> Vec<Result> {
 }
 "#;
         let targets: HashSet<String> = ["process_all".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert_eq!(result.concurrency.len(), 1);
         assert_eq!(result.concurrency[0].0, "process_all");
         assert_eq!(result.concurrency[0].1, "par_iter");
@@ -2665,7 +2699,7 @@ fn concurrent_discover() {
 }
 "#;
         let targets: HashSet<String> = ["concurrent_discover".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert_eq!(result.concurrency.len(), 1);
         assert_eq!(result.concurrency[0].0, "concurrent_discover");
         assert_eq!(result.concurrency[0].1, "rayon::scope");
@@ -2679,7 +2713,7 @@ fn simple() {
 }
 "#;
         let targets: HashSet<String> = ["simple".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(result.concurrency.is_empty());
     }
 
@@ -2691,7 +2725,7 @@ async fn fetch_data(id: u32) -> String {
 }
 "#;
         let targets: HashSet<String> = ["fetch_data".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result
                 .source
@@ -2719,7 +2753,7 @@ fn compute(x: u64) -> u64 {
 }
 "#;
         let targets: HashSet<String> = ["compute".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
             result.source.contains("piano_runtime::enter(\"compute\")"),
@@ -2740,7 +2774,7 @@ impl Client {
 }
 "#;
         let targets: HashSet<String> = ["Client::fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result
                 .source
@@ -2765,7 +2799,7 @@ trait Service {
 }
 "#;
         let targets: HashSet<String> = ["Service::handle".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result
                 .source
@@ -2799,7 +2833,7 @@ trait Processor {
             "Processor::unsafe_default".to_string(),
         ]
         .into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result
                 .source
@@ -2825,7 +2859,7 @@ async fn handler(x: i32) -> String {
 }
 "#;
         let targets: HashSet<String> = ["handler".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(result.source.contains("piano_runtime::PianoFuture::new"));
         assert!(result.source.contains("async move"));
         assert!(result.source.contains(".await"));
@@ -2844,7 +2878,7 @@ fn compute(x: u64) -> u64 {
 }
 "#;
         let targets: HashSet<String> = ["compute".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::enter(\"compute\")"),
             "sync fn should be instrumented"
@@ -2864,7 +2898,7 @@ async fn not_targeted() {
     fetch().await;
 }
 "#;
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             !result.source.contains("PianoFuture"),
             "non-target async fn should not be wrapped"
@@ -2885,7 +2919,9 @@ macro_rules! make_handler {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("stringify!"),
@@ -2910,7 +2946,9 @@ macro_rules! setup {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains(r#"piano_runtime::enter("initialize")"#),
@@ -2931,7 +2969,9 @@ macro_rules! make_async {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("piano_runtime::enter"),
@@ -2956,7 +2996,9 @@ macro_rules! special_fns {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains(r#"piano_runtime::enter("normal")"#),
@@ -2982,7 +3024,9 @@ macro_rules! abi_fns {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains(r#"piano_runtime::enter("rust_abi")"#),
@@ -3010,7 +3054,9 @@ macro_rules! with_const {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains(r#"piano_runtime::enter("process")"#),
@@ -3030,7 +3076,9 @@ macro_rules! make_pair {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         let enter_count = result.matches("piano_runtime::enter").count();
         assert_eq!(
@@ -3053,7 +3101,9 @@ macro_rules! multi {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         let enter_count = result.matches("piano_runtime::enter").count();
         assert_eq!(
@@ -3073,7 +3123,9 @@ macro_rules! log {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         assert!(
             !result.contains("piano_runtime::enter"),
@@ -3092,7 +3144,9 @@ macro_rules! make {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("piano_runtime::enter"),
@@ -3111,7 +3165,9 @@ macro_rules! make {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, false).unwrap().source;
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
 
         assert!(
             !result.contains("piano_runtime::enter"),
@@ -3132,7 +3188,9 @@ macro_rules! make_generic {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains("piano_runtime::enter"),
@@ -3153,7 +3211,9 @@ macro_rules! make {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains(r#"piano_runtime::enter("process")"#),
@@ -3174,7 +3234,9 @@ macro_rules! make {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains(r#"piano_runtime::enter("apply")"#),
@@ -3197,7 +3259,9 @@ macro_rules! make_impl {
 fn main() {}
 "#;
         let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true).unwrap().source;
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
 
         assert!(
             result.contains(r#"piano_runtime::enter("process")"#),
@@ -3355,7 +3419,7 @@ fn fetch() -> impl Future<Output = String> {
 }
 "#;
         let targets: HashSet<String> = ["fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
             "impl Future fn should be wrapped in PianoFuture. Got:\n{}",
@@ -3384,7 +3448,7 @@ fn fetch(x: i32) -> impl Future<Output = i32> {
 }
 "#;
         let targets: HashSet<String> = ["fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         let setup_pos = result.source.find("let doubled").unwrap();
         let piano_pos = result.source.find("PianoFuture::new").unwrap();
         assert!(
@@ -3404,7 +3468,7 @@ fn fetch() -> impl Future<Output = String> {
 }
 "#;
         let targets: HashSet<String> = ["fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         let count = result.source.matches("piano_runtime::enter").count();
         assert_eq!(
             count, 1,
@@ -3425,7 +3489,7 @@ fn delegator() -> impl Future<Output = i32> {
 }
 "#;
         let targets: HashSet<String> = ["delegator".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
             "delegation should be wrapped in PianoFuture. Got:\n{}",
@@ -3443,7 +3507,7 @@ fn fetch() -> impl Future<Output = String> + Send {
 }
 "#;
         let targets: HashSet<String> = ["fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
             "impl Future + Send should be wrapped in PianoFuture. Got:\n{}",
@@ -3462,7 +3526,7 @@ fn fetch() -> Pin<Box<dyn Future<Output = String> + Send>> {
 }
 "#;
         let targets: HashSet<String> = ["fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
             "Pin<Box<dyn Future>> fn should be wrapped in PianoFuture. Got:\n{}",
@@ -3492,7 +3556,7 @@ fn fetch() -> BoxFuture<'static, String> {
 }
 "#;
         let targets: HashSet<String> = ["fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
             "BoxFuture alias fn should be wrapped in PianoFuture. Got:\n{}",
@@ -3514,7 +3578,7 @@ impl Client {
 }
 "#;
         let targets: HashSet<String> = ["Client::fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
             "impl method returning impl Future should be wrapped. Got:\n{}",
@@ -3541,7 +3605,7 @@ trait Service {
 }
 "#;
         let targets: HashSet<String> = ["Service::call".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
             "trait default method returning impl Future should be wrapped. Got:\n{}",
@@ -3557,7 +3621,7 @@ fn compute(x: u64) -> u64 {
 }
 "#;
         let targets: HashSet<String> = ["compute".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::enter(\"compute\")"),
             "sync fn should still get sync guard. Got:\n{}",
@@ -3584,7 +3648,7 @@ fn fetch(flag: bool) -> Pin<Box<dyn Future<Output = String> + Send>> {
 }
 "#;
         let targets: HashSet<String> = ["fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         let piano_count = result
             .source
             .matches("piano_runtime::PianoFuture::new")
@@ -3610,7 +3674,7 @@ fn fetch(items: Vec<i32>) -> impl Future<Output = Vec<i32>> {
 }
 "#;
         let targets: HashSet<String> = ["fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         let piano_count = result
             .source
             .matches("piano_runtime::PianoFuture::new")
@@ -3636,7 +3700,7 @@ fn fetch() -> Pin<Box<dyn Future<Output = i32> + Send>> {
 }
 "#;
         let targets: HashSet<String> = ["fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         let piano_count = result
             .source
             .matches("piano_runtime::PianoFuture::new")
@@ -3666,7 +3730,7 @@ fn fetch(flag: bool) -> impl Future<Output = String> {
 }
 "#;
         let targets: HashSet<String> = ["fetch".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         let piano_count = result
             .source
             .matches("piano_runtime::PianoFuture::new")
@@ -3688,7 +3752,7 @@ fn foo() -> impl Future<Output = ()> {
 }
 "#;
         let targets: HashSet<String> = ["foo".to_string()].into();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
             result.source.contains("piano_runtime::enter(\"foo\")"),
@@ -3707,7 +3771,7 @@ fn foo() -> impl Future<Output = ()> {
         let source =
             "fn target() {\n    let x = 1;\n    let y = 2;\n}\n\nfn other() {\n    let z = 3;\n}\n";
         let targets: HashSet<String> = ["target".to_string()].into_iter().collect();
-        let result = instrument_source(source, &targets, false).unwrap();
+        let result = instrument_source(source, &targets, false, "").unwrap();
         let result_lines: Vec<&str> = result.source.lines().collect();
         // "fn other()" is on original line 6. With 1 guard line injected for target(),
         // it should be at line index 6 (0-indexed).
@@ -3723,5 +3787,73 @@ fn foo() -> impl Future<Output = ()> {
         // The source_map should remap correctly.
         let map = &result.source_map;
         assert_eq!(map.remap_line(7), Some(6));
+    }
+
+    #[test]
+    fn module_prefix_qualifies_guard_name() {
+        let source = r#"
+fn validate_input(x: i32) -> bool {
+    x > 0
+}
+"#;
+        let targets: HashSet<String> = ["validate_input".to_string()].into();
+        let result = instrument_source(source, &targets, false, "db::query")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains(r#"piano_runtime::enter("db::query::validate_input")"#),
+            "guard should use module-qualified name. Got:\n{result}",
+        );
+    }
+
+    #[test]
+    fn module_prefix_qualifies_impl_method() {
+        let source = r#"
+struct Handler;
+impl Handler {
+    fn validate(&self) { }
+}
+"#;
+        let targets: HashSet<String> = ["Handler::validate".to_string()].into();
+        let result = instrument_source(source, &targets, false, "api")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains(r#"piano_runtime::enter("api::Handler::validate")"#),
+            "guard should qualify impl method. Got:\n{result}",
+        );
+    }
+
+    #[test]
+    fn empty_module_prefix_preserves_bare_name() {
+        let source = r#"
+fn walk() {
+    do_stuff();
+}
+"#;
+        let targets: HashSet<String> = ["walk".to_string()].into();
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains(r#"piano_runtime::enter("walk")"#),
+            "empty prefix should not change name. Got:\n{result}",
+        );
+    }
+
+    #[test]
+    fn module_prefix_qualifies_concurrency_info() {
+        let source = r#"
+fn process_all(data: &[i32]) {
+    data.par_iter().for_each(|x| { let _ = x; });
+}
+"#;
+        let targets: HashSet<String> = ["process_all".to_string()].into();
+        let result = instrument_source(source, &targets, false, "worker").unwrap();
+        assert_eq!(
+            result.concurrency.first().map(|(name, _)| name.as_str()),
+            Some("worker::process_all"),
+            "concurrency info should use qualified name",
+        );
     }
 }
