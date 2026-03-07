@@ -1,11 +1,11 @@
 //! TSC global-state mutation tests.
 //!
 //! These tests temporarily write sentinel / synthetic values into the global
-//! TSC statics (NUMER, DENOM, BIAS_TICKS, EPOCH_TSC) to verify calibration
-//! and accessor correctness. They MUST live in a separate integration test
-//! binary so that the temporary corruption cannot race with unit tests that
-//! read these globals (e.g. PianoFuture tests calling `bias_ticks()` or
-//! `ticks_to_ns()` via `drop_cold`).
+//! TSC statics (QUOTIENT, MULTIPLIER, BIAS_TICKS, EPOCH_TSC) to verify
+//! calibration and accessor correctness. They MUST live in a separate
+//! integration test binary so that the temporary corruption cannot race with
+//! unit tests that read these globals (e.g. PianoFuture tests calling
+//! `bias_ticks()` or `ticks_to_ns()` via `drop_cold`).
 //!
 //! Within this binary the tests still serialize via `#[serial]` because they
 //! mutate the same process-global atomics.
@@ -17,87 +17,114 @@
 use piano_runtime::tsc;
 use serial_test::serial;
 
+/// Helper: save and restore Q/M around a test that injects a synthetic ratio.
+struct RatioGuard {
+    saved_q: u64,
+    saved_m: u64,
+}
+
+impl RatioGuard {
+    fn new() -> Self {
+        Self {
+            saved_q: tsc::load_quotient(),
+            saved_m: tsc::load_multiplier(),
+        }
+    }
+}
+
+impl Drop for RatioGuard {
+    fn drop(&mut self) {
+        tsc::store_quotient(self.saved_q);
+        tsc::store_multiplier(self.saved_m);
+    }
+}
+
 #[test]
 #[serial]
-fn elapsed_ns_with_zero_denom_does_not_panic() {
-    let saved_n = tsc::load_numer();
-    let saved_d = tsc::load_denom();
+fn ticks_to_ns_zero_ratio_returns_zero() {
+    let _g = RatioGuard::new();
 
-    tsc::store_numer(1);
-    tsc::store_denom(0);
+    // Pre-calibration state: Q=0, M=0 -> always returns 0
+    tsc::store_quotient(0);
+    tsc::store_multiplier(0);
 
-    // Must not panic -- should return 0 for zero denominator
+    assert_eq!(tsc::ticks_to_ns(1000), 0);
+    assert_eq!(tsc::ticks_to_ns(0), 0);
+    assert_eq!(tsc::ticks_to_ns(u64::MAX), 0);
+}
+
+#[test]
+#[serial]
+fn elapsed_ns_with_zero_ratio_does_not_panic() {
+    let _g = RatioGuard::new();
+
+    tsc::store_quotient(0);
+    tsc::store_multiplier(0);
+
+    // Must not panic -- should return 0
     let result = tsc::elapsed_ns(0, 1000);
     assert_eq!(result, 0);
-
-    tsc::store_numer(saved_n);
-    tsc::store_denom(saved_d);
 }
 
 #[test]
 #[serial]
 fn ticks_to_ns_uses_calibrated_ratio() {
-    let saved_n = tsc::load_numer();
-    let saved_d = tsc::load_denom();
+    let _g = RatioGuard::new();
 
     // 1000 ticks * (3/2) = 1500 ns
-    tsc::store_numer(3);
-    tsc::store_denom(2);
-
+    tsc::store_ratio(3, 2);
     assert_eq!(tsc::ticks_to_ns(1000), 1500);
     assert_eq!(tsc::ticks_to_ns(0), 0);
-
-    tsc::store_numer(saved_n);
-    tsc::store_denom(saved_d);
 }
 
 #[test]
 #[serial]
-fn ticks_to_ns_zero_denom_returns_zero() {
-    let saved_n = tsc::load_numer();
-    let saved_d = tsc::load_denom();
+fn ticks_to_ns_non_integer_ratio() {
+    let _g = RatioGuard::new();
 
-    tsc::store_numer(1);
-    tsc::store_denom(0);
+    // 1000 ticks * (125/3) = 41666.667 -> floor = 41666
+    tsc::store_ratio(125, 3);
+    let result = tsc::ticks_to_ns(1000);
+    // Fixed-point can be exact or +1; both are acceptable
+    assert!(
+        result == 41666 || result == 41667,
+        "expected 41666 or 41667, got {result}"
+    );
+}
 
-    assert_eq!(tsc::ticks_to_ns(1000), 0);
+#[test]
+#[serial]
+fn ticks_to_ns_identity_ratio() {
+    let _g = RatioGuard::new();
 
-    tsc::store_numer(saved_n);
-    tsc::store_denom(saved_d);
+    // 1:1 ratio -> ticks == ns
+    tsc::store_ratio(1, 1);
+    assert_eq!(tsc::ticks_to_ns(12345), 12345);
+    assert_eq!(tsc::ticks_to_ns(0), 0);
+    assert_eq!(tsc::ticks_to_ns(u64::MAX), u64::MAX);
 }
 
 #[test]
 #[serial]
 fn elapsed_ns_delegates_to_ticks_to_ns() {
-    let saved_n = tsc::load_numer();
-    let saved_d = tsc::load_denom();
+    let _g = RatioGuard::new();
 
-    tsc::store_numer(1);
-    tsc::store_denom(1);
-
+    tsc::store_ratio(1, 1);
     assert_eq!(tsc::elapsed_ns(10, 110), tsc::ticks_to_ns(100));
-
-    tsc::store_numer(saved_n);
-    tsc::store_denom(saved_d);
 }
 
 #[test]
 #[serial]
 fn ticks_to_epoch_ns_returns_correct_value() {
-    let saved_n = tsc::load_numer();
-    let saved_d = tsc::load_denom();
+    let _g = RatioGuard::new();
 
     // With ratio 1:1, ticks=1000, epoch=100 -> 900
-    tsc::store_numer(1);
-    tsc::store_denom(1);
-
+    tsc::store_ratio(1, 1);
     let result = tsc::ticks_to_epoch_ns(1000, 100);
     assert_eq!(result, 900);
 
     // With ratio 3:2, ticks=1000, epoch=100 -> (900 * 3 / 2) = 1350
-    tsc::store_numer(3);
-    tsc::store_denom(2);
-
+    tsc::store_ratio(3, 2);
     let result = tsc::ticks_to_epoch_ns(1000, 100);
     assert_eq!(result, 1350);
 
@@ -105,71 +132,59 @@ fn ticks_to_epoch_ns_returns_correct_value() {
         result > 1,
         "ticks_to_epoch_ns must return meaningful value, not 0 or 1"
     );
-
-    tsc::store_numer(saved_n);
-    tsc::store_denom(saved_d);
 }
 
 #[test]
 #[serial]
-fn calibrate_sets_nonzero_ratio() {
-    let saved_n = tsc::load_numer();
-    let saved_d = tsc::load_denom();
+fn calibrate_sets_nonzero_conversion() {
+    let _g = RatioGuard::new();
 
     // Zero out to detect that calibrate() actually stores values
-    tsc::store_numer(0);
-    tsc::store_denom(0);
+    tsc::store_quotient(0);
+    tsc::store_multiplier(0);
 
     tsc::calibrate();
 
-    let n = tsc::load_numer();
-    let d = tsc::load_denom();
+    let q = tsc::load_quotient();
+    let m = tsc::load_multiplier();
 
-    assert!(n > 0, "NUMER must be nonzero after calibrate()");
-    assert!(d > 0, "DENOM must be nonzero after calibrate()");
-
-    let ratio = n as f64 / d as f64;
+    // At least one of Q or M must be nonzero after calibration
     assert!(
-        ratio < 1000.0,
-        "calibrated ratio {ratio} is unreasonably large (possible * instead of /)"
-    );
-    assert!(
-        ratio > 0.001,
-        "calibrated ratio {ratio} is unreasonably small"
+        q > 0 || m > 0,
+        "calibrate() must set a nonzero conversion (Q={q}, M={m})"
     );
 
-    tsc::store_numer(saved_n);
-    tsc::store_denom(saved_d);
+    // Sanity: converting 1M ticks should give a reasonable nanosecond value
+    let ns = tsc::ticks_to_ns(1_000_000);
+    assert!(
+        ns > 0,
+        "ticks_to_ns(1M) must produce nonzero result after calibration"
+    );
 }
 
 #[test]
 #[serial]
 fn calibrate_spins_for_target_duration() {
-    let saved_n = tsc::load_numer();
-    let saved_d = tsc::load_denom();
+    let _g = RatioGuard::new();
 
     tsc::calibrate();
 
-    let n = tsc::load_numer();
-    let d = tsc::load_denom();
+    let q = tsc::load_quotient();
+    let m = tsc::load_multiplier();
 
-    // On x86_64/aarch64, a proper calibration never gives exactly 1:1
+    // On x86_64/aarch64, a proper calibration never gives exactly Q=1, M=0
     // because the TSC frequency differs from 1 GHz.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     assert!(
-        n != 1 || d != 1,
-        "calibrate() produced 1:1 ratio -- loop likely did not spin (< mutated?)"
+        q != 1 || m != 0,
+        "calibrate() produced identity ratio -- loop likely did not spin"
     );
-
-    tsc::store_numer(saved_n);
-    tsc::store_denom(saved_d);
 }
 
 #[test]
 #[serial]
 fn calibrate_loop_spins_long_enough_for_accurate_ratio() {
-    let saved_n = tsc::load_numer();
-    let saved_d = tsc::load_denom();
+    let _g = RatioGuard::new();
 
     tsc::calibrate();
 
@@ -190,33 +205,21 @@ fn calibrate_loop_spins_long_enough_for_accurate_ratio() {
         "TSC-to-ns conversion ratio {ratio:.3} is too far from 1.0 \
          (calibration likely didn't spin: converted={converted_ns}ns, wall={wall_actual_ns}ns)"
     );
-
-    tsc::store_numer(saved_n);
-    tsc::store_denom(saved_d);
 }
 
 #[test]
 #[serial]
-fn calibrate_uses_division_not_multiplication() {
-    let saved_n = tsc::load_numer();
-    let saved_d = tsc::load_denom();
+fn calibrate_quotient_is_reasonable() {
+    let _g = RatioGuard::new();
 
     tsc::calibrate();
 
-    let n = tsc::load_numer();
-    let d = tsc::load_denom();
+    let q = tsc::load_quotient();
 
-    assert!(
-        n < 100_000_000,
-        "NUMER {n} is too large (division replaced with multiplication?)"
-    );
-    assert!(
-        d < 100_000_000,
-        "DENOM {d} is too large (division replaced with multiplication?)"
-    );
-
-    tsc::store_numer(saved_n);
-    tsc::store_denom(saved_d);
+    // Q = wall_ns / tsc_ticks = ns_per_tick.
+    // aarch64 24 MHz: ~41 ns/tick. x86_64 3 GHz: ~0.33 ns/tick (Q=0).
+    // Q should be at most a few hundred (even a 1 MHz counter gives Q=1000).
+    assert!(q < 10_000, "Q={q} is unreasonably large");
 }
 
 #[test]

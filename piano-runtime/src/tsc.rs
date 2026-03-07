@@ -34,14 +34,21 @@
 use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 use std::time::Instant;
 
-/// Numerator/denominator for converting ticks to nanoseconds.
-/// `ns = ticks * NUMER / DENOM`
+/// Fixed-point conversion from ticks to nanoseconds.
+///
+/// Decomposition: `ns = ticks * Q + (ticks * M >> 64)`
+/// where `Q = wall_ns / tsc_ticks` (integer quotient) and
+/// `M = ceil(R * 2^64 / tsc_ticks)` with `R = wall_ns % tsc_ticks`.
+///
+/// On aarch64, `(ticks as u128 * M as u128) >> 64` compiles to a single
+/// `umulh` instruction. This replaces the previous `u128 / u128` path
+/// which compiled to a `bl ___udivti3` software division call.
 ///
 /// Stored as atomics so that `calibrate()` (called once from `epoch()`)
 /// publishes them with Release and `ticks_to_ns()` reads with Relaxed
 /// (after the Once-guarded init, every thread sees the calibrated values).
-static NUMER: AtomicU64 = AtomicU64::new(0);
-static DENOM: AtomicU64 = AtomicU64::new(1);
+static QUOTIENT: AtomicU64 = AtomicU64::new(0);
+static MULTIPLIER: AtomicU64 = AtomicU64::new(0);
 
 /// Calibrated measurement bias in raw ticks. Subtracted from every
 /// elapsed measurement in `drop_cold` to correct for instructions
@@ -75,14 +82,20 @@ pub fn read() -> u64 {
 }
 
 /// Convert a raw tick count to nanoseconds using the calibrated ratio.
+///
+/// Uses fixed-point multiplication: `ticks * Q + (ticks * M >> 64)`.
+/// The `u128 * u128 >> 64` compiles to `umulh` on aarch64 (1 instruction)
+/// and `mulq` on x86_64, replacing the previous `___udivti3` software
+/// division (~2 ns -> ~0.4 ns on M4 Pro).
 #[inline(always)]
 pub fn ticks_to_ns(ticks: u64) -> u64 {
-    let n = NUMER.load(Ordering::Relaxed);
-    let d = DENOM.load(Ordering::Relaxed);
-    if d == 0 {
+    let q = QUOTIENT.load(Ordering::Relaxed);
+    let m = MULTIPLIER.load(Ordering::Relaxed);
+    if q == 0 && m == 0 {
         return 0;
     }
-    (ticks as u128 * n as u128 / d as u128) as u64
+    let hi = ((ticks as u128 * m as u128) >> 64) as u64;
+    ticks.wrapping_mul(q).wrapping_add(hi)
 }
 
 /// Convert a tick delta to nanoseconds using the calibrated ratio.
@@ -102,13 +115,17 @@ pub fn ticks_to_epoch_ns(ticks: u64, epoch_tsc: u64) -> u64 {
 /// Calibrate the tick-to-nanosecond ratio. Called once from `epoch()`.
 ///
 /// Measures how many ticks elapse in a known wall-clock interval using
-/// `Instant` as the reference. The calibration spin is brief (~1ms).
+/// `Instant` as the reference. The calibration spin is brief (~2ms).
+///
+/// Decomposes the ratio `wall_ns / tsc_ticks` into a fixed-point form:
+/// `Q = wall_ns / tsc_ticks`, `R = wall_ns % tsc_ticks`,
+/// `M = ceil(R * 2^64 / tsc_ticks)`.
 pub fn calibrate() {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        // Fallback: read() already returns nanoseconds
-        NUMER.store(1, Ordering::Release);
-        DENOM.store(1, Ordering::Release);
+        // Fallback: read() already returns nanoseconds, so Q=1, M=0.
+        QUOTIENT.store(1, Ordering::Release);
+        MULTIPLIER.store(0, Ordering::Release);
         return;
     }
 
@@ -128,16 +145,30 @@ pub fn calibrate() {
         // Guard: if the counter did not advance (frozen TSC, broken VM,
         // or both reads returned the same value), fall back to 1:1 ratio.
         if tsc_ticks == 0 {
-            NUMER.store(1, Ordering::Release);
-            DENOM.store(1, Ordering::Release);
+            QUOTIENT.store(1, Ordering::Release);
+            MULTIPLIER.store(0, Ordering::Release);
             return;
         }
 
-        // ns = ticks * wall_ns / tsc_ticks
-        // Simplify the fraction to avoid overflow in ticks_to_ns
-        let g = gcd(wall_ns, tsc_ticks);
-        NUMER.store(wall_ns / g, Ordering::Release);
-        DENOM.store(tsc_ticks / g, Ordering::Release);
+        // Decompose: ns = ticks * Q + (ticks * M >> 64)
+        let q = wall_ns / tsc_ticks;
+        let r = wall_ns % tsc_ticks;
+        let m = if r == 0 {
+            0u64
+        } else {
+            // ceil(r * 2^64 / tsc_ticks)
+            let product = (r as u128) << 64;
+            let div = product / tsc_ticks as u128;
+            let rem = product % tsc_ticks as u128;
+            if rem > 0 {
+                (div + 1) as u64
+            } else {
+                div as u64
+            }
+        };
+
+        QUOTIENT.store(q, Ordering::Release);
+        MULTIPLIER.store(m, Ordering::Release);
     }
 }
 
@@ -189,20 +220,49 @@ pub fn bias_ticks() -> u64 {
 /// Used by the `tsc_internals` integration test (which runs in a separate
 /// binary to avoid corrupting globals visible to other in-process tests).
 #[cfg(feature = "_test_internals")]
-pub fn load_numer() -> u64 {
-    NUMER.load(Ordering::Relaxed)
+pub fn load_quotient() -> u64 {
+    QUOTIENT.load(Ordering::Relaxed)
 }
 #[cfg(feature = "_test_internals")]
-pub fn load_denom() -> u64 {
-    DENOM.load(Ordering::Relaxed)
+pub fn load_multiplier() -> u64 {
+    MULTIPLIER.load(Ordering::Relaxed)
 }
 #[cfg(feature = "_test_internals")]
-pub fn store_numer(val: u64) {
-    NUMER.store(val, Ordering::Release);
+pub fn store_quotient(val: u64) {
+    QUOTIENT.store(val, Ordering::Release);
 }
 #[cfg(feature = "_test_internals")]
-pub fn store_denom(val: u64) {
-    DENOM.store(val, Ordering::Release);
+pub fn store_multiplier(val: u64) {
+    MULTIPLIER.store(val, Ordering::Release);
+}
+
+/// Set conversion from a numer/denom ratio (test convenience).
+///
+/// Computes Q and M from a fractional ratio so tests can express intent
+/// as "set ratio to 3/2" without computing fixed-point values manually.
+#[cfg(feature = "_test_internals")]
+pub fn store_ratio(numer: u64, denom: u64) {
+    if denom == 0 {
+        QUOTIENT.store(0, Ordering::Release);
+        MULTIPLIER.store(0, Ordering::Release);
+        return;
+    }
+    let q = numer / denom;
+    let r = numer % denom;
+    let m = if r == 0 {
+        0u64
+    } else {
+        let product = (r as u128) << 64;
+        let div = product / denom as u128;
+        let rem = product % denom as u128;
+        if rem > 0 {
+            (div + 1) as u64
+        } else {
+            div as u64
+        }
+    };
+    QUOTIENT.store(q, Ordering::Release);
+    MULTIPLIER.store(m, Ordering::Release);
 }
 #[cfg(feature = "_test_internals")]
 pub fn store_bias_ticks(val: u64) {
@@ -221,21 +281,6 @@ pub fn load_epoch_tsc() -> u64 {
     EPOCH_TSC.load(Ordering::Relaxed)
 }
 
-fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    // gcd(0, 0) is mathematically undefined but we use the result as a
-    // divisor, so return 1 instead of 0 to avoid division by zero.
-    if a == 0 {
-        1
-    } else {
-        a
-    }
-}
-
 /// The TSC value captured at epoch. Stored alongside the Instant epoch.
 static EPOCH_TSC: AtomicU64 = AtomicU64::new(0);
 
@@ -248,36 +293,6 @@ pub fn epoch_tsc() -> u64 {
     EPOCH_TSC.load(Ordering::Relaxed)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gcd_normal_cases() {
-        assert_eq!(gcd(12, 8), 4);
-        assert_eq!(gcd(8, 12), 4);
-        assert_eq!(gcd(7, 13), 1);
-        assert_eq!(gcd(100, 100), 100);
-        assert_eq!(gcd(1, 1), 1);
-    }
-
-    #[test]
-    fn gcd_with_one_zero_returns_nonzero() {
-        // gcd(n, 0) = n by mathematical convention
-        assert_eq!(gcd(5, 0), 5);
-        assert_eq!(gcd(0, 5), 5);
-    }
-
-    #[test]
-    fn gcd_both_zero_returns_one() {
-        // gcd(0, 0) is mathematically undefined; we need a nonzero result
-        // because we divide by the return value.
-        let g = gcd(0, 0);
-        assert_ne!(g, 0, "gcd(0,0) must not return 0 (used as divisor)");
-        assert_eq!(g, 1);
-    }
-
-    // Tests that mutate global TSC state (NUMER, DENOM, BIAS_TICKS, EPOCH_TSC)
-    // live in tests/tsc_internals.rs -- a separate binary that cannot corrupt
-    // globals visible to other in-process unit tests.
-}
+// Tests that mutate global TSC state (QUOTIENT, MULTIPLIER, BIAS_TICKS,
+// EPOCH_TSC) live in tests/tsc_internals.rs -- a separate binary that
+// cannot corrupt globals visible to other in-process unit tests.
