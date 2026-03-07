@@ -483,6 +483,48 @@ mod tests {
 
     #[test]
     #[serial]
+    fn adopt_at_depth_zero_flushes_frame_data() {
+        // Kills: fork_adopt.rs:86 replace == with !=
+        //        fork_adopt.rs:90 delete !
+        // When adopt() is the first entry on a worker thread (depth 0),
+        // AdoptGuard::drop must flush FRAME_BUFFER to FRAMES. Without this,
+        // worker-thread frame data is silently lost.
+        reset();
+
+        // Simulate a worker thread where adopt is the first stack entry.
+        // On a real worker thread the stack starts empty, so adopt pushes at depth 0.
+        let _parent = enter("depth0_parent");
+        let ctx = fork().unwrap();
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // Worker thread: empty stack, adopt pushes at depth 0.
+                let _adopt = adopt(&ctx);
+                {
+                    let _child = enter("depth0_worker");
+                    burn_cpu(1_000);
+                }
+                // AdoptGuard drops here -- must flush frame data at depth 0.
+            });
+        });
+
+        ctx.finalize();
+        drop(_parent);
+
+        // The worker thread's frame data should be captured.
+        let frames = collect_frames();
+        let worker_frames: Vec<_> = frames
+            .iter()
+            .filter(|f| f.iter().any(|s| s.name == "depth0_worker"))
+            .collect();
+        assert!(
+            !worker_frames.is_empty(),
+            "adopt at depth 0 must flush frame data for worker thread"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn drop_cold_frame_boundary_with_adopt_context() {
         // Kills: collector.rs:968 replace == with !=
         //        collector.rs:969 replace || with && and == with !=
