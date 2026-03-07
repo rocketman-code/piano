@@ -1151,7 +1151,7 @@ pub fn enter(name: &'static str) -> Guard {
 pub fn register(name: &'static str) {
     REGISTERED.with(|reg| {
         let mut reg = reg.borrow_mut();
-        if !reg.contains(&name) {
+        if !reg.iter().any(|&r| std::ptr::eq(r, name)) {
             reg.push(name);
         }
     });
