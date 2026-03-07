@@ -924,6 +924,38 @@ enum MacroImplType {
     Metavar(proc_macro2::TokenTree),
 }
 
+/// Scan backward from `pos` over angle-bracket generics like `<T>` or `<K, V>`.
+/// If the token at `pos` is `>`, walks backward counting nesting depth until the
+/// matching `<` is found, then returns the position before the `<`.
+/// If the token at `pos` is not `>`, returns `pos` unchanged.
+fn skip_angle_brackets_backward(tokens: &[proc_macro2::TokenTree], pos: usize) -> usize {
+    let is_close_angle =
+        matches!(&tokens[pos], proc_macro2::TokenTree::Punct(p) if p.as_char() == '>');
+    if !is_close_angle {
+        return pos;
+    }
+
+    let mut depth: usize = 1;
+    let mut cur = pos;
+    while depth > 0 {
+        if cur == 0 {
+            // Unbalanced — give up and return original position.
+            return pos;
+        }
+        cur -= 1;
+        match &tokens[cur] {
+            proc_macro2::TokenTree::Punct(p) if p.as_char() == '>' => depth += 1,
+            proc_macro2::TokenTree::Punct(p) if p.as_char() == '<' => depth -= 1,
+            _ => {}
+        }
+    }
+    // `cur` is now at the `<`. Return position before it.
+    if cur == 0 {
+        return 0;
+    }
+    cur - 1
+}
+
 /// Scan backward from position `brace_idx` to detect whether a brace group
 /// is the body of an `impl Type { ... }` block. Handles:
 ///   - `impl Foo { ... }` -> Literal("Foo")
@@ -939,16 +971,10 @@ fn detect_impl_type(tokens: &[proc_macro2::TokenTree], brace_idx: usize) -> Opti
 
     let mut pos = brace_idx - 1;
 
-    // Skip trailing generic group: `Foo<T> { ... }` — skip the `<T>`.
-    if let proc_macro2::TokenTree::Group(g) = &tokens[pos] {
-        if g.delimiter() == proc_macro2::Delimiter::None {
-            // proc_macro2 may parse `<T>` as an invisible-delimited group
-            if pos == 0 {
-                return None;
-            }
-            pos -= 1;
-        }
-    }
+    // Skip trailing type generics: `Foo<T> { ... }` — skip past `<T>`.
+    // When parsing source text, `<T>` is tokenized as individual `<`, `T`, `>`
+    // Punct tokens, not as an invisible group.
+    pos = skip_angle_brackets_backward(tokens, pos);
 
     // The type name is now at `pos`. It's either an Ident or a metavar ($ident).
     let (type_result, type_start) = match &tokens[pos] {
@@ -993,16 +1019,9 @@ fn detect_impl_type(tokens: &[proc_macro2::TokenTree], brace_idx: usize) -> Opti
         }
         scan -= 1;
 
-        // Skip the trait name (and optional trailing generic group).
+        // Skip the trait name (and optional trailing generics).
         // Trait could be: Ident, Ident<T>, $trait ($ Ident), $trait<T>.
-        if let proc_macro2::TokenTree::Group(g) = &tokens[scan] {
-            if g.delimiter() == proc_macro2::Delimiter::None {
-                if scan == 0 {
-                    return None;
-                }
-                scan -= 1;
-            }
-        }
+        scan = skip_angle_brackets_backward(tokens, scan);
 
         // Now at trait name ident.
         match &tokens[scan] {
@@ -1025,14 +1044,7 @@ fn detect_impl_type(tokens: &[proc_macro2::TokenTree], brace_idx: usize) -> Opti
         scan -= 1;
 
         // Skip optional generic params on impl: `impl<T>`.
-        if let proc_macro2::TokenTree::Group(g) = &tokens[scan] {
-            if g.delimiter() == proc_macro2::Delimiter::None {
-                if scan == 0 {
-                    return None;
-                }
-                scan -= 1;
-            }
-        }
+        scan = skip_angle_brackets_backward(tokens, scan);
 
         // Must be `impl`.
         if is_ident(tokens, scan, "impl") {
@@ -1043,14 +1055,7 @@ fn detect_impl_type(tokens: &[proc_macro2::TokenTree], brace_idx: usize) -> Opti
 
     // No `for` — this is a direct impl: `impl [<T>] Type { ... }`.
     // Skip optional generic params on impl.
-    if let proc_macro2::TokenTree::Group(g) = &tokens[scan] {
-        if g.delimiter() == proc_macro2::Delimiter::None {
-            if scan == 0 {
-                return None;
-            }
-            scan -= 1;
-        }
-    }
+    scan = skip_angle_brackets_backward(tokens, scan);
 
     // Must be `impl`.
     if is_ident(tokens, scan, "impl") {
@@ -3559,6 +3564,30 @@ fn main() {}
         assert!(
             result.contains(r#"piano_runtime::enter("Cruncher::process")"#),
             "method in impl with literal type should be qualified. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn macro_impl_generic_type_qualifies_method_name() {
+        let source = r#"
+macro_rules! make_impl {
+    () => {
+        impl<T> Container<T> {
+            fn process() {
+                work();
+            }
+        }
+    };
+}
+fn main() {}
+"#;
+        let targets: HashSet<String> = HashSet::new();
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains(r#"piano_runtime::enter("Container::process")"#),
+            "generic impl should still qualify method name. Got:\n{result}"
         );
     }
 
