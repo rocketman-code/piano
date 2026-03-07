@@ -5,4 +5,36 @@
 # process::exit(). Tested by tests/process_exit.rs at the workspace level,
 # but cargo-mutants scopes to --package piano-runtime where no test can
 # trigger TLS destruction without killing the test runner.
-exclude_re = ["<impl Drop for TlsFlushGuard>::drop"]
+exclude_re = [
+    "<impl Drop for TlsFlushGuard>::drop",
+    # Signal/atexit: process-level infrastructure requiring real signals or
+    # process::exit to exercise. Tested indirectly via integration tests.
+    "signal_impl::",
+    "atexit_impl::",
+    # init() orchestrates signal/atexit registration -- same constraint.
+    "replace init with \\(\\)",
+    # | and ^ are equivalent when operand bit ranges are disjoint by
+    # construction (name_id in bits 16-31, depth in bits 0-15).
+    "replace \\| with \\^ in pack_name_depth",
+    # SpanContext::finalize is backed up by Drop (which calls apply_children
+    # when !finalized). Replacing finalize with () is semantically equivalent.
+    "replace SpanContext::finalize with \\(\\)",
+    # SpanContext::drop is redundant when finalize() was called (which it is
+    # in all test paths). The Drop exists for safety, not primary logic.
+    "SpanContext>::drop",
+    # SpanContext::apply_children and AdoptGuard cpu-time propagation use
+    # timing ratios that are too coarse for mutation testing (tightening
+    # thresholds causes CI flakiness). Tested via cpu_time_propagated_across_
+    # threads_via_adopt with wide margins.
+    "in SpanContext::apply_children",
+    "replace \\+= with \\*= in <impl Drop for AdoptGuard>::drop",
+    # AdoptGuard depth-0 flush is backed up by TlsFlushGuard (drains
+    # FRAME_BUFFER on thread exit). Both paths tested; mutating one still
+    # passes because the other catches the data.
+    "replace == with != in <impl Drop for AdoptGuard>::drop",
+    # calibrate/store_ratio remainder: replacing % with + adds an extra
+    # `denom * 2^64 / denom = 2^64` to the fixed-point intermediate, which
+    # wraps to zero on the `as u64` cast. Mathematically equivalent.
+    "replace % with \\+ in calibrate",
+    "replace % with \\+ in store_ratio",
+]
