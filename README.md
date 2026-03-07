@@ -103,13 +103,11 @@ $ piano report --frames
      1    48.12ms      28.11ms       2.98ms       0.87ms       93     21.3KB
      2    49.01ms      28.50ms       3.01ms       0.91ms       95     21.8KB
      3    47.88ms      27.94ms       2.95ms       0.85ms       91     20.9KB
-     4   102.33ms      71.22ms       3.10ms       1.05ms      210     48.7KB <<
+     4   102.33ms      71.22ms       3.10ms       1.05ms      210     48.7KB
      5    48.55ms      28.30ms       3.00ms       0.89ms       94     21.5KB
 
-5 frames | 1 spikes (>2x median)
+5 frames
 ```
-
-Frames exceeding 2x the median are flagged with `<<` for spike detection.
 
 ## How it works
 

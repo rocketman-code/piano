@@ -42,7 +42,7 @@ Wasting an affordance on repetition means something else goes unsaid.
 When a feature is not active, it is invisible. No jargon, no output, no footer
 text from an inactive feature should leak into the default experience. The
 default report is for the frustrated Googler who does not know profiling. Advanced
-features (frames, percentiles, spike detection) appear only when explicitly
+features (frames, percentiles) appear only when explicitly
 requested.
 
 ### 4. Errors define what is valid

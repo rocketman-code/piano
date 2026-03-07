@@ -111,7 +111,7 @@ enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Show per-frame breakdown with spike detection.
+        /// Show per-frame breakdown.
         #[arg(long)]
         frames: bool,
 
@@ -144,7 +144,7 @@ enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Show per-frame breakdown with spike detection.
+        /// Show per-frame breakdown.
         #[arg(long)]
         frames: bool,
 
