@@ -1,13 +1,17 @@
 use std::collections::HashSet;
 
 use quote::quote;
+use syn::spanned::Spanned;
+use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
 use crate::resolve::is_instrumentable;
+use crate::source_map::{SourceMap, StringInjector};
 
 /// Result of instrumenting a source file.
 pub struct InstrumentResult {
     pub source: String,
+    pub source_map: SourceMap,
     /// Functions that contain concurrency patterns, with the pattern name.
     /// e.g. [("concurrent_discover", "rayon::scope"), ("process_all", "par_iter")]
     pub concurrency: Vec<(String, String)>,
@@ -24,18 +28,38 @@ pub fn instrument_source(
     targets: &HashSet<String>,
     instrument_macros: bool,
 ) -> Result<InstrumentResult, syn::Error> {
-    let mut file: syn::File = syn::parse_str(source)?;
-    let mut instrumenter = Instrumenter {
+    let file: syn::File = syn::parse_str(source)?;
+
+    // Collect injection points via read-only visitor.
+    let mut collector = InjectionCollector {
+        source,
         targets: targets.clone(),
-        instrument_macros,
+        injector: StringInjector::new(),
         current_impl: None,
         current_trait: None,
         concurrency: Vec::new(),
     };
-    instrumenter.visit_file_mut(&mut file);
+    collector.visit_file(&file);
+
+    let (rewritten, source_map) = collector.injector.apply(source);
+
+    // Macro instrumentation uses token-stream mutation (separate from the
+    // string-injection path). Apply it on the rewritten source if needed.
+    // prettyplease reformats the entire file, invalidating our source_map,
+    // so we reset it to empty when this path is taken.
+    let (final_source, final_map) = if instrument_macros {
+        let mut rewritten_file: syn::File = syn::parse_str(&rewritten)?;
+        let mut macro_visitor = MacroInstrumenter;
+        macro_visitor.visit_file_mut(&mut rewritten_file);
+        (prettyplease::unparse(&rewritten_file), SourceMap::default())
+    } else {
+        (rewritten, source_map)
+    };
+
     Ok(InstrumentResult {
-        source: prettyplease::unparse(&file),
-        concurrency: instrumenter.concurrency,
+        source: final_source,
+        source_map: final_map,
+        concurrency: collector.concurrency,
     })
 }
 
@@ -159,17 +183,34 @@ fn first_type_arg(seg: &syn::PathSegment) -> Option<&syn::Type> {
     }
 }
 
-struct Instrumenter {
+/// Convert a proc_macro2 LineColumn to a byte offset in the source string.
+/// Handles both `\n` and `\r\n` line endings correctly by splitting on `\n`
+/// so that any trailing `\r` stays in the line's byte length.
+fn line_col_to_byte(source: &str, lc: proc_macro2::LineColumn) -> usize {
+    debug_assert!(lc.line >= 1, "proc_macro2 lines are 1-indexed");
+    let mut byte = 0;
+    for (i, line) in source.split('\n').enumerate() {
+        if i + 1 == lc.line {
+            return byte + lc.column;
+        }
+        byte += line.len() + 1; // +1 for the \n we split on
+    }
+    byte + lc.column
+}
+
+/// Read-only AST visitor that collects text injection points.
+struct InjectionCollector<'s> {
+    source: &'s str,
     targets: HashSet<String>,
-    instrument_macros: bool,
+    injector: StringInjector,
     current_impl: Option<String>,
     current_trait: Option<String>,
     /// Collected concurrency info: (function_name, pattern_name).
     concurrency: Vec<(String, String)>,
 }
 
-impl Instrumenter {
-    fn inject_guard(&mut self, block: &mut syn::Block, name: &str, sig: &syn::Signature) {
+impl<'s> InjectionCollector<'s> {
+    fn collect_guard(&mut self, block: &syn::Block, name: &str, sig: &syn::Signature) {
         if !self.targets.contains(name) {
             return;
         }
@@ -178,179 +219,257 @@ impl Instrumenter {
         // For non-async functions returning futures, wrap only the trailing expression.
         if !is_async {
             if let Some(kind) = returns_future(sig) {
-                self.inject_future_return_guard(block, name, sig, kind);
+                self.collect_future_return_guard(block, name, sig, kind);
                 return;
             }
         }
 
-        let guard_stmt: syn::Stmt = syn::parse_quote! {
-            let __piano_guard = piano_runtime::enter(#name);
-        };
-        block.stmts.insert(0, guard_stmt);
+        let open_pos = block.brace_token.span.open().start();
+        let open_byte = line_col_to_byte(self.source, open_pos) + 1; // after '{'
 
-        // If the function body contains concurrency calls, inject fork
-        // and adopt in the relevant closures.
+        // Check for concurrency patterns.
         if let Some(pattern) = find_concurrency_pattern(block) {
             self.concurrency.push((name.to_string(), pattern));
-            let fork_owned_stmt: syn::Stmt = syn::parse_quote! {
-                let __piano_ctx_owned = piano_runtime::fork();
-            };
-            let fork_ref_stmt: syn::Stmt = syn::parse_quote! {
-                let __piano_ctx = __piano_ctx_owned.as_ref();
-            };
-            // Insert after the guard (position 1, 2)
-            block.stmts.insert(1, fork_owned_stmt);
-            block.stmts.insert(2, fork_ref_stmt);
 
-            // Walk the remaining statements and inject adopt into closures.
-            // in_scope_body=false: top-level function body, .spawn() here is detached.
-            for stmt in block.stmts.iter_mut().skip(3) {
-                match stmt {
-                    syn::Stmt::Expr(expr, _) => {
-                        inject_adopt_in_concurrency_closures(expr, false, false);
-                    }
-                    syn::Stmt::Local(local) => {
-                        if let Some(init) = &mut local.init {
-                            inject_adopt_in_concurrency_closures(&mut init.expr, false, false);
-                        }
-                    }
-                    _ => {}
-                }
+            if is_async {
+                // Async + concurrency: wrap entire body in PianoFuture with
+                // guard + fork inside.
+                let close_pos = block.brace_token.span.close().start();
+                let close_byte = line_col_to_byte(self.source, close_pos);
+
+                self.injector.insert(
+                    open_byte,
+                    format!(
+                        "\npiano_runtime::PianoFuture::new(async move {{\
+                         \n    let __piano_guard = piano_runtime::enter({name:?});\
+                         \n    let __piano_ctx_owned = piano_runtime::fork();\
+                         \n    let __piano_ctx = __piano_ctx_owned.as_ref();"
+                    ),
+                );
+
+                // Collect adopt injections for closures inside the block.
+                collect_adopt_in_block_stmts(
+                    &block.stmts,
+                    false,
+                    false,
+                    self.source,
+                    &mut self.injector,
+                );
+
+                self.injector.insert(close_byte, "\n}).await\n");
+            } else {
+                // Sync + concurrency: guard + fork at top.
+                self.injector.insert(
+                    open_byte,
+                    format!(
+                        "\n    let __piano_guard = piano_runtime::enter({name:?});\
+                         \n    let __piano_ctx_owned = piano_runtime::fork();\
+                         \n    let __piano_ctx = __piano_ctx_owned.as_ref();"
+                    ),
+                );
+
+                // Collect adopt injections for closures inside the block.
+                collect_adopt_in_block_stmts(
+                    &block.stmts,
+                    false,
+                    false,
+                    self.source,
+                    &mut self.injector,
+                );
             }
+            return;
         }
 
-        // For async functions, wrap the entire body in PianoFuture.
-        // The guard (and any fork/adopt stmts) are inside the async move block.
+        // Simple case: no concurrency.
         if is_async {
-            let inner_stmts: Vec<syn::Stmt> = block.stmts.drain(..).collect();
+            // Async function: wrap body in PianoFuture.
+            let close_pos = block.brace_token.span.close().start();
+            let close_byte = line_col_to_byte(self.source, close_pos);
 
-            let inner_block = syn::Block {
-                brace_token: syn::token::Brace::default(),
-                stmts: inner_stmts,
-            };
-
-            let wrapper_expr: syn::Expr = syn::parse_quote! {
-                piano_runtime::PianoFuture::new(async move #inner_block).await
-            };
-            block.stmts = vec![syn::Stmt::Expr(wrapper_expr, None)];
+            self.injector.insert(
+                open_byte,
+                format!(
+                    "\npiano_runtime::PianoFuture::new(async move {{\
+                     \n    let __piano_guard = piano_runtime::enter({name:?});"
+                ),
+            );
+            self.injector.insert(close_byte, "\n}).await\n");
+        } else {
+            // Sync function: just inject guard.
+            self.injector.insert(
+                open_byte,
+                format!("\n    let __piano_guard = piano_runtime::enter({name:?});"),
+            );
         }
     }
 
-    /// Wrap the trailing expression of a future-returning function in `PianoFuture`.
-    ///
-    /// For `-> impl Future<Output = T>`: wraps in `PianoFuture::new(async move { guard; expr.await })`.
-    /// For `-> Pin<Box<dyn Future<...>>>` / `BoxFuture`: additionally wraps in `Box::pin(...)`.
-    ///
-    /// Preceding statements (setup code) are preserved in the outer (sync) scope.
-    /// The timing guard lives only inside the async block so it measures poll time,
-    /// not construction time.
-    fn inject_future_return_guard(
+    /// Collect injections for a future-returning (non-async) function.
+    fn collect_future_return_guard(
         &mut self,
-        block: &mut syn::Block,
+        block: &syn::Block,
         name: &str,
         sig: &syn::Signature,
         kind: FutureReturnKind,
     ) {
-        // Split: preceding stmts stay in place, trailing expr gets wrapped.
-        let Some(syn::Stmt::Expr(trailing_expr, None)) = block.stmts.last().cloned() else {
+        // Find trailing expression.
+        let Some(syn::Stmt::Expr(trailing_expr, None)) = block.stmts.last() else {
             // No trailing expression -- fall back to sync guard.
-            let guard_stmt: syn::Stmt = syn::parse_quote! {
-                let __piano_guard = piano_runtime::enter(#name);
-            };
-            block.stmts.insert(0, guard_stmt);
+            let open_pos = block.brace_token.span.open().start();
+            let open_byte = line_col_to_byte(self.source, open_pos) + 1;
+            self.injector.insert(
+                open_byte,
+                format!("\n    let __piano_guard = piano_runtime::enter({name:?});"),
+            );
             return;
         };
 
-        // Remove the trailing expression (we'll replace it).
-        block.stmts.pop();
+        let trailing_span = trailing_expr.span();
+        let trailing_start = line_col_to_byte(self.source, trailing_span.start());
+        let trailing_end = line_col_to_byte(self.source, trailing_span.end());
 
-        // Extract the return type once for PinBoxDynFuture/KnownAlias (used by
-        // both the ReturnWrapper and trailing-expression wrapping below).
-        let boxed_return_type = if matches!(
-            kind,
-            FutureReturnKind::PinBoxDynFuture | FutureReturnKind::KnownAlias
-        ) {
-            let ty = match &sig.output {
-                syn::ReturnType::Type(_, ty) => ty.as_ref().clone(),
-                _ => unreachable!("returns_future already checked this"),
-            };
-            Some(ty)
-        } else {
-            None
-        };
-
-        // For boxed-future returns, wrap early `return` expressions too.
-        if let Some(return_type) = &boxed_return_type {
-            let mut wrapper = ReturnWrapper {
-                name: name.to_string(),
-                return_type: return_type.clone(),
-            };
-            for stmt in &mut block.stmts {
-                wrapper.visit_stmt_mut(stmt);
-            }
-        }
-
-        let wrapped: syn::Expr = match kind {
+        match kind {
             FutureReturnKind::ImplFuture => {
-                syn::parse_quote! {
-                    piano_runtime::PianoFuture::new(async move {
-                        let __piano_guard = piano_runtime::enter(#name);
-                        (#trailing_expr).await
-                    })
-                }
+                self.injector.insert(
+                    trailing_start,
+                    format!(
+                        "piano_runtime::PianoFuture::new(async move {{\
+                         \n        let __piano_guard = piano_runtime::enter({name:?});\
+                         \n        ("
+                    ),
+                );
+                self.injector.insert(trailing_end, ").await\n    })");
             }
             FutureReturnKind::PinBoxDynFuture | FutureReturnKind::KnownAlias => {
-                let return_type = boxed_return_type
-                    .as_ref()
-                    .expect("boxed_return_type is Some for PinBoxDynFuture/KnownAlias");
-                syn::parse_quote! {
-                    Box::pin(piano_runtime::PianoFuture::new(async move {
-                        let __piano_guard = piano_runtime::enter(#name);
-                        let __piano_inner: #return_type = #trailing_expr;
-                        __piano_inner.await
-                    }))
-                }
+                let return_type = match &sig.output {
+                    syn::ReturnType::Type(_, ty) => quote!(#ty).to_string(),
+                    _ => unreachable!("returns_future already checked this"),
+                };
+
+                // For boxed-future returns, wrap early `return` expressions too.
+                self.collect_return_wrappers(block, name, &return_type);
+
+                self.injector.insert(
+                    trailing_start,
+                    format!(
+                        "Box::pin(piano_runtime::PianoFuture::new(async move {{\
+                         \n        let __piano_guard = piano_runtime::enter({name:?});\
+                         \n        let __piano_inner: {return_type} = "
+                    ),
+                );
+                self.injector
+                    .insert(trailing_end, ";\n        __piano_inner.await\n    }))");
             }
-        };
-
-        block.stmts.push(syn::Stmt::Expr(wrapped, None));
-    }
-}
-
-/// Wraps function-level `return <expr>` in future-returning functions so that
-/// early return paths are also instrumented with PianoFuture.
-struct ReturnWrapper {
-    name: String,
-    return_type: syn::Type,
-}
-
-impl VisitMut for ReturnWrapper {
-    fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
-        match expr {
-            // Boundaries: return inside these is NOT our function's return.
-            syn::Expr::Closure(_) | syn::Expr::Async(_) => return,
-            syn::Expr::Return(ret) => {
-                if let Some(inner) = ret.expr.take() {
-                    let name = &self.name;
-                    let return_type = &self.return_type;
-                    let wrapped: syn::Expr = syn::parse_quote! {
-                        Box::pin(piano_runtime::PianoFuture::new(async move {
-                            let __piano_guard = piano_runtime::enter(#name);
-                            let __piano_inner: #return_type = #inner;
-                            __piano_inner.await
-                        }))
-                    };
-                    ret.expr = Some(Box::new(wrapped));
-                }
-                return;
-            }
-            _ => {}
         }
-        syn::visit_mut::visit_expr_mut(self, expr);
     }
 
-    fn visit_item_fn_mut(&mut self, _node: &mut syn::ItemFn) {}
-    fn visit_impl_item_fn_mut(&mut self, _node: &mut syn::ImplItemFn) {}
+    /// Walk the block's preceding statements for `return <expr>` and wrap them.
+    fn collect_return_wrappers(&mut self, block: &syn::Block, name: &str, return_type: &str) {
+        // Walk all stmts except the last (trailing expr) for return expressions.
+        let stmts = if block.stmts.len() > 1 {
+            &block.stmts[..block.stmts.len() - 1]
+        } else {
+            return;
+        };
+        for stmt in stmts {
+            collect_return_wrappers_in_stmt(
+                stmt,
+                name,
+                return_type,
+                self.source,
+                &mut self.injector,
+            );
+        }
+    }
+}
+
+/// Walk a statement tree for `return <expr>` expressions (for future-returning functions).
+/// Inject wrapping text around the return expression value.
+fn collect_return_wrappers_in_stmt(
+    stmt: &syn::Stmt,
+    name: &str,
+    return_type: &str,
+    source: &str,
+    injector: &mut StringInjector,
+) {
+    match stmt {
+        syn::Stmt::Expr(expr, _) => {
+            collect_return_wrappers_in_expr(expr, name, return_type, source, injector);
+        }
+        syn::Stmt::Local(local) => {
+            if let Some(init) = &local.init {
+                collect_return_wrappers_in_expr(&init.expr, name, return_type, source, injector);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_return_wrappers_in_expr(
+    expr: &syn::Expr,
+    name: &str,
+    return_type: &str,
+    source: &str,
+    injector: &mut StringInjector,
+) {
+    match expr {
+        // Boundaries: return inside closures/async blocks is not our function's return.
+        syn::Expr::Closure(_) | syn::Expr::Async(_) => {}
+        syn::Expr::Return(ret) => {
+            if let Some(inner) = &ret.expr {
+                let inner_start = line_col_to_byte(source, inner.span().start());
+                let inner_end = line_col_to_byte(source, inner.span().end());
+                injector.insert(
+                    inner_start,
+                    format!(
+                        "Box::pin(piano_runtime::PianoFuture::new(async move {{\
+                         \n            let __piano_guard = piano_runtime::enter({name:?});\
+                         \n            let __piano_inner: {return_type} = "
+                    ),
+                );
+                injector.insert(inner_end, ";\n            __piano_inner.await\n        }))");
+            }
+        }
+        // Recurse into sub-expressions.
+        syn::Expr::Block(b) => {
+            for stmt in &b.block.stmts {
+                collect_return_wrappers_in_stmt(stmt, name, return_type, source, injector);
+            }
+        }
+        syn::Expr::If(i) => {
+            for stmt in &i.then_branch.stmts {
+                collect_return_wrappers_in_stmt(stmt, name, return_type, source, injector);
+            }
+            if let Some((_, else_expr)) = &i.else_branch {
+                collect_return_wrappers_in_expr(else_expr, name, return_type, source, injector);
+            }
+        }
+        syn::Expr::Match(m) => {
+            for arm in &m.arms {
+                collect_return_wrappers_in_expr(&arm.body, name, return_type, source, injector);
+            }
+        }
+        syn::Expr::ForLoop(f) => {
+            for stmt in &f.body.stmts {
+                collect_return_wrappers_in_stmt(stmt, name, return_type, source, injector);
+            }
+        }
+        syn::Expr::While(w) => {
+            for stmt in &w.body.stmts {
+                collect_return_wrappers_in_stmt(stmt, name, return_type, source, injector);
+            }
+        }
+        syn::Expr::Loop(l) => {
+            for stmt in &l.body.stmts {
+                collect_return_wrappers_in_stmt(stmt, name, return_type, source, injector);
+            }
+        }
+        syn::Expr::Unsafe(u) => {
+            for stmt in &u.block.stmts {
+                collect_return_wrappers_in_stmt(stmt, name, return_type, source, injector);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Find the first concurrency pattern in a block and return its name.
@@ -435,16 +554,52 @@ fn find_pattern_in_expr(expr: &syn::Expr) -> Option<String> {
     }
 }
 
-/// Walk an expression and inject adopt() at the start of closures that
-/// are arguments to concurrency calls or methods chained after par_iter.
-///
-/// `in_scope_body` is true when walking statements inside a scope closure
-/// (via `recurse_closure_body_for_spawns`), meaning `.spawn()` method calls
-/// are scoped (e.g. `s.spawn()`) rather than detached (e.g. `pool.spawn()`).
-fn inject_adopt_in_concurrency_closures(
-    expr: &mut syn::Expr,
+// ---------------------------------------------------------------------------
+// String-injection adopt collection (read-only AST walk)
+// ---------------------------------------------------------------------------
+
+// Hard-coded 8-space indent — may not match user's style, but the
+// instrumented source is transient (never shown to users).
+const ADOPT_STMT_TEXT: &str =
+    "\n        let __piano_adopt = __piano_ctx.map(|c| piano_runtime::adopt(c));";
+
+/// Walk statements in a block and collect adopt injections at closure brace positions.
+fn collect_adopt_in_block_stmts(
+    stmts: &[syn::Stmt],
     in_parallel_chain: bool,
     in_scope_body: bool,
+    source: &str,
+    injector: &mut StringInjector,
+) {
+    for stmt in stmts {
+        match stmt {
+            syn::Stmt::Expr(expr, _) => {
+                collect_adopt_in_expr(expr, in_parallel_chain, in_scope_body, source, injector);
+            }
+            syn::Stmt::Local(local) => {
+                if let Some(init) = &local.init {
+                    collect_adopt_in_expr(
+                        &init.expr,
+                        in_parallel_chain,
+                        in_scope_body,
+                        source,
+                        injector,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Read-only version of inject_adopt_in_concurrency_closures.
+/// Collects byte offsets for adopt injection instead of mutating the AST.
+fn collect_adopt_in_expr(
+    expr: &syn::Expr,
+    in_parallel_chain: bool,
+    in_scope_body: bool,
+    source: &str,
+    injector: &mut StringInjector,
 ) {
     match expr {
         syn::Expr::MethodCall(mc) => {
@@ -452,52 +607,52 @@ fn inject_adopt_in_concurrency_closures(
             let is_par = PARALLEL_ITER_METHODS.contains(&method.as_str());
             let is_spawn = ADOPT_INJECTION_TARGETS.contains(&method.as_str());
             let is_scope = SCOPE_FUNCTIONS.contains(&method.as_str());
-            // A bare .spawn() method call outside a scope body (e.g. pool.spawn)
-            // is detached -- can't cross the 'static boundary. Inside a scope
-            // body, .spawn() is scoped (e.g. s.spawn) and adopt is safe.
             let is_detached = method == "spawn" && !in_scope_body;
 
             // Recurse into receiver first
-            inject_adopt_in_concurrency_closures(
-                &mut mc.receiver,
+            collect_adopt_in_expr(
+                &mc.receiver,
                 in_parallel_chain,
                 in_scope_body,
+                source,
+                injector,
             );
 
-            // Determine if we're in a parallel chain
             let chain_active =
                 in_parallel_chain || is_par || receiver_has_parallel_method(&mc.receiver);
 
             if is_detached {
-                // Detached spawn (pool.spawn, etc.) -- don't inject adopt,
-                // don't recurse into closure body.
+                // Detached spawn -- don't inject adopt.
             } else if is_scope {
-                // Scope closures are coordinators, not workers — don't adopt,
-                // but recurse into their body to find nested spawn calls.
-                for arg in &mut mc.args {
+                // Scope closures are coordinators -- recurse for nested spawns.
+                for arg in &mc.args {
                     if let syn::Expr::Closure(closure) = arg {
-                        recurse_closure_body_for_spawns(closure);
+                        collect_adopt_in_scope_closure(closure, source, injector);
                     } else {
-                        inject_adopt_in_concurrency_closures(arg, false, in_scope_body);
+                        collect_adopt_in_expr(arg, false, in_scope_body, source, injector);
                     }
                 }
             } else if (chain_active && !is_par) || is_spawn {
-                // Worker closures: inject adopt so their time is attributed,
-                // then recurse into the body for nested concurrency patterns.
-                for arg in &mut mc.args {
+                // Worker closures: inject adopt, then recurse body.
+                for arg in &mc.args {
                     if let syn::Expr::Closure(closure) = arg {
-                        inject_adopt_at_closure_start(closure);
-                        if let syn::Expr::Block(block) = &mut *closure.body {
-                            inject_adopt_in_stmts(&mut block.block.stmts, false, in_scope_body);
+                        collect_adopt_at_closure_start(closure, source, injector);
+                        if let syn::Expr::Block(block) = &*closure.body {
+                            collect_adopt_in_block_stmts(
+                                &block.block.stmts,
+                                false,
+                                in_scope_body,
+                                source,
+                                injector,
+                            );
                         }
                     } else {
-                        inject_adopt_in_concurrency_closures(arg, false, in_scope_body);
+                        collect_adopt_in_expr(arg, false, in_scope_body, source, injector);
                     }
                 }
             } else {
-                // Recurse into args anyway for nested concurrency
-                for arg in &mut mc.args {
-                    inject_adopt_in_concurrency_closures(arg, chain_active, in_scope_body);
+                for arg in &mc.args {
+                    collect_adopt_in_expr(arg, chain_active, in_scope_body, source, injector);
                 }
             }
         }
@@ -512,72 +667,164 @@ fn inject_adopt_in_concurrency_closures(
             let is_detached = func_name.as_deref() == Some("spawn");
 
             if is_scope {
-                for arg in &mut call.args {
+                for arg in &call.args {
                     if let syn::Expr::Closure(closure) = arg {
-                        recurse_closure_body_for_spawns(closure);
+                        collect_adopt_in_scope_closure(closure, source, injector);
                     } else {
-                        inject_adopt_in_concurrency_closures(arg, false, in_scope_body);
+                        collect_adopt_in_expr(arg, false, in_scope_body, source, injector);
                     }
                 }
             } else if is_spawn && !is_detached {
-                for arg in &mut call.args {
+                for arg in &call.args {
                     if let syn::Expr::Closure(closure) = arg {
-                        inject_adopt_at_closure_start(closure);
-                        if let syn::Expr::Block(block) = &mut *closure.body {
-                            inject_adopt_in_stmts(&mut block.block.stmts, false, in_scope_body);
+                        collect_adopt_at_closure_start(closure, source, injector);
+                        if let syn::Expr::Block(block) = &*closure.body {
+                            collect_adopt_in_block_stmts(
+                                &block.block.stmts,
+                                false,
+                                in_scope_body,
+                                source,
+                                injector,
+                            );
                         }
                     } else {
-                        inject_adopt_in_concurrency_closures(arg, false, in_scope_body);
+                        collect_adopt_in_expr(arg, false, in_scope_body, source, injector);
                     }
                 }
             } else if is_detached {
-                // Detached spawn (std::thread::spawn, rayon::spawn, etc.)
-                // Don't inject adopt -- can't cross 'static boundary.
-                // Don't recurse into closure body -- nested scopes can't
-                // use the parent's fork either.
+                // Detached spawn -- don't recurse.
             } else {
-                for arg in &mut call.args {
-                    inject_adopt_in_concurrency_closures(arg, false, in_scope_body);
+                for arg in &call.args {
+                    collect_adopt_in_expr(arg, false, in_scope_body, source, injector);
                 }
             }
         }
         syn::Expr::Block(b) => {
-            inject_adopt_in_stmts(&mut b.block.stmts, in_parallel_chain, in_scope_body);
+            collect_adopt_in_block_stmts(
+                &b.block.stmts,
+                in_parallel_chain,
+                in_scope_body,
+                source,
+                injector,
+            );
         }
         syn::Expr::ForLoop(f) => {
-            inject_adopt_in_stmts(&mut f.body.stmts, in_parallel_chain, in_scope_body);
+            collect_adopt_in_block_stmts(
+                &f.body.stmts,
+                in_parallel_chain,
+                in_scope_body,
+                source,
+                injector,
+            );
         }
         syn::Expr::While(w) => {
-            inject_adopt_in_stmts(&mut w.body.stmts, in_parallel_chain, in_scope_body);
+            collect_adopt_in_block_stmts(
+                &w.body.stmts,
+                in_parallel_chain,
+                in_scope_body,
+                source,
+                injector,
+            );
         }
         syn::Expr::Loop(l) => {
-            inject_adopt_in_stmts(&mut l.body.stmts, in_parallel_chain, in_scope_body);
+            collect_adopt_in_block_stmts(
+                &l.body.stmts,
+                in_parallel_chain,
+                in_scope_body,
+                source,
+                injector,
+            );
         }
         syn::Expr::If(i) => {
-            inject_adopt_in_stmts(&mut i.then_branch.stmts, in_parallel_chain, in_scope_body);
-            if let Some((_, else_branch)) = &mut i.else_branch {
-                inject_adopt_in_concurrency_closures(else_branch, in_parallel_chain, in_scope_body);
+            collect_adopt_in_block_stmts(
+                &i.then_branch.stmts,
+                in_parallel_chain,
+                in_scope_body,
+                source,
+                injector,
+            );
+            if let Some((_, else_branch)) = &i.else_branch {
+                collect_adopt_in_expr(
+                    else_branch,
+                    in_parallel_chain,
+                    in_scope_body,
+                    source,
+                    injector,
+                );
             }
         }
         syn::Expr::Match(m) => {
-            inject_adopt_in_concurrency_closures(&mut m.expr, in_parallel_chain, in_scope_body);
-            for arm in &mut m.arms {
-                if let Some((_, guard)) = &mut arm.guard {
-                    inject_adopt_in_concurrency_closures(guard, in_parallel_chain, in_scope_body);
+            collect_adopt_in_expr(&m.expr, in_parallel_chain, in_scope_body, source, injector);
+            for arm in &m.arms {
+                if let Some((_, guard)) = &arm.guard {
+                    collect_adopt_in_expr(
+                        guard,
+                        in_parallel_chain,
+                        in_scope_body,
+                        source,
+                        injector,
+                    );
                 }
-                inject_adopt_in_concurrency_closures(
-                    &mut arm.body,
+                collect_adopt_in_expr(
+                    &arm.body,
                     in_parallel_chain,
                     in_scope_body,
+                    source,
+                    injector,
                 );
             }
         }
         syn::Expr::Unsafe(u) => {
-            inject_adopt_in_stmts(&mut u.block.stmts, in_parallel_chain, in_scope_body);
+            collect_adopt_in_block_stmts(
+                &u.block.stmts,
+                in_parallel_chain,
+                in_scope_body,
+                source,
+                injector,
+            );
         }
         _ => {}
     }
 }
+
+/// Inject adopt at the start of a closure body.
+fn collect_adopt_at_closure_start(
+    closure: &syn::ExprClosure,
+    source: &str,
+    injector: &mut StringInjector,
+) {
+    match &*closure.body {
+        syn::Expr::Block(block) => {
+            let open_pos = block.block.brace_token.span.open().start();
+            let open_byte = line_col_to_byte(source, open_pos) + 1;
+            injector.insert(open_byte, ADOPT_STMT_TEXT);
+        }
+        other => {
+            // Closure without braces (e.g. `|x| x + 1`).
+            // Inject adopt before the body expression by wrapping in a block.
+            let body_start = line_col_to_byte(source, other.span().start());
+            let body_end = line_col_to_byte(source, other.span().end());
+            injector.insert(body_start, format!("{{ {ADOPT_STMT_TEXT}\n        "));
+            injector.insert(body_end, "\n    }");
+        }
+    }
+}
+
+/// Recurse into a scope closure body for nested spawn calls.
+fn collect_adopt_in_scope_closure(
+    closure: &syn::ExprClosure,
+    source: &str,
+    injector: &mut StringInjector,
+) {
+    if let syn::Expr::Block(block) = &*closure.body {
+        collect_adopt_in_block_stmts(&block.block.stmts, false, true, source, injector);
+    }
+}
+
+// The old AST-mutation adopt injection functions (inject_adopt_in_concurrency_closures,
+// inject_adopt_at_closure_start, recurse_closure_body_for_spawns, inject_adopt_in_stmts)
+// have been replaced by the string-injection equivalents above (collect_adopt_in_expr,
+// collect_adopt_at_closure_start, collect_adopt_in_scope_closure, collect_adopt_in_block_stmts).
 
 fn receiver_has_parallel_method(expr: &syn::Expr) -> bool {
     match expr {
@@ -587,60 +834,6 @@ fn receiver_has_parallel_method(expr: &syn::Expr) -> bool {
                 || receiver_has_parallel_method(&mc.receiver)
         }
         _ => false,
-    }
-}
-
-fn inject_adopt_at_closure_start(closure: &mut syn::ExprClosure) {
-    let adopt_stmt: syn::Stmt = syn::parse_quote! {
-        let __piano_adopt = __piano_ctx.map(|c| piano_runtime::adopt(c));
-    };
-    match &mut *closure.body {
-        syn::Expr::Block(block) => {
-            block.block.stmts.insert(0, adopt_stmt);
-        }
-        other => {
-            let existing = other.clone();
-            *other = syn::parse_quote! {
-                {
-                    #adopt_stmt
-                    #existing
-                }
-            };
-        }
-    }
-}
-
-/// Recurse into a closure body to find nested spawn calls and inject adopt.
-/// Used for scope/scope_fifo closures where the closure is the coordinator,
-/// not a worker — we don't adopt the coordinator, but its spawn calls need adopt.
-fn recurse_closure_body_for_spawns(closure: &mut syn::ExprClosure) {
-    if let syn::Expr::Block(block) = &mut *closure.body {
-        // in_scope_body=true: .spawn() calls here are scoped (e.g. s.spawn),
-        // not detached, so adopt injection is safe.
-        inject_adopt_in_stmts(&mut block.block.stmts, false, true);
-    }
-}
-
-/// Walk statements, injecting adopt into spawn closures.
-/// `__piano_ctx` is `Option<&SpanContext>` which is `Copy`, so `move` closures
-/// can capture it without ownership issues.
-fn inject_adopt_in_stmts(stmts: &mut [syn::Stmt], in_parallel_chain: bool, in_scope_body: bool) {
-    for stmt in stmts.iter_mut() {
-        match stmt {
-            syn::Stmt::Expr(e, _) => {
-                inject_adopt_in_concurrency_closures(e, in_parallel_chain, in_scope_body);
-            }
-            syn::Stmt::Local(local) => {
-                if let Some(init) = &mut local.init {
-                    inject_adopt_in_concurrency_closures(
-                        &mut init.expr,
-                        in_parallel_chain,
-                        in_scope_body,
-                    );
-                }
-            }
-            _ => {}
-        }
     }
 }
 
@@ -1122,59 +1315,65 @@ fn make_guard_tokens(name_tokens: &[proc_macro2::TokenTree]) -> proc_macro2::Tok
     }
 }
 
-impl VisitMut for Instrumenter {
-    fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
+impl<'s> Visit<'s> for InjectionCollector<'s> {
+    fn visit_item_fn(&mut self, node: &'s syn::ItemFn) {
         if is_instrumentable(&node.sig) {
             let name = node.sig.ident.to_string();
-            self.inject_guard(&mut node.block, &name, &node.sig);
+            self.collect_guard(&node.block, &name, &node.sig);
         }
-        syn::visit_mut::visit_item_fn_mut(self, node);
+        syn::visit::visit_item_fn(self, node);
     }
 
-    fn visit_item_impl_mut(&mut self, node: &mut syn::ItemImpl) {
+    fn visit_item_impl(&mut self, node: &'s syn::ItemImpl) {
         let type_name = type_ident(&node.self_ty);
         let prev = self.current_impl.take();
         self.current_impl = Some(type_name);
-        syn::visit_mut::visit_item_impl_mut(self, node);
+        syn::visit::visit_item_impl(self, node);
         self.current_impl = prev;
     }
 
-    fn visit_impl_item_fn_mut(&mut self, node: &mut syn::ImplItemFn) {
+    fn visit_impl_item_fn(&mut self, node: &'s syn::ImplItemFn) {
         if is_instrumentable(&node.sig) {
             let method = node.sig.ident.to_string();
             let qualified = match &self.current_impl {
                 Some(ty) => format!("{ty}::{method}"),
                 None => method,
             };
-            self.inject_guard(&mut node.block, &qualified, &node.sig);
+            self.collect_guard(&node.block, &qualified, &node.sig);
         }
-        syn::visit_mut::visit_impl_item_fn_mut(self, node);
+        syn::visit::visit_impl_item_fn(self, node);
     }
 
-    fn visit_item_trait_mut(&mut self, node: &mut syn::ItemTrait) {
+    fn visit_item_trait(&mut self, node: &'s syn::ItemTrait) {
         let trait_name = node.ident.to_string();
         let prev = self.current_trait.take();
         self.current_trait = Some(trait_name);
-        syn::visit_mut::visit_item_trait_mut(self, node);
+        syn::visit::visit_item_trait(self, node);
         self.current_trait = prev;
     }
 
-    fn visit_trait_item_fn_mut(&mut self, node: &mut syn::TraitItemFn) {
-        if let Some(block) = &mut node.default {
+    fn visit_trait_item_fn(&mut self, node: &'s syn::TraitItemFn) {
+        if let Some(block) = &node.default {
             if is_instrumentable(&node.sig) {
                 let method = node.sig.ident.to_string();
                 let qualified = match &self.current_trait {
                     Some(trait_name) => format!("{trait_name}::{method}"),
                     None => method,
                 };
-                self.inject_guard(block, &qualified, &node.sig);
+                self.collect_guard(block, &qualified, &node.sig);
             }
         }
-        syn::visit_mut::visit_trait_item_fn_mut(self, node);
+        syn::visit::visit_trait_item_fn(self, node);
     }
+}
 
+/// Separate VisitMut that only handles macro_rules! instrumentation.
+/// Kept as VisitMut because macro instrumentation modifies token streams directly.
+struct MacroInstrumenter;
+
+impl VisitMut for MacroInstrumenter {
     fn visit_item_macro_mut(&mut self, node: &mut syn::ItemMacro) {
-        if self.instrument_macros && is_macro_rules(node) {
+        if is_macro_rules(node) {
             instrument_macro_tokens(&mut node.mac.tokens);
         }
         syn::visit_mut::visit_item_macro_mut(self, node);
@@ -1185,31 +1384,27 @@ impl VisitMut for Instrumenter {
 ///
 /// This ensures every instrumented function appears in the output, even if it
 /// was never called during the run.
-pub fn inject_registrations(source: &str, names: &[String]) -> Result<String, syn::Error> {
-    let mut file: syn::File = syn::parse_str(source)?;
-    let mut injector = RegistrationInjector {
-        names: names.to_vec(),
-    };
-    injector.visit_file_mut(&mut file);
-    Ok(prettyplease::unparse(&file))
-}
-
-struct RegistrationInjector {
-    names: Vec<String>,
-}
-
-impl VisitMut for RegistrationInjector {
-    fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
-        if node.sig.ident == "main" {
-            for name in self.names.iter().rev() {
-                let stmt: syn::Stmt = syn::parse_quote! {
-                    piano_runtime::register(#name);
-                };
-                node.block.stmts.insert(0, stmt);
+pub fn inject_registrations(
+    source: &str,
+    names: &[String],
+) -> Result<(String, SourceMap), syn::Error> {
+    let file: syn::File = syn::parse_str(source)?;
+    let mut injector = StringInjector::new();
+    for item in &file.items {
+        if let syn::Item::Fn(func) = item {
+            if func.sig.ident == "main" {
+                let open = func.block.brace_token.span.open().start();
+                let byte_offset = line_col_to_byte(source, open) + 1;
+                let mut text = String::new();
+                for name in names {
+                    text.push_str(&format!("\n    piano_runtime::register(\"{name}\");"));
+                }
+                injector.insert(byte_offset, text);
+                break;
             }
         }
-        syn::visit_mut::visit_item_fn_mut(self, node);
     }
+    Ok(injector.apply(source))
 }
 
 /// Classification of the user's `#[global_allocator]` declaration.
@@ -1289,16 +1484,40 @@ fn cfg_attr_global_allocator_condition(attr: &syn::Attribute) -> Option<syn::Met
     }
 }
 
-/// Wrap a `#[global_allocator]` static's type and initializer with `PianoAllocator`.
-fn wrap_allocator_static(static_item: &mut syn::ItemStatic) {
-    let orig_ty = &static_item.ty;
-    let orig_expr = &static_item.expr;
-    *static_item.ty = syn::parse_quote! {
-        piano_runtime::PianoAllocator<#orig_ty>
-    };
-    *static_item.expr = syn::parse_quote! {
-        piano_runtime::PianoAllocator::new(#orig_expr)
-    };
+/// Extract byte range for a span in the source string.
+fn span_byte_range(source: &str, span: proc_macro2::Span) -> (usize, usize) {
+    let start = line_col_to_byte(source, span.start());
+    let end = line_col_to_byte(source, span.end());
+    (start, end)
+}
+
+/// Wrap a `#[global_allocator]` static's type and initializer with `PianoAllocator`
+/// using string replacement. Returns a list of (start, end, replacement) edits.
+fn wrap_allocator_edits(
+    source: &str,
+    static_item: &syn::ItemStatic,
+) -> Vec<(usize, usize, String)> {
+    let mut edits = Vec::new();
+
+    // Wrap the type: T -> piano_runtime::PianoAllocator<T>
+    let (ty_start, ty_end) = span_byte_range(source, static_item.ty.span());
+    let orig_ty = &source[ty_start..ty_end];
+    edits.push((
+        ty_start,
+        ty_end,
+        format!("piano_runtime::PianoAllocator<{orig_ty}>"),
+    ));
+
+    // Wrap the expr: E -> piano_runtime::PianoAllocator::new(E)
+    let (expr_start, expr_end) = span_byte_range(source, static_item.expr.span());
+    let orig_expr = &source[expr_start..expr_end];
+    edits.push((
+        expr_start,
+        expr_end,
+        format!("piano_runtime::PianoAllocator::new({orig_expr})"),
+    ));
+
+    edits
 }
 
 /// Walk the parsed file and classify any `#[global_allocator]` statics.
@@ -1349,57 +1568,89 @@ pub fn detect_allocator_kind(source: &str) -> Result<AllocatorKind, syn::Error> 
 /// - `Unconditional`: wrap the existing allocator with `PianoAllocator`.
 /// - `CfgGated`: wrap each cfg-gated allocator AND inject a cfg-negated
 ///   `PianoAllocator<System>` fallback for platforms where none match.
-pub fn inject_global_allocator(source: &str, kind: AllocatorKind) -> Result<String, syn::Error> {
-    let mut file: syn::File = syn::parse_str(source)?;
+pub fn inject_global_allocator(
+    source: &str,
+    kind: AllocatorKind,
+) -> Result<(String, SourceMap), syn::Error> {
+    let file: syn::File = syn::parse_str(source)?;
 
     match kind {
         AllocatorKind::Absent => {
-            let item: syn::Item = syn::parse_quote! {
-                #[global_allocator]
-                static _PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>
-                    = piano_runtime::PianoAllocator::new(std::alloc::System);
-            };
-            file.items.insert(0, item);
+            let text = "\n#[global_allocator]\nstatic _PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>\n    = piano_runtime::PianoAllocator::new(std::alloc::System);\n";
+            let mut injector = StringInjector::new();
+            injector.insert(0, text);
+            Ok(injector.apply(source))
         }
         AllocatorKind::Unconditional => {
-            for item in &mut file.items {
+            let mut edits: Vec<(usize, usize, String)> = Vec::new();
+            for item in &file.items {
                 if let syn::Item::Static(static_item) = item {
                     if has_global_allocator_attr(static_item) {
-                        wrap_allocator_static(static_item);
+                        edits = wrap_allocator_edits(source, static_item);
                         break;
                     }
                 }
             }
+            Ok((apply_replacements(source, &edits), SourceMap::default()))
         }
         AllocatorKind::CfgGated(ref predicates) => {
-            // Wrap each cfg-gated allocator with PianoAllocator.
-            for item in &mut file.items {
+            // Collect type/expr edits for each cfg-gated allocator.
+            let mut edits: Vec<(usize, usize, String)> = Vec::new();
+            for item in &file.items {
                 if let syn::Item::Static(static_item) = item {
                     if has_global_allocator_attr(static_item) {
-                        wrap_allocator_static(static_item);
+                        edits.extend(wrap_allocator_edits(source, static_item));
                     }
                 }
             }
 
-            // Inject a cfg-negated fallback PianoAllocator<System>.
-            let negated_cfg: syn::Meta = if predicates.len() == 1 {
-                let pred = &predicates[0];
-                syn::parse_quote! { not(#pred) }
+            // Build the cfg-negated fallback text.
+            // Format predicates compactly (quote! adds unwanted spaces).
+            let pred_strs: Vec<String> =
+                predicates.iter().map(|p| quote!(#p).to_string()).collect();
+            let negated_str = if pred_strs.len() == 1 {
+                format!("not({})", pred_strs[0])
             } else {
-                syn::parse_quote! { not(any(#(#predicates),*)) }
+                format!("not(any({}))", pred_strs.join(", "))
             };
+            let fallback = format!(
+                "\n#[cfg({negated_str})]\n#[global_allocator]\nstatic _PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>\n    = piano_runtime::PianoAllocator::new(std::alloc::System);\n"
+            );
 
-            let fallback: syn::Item = syn::parse_quote! {
-                #[cfg(#negated_cfg)]
-                #[global_allocator]
-                static _PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>
-                    = piano_runtime::PianoAllocator::new(std::alloc::System);
-            };
-            file.items.insert(0, fallback);
+            // Apply type/expr replacements first, then prepend fallback.
+            let replaced = apply_replacements(source, &edits);
+            // Track the prepended fallback lines in the SourceMap so error
+            // remapping knows original lines shifted down.
+            let fallback_newlines = fallback.bytes().filter(|&b| b == b'\n').count() as u32;
+            let mut map = SourceMap::new();
+            if fallback_newlines > 0 {
+                map.record(1, fallback_newlines);
+            }
+            let result = format!("{fallback}{replaced}");
+            Ok((result, map))
         }
     }
+}
 
-    Ok(prettyplease::unparse(&file))
+/// Apply a set of non-overlapping (start, end, replacement) edits to source.
+/// Edits must not overlap. They are applied in offset order.
+fn apply_replacements(source: &str, edits: &[(usize, usize, String)]) -> String {
+    let mut sorted: Vec<&(usize, usize, String)> = edits.iter().collect();
+    sorted.sort_by_key(|(start, _, _)| *start);
+
+    let mut result = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    for (start, end, replacement) in &sorted {
+        debug_assert!(
+            cursor <= *start,
+            "overlapping edits: cursor {cursor} > start {start}"
+        );
+        result.push_str(&source[cursor..*start]);
+        result.push_str(replacement);
+        cursor = *end;
+    }
+    result.push_str(&source[cursor..]);
+    result
 }
 
 /// Wrap `fn main`'s body in `catch_unwind` and inject `piano_runtime::shutdown()`.
@@ -1407,131 +1658,103 @@ pub fn inject_global_allocator(source: &str, kind: AllocatorKind) -> Result<Stri
 /// When `runs_dir` is `Some`, emits `shutdown_to(dir)` to write run data to
 /// the given project-local directory. When `None`, falls back to `shutdown()`
 /// which uses the runtime's default directory resolution.
-pub fn inject_shutdown(source: &str, runs_dir: Option<&str>) -> Result<String, syn::Error> {
-    let mut file: syn::File = syn::parse_str(source)?;
-    let mut injector = ShutdownInjector {
-        runs_dir: runs_dir.map(String::from),
-    };
-    injector.visit_file_mut(&mut file);
-    Ok(prettyplease::unparse(&file))
-}
+pub fn inject_shutdown(
+    source: &str,
+    runs_dir: Option<&str>,
+) -> Result<(String, SourceMap), syn::Error> {
+    let file: syn::File = syn::parse_str(source)?;
+    let mut injector = StringInjector::new();
 
-struct ShutdownInjector {
-    runs_dir: Option<String>,
-}
-
-impl ShutdownInjector {
-    fn init_stmt(&self) -> syn::Stmt {
-        syn::parse_quote! {
-            piano_runtime::init();
-        }
-    }
-
-    fn shutdown_stmt(&self) -> syn::Stmt {
-        match &self.runs_dir {
-            Some(dir) => syn::parse_quote! {
-                piano_runtime::shutdown_to(std::path::Path::new(#dir));
-            },
-            None => syn::parse_quote! {
-                piano_runtime::shutdown();
-            },
-        }
-    }
-
-    fn set_runs_dir_stmt(&self) -> Option<syn::Stmt> {
-        self.runs_dir.as_ref().map(|dir| {
-            syn::parse_quote! {
-                piano_runtime::set_runs_dir(std::path::Path::new(#dir));
+    for item in &file.items {
+        if let syn::Item::Fn(func) = item {
+            if func.sig.ident != "main" {
+                continue;
             }
-        })
-    }
-}
 
-impl VisitMut for ShutdownInjector {
-    fn visit_item_fn_mut(&mut self, node: &mut syn::ItemFn) {
-        if node.sig.ident == "main" {
-            let is_async = node.sig.asyncness.is_some();
-            let has_return_type = !matches!(&node.sig.output, syn::ReturnType::Default);
+            let is_async = func.sig.asyncness.is_some();
+            let has_return_type = !matches!(&func.sig.output, syn::ReturnType::Default);
 
-            let existing_stmts = std::mem::take(&mut node.block.stmts);
-            let shutdown_stmt = self.shutdown_stmt();
-            let set_dir_stmt = self.set_runs_dir_stmt();
+            let open = func.block.brace_token.span.open().start();
+            let close = func.block.brace_token.span.close().start();
+            let open_byte = line_col_to_byte(source, open) + 1;
+            let close_byte = line_col_to_byte(source, close);
+
+            // Build shutdown call text.
+            let shutdown_text = match runs_dir {
+                Some(dir) => {
+                    format!("piano_runtime::shutdown_to(std::path::Path::new(\"{dir}\"));")
+                }
+                None => "piano_runtime::shutdown();".to_string(),
+            };
+
+            // Build optional set_runs_dir text.
+            let set_dir_text = runs_dir.map(|dir| {
+                format!("\n    piano_runtime::set_runs_dir(std::path::Path::new(\"{dir}\"));")
+            });
 
             if is_async {
-                // Async main: can't use catch_unwind (sync closure can't contain .await).
-                // Insert shutdown before the tail expression if there is one.
-                let mut stmts: Vec<syn::Stmt> = Vec::new();
-                stmts.push(self.init_stmt());
-                stmts.extend(set_dir_stmt);
-                if has_return_type && !existing_stmts.is_empty() {
-                    let (body, tail) = existing_stmts.split_at(existing_stmts.len() - 1);
-                    stmts.extend(body.to_vec());
-                    // If the tail is a bare expression (e.g. PianoFuture wrapper),
-                    // bind its result, shutdown, then return. Otherwise shutdown
-                    // would run before the tail expression completes.
-                    if let Some(syn::Stmt::Expr(tail_expr, None)) = tail.first() {
-                        let tail_expr = tail_expr.clone();
-                        let bind_stmt: syn::Stmt = syn::parse_quote! {
-                            let __piano_result = #tail_expr;
-                        };
-                        stmts.push(bind_stmt);
-                        stmts.push(shutdown_stmt);
-                        let return_expr: syn::Expr = syn::parse_quote! { __piano_result };
-                        stmts.push(syn::Stmt::Expr(return_expr, None));
+                // Async main: no catch_unwind.
+                let mut prefix = String::from("\n    piano_runtime::init();");
+                if let Some(ref sdr) = set_dir_text {
+                    prefix.push_str(sdr);
+                }
+
+                if has_return_type && !func.block.stmts.is_empty() {
+                    // Check if last statement is a tail expression (no semicolon).
+                    if let Some(syn::Stmt::Expr(tail_expr, None)) = func.block.stmts.last() {
+                        // Bind the tail expression, shutdown, return.
+                        let tail_start = line_col_to_byte(source, tail_expr.span().start());
+                        injector.insert(open_byte, prefix);
+                        injector.insert(tail_start, "let __piano_result = ".to_string());
+                        let suffix = format!(";\n    {shutdown_text}\n    __piano_result\n");
+                        injector.insert(close_byte, suffix);
                     } else {
-                        stmts.push(shutdown_stmt);
-                        stmts.extend(tail.to_vec());
+                        // Last statement has semicolon; just insert shutdown before }.
+                        injector.insert(open_byte, prefix);
+                        let suffix = format!("\n    {shutdown_text}\n");
+                        injector.insert(close_byte, suffix);
                     }
                 } else {
-                    let mut body = existing_stmts;
-                    // If the last statement is a tail expression (no semicolon),
-                    // add a semicolon so shutdown can follow. Safe because
-                    // main without return type always returns ().
-                    if let Some(syn::Stmt::Expr(expr, semi @ None)) = body.last_mut() {
-                        *semi = Some(syn::token::Semi::default());
-                        let _ = expr; // suppress unused warning
+                    // No return type: insert shutdown before }.
+                    // If the last stmt is a tail expression (no semicolon),
+                    // insert a semicolon after it so shutdown can follow.
+                    injector.insert(open_byte, prefix);
+                    if let Some(syn::Stmt::Expr(tail_expr, None)) = func.block.stmts.last() {
+                        let tail_end = line_col_to_byte(source, tail_expr.span().end());
+                        injector.insert(tail_end, ";".to_string());
                     }
-                    stmts.extend(body);
-                    stmts.push(shutdown_stmt);
+                    let suffix = format!("\n    {shutdown_text}\n");
+                    injector.insert(close_byte, suffix);
                 }
-                node.block.stmts = stmts;
             } else {
-                // Sync main: wrap body in catch_unwind so guards drop on panic
-                // (recording timing data), then shutdown collects it, then re-panic.
-                let catch_stmt: syn::Stmt = syn::parse_quote! {
-                    let __piano_result = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| { #(#existing_stmts)* })
-                    );
-                };
-                let mut stmts: Vec<syn::Stmt> = Vec::new();
-                stmts.push(self.init_stmt());
-                stmts.extend(set_dir_stmt);
-                stmts.push(catch_stmt);
-                stmts.push(shutdown_stmt);
-                if has_return_type {
-                    let tail: syn::Stmt = syn::Stmt::Expr(
-                        syn::parse_quote! {
-                            match __piano_result {
-                                Ok(__piano_val) => __piano_val,
-                                Err(__piano_panic) => std::panic::resume_unwind(__piano_panic),
-                            }
-                        },
-                        None,
-                    );
-                    stmts.push(tail);
-                } else {
-                    let resume_stmt: syn::Stmt = syn::parse_quote! {
-                        if let Err(__piano_panic) = __piano_result {
-                            std::panic::resume_unwind(__piano_panic);
-                        }
-                    };
-                    stmts.push(resume_stmt);
+                // Sync main: wrap body in catch_unwind.
+                let mut prefix = String::from("\n    piano_runtime::init();");
+                if let Some(ref sdr) = set_dir_text {
+                    prefix.push_str(sdr);
                 }
-                node.block.stmts = stmts;
+                prefix.push_str(
+                    "\n    let __piano_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {",
+                );
+                injector.insert(open_byte, prefix);
+
+                let mut suffix = format!("\n    }}));\n    {shutdown_text}");
+                if has_return_type {
+                    suffix.push_str(
+                        "\n    match __piano_result {\n        Ok(__piano_val) => __piano_val,\n        Err(__piano_panic) => std::panic::resume_unwind(__piano_panic),\n    }\n",
+                    );
+                } else {
+                    suffix.push_str(
+                        "\n    if let Err(__piano_panic) = __piano_result {\n        std::panic::resume_unwind(__piano_panic);\n    }\n",
+                    );
+                }
+                injector.insert(close_byte, suffix);
             }
+
+            break;
         }
-        syn::visit_mut::visit_item_fn_mut(self, node);
     }
+
+    Ok(injector.apply(source))
 }
 
 /// Extract the type name from a `syn::Type` for qualified method names.
@@ -1648,7 +1871,7 @@ fn main() {
 }
 "#;
         let names = vec!["walk".to_string(), "parse".to_string()];
-        let result = inject_registrations(source, &names).unwrap();
+        let (result, _map) = inject_registrations(source, &names).unwrap();
         assert!(
             result.contains("piano_runtime::register(\"walk\")"),
             "Got:\n{result}"
@@ -1677,7 +1900,7 @@ fn main() {
     println!("hello");
 }
 "#;
-        let result = inject_global_allocator(source, AllocatorKind::Absent).unwrap();
+        let (result, _map) = inject_global_allocator(source, AllocatorKind::Absent).unwrap();
         assert!(
             result.contains("#[global_allocator]"),
             "should inject global_allocator attribute. Got:\n{result}"
@@ -1702,7 +1925,7 @@ static ALLOC: System = System;
 
 fn main() {}
 "#;
-        let result = inject_global_allocator(source, AllocatorKind::Unconditional).unwrap();
+        let (result, _map) = inject_global_allocator(source, AllocatorKind::Unconditional).unwrap();
         assert!(
             result.contains("PianoAllocator"),
             "should wrap existing allocator. Got:\n{result}"
@@ -1719,7 +1942,7 @@ static ALLOC: Jemalloc = Jemalloc;
 fn main() {}
 "#;
         let kind = detect_allocator_kind(source).unwrap();
-        let result = inject_global_allocator(source, kind).unwrap();
+        let (result, _map) = inject_global_allocator(source, kind).unwrap();
         assert!(
             result.contains("PianoAllocator<Jemalloc>"),
             "should wrap cfg-gated allocator. Got:\n{result}"
@@ -1752,7 +1975,7 @@ static ALLOC_MAC: MiMalloc = MiMalloc;
 fn main() {}
 "#;
         let kind = detect_allocator_kind(source).unwrap();
-        let result = inject_global_allocator(source, kind).unwrap();
+        let (result, _map) = inject_global_allocator(source, kind).unwrap();
         assert!(
             result.contains("PianoAllocator<Jemalloc>"),
             "should wrap linux allocator. Got:\n{result}"
@@ -1782,7 +2005,7 @@ static ALLOC: System = System;
 fn main() {}
 "#;
         let kind = detect_allocator_kind(source).unwrap();
-        let result = inject_global_allocator(source, kind).unwrap();
+        let (result, _map) = inject_global_allocator(source, kind).unwrap();
         assert!(
             result.contains("PianoAllocator"),
             "should wrap allocator. Got:\n{result}"
@@ -1800,7 +2023,7 @@ fn main() {
     do_stuff();
 }
 "#;
-        let result = inject_shutdown(source, Some("/project/target/piano/runs")).unwrap();
+        let (result, _map) = inject_shutdown(source, Some("/project/target/piano/runs")).unwrap();
 
         assert!(
             result.contains("piano_runtime::init()"),
@@ -1823,7 +2046,7 @@ fn main() {
     do_stuff();
 }
 "#;
-        let result = inject_shutdown(source, None).unwrap();
+        let (result, _map) = inject_shutdown(source, None).unwrap();
         assert!(
             result.contains("piano_runtime::shutdown()"),
             "should inject shutdown. Got:\n{result}"
@@ -1851,7 +2074,8 @@ fn main() {
     do_stuff();
 }
 "#;
-        let result = inject_shutdown(source, Some("/tmp/my-project/target/piano/runs")).unwrap();
+        let (result, _map) =
+            inject_shutdown(source, Some("/tmp/my-project/target/piano/runs")).unwrap();
         assert!(
             result.contains("piano_runtime::shutdown_to")
                 && result.contains("std::path::Path::new(\"/tmp/my-project/target/piano/runs\")"),
@@ -1866,7 +2090,7 @@ fn main() {
     do_stuff();
 }
 "#;
-        let result = inject_shutdown(source, Some("/project/target/piano/runs")).unwrap();
+        let (result, _map) = inject_shutdown(source, Some("/project/target/piano/runs")).unwrap();
         assert!(
             result.contains("piano_runtime::set_runs_dir"),
             "should inject set_runs_dir when runs_dir is provided. Got:\n{result}"
@@ -1889,7 +2113,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 "#;
-        let result = inject_shutdown(source, None).unwrap();
+        let (result, _map) = inject_shutdown(source, None).unwrap();
         assert!(
             result.contains("piano_runtime::shutdown()"),
             "should inject shutdown. Got:\n{result}"
@@ -1935,7 +2159,7 @@ async fn main() {
     do_stuff().await;
 }
 "#;
-        let result = inject_shutdown(source, None).unwrap();
+        let (result, _map) = inject_shutdown(source, None).unwrap();
         assert!(
             result.contains("piano_runtime::shutdown()"),
             "should inject shutdown. Got:\n{result}"
@@ -1954,7 +2178,7 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 "#;
-        let result = inject_shutdown(source, None).unwrap();
+        let (result, _map) = inject_shutdown(source, None).unwrap();
         assert!(
             result.contains("piano_runtime::shutdown()"),
             "should inject shutdown. Got:\n{result}"
@@ -1984,7 +2208,7 @@ async fn main() {
     do_stuff().await;
 }
 "#;
-        let result = inject_shutdown(source, Some("/project/target/piano/runs")).unwrap();
+        let (result, _map) = inject_shutdown(source, Some("/project/target/piano/runs")).unwrap();
         assert!(
             result.contains("piano_runtime::set_runs_dir"),
             "should inject set_runs_dir for async main. Got:\n{result}"
@@ -2986,7 +3210,7 @@ fn main() {}
             fn main() {}
         "#;
         let kind = detect_allocator_kind(src).unwrap();
-        let result = inject_global_allocator(src, kind).unwrap();
+        let (result, _map) = inject_global_allocator(src, kind).unwrap();
         assert!(result.contains("PianoAllocator"), "should wrap allocator");
         assert!(result.contains("_PIANO_ALLOC"), "should inject fallback");
         assert!(
@@ -3471,5 +3695,28 @@ fn foo() -> impl Future<Output = ()> {
             "should NOT wrap in PianoFuture when no trailing expression. Got:\n{}",
             result.source,
         );
+    }
+
+    #[test]
+    fn instrument_preserves_original_line_numbers() {
+        let source =
+            "fn target() {\n    let x = 1;\n    let y = 2;\n}\n\nfn other() {\n    let z = 3;\n}\n";
+        let targets: HashSet<String> = ["target".to_string()].into_iter().collect();
+        let result = instrument_source(source, &targets, false).unwrap();
+        let result_lines: Vec<&str> = result.source.lines().collect();
+        // "fn other()" is on original line 6. With 1 guard line injected for target(),
+        // it should be at line index 6 (0-indexed).
+        let other_pos = result_lines
+            .iter()
+            .position(|l| l.contains("fn other()"))
+            .unwrap();
+        assert_eq!(
+            other_pos, 6,
+            "fn other() should be at line index 6 (orig 5 + 1 injection). Got:\n{}",
+            result.source,
+        );
+        // The source_map should remap correctly.
+        let map = &result.source_map;
+        assert_eq!(map.remap_line(7), Some(6));
     }
 }
