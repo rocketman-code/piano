@@ -611,10 +611,14 @@ thread_local! {
 /// handlers (glibc >= 2.18, macOS), this preserves buffered data that the
 /// atexit handler can then collect from the global registries.
 ///
-/// Destruction order: the initializer force-touches RECORDS_BUF, RECORDS,
-/// FRAME_BUFFER, and FRAMES so their destructors are registered first.
-/// Reverse-order destruction means this guard is destroyed first, while
-/// all dependencies are still alive.
+/// Also drains in-flight STACK entries (functions whose Guards never dropped
+/// due to process::exit) into RECORDS_BUF and FRAME_BUFFER before the
+/// buffer-to-Arc drain, recovering timing data for those functions.
+///
+/// Destruction order: the initializer force-touches STACK, RECORDS_BUF,
+/// RECORDS, FRAME_BUFFER, and FRAMES so their destructors are registered
+/// first. Reverse-order destruction means this guard is destroyed first,
+/// while all dependencies are still alive.
 struct TlsFlushGuard;
 
 impl Drop for TlsFlushGuard {
@@ -623,6 +627,63 @@ impl Drop for TlsFlushGuard {
     // workspace level, but not reachable from piano-runtime unit tests because
     // process::exit() would kill the test runner.
     fn drop(&mut self) {
+        // Drain in-flight STACK entries for functions whose Guards never
+        // dropped (process::exit). Read current TSC as the end time.
+        // Must happen before RECORDS_BUF/FRAME_BUFFER drains below,
+        // because we merge into those buffers here.
+        let _ = STACK.try_with(|stack| {
+            let s = unsafe { &mut *stack.get() };
+            if s.is_empty() {
+                return;
+            }
+            let end_tsc = crate::tsc::read();
+            #[cfg(feature = "cpu-time")]
+            let cpu_end_ns = crate::cpu_clock::cpu_now_ns();
+
+            // Process all in-flight entries. Skip entries with start_tsc == 0
+            // (synthetic adopt anchors that are not real timed functions).
+            for entry in s.drain(..) {
+                if entry.start_tsc == 0 {
+                    continue;
+                }
+                let name = lookup_name(unpack_name_id(entry.packed));
+                let raw_ticks = end_tsc.wrapping_sub(entry.start_tsc);
+                let corrected_ticks = raw_ticks.saturating_sub(crate::tsc::bias_ticks());
+                let elapsed_ns = crate::tsc::ticks_to_ns(corrected_ticks);
+                let children_ns = entry.children_ns;
+                let self_ns = elapsed_ns.saturating_sub(children_ns);
+
+                #[cfg(feature = "cpu-time")]
+                let cpu_elapsed_ns = cpu_end_ns.saturating_sub(entry.cpu_start_ns);
+                #[cfg(feature = "cpu-time")]
+                let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
+
+                let _ = RECORDS_BUF.try_with(|buf| {
+                    merge_into_fnagg_vec(
+                        &mut buf.borrow_mut(),
+                        name,
+                        elapsed_ns,
+                        children_ns,
+                        #[cfg(feature = "cpu-time")]
+                        cpu_self_ns,
+                    );
+                });
+
+                let _ = FRAME_BUFFER.try_with(|buf| {
+                    merge_into_frame_buf(
+                        &mut buf.borrow_mut(),
+                        name,
+                        self_ns,
+                        #[cfg(feature = "cpu-time")]
+                        cpu_self_ns,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                });
+            }
+        });
         // Drain RECORDS_BUF -> RECORDS Arc (survives via THREAD_RECORDS).
         let _ = RECORDS_BUF.try_with(|buf| {
             let mut buf = buf.borrow_mut();
@@ -662,6 +723,8 @@ thread_local! {
     /// See `TlsFlushGuard` doc comment for the destruction order contract.
     static TLS_FLUSH_GUARD: TlsFlushGuard = {
         // Force-init dependencies so their destructors register before ours.
+        // STACK must be first: it is read during drop to recover in-flight entries.
+        STACK.with(|_| ());
         RECORDS_BUF.with(|_| ());
         RECORDS.with(|_| ());
         FRAME_BUFFER.with(|_| ());
