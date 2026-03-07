@@ -94,8 +94,8 @@ enum Commands {
     /// Pass arguments to the binary after --.
     Run {
         /// Stop profiling after N seconds (sends SIGTERM to the binary).
-        #[arg(long, value_name = "SECONDS")]
-        duration: Option<u64>,
+        #[arg(long, value_name = "SECONDS", value_parser = parse_duration_secs)]
+        duration: Option<f64>,
 
         /// Arguments to pass to the instrumented binary (after --).
         #[arg(last = true)]
@@ -128,8 +128,8 @@ enum Commands {
         ignore_exit_code: bool,
 
         /// Stop profiling after N seconds (sends SIGTERM to the binary).
-        #[arg(long, value_name = "SECONDS")]
-        duration: Option<u64>,
+        #[arg(long, value_name = "SECONDS", value_parser = parse_duration_secs)]
+        duration: Option<f64>,
 
         /// Arguments to pass to the instrumented binary (after --).
         #[arg(last = true)]
@@ -172,6 +172,25 @@ enum Commands {
         /// Tag name. If omitted, lists all saved tags.
         name: Option<String>,
     },
+}
+
+fn parse_duration_secs(s: &str) -> Result<f64, String> {
+    let secs: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    if secs.is_nan() || secs.is_infinite() {
+        return Err("invalid duration".to_string());
+    }
+    if secs < 0.0 {
+        return Err("duration cannot be negative".to_string());
+    }
+    if secs == 0.0 {
+        return Err("duration cannot be zero".to_string());
+    }
+    if secs > std::time::Duration::MAX.as_secs_f64() {
+        return Err("duration is too large".to_string());
+    }
+    Ok(secs)
 }
 
 fn main() {
@@ -630,8 +649,17 @@ fn run_child(
 
     CHILD_PID.store(child.id(), Ordering::SeqCst);
 
-    if let Some(dur) = timeout {
-        eprintln!("will stop after {} second(s)", dur.as_secs());
+    if let Some(mut dur) = timeout {
+        const MIN_DURATION: Duration = Duration::from_millis(1);
+        if dur < MIN_DURATION {
+            eprintln!(
+                "warning: --duration {}s is below minimum resolution, using {}ms",
+                dur.as_secs_f64(),
+                MIN_DURATION.as_millis()
+            );
+            dur = MIN_DURATION;
+        }
+        eprintln!("will stop after {}s", dur.as_secs_f64());
         std::thread::spawn(move || {
             std::thread::sleep(dur);
             DURATION_EXPIRED.store(true, Ordering::SeqCst);
@@ -678,7 +706,7 @@ fn run_child(
 }
 
 fn cmd_run(
-    duration: Option<u64>,
+    duration: Option<f64>,
     args: Vec<String>,
     project_root: &Option<PathBuf>,
 ) -> Result<(), Error> {
@@ -686,7 +714,7 @@ fn cmd_run(
     eprintln!("running: {}", binary.display());
     eprintln!("--- program output ---");
 
-    let timeout = duration.map(Duration::from_secs);
+    let timeout = duration.map(Duration::from_secs_f64);
     let outcome = run_child(&binary, &args, timeout, false)?;
 
     match outcome.stop_reason {
@@ -705,7 +733,7 @@ fn cmd_profile(
     json: bool,
     threads: bool,
     ignore_exit_code: bool,
-    duration: Option<u64>,
+    duration: Option<f64>,
     args: Vec<String>,
 ) -> Result<(), Error> {
     let Some((binary, runs_dir, total_fns)) = build_project(opts, project_root)? else {
@@ -723,7 +751,7 @@ fn cmd_profile(
         .unwrap_or_default()
         .as_millis();
 
-    let timeout = duration.map(Duration::from_secs);
+    let timeout = duration.map(Duration::from_secs_f64);
     let outcome = run_child(&binary, &args, timeout, json)?;
     let intentional_stop = matches!(
         outcome.stop_reason,

@@ -830,3 +830,81 @@ fn sigint_terminates_child_and_produces_data() {
         "report should contain 'work' function, got: {stdout}"
     );
 }
+
+#[test]
+fn duration_zero_rejected() {
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let output = Command::new(piano_bin)
+        .args(["profile", "--duration", "0"])
+        .output()
+        .expect("failed to run piano");
+
+    assert!(
+        !output.status.success(),
+        "piano profile --duration 0 should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("duration cannot be zero"),
+        "should mention 'duration cannot be zero', got: {stderr}"
+    );
+}
+
+#[test]
+fn duration_negative_rejected() {
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let output = Command::new(piano_bin)
+        .args(["profile", "--duration=-1"])
+        .output()
+        .expect("failed to run piano");
+
+    assert!(
+        !output.status.success(),
+        "piano profile --duration -1 should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("duration cannot be negative"),
+        "should mention 'duration cannot be negative', got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn duration_fractional_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("sleeper");
+    create_sleeping_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let runs_dir = tmp.path().join("runs");
+
+    let output = Command::new(piano_bin)
+        .args(["profile", "--fn", "work", "--duration", "2.5", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run piano profile with --duration 2.5");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano profile --duration 2.5 should exit 0, got: {:?}\nstderr: {stderr}\nstdout: {stdout}",
+        output.status.code()
+    );
+
+    assert!(
+        stderr.contains("will stop after 2.5s"),
+        "should show 'will stop after 2.5s', got: {stderr}"
+    );
+}
