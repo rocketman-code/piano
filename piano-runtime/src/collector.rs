@@ -451,6 +451,10 @@ pub struct InvocationRecord {
 /// Entry on the thread-local timing stack.
 #[derive(Clone, Copy)]
 pub(crate) struct StackEntry {
+    /// TSC value captured during enter(). Stored here (in addition to Guard)
+    /// so TlsFlushGuard::drop can recover timing for in-flight functions
+    /// whose Guards never dropped (process::exit).
+    pub(crate) start_tsc: u64,
     pub(crate) children_ns: u64,
     #[cfg(feature = "cpu-time")]
     pub(crate) cpu_children_ns: u64,
@@ -1115,6 +1119,7 @@ fn enter_cold(name: &'static str) {
         let depth = s.len() as u16;
         let packed = pack_name_depth(name_id, depth);
         s.push(StackEntry {
+            start_tsc: 0,
             children_ns: 0,
             #[cfg(feature = "cpu-time")]
             cpu_children_ns: 0,
@@ -1848,6 +1853,7 @@ pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
     with_stack_mut(|s| {
         let depth = s.len() as u16;
         s.push(StackEntry {
+            start_tsc: 0,
             children_ns: 0,
             #[cfg(feature = "cpu-time")]
             cpu_children_ns: 0,
@@ -2895,13 +2901,13 @@ mod tests {
     #[test]
     fn stack_entry_size() {
         let size = core::mem::size_of::<StackEntry>();
-        // Without cpu-time: 48 bytes (name resolved via packed name_id).
-        // With cpu-time: 64 bytes (two extra u64 fields for cpu_children_ns, cpu_start_ns;
-        // power-of-two enables lsl #6 indexing on ARM).
+        // Without cpu-time: 56 bytes (name resolved via packed name_id; includes start_tsc
+        // for process::exit recovery).
+        // With cpu-time: 72 bytes (two extra u64 fields for cpu_children_ns, cpu_start_ns).
         #[cfg(not(feature = "cpu-time"))]
-        assert_eq!(size, 48, "StackEntry without cpu-time must be 48 bytes");
+        assert_eq!(size, 56, "StackEntry without cpu-time must be 56 bytes");
         #[cfg(feature = "cpu-time")]
-        assert_eq!(size, 64, "StackEntry with cpu-time must be 64 bytes");
+        assert_eq!(size, 72, "StackEntry with cpu-time must be 72 bytes");
     }
 
     #[test]
