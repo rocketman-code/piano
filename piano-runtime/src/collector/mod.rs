@@ -29,19 +29,30 @@
 //! self-time. `SpanContext` auto-finalizes on Drop.
 
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::collections::{HashMap, HashSet};
-use std::io::{BufWriter, Write};
+use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{compiler_fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+pub(crate) mod fork_adopt;
+pub(crate) mod name_table;
+pub(crate) mod ndjson;
+mod signal;
+
+// Re-export submodule items for crate-level access
+pub use fork_adopt::{adopt, fork, AdoptGuard, SpanContext};
+use name_table::{intern_name, pack_name_depth, unpack_depth};
+pub(crate) use name_table::{lookup_name, unpack_name_id};
+use ndjson::{flush_impl, stream_frame, write_ndjson, write_stream_trailer, StreamState};
 
 /// Thread-safe, initialize-once cell using `Once` + `UnsafeCell`.
 ///
 /// Equivalent to `OnceLock` (stabilized in 1.70) but works on Rust 1.59+.
 /// The `Once` primitive guarantees single-writer semantics; after initialization
 /// the value is read-only, so there are no data races.
-struct SyncOnceCell<T> {
+pub(super) struct SyncOnceCell<T> {
     once: Once,
     value: UnsafeCell<Option<T>>,
 }
@@ -118,13 +129,6 @@ static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
 /// and write to STREAM_FILE instead of buffering in FRAMES.
 static STREAMING_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// State for the streaming NDJSON file.
-struct StreamState {
-    file: std::io::BufWriter<std::fs::File>,
-    path: PathBuf,
-    frame_count: usize,
-}
-
 /// Global streaming file handle, lazily opened on first frame.
 ///
 /// All threads serialize frame writes through this single mutex. For typical
@@ -138,259 +142,6 @@ static STREAM_FILE: SyncOnceCell<Mutex<Option<StreamState>>> = SyncOnceCell::new
 
 fn stream_file() -> &'static Mutex<Option<StreamState>> {
     STREAM_FILE.get_or_init(|| Mutex::new(None))
-}
-
-/// Open a new streaming NDJSON file and write the v4 header.
-fn open_stream_file(dir: &std::path::Path) -> std::io::Result<StreamState> {
-    std::fs::create_dir_all(dir)?;
-    let ts = timestamp_ms();
-    let path = dir.join(format!("{ts}.ndjson"));
-    let mut file = std::io::BufWriter::new(std::fs::File::create(&path)?);
-    let run_id = run_id();
-
-    write!(
-        file,
-        "{{\"format_version\":4,\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts}"
-    )?;
-    #[cfg(feature = "cpu-time")]
-    write!(file, ",\"has_cpu_time\":true")?;
-    writeln!(file, "}}")?;
-
-    Ok(StreamState {
-        file,
-        path,
-        frame_count: 0,
-    })
-}
-
-/// Write a frame to an already-locked StreamState.
-fn stream_frame_to_writer(state: &mut StreamState, buf: &[FrameFnSummary]) {
-    let frame_idx = state.frame_count;
-    let tid = THREAD_INDEX.with(|c| c.get());
-    let _ = write!(
-        state.file,
-        "{{\"frame\":{frame_idx},\"tid\":{tid},\"fns\":["
-    );
-    for (i, entry) in buf.iter().enumerate() {
-        if i > 0 {
-            let _ = write!(state.file, ",");
-        }
-        let fn_id = intern_name(entry.name);
-        let _ = write!(
-            state.file,
-            "{{\"id\":{},\"calls\":{},\"self_ns\":{},\"ac\":{},\"ab\":{},\"fc\":{},\"fb\":{}",
-            fn_id,
-            entry.calls,
-            entry.self_ns,
-            entry.alloc_count,
-            entry.alloc_bytes,
-            entry.free_count,
-            entry.free_bytes
-        );
-        #[cfg(feature = "cpu-time")]
-        let _ = write!(state.file, ",\"csn\":{}", entry.cpu_self_ns);
-        let _ = write!(state.file, "}}");
-    }
-    let _ = writeln!(state.file, "]}}");
-    state.frame_count += 1;
-}
-
-/// Push a frame into the thread-local in-memory buffer (fallback path).
-fn push_to_frames(buf: &[FrameFnSummary]) {
-    FRAMES.with(|frames| {
-        frames
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(buf.to_vec());
-    });
-}
-
-/// Stream a completed frame to disk, or fall back to in-memory FRAMES.
-///
-/// When streaming is enabled (init() was called), writes one NDJSON line
-/// per frame to the global stream file. When not enabled (tests), pushes
-/// to the thread-local FRAMES vec as before.
-fn stream_frame(buf: &[FrameFnSummary]) {
-    if !STREAMING_ENABLED.load(Ordering::Relaxed) {
-        push_to_frames(buf);
-        return;
-    }
-
-    let dir = match runs_dir() {
-        Some(d) => d,
-        None => {
-            push_to_frames(buf);
-            return;
-        }
-    };
-
-    let mut state = stream_file().lock().unwrap_or_else(|e| e.into_inner());
-
-    if state.is_none() {
-        // After shutdown, the stream file has been closed and the trailer
-        // written. Don't open a new orphan file (it would have no trailer
-        // and the BufWriter might not flush before process exit).
-        if SHUTDOWN_DONE.load(Ordering::Relaxed) {
-            return;
-        }
-        match open_stream_file(&dir) {
-            Ok(s) => *state = Some(s),
-            Err(e) => {
-                eprintln!("piano: failed to open stream file: {e}");
-                drop(state);
-                push_to_frames(buf);
-                return;
-            }
-        }
-    }
-
-    if let Some(ref mut s) = *state {
-        stream_frame_to_writer(s, buf);
-    }
-}
-
-/// Write the function name table as a trailer line and flush.
-fn write_stream_trailer(state: &mut StreamState) -> std::io::Result<()> {
-    let len = NAME_TABLE_LEN.load(Ordering::Acquire);
-    write!(state.file, "{{\"functions\":[")?;
-    for i in 0..len {
-        if i > 0 {
-            write!(state.file, ",")?;
-        }
-        let name = name_table_get(i).unwrap_or("<unknown>");
-        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-        write!(state.file, "\"{escaped}\"")?;
-    }
-    writeln!(state.file, "]}}")?;
-    state.file.flush()?;
-    Ok(())
-}
-
-/// Signal handling for graceful data recovery on SIGTERM / SIGINT.
-///
-/// On Unix, `init()` registers signal handlers so that profiling data is
-/// flushed before the process exits. This prevents data loss when the
-/// profiled program is killed (e.g. Ctrl-C, `kill`).
-///
-/// Calling `shutdown_impl_inner` from a signal handler is technically not
-/// async-signal-safe (it acquires mutexes, allocates, does file I/O).
-/// This is a pragmatic choice: for a profiling tool the worst case is a
-/// corrupted output file, which is strictly better than losing all data
-/// (the current behavior without signal handling). Many profilers take
-/// the same approach.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-mod signal {
-    use super::*;
-
-    const SIGINT: i32 = 2;
-    const SIGTERM: i32 = 15;
-    const SA_RESETDFL: i32 = {
-        #[cfg(target_os = "linux")]
-        {
-            // SA_RESETDFL == SA_ONESHOT == 0x80000000 on Linux
-            0x80000000u32 as i32
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // SA_RESETDFL == 4 on macOS
-            4
-        }
-    };
-
-    #[cfg(target_os = "linux")]
-    #[repr(C)]
-    struct Sigaction {
-        sa_handler: extern "C" fn(i32),
-        sa_mask: [u8; 128], // sigset_t is 128 bytes on Linux
-        sa_flags: i32,
-        sa_restorer: usize,
-    }
-
-    #[cfg(target_os = "macos")]
-    #[repr(C)]
-    struct Sigaction {
-        sa_handler: extern "C" fn(i32),
-        sa_mask: u32, // sigset_t is 4 bytes on macOS
-        sa_flags: i32,
-    }
-
-    extern "C" {
-        fn sigaction(sig: i32, act: *const Sigaction, oldact: *mut Sigaction) -> i32;
-        fn raise(sig: i32) -> i32;
-    }
-
-    extern "C" fn handler(sig: i32) {
-        // Guard: if shutdown already ran (normal exit path), just re-raise.
-        if SHUTDOWN_DONE.swap(true, Ordering::SeqCst) {
-            // Data already written. Re-raise with default handler
-            // (SA_RESETDFL restored the default before we were called).
-            unsafe { raise(sig) };
-            return;
-        }
-
-        // Best-effort flush. Not async-signal-safe, but losing data is worse.
-        // Uses runs_dir_nonblocking() to avoid deadlocking when the signal
-        // fires while set_runs_dir() holds the RUNS_DIR mutex.
-        if let Some(dir) = runs_dir_nonblocking() {
-            let _ = shutdown_impl_inner(&dir);
-        }
-
-        // Re-raise so the process exits with the correct signal status.
-        // SA_RESETDFL already restored the default disposition, so this
-        // will terminate the process normally.
-        unsafe { raise(sig) };
-    }
-
-    pub(super) fn install_handlers() {
-        unsafe {
-            for &sig in &[SIGINT, SIGTERM] {
-                #[cfg(target_os = "linux")]
-                let act = Sigaction {
-                    sa_handler: handler,
-                    sa_mask: [0u8; 128],
-                    sa_flags: SA_RESETDFL,
-                    sa_restorer: 0,
-                };
-                #[cfg(target_os = "macos")]
-                let act = Sigaction {
-                    sa_handler: handler,
-                    sa_mask: 0,
-                    sa_flags: SA_RESETDFL,
-                };
-                sigaction(sig, &act, std::ptr::null_mut());
-            }
-        }
-    }
-}
-
-/// Register a C-level atexit handler so profiling data is flushed when user
-/// code calls `std::process::exit()`.
-///
-/// `std::process::exit()` calls libc `exit()`, which runs atexit handlers
-/// but does NOT trigger Rust stack unwinding. Without this, all profiling
-/// data is silently lost on `process::exit()`. The `SHUTDOWN_DONE` atomic
-/// prevents double-writes when the normal shutdown path also runs.
-mod atexit {
-    use super::*;
-
-    extern "C" {
-        fn atexit(f: extern "C" fn()) -> i32;
-    }
-
-    extern "C" fn on_exit() {
-        if SHUTDOWN_DONE.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        if let Some(dir) = runs_dir_nonblocking() {
-            let _ = shutdown_impl_inner(&dir);
-        }
-    }
-
-    pub(super) fn register() {
-        unsafe {
-            atexit(on_exit);
-        }
-    }
 }
 
 fn epoch() -> Instant {
@@ -830,172 +581,6 @@ fn flush_records_buf() {
             }
         });
     });
-}
-
-// -- Interned function name table ------------------------------------------
-//
-// Maps u16 IDs to `&'static str` function names so the Guard can carry a
-// compact name reference without growing beyond 16 bytes.
-//
-// Layout: append-only Vec behind a Mutex. Reads during drop_cold take the
-// lock briefly; writes happen once per unique name in enter_cold.
-// A thread-local cache avoids the global lock on the hot path.
-
-/// Lock-free interned name table: index -> &'static str.
-///
-/// Each slot stores a `&'static str` as (AtomicPtr<u8>, AtomicUsize) for the
-/// data pointer and length. Reads use Acquire ordering; writes use Release.
-/// The table is append-only: once written, a slot never changes.
-/// NAME_TABLE_LEN tracks how many slots are valid.
-///
-/// Maximum 4096 unique function names. This covers all practical programs
-/// (typical instrumented binaries have <100 unique functions). The table
-/// occupies 64KB of BSS (zero-initialized, no runtime cost until used).
-const NAME_TABLE_CAPACITY: usize = 4096;
-
-static NAME_TABLE_PTRS: [AtomicPtr<u8>; NAME_TABLE_CAPACITY] = {
-    // SAFETY: AtomicPtr<u8> has the same representation as *mut u8,
-    // and null is a valid value for AtomicPtr.
-    // const { } blocks aren't available at MSRV 1.59, so we use transmute.
-    // This is a well-known pattern for initializing large atomic arrays.
-    unsafe { core::mem::transmute([core::ptr::null_mut::<u8>(); NAME_TABLE_CAPACITY]) }
-};
-#[allow(unused_braces)]
-static NAME_TABLE_LENS: [AtomicUsize; NAME_TABLE_CAPACITY] =
-    { unsafe { core::mem::transmute([0usize; NAME_TABLE_CAPACITY]) } };
-static NAME_TABLE_LEN: AtomicUsize = AtomicUsize::new(0);
-
-/// Mutex protecting writes to the name table. Reads are lock-free.
-/// Uses SyncOnceCell for MSRV 1.59 compatibility (Mutex::new is not const).
-static NAME_TABLE_WRITE_LOCK: SyncOnceCell<Mutex<()>> = SyncOnceCell::new();
-
-fn name_table_lock() -> &'static Mutex<()> {
-    NAME_TABLE_WRITE_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-/// Read a name from the lock-free table by index.
-/// Returns None if index is out of range.
-#[inline(always)]
-fn name_table_get(idx: usize) -> Option<&'static str> {
-    if idx >= NAME_TABLE_LEN.load(Ordering::Acquire) {
-        return None;
-    }
-    let ptr = NAME_TABLE_PTRS[idx].load(Ordering::Acquire);
-    let len = NAME_TABLE_LENS[idx].load(Ordering::Acquire);
-    // SAFETY: the pointer and length were stored from a valid &'static str
-    // and the slot is immutable once written (append-only table).
-    Some(unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len)) })
-}
-
-/// Append a name to the lock-free table. Caller must hold NAME_TABLE_WRITE_LOCK.
-/// Returns the assigned index.
-/// Compute the saturation index when the name table is full.
-///
-/// Returns the last valid slot so that lookups remain in-bounds even if
-/// a new unique function name appears after the table is exhausted.
-/// Extracted as a pure function for testability in debug builds where
-/// `name_table_push` panics via `debug_assert` on overflow.
-#[inline(always)]
-fn name_table_overflow_index() -> u16 {
-    (NAME_TABLE_CAPACITY - 1) as u16
-}
-
-fn name_table_push(name: &'static str) -> u16 {
-    let idx = NAME_TABLE_LEN.load(Ordering::Acquire);
-    debug_assert!(
-        idx < NAME_TABLE_CAPACITY,
-        "interned name table overflow: more than {NAME_TABLE_CAPACITY} unique function names"
-    );
-    if idx >= NAME_TABLE_CAPACITY {
-        // Saturate at max capacity -- degrades gracefully.
-        return name_table_overflow_index();
-    }
-    NAME_TABLE_PTRS[idx].store(name.as_ptr() as *mut u8, Ordering::Release);
-    NAME_TABLE_LENS[idx].store(name.len(), Ordering::Release);
-    NAME_TABLE_LEN.store(idx + 1, Ordering::Release);
-    idx as u16
-}
-
-// Thread-local cache mapping name pointer -> interned ID.
-// Uses pointer identity (`&'static str` addresses are stable).
-thread_local! {
-    static NAME_CACHE: RefCell<HashMap<usize, u16>> = RefCell::new(HashMap::new());
-}
-
-/// Intern a function name, returning its u16 ID.
-/// Fast path: thread-local cache hit (no global lock).
-/// Slow path: global table lookup/insert under write lock, then cache.
-#[inline(always)]
-fn intern_name(name: &'static str) -> u16 {
-    let ptr = name.as_ptr() as usize;
-    let cached = NAME_CACHE.with(|cache| cache.borrow().get(&ptr).copied());
-    if let Some(id) = cached {
-        return id;
-    }
-    intern_name_slow(name, ptr)
-}
-
-#[inline(never)]
-fn intern_name_slow(name: &'static str, ptr: usize) -> u16 {
-    let _guard = name_table_lock().lock().unwrap_or_else(|e| e.into_inner());
-    // Check if already in global table (another thread may have added it).
-    let len = NAME_TABLE_LEN.load(Ordering::Acquire);
-    let id = {
-        let found = NAME_TABLE_PTRS[..len]
-            .iter()
-            .position(|p| p.load(Ordering::Acquire) as usize == ptr);
-        if let Some(pos) = found {
-            pos as u16
-        } else {
-            name_table_push(name)
-        }
-    };
-    drop(_guard);
-    NAME_CACHE.with(|cache| {
-        cache.borrow_mut().insert(ptr, id);
-    });
-    id
-}
-
-/// Pack a name ID (16 bits) and stack depth (16 bits) into a u64.
-///
-/// Layout: `[unused:32][name_id:16][depth:16]`
-#[inline(always)]
-fn pack_name_depth(name_id: u16, depth: u16) -> u64 {
-    ((name_id as u64) << 16) | (depth as u64)
-}
-
-/// Unpack the name ID (bits 16..31) from a packed u64.
-#[inline(always)]
-pub(crate) fn unpack_name_id(packed: u64) -> u16 {
-    (packed >> 16) as u16
-}
-
-/// Unpack the stack depth (low 16 bits) from a packed u64.
-#[inline(always)]
-fn unpack_depth(packed: u64) -> u16 {
-    packed as u16
-}
-
-/// Resolve a name ID back to its interned `&'static str`.
-///
-/// Lock-free: reads directly from the static atomic arrays.
-/// No TLS access, no Mutex, no allocation.
-///
-/// Panics (debug) / returns `"<unknown>"` (release) if the ID is out of range.
-#[inline(always)]
-pub(crate) fn lookup_name(name_id: u16) -> &'static str {
-    match name_table_get(name_id as usize) {
-        Some(name) => name,
-        None => {
-            debug_assert!(
-                false,
-                "lookup_name: id {name_id} out of range (table len {})",
-                NAME_TABLE_LEN.load(Ordering::Relaxed)
-            );
-            "<unknown>"
-        }
-    }
 }
 
 /// RAII timing guard. Records elapsed time on drop.
@@ -1456,69 +1041,6 @@ fn dirs_fallback() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Write an NDJSON file with frame-level data.
-///
-/// Line 1: header with metadata and function name table.
-/// Lines 2+: one line per frame with per-function summaries.
-fn write_ndjson(
-    frames: &[(usize, Vec<FrameFnSummary>)],
-    fn_names: &[&str],
-    path: &std::path::Path,
-) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut f = BufWriter::new(std::fs::File::create(path)?);
-    let ts = timestamp_ms();
-    let run_id = run_id();
-
-    // v4 header: metadata only (no functions — those go in the trailer)
-    write!(
-        f,
-        "{{\"format_version\":4,\"run_id\":\"{run_id}\",\"timestamp_ms\":{ts}"
-    )?;
-    #[cfg(feature = "cpu-time")]
-    write!(f, ",\"has_cpu_time\":true")?;
-    writeln!(f, "}}")?;
-
-    // Build index for O(1) fn_id lookup
-    let fn_id_map: HashMap<&str, usize> =
-        fn_names.iter().enumerate().map(|(i, &n)| (n, i)).collect();
-
-    // One line per frame
-    for (frame_idx, (tid, frame)) in frames.iter().enumerate() {
-        write!(f, "{{\"frame\":{frame_idx},\"tid\":{tid},\"fns\":[")?;
-        for (i, s) in frame.iter().enumerate() {
-            if i > 0 {
-                write!(f, ",")?;
-            }
-            let fn_id = fn_id_map.get(s.name).copied().unwrap_or(0);
-            write!(
-                f,
-                "{{\"id\":{},\"calls\":{},\"self_ns\":{},\"ac\":{},\"ab\":{},\"fc\":{},\"fb\":{}",
-                fn_id, s.calls, s.self_ns, s.alloc_count, s.alloc_bytes, s.free_count, s.free_bytes
-            )?;
-            #[cfg(feature = "cpu-time")]
-            write!(f, ",\"csn\":{}", s.cpu_self_ns)?;
-            write!(f, "}}")?;
-        }
-        writeln!(f, "]}}")?;
-    }
-
-    // v4 trailer: function name table
-    write!(f, "{{\"functions\":[")?;
-    for (i, name) in fn_names.iter().enumerate() {
-        if i > 0 {
-            write!(f, ",")?;
-        }
-        let name = name.replace('\\', "\\\\").replace('"', "\\\"");
-        write!(f, "\"{name}\"")?;
-    }
-    writeln!(f, "]}}")?;
-
-    Ok(())
-}
-
 /// Flush collected timing data to disk in NDJSON format.
 ///
 /// If frame data is present, writes one line per frame. If only aggregate
@@ -1558,45 +1080,6 @@ pub fn flush() {
     flush_impl(&dir);
 }
 
-/// Collect frames from all threads and write them to the given directory.
-///
-/// Shared implementation for `flush()` (non-streaming path) and `flush_to()`.
-/// Collects (clones) frames from all threads -- we intentionally do NOT drain
-/// other threads' frames here. Only the local thread's state is cleared via
-/// `reset()`. Other threads' frames persist for the final `shutdown()` write.
-fn flush_impl(dir: &std::path::Path) {
-    let mut frames = collect_frames_with_tid();
-
-    // Synthesize from aggregates if no frames exist (same as shutdown_impl_inner).
-    if frames.is_empty() {
-        let agg = collect_all_fnagg();
-        if agg.is_empty() {
-            return;
-        }
-        frames.push((0, synthesize_frame_from_agg(&agg)));
-    }
-
-    let mut seen = HashSet::new();
-    let mut fn_names: Vec<&str> = Vec::new();
-    for (_, frame) in &frames {
-        for s in frame {
-            if seen.insert(s.name) {
-                fn_names.push(s.name);
-            }
-        }
-    }
-    let path = dir.join(format!("{}.ndjson", timestamp_ms()));
-    if let Err(e) = write_ndjson(&frames, &fn_names, &path) {
-        eprintln!(
-            "piano: failed to write profiling data to {}: {e}",
-            path.display()
-        );
-    }
-    // Clear only the local thread's records, stack, and frames so subsequent
-    // enter() calls start fresh. Other threads' state is left intact.
-    reset();
-}
-
 /// Write collected profiling data to the specified directory.
 ///
 /// Like `flush()` but takes an explicit directory, bypassing the global
@@ -1618,7 +1101,7 @@ pub fn flush_to(dir: &std::path::Path) {
 pub fn init() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     signal::install_handlers();
-    atexit::register();
+    signal::register_atexit();
     STREAMING_ENABLED.store(true, Ordering::Relaxed);
 }
 
@@ -1788,166 +1271,6 @@ fn shutdown_impl_inner(dir: &std::path::Path) -> bool {
     write_failed
 }
 
-/// Context for propagating parent-child CPU timing across thread boundaries.
-///
-/// Created by `fork()` on the parent thread, passed to child threads via
-/// `adopt()`. When the child completes, its CPU time is accumulated
-/// in `children_cpu_ns` which the parent reads back via Drop (or explicit `finalize()`).
-/// Wall time is NOT propagated cross-thread (it's not additive for parallel work).
-#[non_exhaustive]
-pub struct SpanContext {
-    parent_name: &'static str,
-    #[cfg(feature = "cpu-time")]
-    children_cpu_ns: Arc<Mutex<u64>>,
-    finalized: bool,
-}
-
-impl SpanContext {
-    /// Explicitly finalize cross-thread attribution.
-    /// Equivalent to dropping the SpanContext, but makes intent clear.
-    pub fn finalize(mut self) {
-        self.apply_children();
-        self.finalized = true;
-    }
-
-    fn apply_children(&self) {
-        #[cfg(feature = "cpu-time")]
-        {
-            let children_cpu = *self
-                .children_cpu_ns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            with_stack_mut(|s| {
-                if let Some(top) = s.last_mut() {
-                    top.cpu_children_ns += children_cpu;
-                }
-            });
-        }
-    }
-}
-
-impl Drop for SpanContext {
-    fn drop(&mut self) {
-        if !self.finalized {
-            self.apply_children();
-        }
-    }
-}
-
-/// RAII guard for cross-thread adoption. Pops the synthetic parent on drop
-/// and propagates CPU time back to the parent's `SpanContext`.
-#[must_use = "dropping AdoptGuard immediately records ~0ms; bind it with `let _guard = ...`"]
-#[non_exhaustive]
-pub struct AdoptGuard {
-    #[cfg(feature = "cpu-time")]
-    cpu_start_ns: u64,
-    #[cfg(feature = "cpu-time")]
-    ctx_children_cpu_ns: Arc<Mutex<u64>>,
-}
-
-impl Drop for AdoptGuard {
-    fn drop(&mut self) {
-        // Restore the parent's saved alloc counters (same pattern as Guard::drop).
-        // The adopted scope's alloc data isn't recorded into an InvocationRecord,
-        // but the restore is necessary for correct nesting.
-        with_stack_mut(|s| {
-            let entry = match s.pop() {
-                Some(e) => e,
-                None => return,
-            };
-
-            let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
-                cell.set(entry.saved_alloc);
-            });
-
-            // The synthetic adopt entry is at depth 0. When it drops, any
-            // pending FRAME_BUFFER data from child functions (which ran at
-            // depth 1+) must be flushed to FRAMES — same as a normal
-            // depth-0 guard drop. Without this, worker-thread frame data
-            // would be silently lost.
-            if unpack_depth(entry.packed) == 0 {
-                flush_records_buf();
-                FRAME_BUFFER.with(|buf| {
-                    let b = buf.borrow();
-                    if !b.is_empty() {
-                        stream_frame(&b);
-                    }
-                    drop(b);
-                    buf.borrow_mut().clear();
-                });
-            }
-
-            // Propagate this thread's CPU time back to the parent context.
-            #[cfg(feature = "cpu-time")]
-            {
-                let cpu_elapsed_ns =
-                    crate::cpu_clock::cpu_now_ns().saturating_sub(self.cpu_start_ns);
-                let mut cpu_children = self
-                    .ctx_children_cpu_ns
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                *cpu_children += cpu_elapsed_ns;
-            }
-        });
-    }
-}
-
-/// Capture the current stack top as a cross-thread span context.
-///
-/// Returns `None` if the call stack is empty (no active span to fork from).
-/// Pass the returned context to child threads via `adopt()`.
-pub fn fork() -> Option<SpanContext> {
-    with_stack_ref(|s| {
-        let top = s.last()?;
-        Some(SpanContext {
-            parent_name: lookup_name(unpack_name_id(top.packed)),
-            #[cfg(feature = "cpu-time")]
-            children_cpu_ns: Arc::new(Mutex::new(0)),
-            finalized: false,
-        })
-    })
-}
-
-/// Adopt a parent span context on a child thread.
-///
-/// Pushes a synthetic parent entry so that `enter()`/`Guard::drop()` on this
-/// thread correctly attributes children time. Returns an `AdoptGuard` that
-/// propagates CPU time back to the parent on drop.
-pub fn adopt(ctx: &SpanContext) -> AdoptGuard {
-    // Save current alloc counters and zero them, same as enter().
-    let saved_alloc = crate::alloc::ALLOC_COUNTERS
-        .try_with(|cell| {
-            let snap = cell.get();
-            cell.set(crate::alloc::AllocSnapshot::new());
-            snap
-        })
-        .unwrap_or_default();
-
-    #[cfg(feature = "cpu-time")]
-    let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
-
-    with_stack_mut(|s| {
-        let depth = s.len() as u16;
-        s.push(StackEntry {
-            start_tsc: 0,
-            children_ns: 0,
-            #[cfg(feature = "cpu-time")]
-            cpu_children_ns: 0,
-            #[cfg(feature = "cpu-time")]
-            cpu_start_ns,
-            saved_alloc,
-            packed: pack_name_depth(intern_name(ctx.parent_name), depth),
-        });
-    });
-
-    AdoptGuard {
-        #[cfg(feature = "cpu-time")]
-        cpu_start_ns,
-        #[cfg(feature = "cpu-time")]
-        ctx_children_cpu_ns: Arc::clone(&ctx.children_cpu_ns),
-    }
-}
-
 /// CPU-bound workload for testing: hash a buffer `iterations` times.
 /// Uses wrapping arithmetic to prevent optimization while staying deterministic.
 #[cfg(test)]
@@ -1963,6 +1286,7 @@ pub(crate) fn burn_cpu(iterations: u64) {
 
 #[cfg(test)]
 mod tests {
+    use super::ndjson::open_stream_file;
     use super::*;
     use serial_test::serial;
     use std::thread;
@@ -2053,9 +1377,9 @@ mod tests {
             signal::install_handlers();
             signal::install_handlers();
         }
-        atexit::register();
-        atexit::register();
-        atexit::register();
+        signal::register_atexit();
+        signal::register_atexit();
+        signal::register_atexit();
     }
 
     #[test]
@@ -2328,113 +1652,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn fork_returns_none_with_empty_stack() {
-        reset();
-        assert!(fork().is_none(), "fork should return None with empty stack");
-    }
-
-    #[test]
-    #[serial]
-    fn fork_adopt_propagates_child_time_to_parent() {
-        reset();
-        {
-            let _parent = enter("parent_fn");
-            burn_cpu(5_000);
-
-            let ctx = fork().expect("should have parent on stack");
-
-            // Simulate a child thread (same thread for test simplicity).
-            {
-                let _adopt = adopt(&ctx);
-                {
-                    let _child = enter("child_fn");
-                    burn_cpu(20_000);
-                }
-            }
-
-            ctx.finalize();
-        }
-
-        let records = collect();
-        let parent = records.iter().find(|r| r.name == "parent_fn").unwrap();
-        let child = records.iter().find(|r| r.name == "child_fn").unwrap();
-
-        // Both recorded with correct call counts.
-        assert_eq!(parent.calls, 1);
-        assert_eq!(child.calls, 1);
-        // Parent total exceeds child total.
-        assert!(
-            parent.total_ms > child.total_ms,
-            "parent total ({:.1}ms) should exceed child total ({:.1}ms)",
-            parent.total_ms,
-            child.total_ms
-        );
-
-        // Wall self no longer reduced by cross-thread children.
-        assert!(
-            parent.self_ms > parent.total_ms * 0.5,
-            "parent self ({:.1}ms) should not be reduced by cross-thread child wall. total={:.1}ms",
-            parent.self_ms,
-            parent.total_ms
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn adopt_without_child_work_adds_minimal_overhead() {
-        reset();
-        {
-            let _parent = enter("overhead_parent");
-            let ctx = fork().unwrap();
-            {
-                let _adopt = adopt(&ctx);
-                // No work on child thread.
-            }
-            ctx.finalize();
-        }
-
-        let records = collect();
-        let parent = records
-            .iter()
-            .find(|r| r.name == "overhead_parent")
-            .unwrap();
-        // Parent should still have valid timing.
-        assert!(parent.calls == 1);
-        assert!(parent.total_ms >= 0.0);
-    }
-
-    #[test]
-    #[serial]
-    fn multiple_children_accumulate_in_parent() {
-        reset();
-        {
-            let _parent = enter("multi_parent");
-            burn_cpu(5_000);
-
-            let ctx = fork().unwrap();
-
-            // Simulate 3 child threads.
-            for _ in 0..3 {
-                let _adopt = adopt(&ctx);
-                {
-                    let _child = enter("worker");
-                    burn_cpu(10_000);
-                }
-            }
-
-            ctx.finalize();
-        }
-
-        let records = collect();
-        let parent = records.iter().find(|r| r.name == "multi_parent").unwrap();
-        let worker = records.iter().find(|r| r.name == "worker").unwrap();
-
-        assert_eq!(parent.calls, 1, "parent should have 1 call");
-        assert_eq!(worker.calls, 3, "should have 3 worker calls");
-    }
-
-    #[test]
-    #[serial]
     fn invocation_records_capture_depth() {
         reset();
         {
@@ -2450,43 +1667,6 @@ mod tests {
         let inner_inv = invocations.iter().find(|r| r.name == "inner").unwrap();
         assert_eq!(outer_inv.depth, 0);
         assert_eq!(inner_inv.depth, 1);
-    }
-
-    #[test]
-    #[serial]
-    fn cross_thread_fork_adopt_propagates() {
-        reset();
-        {
-            let _parent = enter("parent_fn");
-            burn_cpu(5_000);
-
-            let ctx = fork().expect("should have parent on stack");
-
-            thread::scope(|s| {
-                s.spawn(|| {
-                    let _adopt = adopt(&ctx);
-                    {
-                        let _child = enter("thread_child");
-                        burn_cpu(10_000);
-                    }
-                });
-            });
-
-            ctx.finalize();
-        }
-
-        let records = collect();
-        let parent = records.iter().find(|r| r.name == "parent_fn").unwrap();
-
-        // collect() is thread-local so we can only see the parent.
-        // Wall self no longer reduced by cross-thread children.
-        assert_eq!(parent.calls, 1);
-        assert!(
-            parent.self_ms > parent.total_ms * 0.5,
-            "parent self ({:.1}ms) should not be reduced by cross-thread child wall. total={:.1}ms",
-            parent.self_ms,
-            parent.total_ms
-        );
     }
 
     #[test]
@@ -2622,40 +1802,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn span_context_auto_finalizes_on_drop() {
-        reset();
-        {
-            let _parent = enter("auto_parent");
-            burn_cpu(5_000);
-
-            // fork + adopt, but do NOT call finalize() — rely on Drop.
-            {
-                let ctx = fork().expect("should have parent on stack");
-                {
-                    let _adopt = adopt(&ctx);
-                    {
-                        let _child = enter("auto_child");
-                        burn_cpu(20_000);
-                    }
-                }
-                // ctx drops here — should auto-finalize
-            }
-        }
-
-        let records = collect();
-        let parent = records.iter().find(|r| r.name == "auto_parent").unwrap();
-
-        // Wall self no longer reduced by cross-thread children.
-        assert!(
-            parent.self_ms > parent.total_ms * 0.5,
-            "parent self ({:.1}ms) should not be reduced by cross-thread child wall. total={:.1}ms",
-            parent.self_ms,
-            parent.total_ms
-        );
-    }
-
-    #[test]
-    #[serial]
     fn shutdown_writes_ndjson_with_all_thread_data() {
         reset();
         std::thread::scope(|s| {
@@ -2697,50 +1843,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn fork_adopt_does_not_inflate_reported_times() {
-        // Verify that fork/adopt overhead is NOT attributed to any function.
-        // Only instrumented functions (via enter()) should appear in output.
-        reset();
-        {
-            let _parent = enter("timed_parent");
-            burn_cpu(5_000);
-
-            let ctx = fork().unwrap();
-
-            // Simulate rayon: 4 children each doing work
-            for _ in 0..4 {
-                let _adopt = adopt(&ctx);
-                {
-                    let _child = enter("timed_child");
-                    burn_cpu(10_000);
-                }
-            }
-            // ctx auto-finalizes on drop
-        }
-
-        // No cross-thread spawning here, so thread-local collect() is sufficient
-        // and avoids picking up stale records from other threads in parallel tests.
-        let records = collect();
-
-        // Only "timed_parent" and "timed_child" should appear. No adopt/fork entries.
-        let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
-        assert!(
-            !names
-                .iter()
-                .any(|n| n.contains("adopt") || n.contains("fork") || n.contains("piano")),
-            "fork/adopt should not appear in output. Got: {names:?}",
-        );
-
-        let parent = records.iter().find(|r| r.name == "timed_parent").unwrap();
-        let child = records.iter().find(|r| r.name == "timed_child").unwrap();
-
-        // Parent should appear once, child 4 times.
-        assert_eq!(parent.calls, 1);
-        assert_eq!(child.calls, 4);
-    }
-
-    #[test]
-    #[serial]
     #[ignore] // reset_all() clears ALL threads; must run in full isolation (--ignored)
     fn reset_all_clears_cross_thread_records() {
         reset();
@@ -2766,92 +1868,6 @@ mod tests {
             !after.iter().any(|r| r.name == "reset_all_thread"),
             "reset_all should have cleared cross-thread records. Got: {:?}",
             after.iter().map(|r| &r.name).collect::<Vec<_>>()
-        );
-    }
-
-    #[cfg(feature = "cpu-time")]
-    #[test]
-    #[serial]
-    fn cpu_time_propagated_across_threads_via_adopt() {
-        reset();
-        {
-            let _parent = enter("cpu_parent");
-            burn_cpu(5_000); // parent's own work
-
-            let ctx = fork().expect("should have parent on stack");
-
-            thread::scope(|s| {
-                s.spawn(|| {
-                    let _adopt = adopt(&ctx);
-                    {
-                        let _child = enter("cpu_child");
-                        burn_cpu(50_000); // much more child CPU
-                    }
-                });
-            });
-
-            ctx.finalize();
-        }
-
-        let records = collect();
-        let parent = records
-            .iter()
-            .find(|r| r.name == "cpu_parent")
-            .expect("cpu_parent not found");
-
-        // Key insight: after the wall-time fix, parent.self_ms is large because
-        // wall time is NOT subtracted cross-thread. But parent.cpu_self_ms should
-        // be small because CPU time IS propagated across thread boundaries via
-        // fork/adopt, so the child's CPU time was subtracted from the parent's
-        // CPU budget.
-        eprintln!(
-            "cpu_parent: self_ms={:.3}, cpu_self_ms={:.3}, total_ms={:.3}",
-            parent.self_ms, parent.cpu_self_ms, parent.total_ms
-        );
-        assert!(
-            parent.cpu_self_ms < parent.self_ms * 0.8,
-            "cpu_self_ms ({:.3}) should be significantly less than self_ms ({:.3}) \
-             because child CPU time is propagated cross-thread but wall time is not",
-            parent.cpu_self_ms,
-            parent.self_ms,
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn fork_adopt_does_not_subtract_wall_time_from_parent() {
-        // Wall time should NOT be subtracted cross-thread.
-        // Parent wall self = elapsed - same-thread children only.
-        reset();
-        {
-            let _parent = enter("wall_parent");
-            burn_cpu(5_000);
-
-            let ctx = fork().unwrap();
-
-            {
-                let _adopt = adopt(&ctx);
-                {
-                    let _child = enter("wall_child");
-                    burn_cpu(50_000);
-                }
-            }
-
-            ctx.finalize();
-        }
-
-        let records = collect();
-        let parent = records.iter().find(|r| r.name == "wall_parent").unwrap();
-        let child = records.iter().find(|r| r.name == "wall_child").unwrap();
-
-        // After fix: parent.self_ms ~ parent.total_ms (no cross-thread wall subtraction).
-        assert!(
-            parent.self_ms > child.self_ms * 0.5,
-            "parent wall self ({:.3}ms) should NOT be reduced by cross-thread child wall ({:.3}ms). \
-             parent.total={:.3}ms",
-            parent.self_ms,
-            child.self_ms,
-            parent.total_ms,
         );
     }
 
@@ -2987,25 +2003,6 @@ mod tests {
     }
 
     #[test]
-    fn pack_unpack_round_trip() {
-        let name_id: u16 = 42;
-        let depth: u16 = 7;
-        let packed = pack_name_depth(name_id, depth);
-        assert_eq!(unpack_depth(packed), depth);
-        assert_eq!(unpack_name_id(packed), name_id);
-
-        // Max values
-        let packed_max = pack_name_depth(u16::MAX, u16::MAX);
-        assert_eq!(unpack_depth(packed_max), u16::MAX);
-        assert_eq!(unpack_name_id(packed_max), u16::MAX);
-
-        // Zero values
-        let packed_zero = pack_name_depth(0, 0);
-        assert_eq!(unpack_depth(packed_zero), 0);
-        assert_eq!(unpack_name_id(packed_zero), 0);
-    }
-
-    #[test]
     #[serial]
     fn shutdown_impl_reports_write_errors_to_stderr() {
         reset();
@@ -3106,81 +2103,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn stream_writes_valid_v4_ndjson() {
-        reset();
-        let tmp = std::env::temp_dir().join(format!("piano_stream_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        // Test the streaming infrastructure directly by calling
-        // open_stream_file / stream_frame_to_writer / write_stream_trailer.
-        // This avoids setting the global STREAMING_ENABLED flag, which would
-        // interfere with parallel tests that expect the FRAMES path.
-        let mut state = open_stream_file(&tmp).unwrap();
-
-        // Generate 3 frames worth of data
-        for _ in 0..3 {
-            let _g = enter("stream_test_fn");
-            burn_cpu(5_000);
-        }
-
-        // Collect the frames that were pushed to FRAMES (streaming disabled).
-        let frames = collect_frames();
-        let my_frames: Vec<_> = frames
-            .iter()
-            .filter(|f| f.iter().any(|s| s.name == "stream_test_fn"))
-            .collect();
-        assert_eq!(
-            my_frames.len(),
-            3,
-            "should have 3 frames with stream_test_fn"
-        );
-
-        // Write each frame to the stream file
-        for frame in &my_frames {
-            stream_frame_to_writer(&mut state, frame);
-        }
-
-        // Write trailer and flush
-        write_stream_trailer(&mut state).unwrap();
-        drop(state);
-
-        // Find the .ndjson file
-        let files: Vec<_> = std::fs::read_dir(&tmp)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
-            .collect();
-        assert_eq!(files.len(), 1, "expected exactly one ndjson file");
-
-        let content = std::fs::read_to_string(files[0].path()).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-
-        // Header (line 0): metadata, no functions
-        assert!(
-            lines[0].contains("\"format_version\":4"),
-            "header should have format_version 4: {}",
-            lines[0]
-        );
-        assert!(lines[0].contains("\"run_id\""));
-        assert!(!lines[0].contains("\"functions\""));
-
-        // Frames (lines 1-3)
-        assert!(lines[1].contains("\"frame\":0"));
-        assert!(lines[2].contains("\"frame\":1"));
-        assert!(lines[3].contains("\"frame\":2"));
-
-        // Trailer (last line): functions array
-        let last = lines.last().unwrap();
-        assert!(last.contains("\"functions\""));
-        assert!(last.contains("stream_test_fn"));
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    #[serial]
     fn frames_on_disk_before_shutdown() {
         // Verify the end-to-end wiring: drop_cold at depth 0 calls
         // stream_frame(), which writes to disk when streaming is enabled.
@@ -3251,132 +2173,6 @@ mod tests {
         clear_runs_dir();
         let _ = std::fs::remove_dir_all(&tmp);
     }
-
-    #[test]
-    #[serial]
-    fn shutdown_streaming_writes_trailer() {
-        // Test that the streaming shutdown path produces a complete v4 file.
-        //
-        // Uses local StreamState (not the global STREAM_FILE) to avoid
-        // racing with frames_on_disk_before_shutdown. Constructs frame
-        // data directly to avoid collect_frames() interference.
-        let tmp =
-            std::env::temp_dir().join(format!("piano_shutdown_trailer_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        // Register the function name so write_stream_trailer includes it.
-        register("shutdown_trailer_fn");
-
-        // Build frame data directly -- no reliance on global FRAMES.
-        let frame = vec![FrameFnSummary {
-            name: "shutdown_trailer_fn",
-            calls: 1,
-            self_ns: 1_000_000,
-            #[cfg(feature = "cpu-time")]
-            cpu_self_ns: 500_000,
-            alloc_count: 0,
-            alloc_bytes: 0,
-            free_count: 0,
-            free_bytes: 0,
-        }];
-
-        // Simulate the streaming path: open file, write 2 frames, write trailer.
-        let mut state = open_stream_file(&tmp).unwrap();
-        stream_frame_to_writer(&mut state, &frame);
-        stream_frame_to_writer(&mut state, &frame);
-        write_stream_trailer(&mut state).unwrap();
-        drop(state);
-
-        let files: Vec<_> = std::fs::read_dir(&tmp)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
-            .collect();
-        assert_eq!(files.len(), 1);
-
-        let content = std::fs::read_to_string(files[0].path()).unwrap();
-        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-
-        // Header + 2 frames + trailer = 4 lines
-        assert_eq!(lines.len(), 4);
-        assert!(lines[0].contains("\"format_version\":4"));
-        assert!(lines[1].contains("\"frame\":0"));
-        assert!(lines[2].contains("\"frame\":1"));
-        assert!(lines[3].contains("\"functions\""));
-        assert!(lines[3].contains("shutdown_trailer_fn"));
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    #[serial]
-    fn stream_frame_field_values_round_trip() {
-        let tmp = std::env::temp_dir().join(format!("piano_rt_roundtrip_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let mut state = open_stream_file(&tmp).unwrap();
-
-        let frame_data = vec![FrameFnSummary {
-            name: "roundtrip_fn",
-            calls: 42,
-            self_ns: 123_456_789,
-            #[cfg(feature = "cpu-time")]
-            cpu_self_ns: 100_000_000,
-            alloc_count: 7,
-            alloc_bytes: 2048,
-            free_count: 3,
-            free_bytes: 1024,
-        }];
-
-        stream_frame_to_writer(&mut state, &frame_data);
-        write_stream_trailer(&mut state).unwrap();
-        drop(state);
-
-        let files: Vec<_> = std::fs::read_dir(&tmp)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
-            .collect();
-        let content = std::fs::read_to_string(files[0].path()).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-
-        let frame_line = lines[1];
-        assert!(frame_line.contains("\"frame\":0"), "frame index");
-
-        let fns_start = frame_line.find("\"fns\":[").unwrap() + "\"fns\":[".len();
-        let fns_end = frame_line[fns_start..].rfind(']').unwrap();
-        let entry_str = &frame_line[fns_start..fns_start + fns_end];
-
-        fn extract(s: &str, key: &str) -> u64 {
-            let start = s.find(key).unwrap() + key.len();
-            let end = s[start..]
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(s.len() - start);
-            s[start..start + end].parse().unwrap()
-        }
-
-        assert_eq!(extract(entry_str, "\"calls\":"), 42, "calls");
-        assert_eq!(extract(entry_str, "\"self_ns\":"), 123_456_789, "self_ns");
-        assert_eq!(extract(entry_str, "\"ac\":"), 7, "alloc_count");
-        assert_eq!(extract(entry_str, "\"ab\":"), 2048, "alloc_bytes");
-        assert_eq!(extract(entry_str, "\"fc\":"), 3, "free_count");
-        assert_eq!(extract(entry_str, "\"fb\":"), 1024, "free_bytes");
-
-        let trailer = *lines.last().unwrap();
-        assert!(
-            trailer.contains("roundtrip_fn"),
-            "trailer should contain function name"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    // The streaming fallback path (STREAMING_ENABLED=true but no stream file
-    // opened) is tested by shutdown_streaming_synthesizes_frame_from_agg_when_no_stream_opened
-    // using #[serial] to avoid global flag races.
 
     #[test]
     #[serial]
@@ -3455,104 +2251,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn trailer_fn_id_round_trip() {
-        let tmp = std::env::temp_dir().join(format!("piano_trailer_rt_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let mut state = open_stream_file(&tmp).unwrap();
-
-        let name_plain: &'static str = "simple_fn";
-        let name_generic: &'static str = "Vec<String>::push";
-        let name_backslash: &'static str = "path\\to\\fn";
-
-        let id_plain = intern_name(name_plain);
-        let id_generic = intern_name(name_generic);
-        let id_backslash = intern_name(name_backslash);
-
-        let frame = vec![
-            FrameFnSummary {
-                name: name_plain,
-                calls: 1,
-                self_ns: 100,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns: 0,
-                alloc_count: 0,
-                alloc_bytes: 0,
-                free_count: 0,
-                free_bytes: 0,
-            },
-            FrameFnSummary {
-                name: name_generic,
-                calls: 2,
-                self_ns: 200,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns: 0,
-                alloc_count: 0,
-                alloc_bytes: 0,
-                free_count: 0,
-                free_bytes: 0,
-            },
-            FrameFnSummary {
-                name: name_backslash,
-                calls: 3,
-                self_ns: 300,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns: 0,
-                alloc_count: 0,
-                alloc_bytes: 0,
-                free_count: 0,
-                free_bytes: 0,
-            },
-        ];
-        stream_frame_to_writer(&mut state, &frame);
-        write_stream_trailer(&mut state).unwrap();
-        drop(state);
-
-        let files: Vec<_> = std::fs::read_dir(&tmp)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
-            .collect();
-        let content = std::fs::read_to_string(files[0].path()).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        let trailer = *lines.last().unwrap();
-
-        // Parse trailer: {"functions":["name0","name1",...]}
-        let fns_start = trailer.find("\"functions\":[").unwrap() + "\"functions\":[".len();
-        let fns_end = trailer[fns_start..].find(']').unwrap();
-        let fns_str = &trailer[fns_start..fns_start + fns_end];
-
-        let parsed: Vec<String> = fns_str
-            .split("\",\"")
-            .map(|s| {
-                s.trim_matches('"')
-                    .replace("\\\\", "\\")
-                    .replace("\\\"", "\"")
-            })
-            .collect();
-
-        assert_eq!(
-            parsed.get(id_plain as usize).map(|s| s.as_str()),
-            Some("simple_fn"),
-            "plain name at id {id_plain}"
-        );
-        assert_eq!(
-            parsed.get(id_generic as usize).map(|s| s.as_str()),
-            Some("Vec<String>::push"),
-            "generic name at id {id_generic}"
-        );
-        assert_eq!(
-            parsed.get(id_backslash as usize).map(|s| s.as_str()),
-            Some("path\\to\\fn"),
-            "backslash name at id {id_backslash}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    #[serial]
     #[cfg(debug_assertions)]
     fn reentrant_stack_access_panics_in_debug() {
         // Verify that the debug-mode borrow guard on STACK detects reentrant
@@ -3569,23 +2267,6 @@ mod tests {
         assert!(
             result.is_err(),
             "nested STACK access should panic in debug mode"
-        );
-    }
-
-    #[test]
-    fn name_table_overflow_index_is_last_valid_slot() {
-        // The overflow saturation index must be the last valid slot
-        // (capacity - 1) so that lookups stay in-bounds.
-        let idx = name_table_overflow_index();
-        let expected = (NAME_TABLE_CAPACITY - 1) as u16;
-        assert_eq!(
-            idx, expected,
-            "overflow index should be capacity-1 ({expected}), got {idx}"
-        );
-        // The index must be within the table's bounds.
-        assert!(
-            (idx as usize) < NAME_TABLE_CAPACITY,
-            "overflow index {idx} must be < capacity {NAME_TABLE_CAPACITY}"
         );
     }
 
@@ -3762,295 +2443,6 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Mutant-killing tests: drop_cold comparison/logic
-    // ---------------------------------------------------------------
-
-    #[test]
-    #[serial]
-    fn drop_cold_frame_boundary_with_adopt_context() {
-        // Kills: collector.rs:968 replace == with !=
-        //        collector.rs:969 replace || with && and == with !=
-        // When fork/adopt places an entry at depth 0, real functions run at
-        // depth 1+. The frame boundary fires when all remaining entries are
-        // depth 0 (remaining_all_base), OR when the dropped entry itself is
-        // depth 0. We verify frames are produced correctly in both scenarios.
-        reset();
-
-        // Scenario 1: normal depth-0 drop produces a frame.
-        {
-            let _g = enter("fb_normal");
-            burn_cpu(1_000);
-        }
-        let frames = collect_frames();
-        let normal_frames: Vec<_> = frames
-            .iter()
-            .filter(|f| f.iter().any(|s| s.name == "fb_normal"))
-            .collect();
-        assert_eq!(
-            normal_frames.len(),
-            1,
-            "depth-0 drop should produce exactly 1 frame"
-        );
-
-        // Scenario 2: adopt context -- child at depth 1 should produce frame
-        // data when it drops (since remaining entries are all depth 0).
-        {
-            let _parent = enter("fb_adopt_parent");
-            let ctx = fork().unwrap();
-            {
-                let _adopt = adopt(&ctx);
-                {
-                    let _child = enter("fb_adopt_child");
-                    burn_cpu(1_000);
-                }
-            }
-            ctx.finalize();
-        }
-        let frames = collect_frames();
-        let adopt_frames: Vec<_> = frames
-            .iter()
-            .filter(|f| f.iter().any(|s| s.name == "fb_adopt_child"))
-            .collect();
-        assert!(
-            !adopt_frames.is_empty(),
-            "adopt context child should produce frame data"
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: streaming/NDJSON write path comparisons
-    // ---------------------------------------------------------------
-
-    #[test]
-    #[serial]
-    fn stream_frame_to_writer_comma_separation() {
-        // Kills: collector.rs:171 replace > with ==/</>=
-        // With 2+ entries, commas should separate them. With 1 entry, no comma.
-        let tmp = std::env::temp_dir().join(format!("piano_comma_sep_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let mut state = open_stream_file(&tmp).unwrap();
-
-        // Single entry: no comma
-        let single = vec![FrameFnSummary {
-            name: "comma_a",
-            calls: 1,
-            self_ns: 100,
-            #[cfg(feature = "cpu-time")]
-            cpu_self_ns: 0,
-            alloc_count: 0,
-            alloc_bytes: 0,
-            free_count: 0,
-            free_bytes: 0,
-        }];
-        stream_frame_to_writer(&mut state, &single);
-
-        // Multiple entries: commas between them
-        let multi = vec![
-            FrameFnSummary {
-                name: "comma_b",
-                calls: 1,
-                self_ns: 100,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns: 0,
-                alloc_count: 0,
-                alloc_bytes: 0,
-                free_count: 0,
-                free_bytes: 0,
-            },
-            FrameFnSummary {
-                name: "comma_c",
-                calls: 2,
-                self_ns: 200,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns: 0,
-                alloc_count: 0,
-                alloc_bytes: 0,
-                free_count: 0,
-                free_bytes: 0,
-            },
-        ];
-        stream_frame_to_writer(&mut state, &multi);
-        write_stream_trailer(&mut state).unwrap();
-        drop(state);
-
-        let files: Vec<_> = std::fs::read_dir(&tmp)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
-            .collect();
-        let content = std::fs::read_to_string(files[0].path()).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-
-        // Frame 0 (single entry): no comma in fns array, no leading comma.
-        // Mutant `i > 0` -> `i >= 0` would produce [,{...}] (leading comma).
-        let frame0_fns = &lines[1][lines[1].find("\"fns\":[").unwrap()..];
-        let comma_count_0 = frame0_fns.matches("},{").count();
-        assert_eq!(
-            comma_count_0, 0,
-            "single-entry frame should have no comma between entries"
-        );
-        assert!(
-            frame0_fns.contains("\"fns\":[{"),
-            "fns array should start with [{{ not [,{{: {frame0_fns}"
-        );
-
-        // Frame 1 (two entries): exactly one comma between entries, no leading comma.
-        let frame1_fns = &lines[2][lines[2].find("\"fns\":[").unwrap()..];
-        let comma_count_1 = frame1_fns.matches("},{").count();
-        assert_eq!(
-            comma_count_1, 1,
-            "two-entry frame should have exactly one comma separator"
-        );
-        assert!(
-            frame1_fns.contains("\"fns\":[{"),
-            "fns array should start with [{{ not [,{{: {frame1_fns}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    #[serial]
-    fn write_stream_trailer_comma_separation() {
-        // Kills: collector.rs:253 replace > with >=
-        // Verifies commas between function names in the trailer.
-        let tmp = std::env::temp_dir().join(format!("piano_trailer_comma_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        // Intern at least 2 names so the trailer has commas.
-        let _id1 = intern_name("trailer_comma_a");
-        let _id2 = intern_name("trailer_comma_b");
-
-        let mut state = open_stream_file(&tmp).unwrap();
-        write_stream_trailer(&mut state).unwrap();
-        drop(state);
-
-        let files: Vec<_> = std::fs::read_dir(&tmp)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
-            .collect();
-        let content = std::fs::read_to_string(files[0].path()).unwrap();
-        let trailer = content.lines().last().unwrap();
-
-        // With >= instead of >, a leading comma would appear: [,"name1","name2"]
-        assert!(
-            !trailer.contains("[,"),
-            "trailer should not start with a comma: {trailer}"
-        );
-        // With > replaced by ==, only the first entry would get a comma prefix
-        // (when i == 0, which is wrong). Check structure is valid.
-        assert!(
-            trailer.contains("\"functions\":[\""),
-            "trailer should have functions array starting with a quote: {trailer}"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn write_ndjson_comma_separation() {
-        // Kills: collector.rs:1303 and 1319 replace > with ==/</>=
-        let tmp = std::env::temp_dir().join(format!("piano_ndjson_comma_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-
-        let fn_names = vec!["ndjson_fn_a", "ndjson_fn_b"];
-        let frames = vec![(
-            0,
-            vec![
-                FrameFnSummary {
-                    name: "ndjson_fn_a",
-                    calls: 1,
-                    self_ns: 100,
-                    #[cfg(feature = "cpu-time")]
-                    cpu_self_ns: 0,
-                    alloc_count: 0,
-                    alloc_bytes: 0,
-                    free_count: 0,
-                    free_bytes: 0,
-                },
-                FrameFnSummary {
-                    name: "ndjson_fn_b",
-                    calls: 2,
-                    self_ns: 200,
-                    #[cfg(feature = "cpu-time")]
-                    cpu_self_ns: 0,
-                    alloc_count: 0,
-                    alloc_bytes: 0,
-                    free_count: 0,
-                    free_bytes: 0,
-                },
-            ],
-        )];
-
-        let path = tmp.join("test.ndjson");
-        write_ndjson(&frames, &fn_names, &path).unwrap();
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-
-        // v4: header has no functions array; trailer (last line) has it.
-        let header = lines[0];
-        assert!(
-            !header.contains("\"functions\""),
-            "v4 header should not contain functions: {header}"
-        );
-        let trailer = *lines.last().unwrap();
-        assert!(
-            trailer.contains("\"functions\":[\"ndjson_fn_a\",\"ndjson_fn_b\"]"),
-            "trailer functions array should have proper comma separation: {trailer}"
-        );
-
-        // Frame line: fns array should have comma between entries, not before first.
-        let frame = lines[1];
-        let fns_section = &frame[frame.find("\"fns\":[").unwrap()..];
-        assert!(
-            !fns_section.starts_with("\"fns\":[,"),
-            "fns array should not start with comma: {fns_section}"
-        );
-        let entry_count = fns_section.matches("\"id\":").count();
-        assert_eq!(entry_count, 2, "should have 2 fn entries");
-        let comma_between = fns_section.matches("},{").count();
-        assert_eq!(
-            comma_between, 1,
-            "should have exactly 1 comma between 2 entries"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: pack_name_depth bitwise OR
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn pack_name_depth_uses_or_not_xor() {
-        // Kills: collector.rs:811 replace | with ^
-        // When both name_id and depth have overlapping bits in the low 16,
-        // XOR would cancel them out while OR preserves them.
-        // With | : (5 << 16) | 5 = 0x50005 => name_id=5, depth=5
-        // With ^ : (5 << 16) ^ 5 = 0x50005 (same, no overlap in shifted positions)
-        // But if we pack(0xFFFF, 0xFFFF):
-        // With | : (0xFFFF << 16) | 0xFFFF = 0xFFFF_FFFF
-        // With ^ : (0xFFFF << 16) ^ 0xFFFF = 0xFFFF_FFFF (same, no overlap)
-        // The fields don't overlap so | vs ^ gives the same result.
-        // However, pack is used with unpack. The real test is the round trip,
-        // which already exists. Let's test with values that ensure correctness.
-        let packed = pack_name_depth(0x1234, 0x5678);
-        assert_eq!(unpack_name_id(packed), 0x1234);
-        assert_eq!(unpack_depth(packed), 0x5678);
-
-        // Verify the raw bit pattern: (0x1234 << 16) | 0x5678
-        let expected: u64 = (0x1234u64 << 16) | 0x5678u64;
-        assert_eq!(
-            packed, expected,
-            "pack_name_depth should produce (name_id << 16) | depth"
-        );
-    }
-
-    // ---------------------------------------------------------------
     // Mutant-killing tests: aggregate division
     // ---------------------------------------------------------------
 
@@ -4149,22 +2541,6 @@ mod tests {
             Some(tmp),
             "runs_dir_nonblocking should return the configured dir"
         );
-    }
-
-    // ---------------------------------------------------------------
-    // Mutant-killing tests: name_table_lock
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn name_table_lock_returns_mutex() {
-        // Kills: collector.rs:719 replace name_table_lock with Box::leak(...)
-        // The lock should be acquirable and releasable without panic.
-        let lock = name_table_lock();
-        let guard = lock.lock().unwrap();
-        drop(guard);
-        // Acquire again to verify it was properly released.
-        let guard2 = lock.lock().unwrap();
-        drop(guard2);
     }
 
     // ---------------------------------------------------------------
