@@ -244,6 +244,125 @@ fn report_no_runs_shows_recovery_guidance() {
     );
 }
 
+#[test]
+fn multi_file_same_name_gets_module_qualified_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("multimod");
+    fs::create_dir_all(project_dir.join("src")).unwrap();
+
+    fs::write(
+        project_dir.join("Cargo.toml"),
+        r#"[package]
+name = "multimod"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "multimod"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        project_dir.join("src").join("main.rs"),
+        r#"mod db;
+
+fn main() {
+    let a = process();
+    let b = db::process();
+    println!("{a} {b}");
+}
+
+fn process() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..1000 {
+        sum += i;
+    }
+    sum
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        project_dir.join("src").join("db.rs"),
+        r#"pub fn process() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..500 {
+        sum += i;
+    }
+    sum
+}
+"#,
+    )
+    .unwrap();
+
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // No --fn flag: instrument everything.
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let binary_path = stdout.trim();
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let run_output = Command::new(binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run_output.status.success(),
+        "instrumented binary failed:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+    let stats = common::aggregate_ndjson(&content);
+
+    // The crate-root process() should appear as "process" (no module prefix).
+    assert!(
+        stats.contains_key("process"),
+        "should have 'process' from crate root, got keys: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        stats["process"].calls >= 1,
+        "process should have at least 1 call"
+    );
+
+    // The db module's process() should appear as "db::process".
+    assert!(
+        stats.contains_key("db::process"),
+        "should have 'db::process' from db module, got keys: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        stats["db::process"].calls >= 1,
+        "db::process should have at least 1 call"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Signal recovery
 // ---------------------------------------------------------------------------
