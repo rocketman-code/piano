@@ -528,22 +528,9 @@ pub fn format_table_with_frames(frame_data: &FrameData, show_all: bool) -> Strin
 /// Format per-frame breakdown table.
 ///
 /// Each row is one frame. Columns: Frame | Total | [one column per function] | Allocs | Alloc Bytes
-/// Frames where total exceeds 2x median are flagged as spikes.
 pub fn format_frames_table(frame_data: &FrameData) -> String {
     let fn_names = &frame_data.fn_names;
     let n_fns = fn_names.len();
-
-    // Compute per-frame totals for spike detection.
-    let frame_totals: Vec<u64> = frame_data
-        .frames
-        .iter()
-        .map(|f| f.iter().map(|e| e.self_ns).sum())
-        .collect();
-
-    let mut sorted_totals = frame_totals.clone();
-    sorted_totals.sort_unstable();
-    let median = percentile(&sorted_totals, 50.0);
-    let spike_threshold = median.saturating_mul(2);
 
     // Compute per-function column width: at least 12, or the longest name.
     let fn_col_width = fn_names.iter().map(|n| n.len()).max().unwrap_or(12).max(12);
@@ -565,8 +552,7 @@ pub fn format_frames_table(frame_data: &FrameData) -> String {
 
     // Rows.
     for (i, frame) in frame_data.frames.iter().enumerate() {
-        let total = frame_totals[i];
-        let is_spike = total > spike_threshold && median > 0;
+        let total: u64 = frame.iter().map(|e| e.self_ns).sum();
 
         out.push_str(&format!("{:>6} {:>10}", i + 1, format_ns(total)));
 
@@ -580,32 +566,15 @@ pub fn format_frames_table(frame_data: &FrameData) -> String {
         let allocs: u64 = frame.iter().map(|e| e.alloc_count).sum();
         let bytes: u64 = frame.iter().map(|e| e.alloc_bytes).sum();
         out.push_str(&format!(" {:>8} {:>12}", allocs, format_bytes(bytes)));
-
-        if is_spike {
-            out.push_str(" <<");
-        }
         out.push('\n');
     }
 
-    let n_spikes = frame_totals
-        .iter()
-        .filter(|&&t| t > spike_threshold && median > 0)
-        .count();
     out.push_str(&format!(
-        "{DIM}\n{} frames | {} spikes (>2x median)\n{DIM:#}",
+        "{DIM}\n{} frames\n{DIM:#}",
         frame_data.frames.len(),
-        n_spikes
     ));
 
     out
-}
-
-fn percentile(sorted: &[u64], p: f64) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let idx = ((p / 100.0) * (sorted.len() - 1) as f64).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
 }
 
 fn format_ns(ns: u64) -> String {
@@ -2071,7 +2040,6 @@ mod tests {
                         free_bytes: 0,
                     },
                 ],
-                // Spike frame: 4x the typical total
                 vec![
                     FrameFnEntry {
                         fn_id: 0,
@@ -2102,10 +2070,9 @@ mod tests {
         assert!(table.contains("Frame"), "should have Frame column header");
         assert!(table.contains("update"), "should have function column");
         assert!(table.contains("physics"), "should have function column");
-        // Spike detection: frame 2 has 8ms update vs 2ms, should be flagged
         assert!(
-            table.contains("<<"),
-            "should flag the spike frame. Got:\n{table}"
+            !table.contains("<<"),
+            "should not contain spike markers. Got:\n{table}"
         );
     }
 
