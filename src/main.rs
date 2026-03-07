@@ -20,7 +20,9 @@ use piano::report::{
     load_latest_runs_per_thread, load_ndjson, load_run, load_run_by_id, load_tagged_run,
     load_two_latest_runs, relative_time, resolve_tag, reverse_resolve_tag, save_tag,
 };
-use piano::resolve::{ResolveResult, SkippedFunction, TargetSpec, resolve_targets};
+use piano::resolve::{
+    ResolveResult, SkippedFunction, TargetSpec, module_prefix, qualify, resolve_targets,
+};
 use piano::rewrite::{
     detect_allocator_kind, inject_global_allocator, inject_registrations, inject_shutdown,
     instrument_source,
@@ -391,13 +393,13 @@ fn build_project(
                 source,
             })?;
 
-        let result =
-            instrument_source(&source, &target_set, instrument_macros).map_err(|source| {
-                Error::ParseError {
-                    path: display_path.clone(),
-                    source,
-                }
-            })?;
+        let prefix = module_prefix(relative);
+        let result = instrument_source(&source, &target_set, instrument_macros, &prefix).map_err(
+            |source| Error::ParseError {
+                path: display_path.clone(),
+                source,
+            },
+        )?;
 
         all_concurrency.extend(result.concurrency);
         source_maps.insert(display_path, result.source_map);
@@ -422,7 +424,10 @@ fn build_project(
     {
         let all_fn_names: Vec<String> = targets
             .iter()
-            .flat_map(|t| t.functions.iter().cloned())
+            .flat_map(|t| {
+                let prefix = module_prefix(t.file.strip_prefix(&src_dir).unwrap_or(&t.file));
+                t.functions.iter().map(move |f| qualify(&prefix, f))
+            })
             .collect();
         let main_source =
             std::fs::read_to_string(&main_file).map_err(|source| Error::RunReadError {
