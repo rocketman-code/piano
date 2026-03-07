@@ -890,7 +890,7 @@ version = "0.1.0"
         let rendered = "error[E0308]: mismatched types\n --> src/main.rs:7:18\n  |\n7 |     let x: i32 = \"hello\";\n  |                  ^^^^^^^ expected `i32`, found `&str`\n";
         let mut file_maps = std::collections::HashMap::new();
         let mut map = crate::source_map::SourceMap::new();
-        map.record(1, 2);
+        map.record(1, 2, 2);
         file_maps.insert(PathBuf::from("src/main.rs"), map);
 
         let result = remap_rendered_error(rendered, &file_maps);

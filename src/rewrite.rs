@@ -1624,7 +1624,12 @@ pub fn inject_global_allocator(
             let fallback_newlines = fallback.bytes().filter(|&b| b == b'\n').count() as u32;
             let mut map = SourceMap::new();
             if fallback_newlines > 0 {
-                map.record(1, fallback_newlines);
+                let none_span = if fallback.ends_with('\n') {
+                    fallback_newlines - 1
+                } else {
+                    fallback_newlines
+                };
+                map.record(1, fallback_newlines, none_span);
             }
             let result = format!("{fallback}{replaced}");
             Ok((result, map))
