@@ -345,6 +345,10 @@ pub fn find_bin_entry_point(project_dir: &Path, bin_name: Option<&str>) -> Resul
             }
         }
     } else if let Some(target) = bin_name {
+        // Check auto-discovered binaries in src/bin/ first.
+        if let Ok(path) = resolve_bin_path(project_dir, target) {
+            return Ok(path);
+        }
         let pkg_name = doc
             .get("package")
             .and_then(|p| p.get("name"))
@@ -864,6 +868,38 @@ version = "0.1.0"
             err_msg.contains("no binary target named 'othername'"),
             "unexpected error: {err_msg}"
         );
+    }
+
+    #[test]
+    fn find_bin_entry_point_auto_discovers_src_bin() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"[package]
+name = "demo"
+version = "0.1.0"
+"#;
+        create_file(tmp.path(), "Cargo.toml", toml);
+        create_file(tmp.path(), "src/main.rs", "fn main() {}");
+        create_file(tmp.path(), "src/bin/server.rs", "fn main() {}");
+
+        // --bin server should find src/bin/server.rs without [[bin]] entries
+        let result = find_bin_entry_point(tmp.path(), Some("server")).unwrap();
+        assert_eq!(result, PathBuf::from("src/bin/server.rs"));
+    }
+
+    #[test]
+    fn find_bin_entry_point_auto_discovers_src_bin_dir() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"[package]
+name = "demo"
+version = "0.1.0"
+"#;
+        create_file(tmp.path(), "Cargo.toml", toml);
+        create_file(tmp.path(), "src/main.rs", "fn main() {}");
+        create_file(tmp.path(), "src/bin/worker/main.rs", "fn main() {}");
+
+        // --bin worker should find src/bin/worker/main.rs without [[bin]] entries
+        let result = find_bin_entry_point(tmp.path(), Some("worker")).unwrap();
+        assert_eq!(result, PathBuf::from("src/bin/worker/main.rs"));
     }
 
     #[test]
