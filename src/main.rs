@@ -609,6 +609,7 @@ fn run_child(
     args: &[String],
     timeout: Option<Duration>,
     suppress_stdout: bool,
+    env: &[(&str, &str)],
 ) -> Result<ChildOutcome, Error> {
     // Reset flags from any previous invocation.
     DURATION_EXPIRED.store(false, Ordering::SeqCst);
@@ -616,6 +617,9 @@ fn run_child(
 
     let mut cmd = process::Command::new(binary);
     cmd.args(args);
+    for &(key, val) in env {
+        cmd.env(key, val);
+    }
     if suppress_stdout {
         cmd.stdout(process::Stdio::null());
     }
@@ -715,7 +719,7 @@ fn cmd_run(
     eprintln!("--- program output ---");
 
     let timeout = duration.map(Duration::from_secs_f64);
-    let outcome = run_child(&binary, &args, timeout, false)?;
+    let outcome = run_child(&binary, &args, timeout, false, &[])?;
 
     match outcome.stop_reason {
         StopReason::Duration => std::process::exit(0),
@@ -751,8 +755,14 @@ fn cmd_profile(
         .unwrap_or_default()
         .as_millis();
 
+    let child_env: Vec<(&str, &str)> = if frames {
+        vec![("PIANO_STREAM_FRAMES", "1")]
+    } else {
+        vec![]
+    };
+
     let timeout = duration.map(Duration::from_secs_f64);
-    let outcome = run_child(&binary, &args, timeout, json)?;
+    let outcome = run_child(&binary, &args, timeout, json, &child_env)?;
     let intentional_stop = matches!(
         outcome.stop_reason,
         StopReason::Duration | StopReason::Interrupted
