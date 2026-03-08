@@ -809,17 +809,16 @@ fn enter_cold(name: &'static str) {
 
     let name_id = intern_name(name);
 
-    let saved_alloc = crate::alloc::ALLOC_COUNTERS
-        .try_with(|cell| {
-            let snap = cell.get();
-            cell.set(crate::alloc::AllocSnapshot::new());
-            snap
-        })
-        .unwrap_or_default();
-
     #[cfg(feature = "cpu-time")]
     let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
 
+    // Push onto stack BEFORE snapshotting alloc counters. This ensures
+    // any allocation caused by Vec growth is attributed to the runtime,
+    // not to the user's function (fixes phantom alloc in recursion).
+    //
+    // Snapshot and zero alloc counters inside the same closure to avoid
+    // a second with_stack_mut TLS access. ALLOC_COUNTERS is a separate
+    // TLS from STACK, so reading it here is safe.
     with_stack_mut(|s| {
         let depth = s.len() as u16;
         let packed = pack_name_depth(name_id, depth);
@@ -830,10 +829,25 @@ fn enter_cold(name: &'static str) {
             cpu_children_ns: 0,
             #[cfg(feature = "cpu-time")]
             cpu_start_ns,
-            saved_alloc,
+            saved_alloc: Default::default(), // placeholder until Vec growth settles
             packed,
         });
-    })
+
+        // Now snapshot and zero alloc counters — any Vec growth above is
+        // already counted in the parent's accumulator, not ours.
+        let saved_alloc = crate::alloc::ALLOC_COUNTERS
+            .try_with(|cell| {
+                let snap = cell.get();
+                cell.set(crate::alloc::AllocSnapshot::new());
+                snap
+            })
+            .unwrap_or_default();
+
+        // Patch the entry we just pushed with the real snapshot.
+        if let Some(entry) = s.last_mut() {
+            entry.saved_alloc = saved_alloc;
+        }
+    });
 }
 
 /// Start timing a function. Returns a Guard that records the measurement on drop.
@@ -2876,5 +2890,38 @@ mod tests {
         assert_eq!(entry.alloc_bytes, 1536, "should record 1536 alloc bytes");
         assert_eq!(entry.free_count, 1, "should record 1 free");
         assert_eq!(entry.free_bytes, 256, "should record 256 free bytes");
+    }
+
+    #[test]
+    #[serial]
+    fn recursive_non_allocating_has_zero_allocs() {
+        // A recursive function that does no allocation should not pick up
+        // phantom allocs from STACK Vec growth during enter_cold().
+        reset();
+
+        // Simulate a recursive call chain deep enough to trigger Vec growth.
+        // Vec starts empty, capacity doubles: 0 -> 1 -> 2 -> 4 -> 8 -> 16...
+        // 20 levels ensures multiple reallocations.
+        fn recurse(depth: u32) {
+            let _g = enter("recurse_fn");
+            if depth > 0 {
+                recurse(depth - 1);
+            }
+        }
+        recurse(20);
+
+        flush_records_buf();
+        let agg = RECORDS.with(|records| records.lock().unwrap().clone());
+        let entry = agg.iter().find(|e| e.name == "recurse_fn").unwrap();
+        assert_eq!(
+            entry.alloc_count, 0,
+            "non-allocating recursive function should have 0 alloc_count, got {}",
+            entry.alloc_count
+        );
+        assert_eq!(
+            entry.alloc_bytes, 0,
+            "non-allocating recursive function should have 0 alloc_bytes, got {}",
+            entry.alloc_bytes
+        );
     }
 }
