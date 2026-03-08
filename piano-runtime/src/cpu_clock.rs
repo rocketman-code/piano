@@ -33,6 +33,52 @@ extern "C" {
     fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
 }
 
+#[cfg(feature = "cpu-time")]
+use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+
+#[cfg(feature = "cpu-time")]
+static CPU_BIAS_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Calibrate the measurement bias (cost of a cpu_now_ns() call pair in nanoseconds).
+/// Uses trimmed mean (2% trim) for robustness against outliers.
+/// Called once from epoch() after TSC calibration.
+#[cfg(feature = "cpu-time")]
+pub(crate) fn calibrate_bias() {
+    const N: usize = 10_000;
+    let mut samples = Vec::with_capacity(N);
+    for _ in 0..N {
+        let start = cpu_now_ns();
+        compiler_fence(Ordering::SeqCst);
+        let end = cpu_now_ns();
+        samples.push(end.saturating_sub(start));
+    }
+    samples.sort_unstable();
+    // 2% trim from each end for outlier robustness.
+    // N/50 = 200; trimming 0% vs 2% yields nearly identical means on
+    // well-behaved data, making the `/` vs `%` mutant unkillable by test.
+    let trim = N / 50;
+    let trimmed = &samples[trim..N - trim];
+    let sum: u64 = trimmed.iter().sum();
+    let mean_ns = sum / trimmed.len() as u64;
+    CPU_BIAS_NS.store(mean_ns, Ordering::Release);
+}
+
+/// Return the calibrated CPU-time bias in nanoseconds.
+#[cfg(feature = "cpu-time")]
+#[inline(always)]
+pub(crate) fn bias_ns() -> u64 {
+    CPU_BIAS_NS.load(Ordering::Relaxed)
+}
+
+#[cfg(all(feature = "_test_internals", feature = "cpu-time"))]
+pub fn store_cpu_bias_ns(val: u64) {
+    CPU_BIAS_NS.store(val, Ordering::Release);
+}
+#[cfg(all(feature = "_test_internals", feature = "cpu-time"))]
+pub fn load_cpu_bias_ns() -> u64 {
+    CPU_BIAS_NS.load(Ordering::Relaxed)
+}
+
 /// Return the current thread's CPU time in nanoseconds.
 ///
 /// Uses `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` which measures only time
@@ -53,6 +99,61 @@ pub(crate) fn cpu_now_ns() -> u64 {
 #[cfg(feature = "cpu-time")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calibrate_bias_produces_nonzero() {
+        calibrate_bias();
+        let b = bias_ns();
+        // clock_gettime overhead should be at least 5ns on any real hardware.
+        // This also catches the mutant that replaces bias_ns() -> 1.
+        assert!(b >= 5, "CPU bias should be >= 5ns, got {b}");
+        // and less than 10us (even on slow systems)
+        assert!(b < 10_000, "CPU bias should be < 10us, got {b}ns");
+    }
+
+    #[test]
+    fn calibrate_bias_is_consistent() {
+        // Kills mutants that replace `/` with `%` in calibrate_bias.
+        // With real division, repeated calibrations yield the same mean.
+        // With `%`, the remainder depends on the exact sum, which varies
+        // between runs due to measurement noise -- two remainders are
+        // unlikely to be close.
+        calibrate_bias();
+        let b1 = bias_ns();
+        calibrate_bias();
+        let b2 = bias_ns();
+        calibrate_bias();
+        let b3 = bias_ns();
+
+        let max = b1.max(b2).max(b3);
+        let min = b1.min(b2).min(b3).max(1);
+        let spread = max as f64 / min as f64;
+        assert!(
+            spread < 3.0,
+            "calibrate_bias inconsistent: {b1}, {b2}, {b3} (spread {spread:.1}x)"
+        );
+        // Upper bound: clock_gettime overhead should not exceed 5000ns
+        // (generous to accommodate instrumented builds like cargo-llvm-cov)
+        assert!(
+            max < 5_000,
+            "calibrate_bias {max}ns exceeds 5us -- likely not a mean"
+        );
+    }
+
+    #[cfg(feature = "_test_internals")]
+    #[test]
+    fn store_load_cpu_bias_round_trip() {
+        // Kills mutants: store -> no-op, load -> 0, load -> 1, bias_ns -> 1
+        store_cpu_bias_ns(42);
+        assert_eq!(load_cpu_bias_ns(), 42, "load should return stored value");
+        assert_eq!(bias_ns(), 42, "bias_ns should read same atomic");
+
+        store_cpu_bias_ns(9999);
+        assert_eq!(load_cpu_bias_ns(), 9999);
+
+        // Reset to avoid affecting other tests
+        store_cpu_bias_ns(0);
+    }
 
     #[test]
     fn cpu_time_advances_during_compute() {

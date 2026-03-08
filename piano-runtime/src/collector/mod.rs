@@ -148,6 +148,8 @@ fn epoch() -> Instant {
     *EPOCH.get_or_init(|| {
         crate::tsc::calibrate();
         crate::tsc::calibrate_bias();
+        #[cfg(feature = "cpu-time")]
+        crate::cpu_clock::calibrate_bias();
         let tsc_val = crate::tsc::read();
         let now = Instant::now();
         crate::tsc::set_epoch_tsc(tsc_val);
@@ -434,7 +436,9 @@ impl Drop for TlsFlushGuard {
                 let self_ns = elapsed_ns.saturating_sub(children_ns);
 
                 #[cfg(feature = "cpu-time")]
-                let cpu_elapsed_ns = cpu_end_ns.saturating_sub(entry.cpu_start_ns);
+                let cpu_elapsed_ns = cpu_end_ns
+                    .saturating_sub(entry.cpu_start_ns)
+                    .saturating_sub(crate::cpu_clock::bias_ns());
                 #[cfg(feature = "cpu-time")]
                 let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
 
@@ -689,7 +693,9 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
         let self_ns = elapsed_ns.saturating_sub(children_ns);
 
         #[cfg(feature = "cpu-time")]
-        let cpu_elapsed_ns = cpu_end_ns.saturating_sub(entry.cpu_start_ns);
+        let cpu_elapsed_ns = cpu_end_ns
+            .saturating_sub(entry.cpu_start_ns)
+            .saturating_sub(crate::cpu_clock::bias_ns());
         #[cfg(feature = "cpu-time")]
         let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
 
