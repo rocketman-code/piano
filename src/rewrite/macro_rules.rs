@@ -1461,4 +1461,51 @@ fn main() {}
             result.macro_fn_names
         );
     }
+
+    #[test]
+    fn macro_filter_agrees_with_classify() {
+        // Both paths must agree: classify() on a parsed signature and
+        // match_fn_pattern() on the equivalent token stream must make
+        // the same accept/reject decision.
+        use crate::resolve::{Classification, classify};
+
+        let cases = [
+            ("fn foo() {}", true),
+            ("pub fn foo() {}", true),
+            ("async fn foo() {}", true),
+            ("pub async fn foo() {}", true),
+            ("extern \"Rust\" fn foo() {}", true),
+            ("pub extern \"Rust\" fn foo() {}", true),
+            ("const fn foo() {}", false),
+            ("unsafe fn foo() {}", false),
+            ("extern \"C\" fn foo() {}", false),
+            ("extern fn foo() {}", false),
+            ("pub const fn foo() {}", false),
+            ("pub unsafe fn foo() {}", false),
+            ("pub extern \"C\" fn foo() {}", false),
+        ];
+
+        for (code, expected_instrumentable) in cases {
+            // Path 1: classify() on parsed signature
+            let item: syn::ItemFn = syn::parse_str(code).unwrap_or_else(|e| {
+                panic!("failed to parse '{code}': {e}");
+            });
+            let classify_says = matches!(classify(&item.sig), Classification::Instrumentable);
+
+            // Path 2: match_fn_pattern() on token stream
+            let tokens: proc_macro2::TokenStream = code.parse().unwrap();
+            let flat: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
+            let macro_says = super::match_fn_pattern(&flat, 0).is_some();
+
+            assert_eq!(
+                classify_says, macro_says,
+                "classify() and match_fn_pattern() disagree on '{code}': \
+                 classify={classify_says}, macro={macro_says}"
+            );
+            assert_eq!(
+                classify_says, expected_instrumentable,
+                "unexpected result for '{code}': got {classify_says}, expected {expected_instrumentable}"
+            );
+        }
+    }
 }
