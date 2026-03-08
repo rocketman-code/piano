@@ -487,16 +487,16 @@ fn drain_inflight_stack() {
 
             // cpu_start_ns == 0 means enter() never completed (process::exit
             // between enter_cold and the cpu_start_ns patch). Report 0.
+            // Raw CPU elapsed: no per-call bias subtraction. Amortized correction
+            // is applied at aggregation (raw_total - calls * bias), matching drop_cold.
             #[cfg(feature = "cpu-time")]
-            let cpu_elapsed_ns = if entry.cpu_start_ns == 0 {
+            let cpu_raw_elapsed = if entry.cpu_start_ns == 0 {
                 0
             } else {
-                cpu_end_ns
-                    .saturating_sub(entry.cpu_start_ns)
-                    .saturating_sub(crate::cpu_clock::bias_ns())
+                cpu_end_ns.saturating_sub(entry.cpu_start_ns)
             };
             #[cfg(feature = "cpu-time")]
-            let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
+            let cpu_self_ns = cpu_raw_elapsed.saturating_sub(entry.cpu_children_ns);
 
             let scope_alloc = if i + 1 < len {
                 s[i + 1].saved_alloc
