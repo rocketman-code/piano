@@ -7,6 +7,38 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-03-08
+
+Piano now instruments significantly more of your code -- functions returning `impl Future`, functions inside `macro_rules!`, and trait methods like `Display::fmt` vs `Debug::fmt` that previously collided into one entry. Four new CLI flags open up new workflows: `--json` for scripting, `--duration` for long-running programs, `--bin` for multi-binary crates, and `--threads` for per-thread breakdowns.
+
+### Added
+
+- `--json` flag for `piano profile`, `piano report`, and `piano diff` -- pipe profiling data into scripts or other tools (#412, #415)
+- `--duration` flag -- profile a long-running server for N seconds, then stop and report automatically (#419, #416)
+- `--bin` flag -- profile a specific binary in multi-binary crates; discovers targets from `[[bin]]` entries and `src/bin/` automatically (#480)
+- `--threads` flag -- see timing broken down by thread instead of aggregated (#414)
+- Functions returning `impl Future` now instrumented -- these were silently skipped before, leaving gaps in async profiles (#426)
+- Functions defined inside `macro_rules!` bodies now instrumented with type-qualified names (#452, #454)
+- Trait methods disambiguated: `<Type as Display>::fmt` and `<Type as Debug>::fmt` appear as separate entries instead of colliding into one `fmt` row (#497)
+- Module-qualified function names in output for unambiguous identification across large codebases
+- Visual separator between your program's output and Piano's report
+
+### Fixed
+
+- CPU time was inflated up to 17x for high-call-count functions -- a per-call bias quantum accumulated instead of being corrected in aggregate (#498)
+- Recursive functions reported phantom allocation counts caused by internal TLS bookkeeping (#499)
+- Ctrl-C now propagates to the child process instead of leaving it running orphaned (#413)
+- Compilation error messages pointed to wrong line numbers after instrumentation (#420)
+- Profiling data from `process::exit()` recovery no longer double-subtracts CPU bias (#515)
+- Signal-triggered shutdown (Ctrl-C, SIGTERM) now drains in-flight stack entries instead of losing them
+- Stale profiling data from previous runs no longer contaminates new reports
+- Spurious allocation counts no longer attributed to internal runtime operations
+- Non-UTF-8 path components in module names handled gracefully instead of panicking
+
+### Removed
+
+- Spike detection removed from `--frames` output -- it flagged normal variance as anomalies (#459)
+
 ## [0.11.0] - 2026-03-04
 
 Async profiling rewritten for correctness and lower overhead, plus automatic bias calibration that reduces measurement overhead by up to 81% on x86_64.
@@ -293,7 +325,8 @@ Per-frame allocation tracking, cross-thread instrumentation, NDJSON output, and 
 
 Initial tagged release.
 
-[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/rocketman-code/piano/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/rocketman-code/piano/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rocketman-code/piano/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/rocketman-code/piano/compare/v0.9.2...v0.9.3
