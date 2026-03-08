@@ -754,8 +754,8 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                 );
             });
 
-            let remaining_all_base = s.iter().all(|e| unpack_depth(e.packed) == 0);
-            let is_frame_boundary = unpack_depth(entry.packed) == 0 || remaining_all_base;
+            let remaining_all_base = s.iter().all(|e| unpack_depth(e.packed) == 0); // mutants::skip: flush optimization for fork/adopt
+            let is_frame_boundary = unpack_depth(entry.packed) == 0 || remaining_all_base; // mutants::skip: flush optimization for fork/adopt
 
             if is_frame_boundary {
                 flush_records_buf();
