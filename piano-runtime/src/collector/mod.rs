@@ -1384,10 +1384,10 @@ fn shutdown_impl_inner(dir: &std::path::Path) -> bool {
             if let Some(ref mut s) = *state {
                 // Flush any in-flight frames that drain_inflight_stack pushed
                 // to FRAMES Arcs. These haven't been streamed yet.
+                // Uses write_shutdown_frames (global-only, no TLS) because
+                // process::exit() may have destroyed TLS before atexit runs.
                 let remaining = collect_frames_with_tid();
-                for (_, frame) in &remaining {
-                    ndjson::stream_frame_to_writer(s, frame);
-                }
+                ndjson::write_shutdown_frames(s, &remaining);
                 if let Err(e) = write_stream_trailer(s) {
                     eprintln!(
                         "piano: failed to write trailer to {}: {e}",

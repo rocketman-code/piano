@@ -101,8 +101,9 @@ thread_local! {
 #[inline(always)]
 pub(super) fn intern_name(name: &'static str) -> u16 {
     let ptr = name.as_ptr() as usize;
-    let cached = NAME_CACHE.with(|cache| cache.borrow().get(&ptr).copied());
-    if let Some(id) = cached {
+    // try_with: TLS may be destroyed during atexit (process::exit path).
+    // On failure, skip the cache and go straight to the global table.
+    if let Ok(Some(id)) = NAME_CACHE.try_with(|cache| cache.borrow().get(&ptr).copied()) {
         return id;
     }
     intern_name_slow(name, ptr)
@@ -124,7 +125,8 @@ fn intern_name_slow(name: &'static str, ptr: usize) -> u16 {
         }
     };
     drop(_guard);
-    NAME_CACHE.with(|cache| {
+    // try_with: skip cache write if TLS is destroyed (atexit path).
+    let _ = NAME_CACHE.try_with(|cache| {
         cache.borrow_mut().insert(ptr, id);
     });
     id

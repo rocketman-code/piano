@@ -133,3 +133,81 @@ fn process_exit_produces_valid_profiling_data() {
         "main() should have been called at least once"
     );
 }
+
+/// Streaming mode (PIANO_STREAM_FRAMES=1) exercises the atexit path through
+/// `stream_frame_to_writer` and `intern_name`, which use TLS (THREAD_INDEX,
+/// NAME_CACHE). When `process::exit()` destroys TLS before the atexit handler
+/// runs, these `.with()` calls would panic. The fix converts them to
+/// `.try_with()` with graceful fallback.
+#[test]
+fn process_exit_streaming_no_tls_panic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("exit-stream-test");
+    create_exit_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let build_output = std::process::Command::new(piano_bin)
+        .args(["build", "--fn", "work", "--fn", "main", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("piano build failed");
+
+    assert!(
+        build_output.status.success(),
+        "piano build failed:\n{}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let binary_path = String::from_utf8_lossy(&build_output.stdout)
+        .trim()
+        .to_string();
+
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    // Run with PIANO_STREAM_FRAMES=1 to exercise the streaming atexit path.
+    let run_output = std::process::Command::new(&binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .env("PIANO_STREAM_FRAMES", "1")
+        .output()
+        .expect("failed to run instrumented binary");
+
+    let stderr = String::from_utf8_lossy(&run_output.stderr);
+
+    // Must NOT contain TLS panic -- this is the core assertion for issue #518.
+    assert!(
+        !stderr.contains("cannot access a Thread Local Storage"),
+        "TLS panic detected in streaming atexit path:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panic"),
+        "unexpected panic in stderr:\n{stderr}"
+    );
+
+    // Must have produced NDJSON output.
+    let ndjson_files: Vec<_> = fs::read_dir(&runs_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+        .collect();
+
+    assert!(
+        !ndjson_files.is_empty(),
+        "no NDJSON files written in streaming mode (runtime crashed without writing data)"
+    );
+
+    let ndjson_path = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&ndjson_path).unwrap();
+    let stats = common::aggregate_ndjson(&content);
+
+    assert!(
+        stats.contains_key("work"),
+        "streaming profiling data should contain 'work' function, got: {stats:?}"
+    );
+}

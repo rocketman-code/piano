@@ -72,6 +72,60 @@ pub(super) fn stream_frame_to_writer(state: &mut StreamState, buf: &[FrameFnSumm
     state.frame_count += 1;
 }
 
+/// Write remaining frames to the stream file during shutdown.
+///
+/// Cold path: uses only global state, no TLS access. Safe to call from the
+/// atexit handler after `process::exit()` has destroyed thread-local storage.
+/// - `tid` comes from `THREAD_FRAMES` global (already stored in the tuple).
+/// - `fn_id` resolved via `name_table_get` (lock-free global atomic array),
+///   bypassing the `NAME_CACHE` TLS cache that `intern_name` uses.
+pub(super) fn write_shutdown_frames(
+    state: &mut StreamState,
+    frames: &[(usize, Vec<FrameFnSummary>)],
+) {
+    // Build ptr→id map from global NAME_TABLE (lock-free reads, no TLS).
+    let len = NAME_TABLE_LEN.load(Ordering::Acquire);
+    let mut name_to_id = std::collections::HashMap::<usize, u16>::new();
+    for i in 0..len {
+        if let Some(name) = name_table_get(i) {
+            name_to_id.insert(name.as_ptr() as usize, i as u16);
+        }
+    }
+
+    for (tid, frame) in frames {
+        let frame_idx = state.frame_count;
+        let _ = write!(
+            state.file,
+            "{{\"frame\":{frame_idx},\"tid\":{tid},\"fns\":["
+        );
+        for (i, entry) in frame.iter().enumerate() {
+            if i > 0 {
+                let _ = write!(state.file, ",");
+            }
+            let fn_id = name_to_id
+                .get(&(entry.name.as_ptr() as usize))
+                .copied()
+                .unwrap_or(0);
+            let _ = write!(
+                state.file,
+                "{{\"id\":{},\"calls\":{},\"self_ns\":{},\"ac\":{},\"ab\":{},\"fc\":{},\"fb\":{}",
+                fn_id,
+                entry.calls,
+                entry.self_ns,
+                entry.alloc_count,
+                entry.alloc_bytes,
+                entry.free_count,
+                entry.free_bytes
+            );
+            #[cfg(feature = "cpu-time")]
+            let _ = write!(state.file, ",\"csn\":{}", entry.cpu_self_ns);
+            let _ = write!(state.file, "}}");
+        }
+        let _ = writeln!(state.file, "]}}");
+        state.frame_count += 1;
+    }
+}
+
 /// Push a frame into the thread-local in-memory buffer (fallback path).
 pub(super) fn push_to_frames(buf: &[FrameFnSummary]) {
     FRAMES.with(|frames| {
@@ -746,6 +800,193 @@ mod tests {
             Some("path\\to\\fn"),
             "backslash name at id {id_backslash}"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[serial]
+    fn write_shutdown_frames_produces_output() {
+        // Kills: replace write_shutdown_frames with ()
+        reset();
+        let tmp =
+            std::env::temp_dir().join(format!("piano_shutdown_frames_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Intern names into the global NAME_TABLE before calling write_shutdown_frames.
+        let name_a: &'static str = "shutdown_frames_fn_a";
+        let id_a = intern_name(name_a);
+
+        let frames: Vec<(usize, Vec<FrameFnSummary>)> = vec![(
+            0,
+            vec![FrameFnSummary {
+                name: name_a,
+                calls: 5,
+                self_ns: 999,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 0,
+                alloc_count: 1,
+                alloc_bytes: 64,
+                free_count: 0,
+                free_bytes: 0,
+            }],
+        )];
+
+        let mut state = open_stream_file(&tmp).unwrap();
+        write_shutdown_frames(&mut state, &frames);
+        write_stream_trailer(&mut state).unwrap();
+        drop(state);
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+
+        // Header + 1 frame + trailer = 3 lines
+        assert_eq!(lines.len(), 3, "should have header + frame + trailer");
+        assert!(lines[1].contains("\"frame\":0"), "frame line present");
+        assert!(
+            lines[1].contains(&format!("\"id\":{id_a}")),
+            "fn_id should match interned id"
+        );
+        assert!(lines[1].contains("\"calls\":5"), "calls value");
+        assert!(lines[1].contains("\"self_ns\":999"), "self_ns value");
+        assert!(lines[1].contains("\"ac\":1"), "alloc_count value");
+        assert!(lines[1].contains("\"ab\":64"), "alloc_bytes value");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[serial]
+    fn write_shutdown_frames_comma_separation() {
+        // Kills: replace > with ==/</>= in write_shutdown_frames (line 102)
+        reset();
+        let tmp = std::env::temp_dir().join(format!("piano_shutdown_comma_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let name_x: &'static str = "shutdown_comma_x";
+        let name_y: &'static str = "shutdown_comma_y";
+        intern_name(name_x);
+        intern_name(name_y);
+
+        let mk = |name: &'static str, calls: u64| FrameFnSummary {
+            name,
+            calls,
+            self_ns: 100,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 0,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
+        };
+
+        // Frame 0: single entry (no comma expected)
+        // Frame 1: two entries (one comma expected)
+        let frames: Vec<(usize, Vec<FrameFnSummary>)> = vec![
+            (0, vec![mk(name_x, 1)]),
+            (1, vec![mk(name_x, 2), mk(name_y, 3)]),
+        ];
+
+        let mut state = open_stream_file(&tmp).unwrap();
+        write_shutdown_frames(&mut state, &frames);
+        write_stream_trailer(&mut state).unwrap();
+        drop(state);
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+
+        // Header + 2 frames + trailer = 4 lines
+        assert_eq!(lines.len(), 4);
+
+        // Frame 0 (single entry): no comma between entries, no leading comma
+        let f0_fns = &lines[1][lines[1].find("\"fns\":[").unwrap()..];
+        assert_eq!(
+            f0_fns.matches("},{").count(),
+            0,
+            "single-entry frame should have no comma between entries"
+        );
+        assert!(
+            f0_fns.contains("\"fns\":[{"),
+            "fns array should start with [{{ not [,{{: {f0_fns}"
+        );
+
+        // Frame 1 (two entries): exactly one comma separator, no leading comma
+        let f1_fns = &lines[2][lines[2].find("\"fns\":[").unwrap()..];
+        assert_eq!(
+            f1_fns.matches("},{").count(),
+            1,
+            "two-entry frame should have exactly one comma separator"
+        );
+        assert!(
+            f1_fns.contains("\"fns\":[{"),
+            "fns array should start with [{{ not [,{{: {f1_fns}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[serial]
+    fn write_shutdown_frames_increments_frame_count() {
+        // Kills: replace += with -=/*= in write_shutdown_frames (line 125)
+        reset();
+        let tmp = std::env::temp_dir().join(format!("piano_shutdown_count_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let name_z: &'static str = "shutdown_count_z";
+        intern_name(name_z);
+
+        let mk = || FrameFnSummary {
+            name: name_z,
+            calls: 1,
+            self_ns: 100,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 0,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
+        };
+
+        // Three (tid, frame) pairs -> frame_count should go 0, 1, 2
+        let frames: Vec<(usize, Vec<FrameFnSummary>)> =
+            vec![(0, vec![mk()]), (1, vec![mk()]), (2, vec![mk()])];
+
+        let mut state = open_stream_file(&tmp).unwrap();
+        assert_eq!(state.frame_count, 0, "starts at 0");
+        write_shutdown_frames(&mut state, &frames);
+        assert_eq!(state.frame_count, 3, "should be 3 after writing 3 frames");
+
+        // Also verify the frame indices in the output
+        write_stream_trailer(&mut state).unwrap();
+        drop(state);
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+
+        // Header + 3 frames + trailer = 5 lines
+        assert_eq!(lines.len(), 5);
+        assert!(lines[1].contains("\"frame\":0"), "first frame index is 0");
+        assert!(lines[2].contains("\"frame\":1"), "second frame index is 1");
+        assert!(lines[3].contains("\"frame\":2"), "third frame index is 2");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
