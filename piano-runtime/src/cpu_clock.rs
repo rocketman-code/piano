@@ -36,47 +36,87 @@ extern "C" {
 #[cfg(feature = "cpu-time")]
 use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
+/// CPU-time bias stored as f64 bits in AtomicU64. Amortized measurement
+/// gives sub-nanosecond precision, eliminating the 42ns quantum systematic
+/// bias that per-call saturating_sub creates on Apple Silicon.
 #[cfg(feature = "cpu-time")]
-static CPU_BIAS_NS: AtomicU64 = AtomicU64::new(0);
+static CPU_BIAS_F64: AtomicU64 = AtomicU64::new(0);
 
-/// Calibrate the measurement bias (cost of a cpu_now_ns() call pair in nanoseconds).
-/// Uses trimmed mean (2% trim) for robustness against outliers.
+/// Guard instrumentation overhead (guard_cost - bias) stored as f64 bits.
+/// Added to parent.cpu_children per child call to correct parent inflation.
+#[cfg(feature = "cpu-time")]
+static GUARD_OVERHEAD_F64: AtomicU64 = AtomicU64::new(0);
+
+/// Calibrate the measurement bias: amortized cost of tsc::read() per call,
+/// matching the exit sequence overhead between body-end and cpu_end capture.
 /// Called once from epoch() after TSC calibration.
 #[cfg(feature = "cpu-time")]
 pub(crate) fn calibrate_bias() {
-    const N: usize = 10_000;
-    let mut samples = Vec::with_capacity(N);
+    const N: usize = 100_000;
+    let start = cpu_now_ns();
     for _ in 0..N {
-        let start = cpu_now_ns();
         compiler_fence(Ordering::SeqCst);
-        let end = cpu_now_ns();
-        samples.push(end.saturating_sub(start));
+        crate::tsc::read();
     }
-    samples.sort_unstable();
-    // 2% trim from each end for outlier robustness.
-    // N/50 = 200; trimming 0% vs 2% yields nearly identical means on
-    // well-behaved data, making the `/` vs `%` mutant unkillable by test.
-    let trim = N / 50;
-    let trimmed = &samples[trim..N - trim];
-    let sum: u64 = trimmed.iter().sum();
-    let mean_ns = sum / trimmed.len() as u64;
-    CPU_BIAS_NS.store(mean_ns, Ordering::Release);
+    let end = cpu_now_ns();
+    let bias = (end - start) as f64 / N as f64;
+    CPU_BIAS_F64.store(bias.to_bits(), Ordering::Release);
 }
 
-/// Return the calibrated CPU-time bias in nanoseconds.
+/// Return the calibrated CPU-time bias as f64 nanoseconds.
+/// Used at aggregation for amortized correction: corrected = raw - calls * bias.
+#[cfg(feature = "cpu-time")]
+#[inline(always)]
+pub(crate) fn bias_f64() -> f64 {
+    f64::from_bits(CPU_BIAS_F64.load(Ordering::Relaxed))
+}
+
+/// Return the calibrated CPU-time bias as integer nanoseconds.
+/// Used in TlsFlushGuard crash recovery (precision not required).
 #[cfg(feature = "cpu-time")]
 #[inline(always)]
 pub(crate) fn bias_ns() -> u64 {
-    CPU_BIAS_NS.load(Ordering::Relaxed)
+    bias_f64() as u64
+}
+
+/// Return the guard instrumentation overhead as f64 nanoseconds.
+/// This is the per-child-call cost that falls inside the parent's CPU bracket
+/// but outside the child's raw elapsed.
+#[cfg(feature = "cpu-time")]
+#[inline(always)]
+pub(crate) fn guard_overhead_f64() -> f64 {
+    f64::from_bits(GUARD_OVERHEAD_F64.load(Ordering::Relaxed))
+}
+
+/// Return the guard instrumentation overhead as integer nanoseconds.
+/// Truncates the f64 value (~0.5ns/call error, <0.1% of typical ~50ns value).
+#[cfg(feature = "cpu-time")]
+#[inline(always)]
+pub(crate) fn guard_overhead_ns() -> u64 {
+    guard_overhead_f64() as u64
+}
+
+/// Store the calibrated guard overhead (called from collector after calibration).
+#[cfg(feature = "cpu-time")]
+pub(crate) fn store_guard_overhead(val: f64) {
+    GUARD_OVERHEAD_F64.store(val.to_bits(), Ordering::Release);
 }
 
 #[cfg(all(feature = "_test_internals", feature = "cpu-time"))]
 pub fn store_cpu_bias_ns(val: u64) {
-    CPU_BIAS_NS.store(val, Ordering::Release);
+    CPU_BIAS_F64.store((val as f64).to_bits(), Ordering::Release);
 }
 #[cfg(all(feature = "_test_internals", feature = "cpu-time"))]
 pub fn load_cpu_bias_ns() -> u64 {
-    CPU_BIAS_NS.load(Ordering::Relaxed)
+    bias_ns()
+}
+#[cfg(all(feature = "_test_internals", feature = "cpu-time"))]
+pub fn store_guard_overhead_ns(val: u64) {
+    store_guard_overhead(val as f64);
+}
+#[cfg(all(feature = "_test_internals", feature = "cpu-time"))]
+pub fn load_guard_overhead_ns() -> u64 {
+    guard_overhead_ns()
 }
 
 /// Return the current thread's CPU time in nanoseconds.
@@ -103,40 +143,37 @@ mod tests {
     #[test]
     fn calibrate_bias_produces_nonzero() {
         calibrate_bias();
-        let b = bias_ns();
-        // clock_gettime overhead should be at least 5ns on any real hardware.
-        // This also catches the mutant that replaces bias_ns() -> 1.
-        assert!(b >= 5, "CPU bias should be >= 5ns, got {b}");
+        let b = bias_f64();
+        // tsc::read overhead should be at least 2ns on any real hardware.
+        assert!(b >= 2.0, "CPU bias should be >= 2ns, got {b:.1}");
         // and less than 10us (even on slow systems)
-        assert!(b < 10_000, "CPU bias should be < 10us, got {b}ns");
+        assert!(b < 10_000.0, "CPU bias should be < 10us, got {b:.1}ns");
+        // Integer accessor should round-trip
+        assert!(bias_ns() >= 2, "bias_ns should be >= 2, got {}", bias_ns());
     }
 
     #[test]
     fn calibrate_bias_is_consistent() {
-        // Kills mutants that replace `/` with `%` in calibrate_bias.
-        // With real division, repeated calibrations yield the same mean.
-        // With `%`, the remainder depends on the exact sum, which varies
-        // between runs due to measurement noise -- two remainders are
-        // unlikely to be close.
+        // Kills mutants that replace `/` with other ops in calibrate_bias.
+        // Amortized measurement should produce consistent results across runs.
         calibrate_bias();
-        let b1 = bias_ns();
+        let b1 = bias_f64();
         calibrate_bias();
-        let b2 = bias_ns();
+        let b2 = bias_f64();
         calibrate_bias();
-        let b3 = bias_ns();
+        let b3 = bias_f64();
 
         let max = b1.max(b2).max(b3);
-        let min = b1.min(b2).min(b3).max(1);
-        let spread = max as f64 / min as f64;
+        let min = b1.min(b2).min(b3).max(1.0);
+        let spread = max / min;
         assert!(
             spread < 3.0,
-            "calibrate_bias inconsistent: {b1}, {b2}, {b3} (spread {spread:.1}x)"
+            "calibrate_bias inconsistent: {b1:.1}, {b2:.1}, {b3:.1} (spread {spread:.1}x)"
         );
-        // Upper bound: clock_gettime overhead should not exceed 5000ns
-        // (generous to accommodate instrumented builds like cargo-llvm-cov)
+        // Upper bound: tsc::read overhead should not exceed 5000ns
         assert!(
-            max < 5_000,
-            "calibrate_bias {max}ns exceeds 5us -- likely not a mean"
+            max < 5_000.0,
+            "calibrate_bias {max:.1}ns exceeds 5us -- likely not a mean"
         );
     }
 
@@ -153,6 +190,17 @@ mod tests {
 
         // Reset to avoid affecting other tests
         store_cpu_bias_ns(0);
+    }
+
+    #[cfg(feature = "_test_internals")]
+    #[test]
+    fn store_load_guard_overhead_round_trip() {
+        store_guard_overhead_ns(100);
+        assert_eq!(load_guard_overhead_ns(), 100);
+        assert_eq!(guard_overhead_ns(), 100);
+
+        store_guard_overhead_ns(0);
+        assert_eq!(load_guard_overhead_ns(), 0);
     }
 
     #[test]

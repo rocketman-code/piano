@@ -32,3 +32,9 @@ pub use piano_future::PianoFuture;
 pub use collector::clear_runs_dir;
 #[cfg(any(test, feature = "_test_internals"))]
 pub use collector::collect_invocations;
+
+#[cfg(all(feature = "_test_internals", feature = "cpu-time"))]
+#[doc(hidden)]
+pub use cpu_clock::{
+    load_cpu_bias_ns, load_guard_overhead_ns, store_cpu_bias_ns, store_guard_overhead_ns,
+};
