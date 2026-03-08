@@ -4,10 +4,122 @@ use std::process::Command;
 use std::sync::LazyLock;
 
 use ignore::WalkBuilder;
+use serde::Deserialize;
 use toml_edit::DocumentMut;
 
 use crate::error::{Error, io_context};
 use crate::source_map::SourceMap;
+
+// --- Cargo metadata types ---
+
+#[derive(Debug, Deserialize)]
+pub struct CargoMetadata {
+    pub workspace_root: PathBuf,
+    pub packages: Vec<MetadataPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetadataPackage {
+    pub name: String,
+    pub manifest_path: PathBuf,
+    pub targets: Vec<MetadataTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetadataTarget {
+    pub name: String,
+    pub kind: Vec<String>,
+    pub src_path: PathBuf,
+}
+
+/// Run `cargo metadata --format-version 1 --no-deps` in the given directory
+/// and parse the result.
+pub fn cargo_metadata(project_dir: &Path) -> Result<CargoMetadata, Error> {
+    let output = Command::new("cargo")
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--no-deps")
+        .current_dir(project_dir)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .output()
+        .map_err(|e| Error::BuildFailed(format!("failed to run cargo metadata: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::BuildFailed(format!(
+            "cargo metadata failed: {stderr}"
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout)
+        .map_err(|e| Error::BuildFailed(format!("failed to parse cargo metadata: {e}")))
+}
+
+/// Find a binary target in the metadata for the given package.
+///
+/// When `bin_name` is `Some`, looks for that specific binary target.
+/// When `None`, returns the first binary target found.
+///
+/// Returns `(package_name, src_path)` where src_path is the absolute path
+/// to the binary's entry point.
+pub fn find_bin_target(
+    metadata: &CargoMetadata,
+    package_name: Option<&str>,
+    bin_name: Option<&str>,
+) -> Result<(String, PathBuf), Error> {
+    // Filter packages: if package_name given, match it; otherwise use all.
+    let candidates: Vec<&MetadataPackage> = if let Some(pkg) = package_name {
+        metadata.packages.iter().filter(|p| p.name == pkg).collect()
+    } else {
+        metadata.packages.iter().collect()
+    };
+
+    if candidates.is_empty() {
+        let name = package_name.unwrap_or("<any>");
+        return Err(Error::BuildFailed(format!(
+            "no package '{name}' found in cargo metadata"
+        )));
+    }
+
+    for pkg in &candidates {
+        for target in &pkg.targets {
+            if !target.kind.iter().any(|k| k == "bin") {
+                continue;
+            }
+            if let Some(wanted) = bin_name {
+                if target.name != wanted {
+                    continue;
+                }
+            }
+            return Ok((pkg.name.clone(), target.src_path.clone()));
+        }
+    }
+
+    let bin_desc = bin_name.unwrap_or("default");
+    let pkg_desc = package_name.unwrap_or("<any>");
+    Err(Error::BuildFailed(format!(
+        "no binary target '{bin_desc}' found in package '{pkg_desc}'"
+    )))
+}
+
+/// Find the package in metadata whose manifest_path is closest to `project_dir`.
+///
+/// This is used when no explicit `--bin` is given to find the "current" package
+/// the user is working in (e.g., when running from a workspace member directory).
+pub fn find_current_package<'a>(
+    metadata: &'a CargoMetadata,
+    project_dir: &Path,
+) -> Option<&'a MetadataPackage> {
+    let project_dir = project_dir.canonicalize().ok()?;
+    metadata.packages.iter().find(|pkg| {
+        pkg.manifest_path
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .is_some_and(|p| p == project_dir)
+    })
+}
 
 /// Copy the user's project into a staging directory, respecting .gitignore
 /// and skipping the `target/` directory.
@@ -246,28 +358,6 @@ fn filter_piano_internals(rendered: &str) -> String {
     filtered.join("\n")
 }
 
-/// Find the workspace root for a project directory.
-///
-/// Walks up from `project_dir` looking for the nearest parent `Cargo.toml`
-/// containing a `[workspace]` table. Does not validate that this project
-/// is an actual member of the workspace -- Cargo will catch mismatches at
-/// build time. Returns `None` if no workspace root is found.
-pub fn find_workspace_root(project_dir: &Path) -> Option<PathBuf> {
-    let project_dir = project_dir.canonicalize().ok()?;
-    let mut dir = project_dir.parent()?;
-    loop {
-        let cargo_toml = dir.join("Cargo.toml");
-        if cargo_toml.exists() {
-            let content = std::fs::read_to_string(&cargo_toml).ok()?;
-            let doc: DocumentMut = content.parse().ok()?;
-            if doc.get("workspace").is_some() {
-                return Some(dir.to_path_buf());
-            }
-        }
-        dir = dir.parent()?;
-    }
-}
-
 /// Find the project root by walking up from `start_dir` looking for Cargo.toml.
 ///
 /// Returns the canonicalized directory containing the nearest Cargo.toml.
@@ -286,110 +376,6 @@ pub fn find_project_root(start_dir: &Path) -> Result<PathBuf, Error> {
             None => return Err(Error::NoProjectFound(start_dir.to_path_buf())),
         }
     }
-}
-
-/// Find the binary entry point for a Cargo project.
-///
-/// When `bin_name` is `Some`, looks for the named `[[bin]]` entry only.
-/// When `None`, resolves the entry point using Cargo's rules:
-///
-/// 1. `[[bin]]` entries with an explicit `path` field -- returns the first match.
-/// 2. `[[bin]]` entries with a `name` but no `path` -- infers the source as
-///    `src/bin/<name>.rs` or `src/bin/<name>/main.rs` (Cargo's convention).
-/// 3. Falls back to `src/main.rs` if no `[[bin]]` section or no matches.
-///
-/// When multiple `[[bin]]` entries exist and no `bin_name` is given, the first
-/// match (in declaration order) is used. Returns an error if no entry point
-/// can be found.
-pub fn find_bin_entry_point(project_dir: &Path, bin_name: Option<&str>) -> Result<PathBuf, Error> {
-    let cargo_toml_path = project_dir.join("Cargo.toml");
-    let content =
-        std::fs::read_to_string(&cargo_toml_path).map_err(io_context("read", &cargo_toml_path))?;
-    let doc: DocumentMut = content
-        .parse::<DocumentMut>()
-        .map_err(|e| Error::BuildFailed(format!("failed to parse Cargo.toml: {e}")))?;
-
-    if let Some(bins) = doc.get("bin").and_then(|b| b.as_array_of_tables()) {
-        if let Some(target) = bin_name {
-            // Find the specific named binary.
-            for bin in bins {
-                let name = bin.get("name").and_then(|n| n.as_str());
-                if name != Some(target) {
-                    continue;
-                }
-                if let Some(path) = bin.get("path").and_then(|p| p.as_str()) {
-                    return Ok(PathBuf::from(path));
-                }
-                // Infer path from name.
-                return resolve_bin_path(project_dir, target);
-            }
-            return Err(Error::BuildFailed(format!(
-                "no [[bin]] entry named '{target}' in Cargo.toml"
-            )));
-        }
-
-        // No --bin specified: use first match (existing behavior).
-        // First pass: check for an explicit path.
-        for bin in bins {
-            if let Some(path) = bin.get("path").and_then(|p| p.as_str()) {
-                return Ok(PathBuf::from(path));
-            }
-        }
-
-        // Second pass: infer from name (src/bin/<name>.rs or src/bin/<name>/main.rs).
-        for bin in bins {
-            if let Some(name) = bin.get("name").and_then(|n| n.as_str()) {
-                if let Ok(path) = resolve_bin_path(project_dir, name) {
-                    return Ok(path);
-                }
-            }
-        }
-    } else if let Some(target) = bin_name {
-        // Check auto-discovered binaries in src/bin/ first.
-        if let Ok(path) = resolve_bin_path(project_dir, target) {
-            return Ok(path);
-        }
-        let pkg_name = doc
-            .get("package")
-            .and_then(|p| p.get("name"))
-            .and_then(|n| n.as_str());
-        if pkg_name != Some(target) {
-            return Err(Error::BuildFailed(format!(
-                "no binary target named '{target}' in Cargo.toml"
-            )));
-        }
-        // Name matches package -- fall through to src/main.rs check below.
-    }
-
-    // Cargo default: src/main.rs
-    let default = PathBuf::from("src").join("main.rs");
-    if project_dir.join(&default).exists() {
-        return Ok(default);
-    }
-
-    Err(Error::BuildFailed(format!(
-        "could not find binary entry point: no [[bin]] path in Cargo.toml and {} does not exist",
-        project_dir.join(&default).display()
-    )))
-}
-
-/// Resolve the source path for a named binary target using Cargo conventions:
-/// `src/bin/<name>.rs` or `src/bin/<name>/main.rs`.
-fn resolve_bin_path(project_dir: &Path, name: &str) -> Result<PathBuf, Error> {
-    let single_file = PathBuf::from("src").join("bin").join(format!("{name}.rs"));
-    if project_dir.join(&single_file).exists() {
-        return Ok(single_file);
-    }
-
-    let dir_main = PathBuf::from("src").join("bin").join(name).join("main.rs");
-    if project_dir.join(&dir_main).exists() {
-        return Ok(dir_main);
-    }
-
-    Err(Error::BuildFailed(format!(
-        "could not find source for binary '{name}': \
-         neither src/bin/{name}.rs nor src/bin/{name}/main.rs exists"
-    )))
 }
 
 /// Build the instrumented binary using `cargo build --release --message-format=json`.
@@ -582,108 +568,152 @@ edition = "2021"
     }
 
     #[test]
-    fn find_workspace_root_detects_parent_workspace() {
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path().join("ws");
+    fn find_bin_target_finds_default_binary() {
+        let metadata = CargoMetadata {
+            workspace_root: PathBuf::from("/project"),
+            packages: vec![MetadataPackage {
+                name: "demo".to_string(),
+                manifest_path: PathBuf::from("/project/Cargo.toml"),
+                targets: vec![MetadataTarget {
+                    name: "demo".to_string(),
+                    kind: vec!["bin".to_string()],
+                    src_path: PathBuf::from("/project/src/main.rs"),
+                }],
+            }],
+        };
 
-        // Create workspace root with [workspace] table.
-        create_file(&ws, "Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
-        // Create a member project.
-        create_file(
-            &ws,
-            "crates/member/Cargo.toml",
-            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
-        );
-        create_file(&ws, "crates/member/src/main.rs", "fn main() {}");
-
-        let member_dir = ws.join("crates").join("member");
-        let result = find_workspace_root(&member_dir);
-        assert!(result.is_some(), "should find workspace root");
-        assert_eq!(result.unwrap(), ws.canonicalize().unwrap());
+        let (name, path) = find_bin_target(&metadata, None, None).unwrap();
+        assert_eq!(name, "demo");
+        assert_eq!(path, PathBuf::from("/project/src/main.rs"));
     }
 
     #[test]
-    fn find_workspace_root_returns_none_for_standalone() {
-        let tmp = TempDir::new().unwrap();
-        create_file(
-            tmp.path(),
-            "Cargo.toml",
-            "[package]\nname = \"standalone\"\nversion = \"0.1.0\"\n",
-        );
-        create_file(tmp.path(), "src/main.rs", "fn main() {}");
+    fn find_bin_target_finds_named_binary() {
+        let metadata = CargoMetadata {
+            workspace_root: PathBuf::from("/project"),
+            packages: vec![MetadataPackage {
+                name: "demo".to_string(),
+                manifest_path: PathBuf::from("/project/Cargo.toml"),
+                targets: vec![
+                    MetadataTarget {
+                        name: "server".to_string(),
+                        kind: vec!["bin".to_string()],
+                        src_path: PathBuf::from("/project/src/server.rs"),
+                    },
+                    MetadataTarget {
+                        name: "worker".to_string(),
+                        kind: vec!["bin".to_string()],
+                        src_path: PathBuf::from("/project/src/worker.rs"),
+                    },
+                ],
+            }],
+        };
 
-        let result = find_workspace_root(tmp.path());
+        let (name, path) = find_bin_target(&metadata, None, Some("worker")).unwrap();
+        assert_eq!(name, "demo");
+        assert_eq!(path, PathBuf::from("/project/src/worker.rs"));
+    }
+
+    #[test]
+    fn find_bin_target_skips_lib_targets() {
+        let metadata = CargoMetadata {
+            workspace_root: PathBuf::from("/project"),
+            packages: vec![MetadataPackage {
+                name: "demo".to_string(),
+                manifest_path: PathBuf::from("/project/Cargo.toml"),
+                targets: vec![
+                    MetadataTarget {
+                        name: "demo".to_string(),
+                        kind: vec!["lib".to_string()],
+                        src_path: PathBuf::from("/project/src/lib.rs"),
+                    },
+                    MetadataTarget {
+                        name: "demo".to_string(),
+                        kind: vec!["bin".to_string()],
+                        src_path: PathBuf::from("/project/src/main.rs"),
+                    },
+                ],
+            }],
+        };
+
+        let (_, path) = find_bin_target(&metadata, None, None).unwrap();
+        assert_eq!(path, PathBuf::from("/project/src/main.rs"));
+    }
+
+    #[test]
+    fn find_bin_target_errors_when_not_found() {
+        let metadata = CargoMetadata {
+            workspace_root: PathBuf::from("/project"),
+            packages: vec![MetadataPackage {
+                name: "demo".to_string(),
+                manifest_path: PathBuf::from("/project/Cargo.toml"),
+                targets: vec![MetadataTarget {
+                    name: "demo".to_string(),
+                    kind: vec!["bin".to_string()],
+                    src_path: PathBuf::from("/project/src/main.rs"),
+                }],
+            }],
+        };
+
+        let result = find_bin_target(&metadata, None, Some("nonexistent"));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
         assert!(
-            result.is_none(),
-            "standalone project should not find workspace root"
+            msg.contains("nonexistent"),
+            "error should mention target name: {msg}"
         );
     }
 
     #[test]
-    fn find_bin_entry_point_with_explicit_path() {
-        let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
+    fn find_bin_target_filters_by_package() {
+        let metadata = CargoMetadata {
+            workspace_root: PathBuf::from("/ws"),
+            packages: vec![
+                MetadataPackage {
+                    name: "core".to_string(),
+                    manifest_path: PathBuf::from("/ws/crates/core/Cargo.toml"),
+                    targets: vec![MetadataTarget {
+                        name: "myapp".to_string(),
+                        kind: vec!["bin".to_string()],
+                        src_path: PathBuf::from("/ws/crates/core/src/main.rs"),
+                    }],
+                },
+                MetadataPackage {
+                    name: "utils".to_string(),
+                    manifest_path: PathBuf::from("/ws/crates/utils/Cargo.toml"),
+                    targets: vec![MetadataTarget {
+                        name: "utils".to_string(),
+                        kind: vec!["lib".to_string()],
+                        src_path: PathBuf::from("/ws/crates/utils/src/lib.rs"),
+                    }],
+                },
+            ],
+        };
 
-[[bin]]
-name = "demo"
-path = "src/custom/app.rs"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        create_file(tmp.path(), "src/custom/app.rs", "fn main() {}");
-
-        let result = find_bin_entry_point(tmp.path(), None).unwrap();
-        assert_eq!(result, PathBuf::from("src/custom/app.rs"));
+        let (name, path) = find_bin_target(&metadata, Some("core"), None).unwrap();
+        assert_eq!(name, "core");
+        assert_eq!(path, PathBuf::from("/ws/crates/core/src/main.rs"));
     }
 
     #[test]
-    fn find_bin_entry_point_infers_from_name_single_file() {
+    fn find_current_package_matches_dir() {
         let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
+        let pkg_dir = tmp.path().join("crates/core");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        create_file(&pkg_dir, "Cargo.toml", "[package]\nname = \"core\"");
 
-[[bin]]
-name = "mytool"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        create_file(tmp.path(), "src/bin/mytool.rs", "fn main() {}");
+        let metadata = CargoMetadata {
+            workspace_root: tmp.path().to_path_buf(),
+            packages: vec![MetadataPackage {
+                name: "core".to_string(),
+                manifest_path: pkg_dir.join("Cargo.toml"),
+                targets: vec![],
+            }],
+        };
 
-        let result = find_bin_entry_point(tmp.path(), None).unwrap();
-        assert_eq!(result, PathBuf::from("src/bin/mytool.rs"));
-    }
-
-    #[test]
-    fn find_bin_entry_point_infers_from_name_dir_main() {
-        let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
-
-[[bin]]
-name = "mytool"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        // No src/bin/mytool.rs, but src/bin/mytool/main.rs exists.
-        create_file(tmp.path(), "src/bin/mytool/main.rs", "fn main() {}");
-
-        let result = find_bin_entry_point(tmp.path(), None).unwrap();
-        assert_eq!(result, PathBuf::from("src/bin/mytool/main.rs"));
-    }
-
-    #[test]
-    fn find_bin_entry_point_defaults_to_src_main() {
-        let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        create_file(tmp.path(), "src/main.rs", "fn main() {}");
-
-        let result = find_bin_entry_point(tmp.path(), None).unwrap();
-        assert_eq!(result, PathBuf::from("src/main.rs"));
+        let pkg = find_current_package(&metadata, &pkg_dir);
+        assert!(pkg.is_some());
+        assert_eq!(pkg.unwrap().name, "core");
     }
 
     #[test]
@@ -760,182 +790,6 @@ version = "0.1.0"
         assert!(
             !staging.path().join("src/old_module.rs").exists(),
             "stale file should be removed from staging"
-        );
-    }
-
-    #[test]
-    fn find_bin_entry_point_named_with_explicit_path() {
-        let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
-
-[[bin]]
-name = "server"
-path = "src/custom/server.rs"
-
-[[bin]]
-name = "worker"
-path = "src/custom/worker.rs"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        create_file(tmp.path(), "src/custom/server.rs", "fn main() {}");
-        create_file(tmp.path(), "src/custom/worker.rs", "fn main() {}");
-
-        let result = find_bin_entry_point(tmp.path(), Some("worker")).unwrap();
-        assert_eq!(result, PathBuf::from("src/custom/worker.rs"));
-    }
-
-    #[test]
-    fn find_bin_entry_point_named_infers_path() {
-        let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
-
-[[bin]]
-name = "cli"
-
-[[bin]]
-name = "daemon"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        create_file(tmp.path(), "src/bin/cli.rs", "fn main() {}");
-        create_file(tmp.path(), "src/bin/daemon/main.rs", "fn main() {}");
-
-        // Infer src/bin/cli.rs
-        let result = find_bin_entry_point(tmp.path(), Some("cli")).unwrap();
-        assert_eq!(result, PathBuf::from("src/bin/cli.rs"));
-
-        // Infer src/bin/daemon/main.rs
-        let result = find_bin_entry_point(tmp.path(), Some("daemon")).unwrap();
-        assert_eq!(result, PathBuf::from("src/bin/daemon/main.rs"));
-    }
-
-    #[test]
-    fn find_bin_entry_point_named_not_found_in_entries() {
-        let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
-
-[[bin]]
-name = "server"
-path = "src/server.rs"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        create_file(tmp.path(), "src/server.rs", "fn main() {}");
-
-        let result = find_bin_entry_point(tmp.path(), Some("nonexistent"));
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("no [[bin]] entry named 'nonexistent'"),
-            "unexpected error: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn find_bin_entry_point_implicit_binary_matches_package_name() {
-        let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        create_file(tmp.path(), "src/main.rs", "fn main() {}");
-
-        // --bin demo should work: matches [package].name and src/main.rs exists
-        let result = find_bin_entry_point(tmp.path(), Some("demo")).unwrap();
-        assert_eq!(result, PathBuf::from("src/main.rs"));
-    }
-
-    #[test]
-    fn find_bin_entry_point_implicit_binary_wrong_name() {
-        let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        create_file(tmp.path(), "src/main.rs", "fn main() {}");
-
-        // --bin othername should fail: doesn't match package name
-        let result = find_bin_entry_point(tmp.path(), Some("othername"));
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("no binary target named 'othername'"),
-            "unexpected error: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn find_bin_entry_point_auto_discovers_src_bin() {
-        let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        create_file(tmp.path(), "src/main.rs", "fn main() {}");
-        create_file(tmp.path(), "src/bin/server.rs", "fn main() {}");
-
-        // --bin server should find src/bin/server.rs without [[bin]] entries
-        let result = find_bin_entry_point(tmp.path(), Some("server")).unwrap();
-        assert_eq!(result, PathBuf::from("src/bin/server.rs"));
-    }
-
-    #[test]
-    fn find_bin_entry_point_auto_discovers_src_bin_dir() {
-        let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        create_file(tmp.path(), "src/main.rs", "fn main() {}");
-        create_file(tmp.path(), "src/bin/worker/main.rs", "fn main() {}");
-
-        // --bin worker should find src/bin/worker/main.rs without [[bin]] entries
-        let result = find_bin_entry_point(tmp.path(), Some("worker")).unwrap();
-        assert_eq!(result, PathBuf::from("src/bin/worker/main.rs"));
-    }
-
-    #[test]
-    fn find_bin_entry_point_src_bin_shadows_package_name() {
-        let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        create_file(tmp.path(), "src/main.rs", "fn main() {}");
-        create_file(tmp.path(), "src/bin/demo.rs", "fn main() {}");
-
-        // When --bin name matches both a src/bin/ file and the package name,
-        // src/bin/ takes precedence. This matches Cargo's auto-discovery rules:
-        // explicit bin targets shadow the implicit package-name binary.
-        let result = find_bin_entry_point(tmp.path(), Some("demo")).unwrap();
-        assert_eq!(result, PathBuf::from("src/bin/demo.rs"));
-    }
-
-    #[test]
-    fn find_bin_entry_point_errors_when_no_entry_found() {
-        let tmp = TempDir::new().unwrap();
-        let toml = r#"[package]
-name = "demo"
-version = "0.1.0"
-"#;
-        create_file(tmp.path(), "Cargo.toml", toml);
-        // No src/main.rs, no [[bin]] entries.
-
-        let result = find_bin_entry_point(tmp.path(), None);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("could not find binary entry point"),
-            "unexpected error: {err_msg}"
         );
     }
 
