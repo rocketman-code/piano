@@ -6,7 +6,8 @@ use std::sync::atomic::Ordering;
 use super::name_table::{intern_name, name_table_get, NAME_TABLE_LEN};
 use super::{
     collect_all_fnagg, collect_frames_with_tid, run_id, stream_file, synthesize_frame_from_agg,
-    timestamp_ms, FrameFnSummary, FRAMES, SHUTDOWN_DONE, STREAMING_ENABLED, THREAD_INDEX,
+    timestamp_ms, FrameFnSummary, FRAMES, SHUTDOWN_DONE, STREAMING_ENABLED, STREAM_FRAMES,
+    THREAD_INDEX,
 };
 
 /// State for the streaming NDJSON file.
@@ -89,6 +90,10 @@ pub(super) fn push_to_frames(buf: &[FrameFnSummary]) {
 pub(super) fn stream_frame(buf: &[FrameFnSummary]) {
     if !STREAMING_ENABLED.load(Ordering::Relaxed) {
         push_to_frames(buf);
+        return;
+    }
+
+    if !STREAM_FRAMES.load(Ordering::Relaxed) {
         return;
     }
 
