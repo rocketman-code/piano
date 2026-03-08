@@ -84,7 +84,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for PianoAllocator<A> {
 }
 
 #[inline(always)]
-fn track_alloc(bytes: u64) {
+pub(crate) fn track_alloc(bytes: u64) {
     // Cell::get/set are plain memory reads/writes -- no allocation, no
     // re-entrancy risk, no destructor. Safe from the global allocator.
     let _ = ALLOC_COUNTERS.try_with(|cell| {
@@ -96,7 +96,7 @@ fn track_alloc(bytes: u64) {
 }
 
 #[inline(always)]
-fn track_dealloc(bytes: u64) {
+pub(crate) fn track_dealloc(bytes: u64) {
     let _ = ALLOC_COUNTERS.try_with(|cell| {
         let mut snap = cell.get();
         snap.free_count += 1;
