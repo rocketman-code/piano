@@ -277,13 +277,15 @@ impl<'s> InjectionCollector<'s> {
                 );
 
                 // Collect adopt injections for closures inside the block.
-                collect_adopt_in_block_stmts(
-                    &block.stmts,
-                    false,
-                    false,
-                    self.source,
-                    &mut self.injector,
-                );
+                let mut adopt = AdoptCollector {
+                    in_parallel_chain: false,
+                    in_scope_body: false,
+                    source: self.source,
+                    injector: &mut self.injector,
+                };
+                for stmt in &block.stmts {
+                    adopt.visit_stmt(stmt);
+                }
 
                 self.injector.insert(close_byte, "\n}).await\n");
             } else {
@@ -298,13 +300,15 @@ impl<'s> InjectionCollector<'s> {
                 );
 
                 // Collect adopt injections for closures inside the block.
-                collect_adopt_in_block_stmts(
-                    &block.stmts,
-                    false,
-                    false,
-                    self.source,
-                    &mut self.injector,
-                );
+                let mut adopt = AdoptCollector {
+                    in_parallel_chain: false,
+                    in_scope_body: false,
+                    source: self.source,
+                    injector: &mut self.injector,
+                };
+                for stmt in &block.stmts {
+                    adopt.visit_stmt(stmt);
+                }
             }
             return;
         }
@@ -402,106 +406,48 @@ impl<'s> InjectionCollector<'s> {
         } else {
             return;
         };
+        let mut collector = ReturnWrapperCollector {
+            name,
+            return_type,
+            source: self.source,
+            injector: &mut self.injector,
+        };
         for stmt in stmts {
-            collect_return_wrappers_in_stmt(
-                stmt,
-                name,
-                return_type,
-                self.source,
-                &mut self.injector,
+            collector.visit_stmt(stmt);
+        }
+    }
+}
+
+struct ReturnWrapperCollector<'a> {
+    name: &'a str,
+    return_type: &'a str,
+    source: &'a str,
+    injector: &'a mut StringInjector,
+}
+
+impl<'ast, 'a> Visit<'ast> for ReturnWrapperCollector<'a> {
+    fn visit_expr_return(&mut self, ret: &'ast syn::ExprReturn) {
+        if let Some(inner) = &ret.expr {
+            let inner_start = line_col_to_byte(self.source, inner.span().start());
+            let inner_end = line_col_to_byte(self.source, inner.span().end());
+            self.injector.insert(
+                inner_start,
+                format!(
+                    "Box::pin(piano_runtime::PianoFuture::new(async move {{\
+                     \n            let __piano_guard = piano_runtime::enter({:?});\
+                     \n            let __piano_inner: {} = ",
+                    self.name, self.return_type
+                ),
             );
+            self.injector
+                .insert(inner_end, ";\n            __piano_inner.await\n        }))");
         }
+        // Don't recurse into the return's inner expression -- it's already wrapped.
     }
-}
 
-/// Walk a statement tree for `return <expr>` expressions (for future-returning functions).
-/// Inject wrapping text around the return expression value.
-fn collect_return_wrappers_in_stmt(
-    stmt: &syn::Stmt,
-    name: &str,
-    return_type: &str,
-    source: &str,
-    injector: &mut StringInjector,
-) {
-    match stmt {
-        syn::Stmt::Expr(expr, _) => {
-            collect_return_wrappers_in_expr(expr, name, return_type, source, injector);
-        }
-        syn::Stmt::Local(local) => {
-            if let Some(init) = &local.init {
-                collect_return_wrappers_in_expr(&init.expr, name, return_type, source, injector);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_return_wrappers_in_expr(
-    expr: &syn::Expr,
-    name: &str,
-    return_type: &str,
-    source: &str,
-    injector: &mut StringInjector,
-) {
-    match expr {
-        // Boundaries: return inside closures/async blocks is not our function's return.
-        syn::Expr::Closure(_) | syn::Expr::Async(_) => {}
-        syn::Expr::Return(ret) => {
-            if let Some(inner) = &ret.expr {
-                let inner_start = line_col_to_byte(source, inner.span().start());
-                let inner_end = line_col_to_byte(source, inner.span().end());
-                injector.insert(
-                    inner_start,
-                    format!(
-                        "Box::pin(piano_runtime::PianoFuture::new(async move {{\
-                         \n            let __piano_guard = piano_runtime::enter({name:?});\
-                         \n            let __piano_inner: {return_type} = "
-                    ),
-                );
-                injector.insert(inner_end, ";\n            __piano_inner.await\n        }))");
-            }
-        }
-        // Recurse into sub-expressions.
-        syn::Expr::Block(b) => {
-            for stmt in &b.block.stmts {
-                collect_return_wrappers_in_stmt(stmt, name, return_type, source, injector);
-            }
-        }
-        syn::Expr::If(i) => {
-            for stmt in &i.then_branch.stmts {
-                collect_return_wrappers_in_stmt(stmt, name, return_type, source, injector);
-            }
-            if let Some((_, else_expr)) = &i.else_branch {
-                collect_return_wrappers_in_expr(else_expr, name, return_type, source, injector);
-            }
-        }
-        syn::Expr::Match(m) => {
-            for arm in &m.arms {
-                collect_return_wrappers_in_expr(&arm.body, name, return_type, source, injector);
-            }
-        }
-        syn::Expr::ForLoop(f) => {
-            for stmt in &f.body.stmts {
-                collect_return_wrappers_in_stmt(stmt, name, return_type, source, injector);
-            }
-        }
-        syn::Expr::While(w) => {
-            for stmt in &w.body.stmts {
-                collect_return_wrappers_in_stmt(stmt, name, return_type, source, injector);
-            }
-        }
-        syn::Expr::Loop(l) => {
-            for stmt in &l.body.stmts {
-                collect_return_wrappers_in_stmt(stmt, name, return_type, source, injector);
-            }
-        }
-        syn::Expr::Unsafe(u) => {
-            for stmt in &u.block.stmts {
-                collect_return_wrappers_in_stmt(stmt, name, return_type, source, injector);
-            }
-        }
-        _ => {}
-    }
+    // Boundaries: return inside closures/async blocks is not our function's return.
+    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
 }
 
 /// Find the first concurrency pattern in a block and return its name.
@@ -512,18 +458,78 @@ fn collect_return_wrappers_in_expr(
 /// Stops recursion at detached spawn calls (method or function) since their
 /// 'static boundary prevents fork/adopt from working.
 fn find_concurrency_pattern(block: &syn::Block) -> Option<String> {
-    block.stmts.iter().find_map(find_pattern_in_stmt)
+    let mut finder = ConcurrencyPatternFinder { found: None };
+    for stmt in &block.stmts {
+        finder.visit_stmt(stmt);
+        if finder.found.is_some() {
+            return finder.found;
+        }
+    }
+    None
 }
 
-fn find_pattern_in_stmt(stmt: &syn::Stmt) -> Option<String> {
-    match stmt {
-        syn::Stmt::Expr(e, _) => find_pattern_in_expr(e),
-        syn::Stmt::Local(local) => local
-            .init
-            .as_ref()
-            .and_then(|init| find_pattern_in_expr(&init.expr)),
-        _ => None,
+struct ConcurrencyPatternFinder {
+    found: Option<String>,
+}
+
+impl<'ast> Visit<'ast> for ConcurrencyPatternFinder {
+    fn visit_expr_method_call(&mut self, mc: &'ast syn::ExprMethodCall) {
+        if self.found.is_some() {
+            return;
+        }
+        let method = mc.method.to_string();
+        if PARALLEL_ITER_METHODS.contains(&method.as_str()) {
+            self.found = Some(method);
+            return;
+        }
+        if FORK_INJECTION_TRIGGERS.contains(&method.as_str()) {
+            self.found = Some(method);
+            return;
+        }
+        // Don't recurse into detached .spawn() args -- anything inside
+        // inherits the 'static boundary, so fork/adopt can't help.
+        if method == "spawn" {
+            return;
+        }
+        // Default recursion into receiver and args.
+        syn::visit::visit_expr_method_call(self, mc);
     }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if self.found.is_some() {
+            return;
+        }
+        let name = call_func_name(call);
+        if let Some(ref n) = name
+            && FORK_INJECTION_TRIGGERS.contains(&n.as_str())
+        {
+            // Build the full path, e.g. "rayon::scope"
+            if let syn::Expr::Path(path) = &*call.func {
+                let full_path: String = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                self.found = Some(full_path);
+                return;
+            }
+        }
+        // Don't recurse into detached spawn args.
+        if name.as_deref() == Some("spawn") {
+            return;
+        }
+        // Default recursion into func and args.
+        syn::visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        // Recurse into closure body (concurrency can be inside a closure arg).
+        self.visit_expr(&c.body);
+    }
+
+    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
 }
 
 /// Extract the last path segment name from a function call expression.
@@ -536,56 +542,6 @@ fn call_func_name(call: &syn::ExprCall) -> Option<String> {
     }
 }
 
-fn find_pattern_in_expr(expr: &syn::Expr) -> Option<String> {
-    match expr {
-        syn::Expr::MethodCall(mc) => {
-            let method = mc.method.to_string();
-            if PARALLEL_ITER_METHODS.contains(&method.as_str()) {
-                return Some(method);
-            }
-            if FORK_INJECTION_TRIGGERS.contains(&method.as_str()) {
-                return Some(method);
-            }
-            // Don't recurse into detached .spawn() args -- anything inside
-            // inherits the 'static boundary, so fork/adopt can't help.
-            if method == "spawn" {
-                return None;
-            }
-            if let Some(p) = find_pattern_in_expr(&mc.receiver) {
-                return Some(p);
-            }
-            mc.args.iter().find_map(find_pattern_in_expr)
-        }
-        syn::Expr::Call(call) => {
-            let name = call_func_name(call);
-            if let Some(ref n) = name
-                && FORK_INJECTION_TRIGGERS.contains(&n.as_str())
-            {
-                // Build the full path, e.g. "rayon::scope"
-                if let syn::Expr::Path(path) = &*call.func {
-                    let full_path: String = path
-                        .path
-                        .segments
-                        .iter()
-                        .map(|s| s.ident.to_string())
-                        .collect::<Vec<_>>()
-                        .join("::");
-                    return Some(full_path);
-                }
-            }
-            // Don't recurse into detached spawn args -- anything inside
-            // inherits the 'static boundary, so fork/adopt can't help.
-            if name.as_deref() == Some("spawn") {
-                return None;
-            }
-            call.args.iter().find_map(find_pattern_in_expr)
-        }
-        syn::Expr::Block(b) => b.block.stmts.iter().find_map(find_pattern_in_stmt),
-        syn::Expr::Closure(c) => find_pattern_in_expr(&c.body),
-        _ => None,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // String-injection adopt collection (read-only AST walk)
 // ---------------------------------------------------------------------------
@@ -595,228 +551,134 @@ fn find_pattern_in_expr(expr: &syn::Expr) -> Option<String> {
 const ADOPT_STMT_TEXT: &str =
     "\n        let __piano_adopt = __piano_ctx.map(|c| piano_runtime::adopt(c));";
 
-/// Walk statements in a block and collect adopt injections at closure brace positions.
-fn collect_adopt_in_block_stmts(
-    stmts: &[syn::Stmt],
+struct AdoptCollector<'a> {
     in_parallel_chain: bool,
     in_scope_body: bool,
-    source: &str,
-    injector: &mut StringInjector,
-) {
-    for stmt in stmts {
-        match stmt {
-            syn::Stmt::Expr(expr, _) => {
-                collect_adopt_in_expr(expr, in_parallel_chain, in_scope_body, source, injector);
-            }
-            syn::Stmt::Local(local) => {
-                if let Some(init) = &local.init {
-                    collect_adopt_in_expr(
-                        &init.expr,
-                        in_parallel_chain,
-                        in_scope_body,
-                        source,
-                        injector,
-                    );
-                }
-            }
-            _ => {}
-        }
+    source: &'a str,
+    injector: &'a mut StringInjector,
+}
+
+impl<'a> AdoptCollector<'a> {
+    fn visit_with_chain(&mut self, expr: &syn::Expr, chain: bool) {
+        let prev = self.in_parallel_chain;
+        self.in_parallel_chain = chain;
+        self.visit_expr(expr);
+        self.in_parallel_chain = prev;
     }
 }
 
-/// Read-only version of inject_adopt_in_concurrency_closures.
-/// Collects byte offsets for adopt injection instead of mutating the AST.
-fn collect_adopt_in_expr(
-    expr: &syn::Expr,
-    in_parallel_chain: bool,
-    in_scope_body: bool,
-    source: &str,
-    injector: &mut StringInjector,
-) {
-    match expr {
-        syn::Expr::MethodCall(mc) => {
-            let method = mc.method.to_string();
-            let is_par = PARALLEL_ITER_METHODS.contains(&method.as_str());
-            let is_spawn = ADOPT_INJECTION_TARGETS.contains(&method.as_str());
-            let is_scope = SCOPE_FUNCTIONS.contains(&method.as_str());
-            let is_detached = method == "spawn" && !in_scope_body;
+impl<'ast, 'a> Visit<'ast> for AdoptCollector<'a> {
+    fn visit_expr_method_call(&mut self, mc: &'ast syn::ExprMethodCall) {
+        let method = mc.method.to_string();
+        let is_par = PARALLEL_ITER_METHODS.contains(&method.as_str());
+        let is_spawn = ADOPT_INJECTION_TARGETS.contains(&method.as_str());
+        let is_scope = SCOPE_FUNCTIONS.contains(&method.as_str());
+        let is_detached = method == "spawn" && !self.in_scope_body;
 
-            // Recurse into receiver first
-            collect_adopt_in_expr(
-                &mc.receiver,
-                in_parallel_chain,
-                in_scope_body,
-                source,
-                injector,
-            );
+        // Recurse into receiver first (preserving current chain state).
+        self.visit_expr(&mc.receiver);
 
-            let chain_active =
-                in_parallel_chain || is_par || receiver_has_parallel_method(&mc.receiver);
+        let chain_active =
+            self.in_parallel_chain || is_par || receiver_has_parallel_method(&mc.receiver);
 
-            if is_detached {
-                // Detached spawn -- don't inject adopt.
-            } else if is_scope {
-                // Scope closures are coordinators -- recurse for nested spawns.
-                for arg in &mc.args {
-                    if let syn::Expr::Closure(closure) = arg {
-                        collect_adopt_in_scope_closure(closure, source, injector);
-                    } else {
-                        collect_adopt_in_expr(arg, false, in_scope_body, source, injector);
-                    }
+        if is_detached {
+            // Detached spawn -- don't inject adopt, don't recurse into args.
+        } else if is_scope {
+            // Scope closures are coordinators -- recurse body for nested spawns.
+            for arg in &mc.args {
+                if let syn::Expr::Closure(closure) = arg {
+                    collect_adopt_in_scope_closure(closure, self.source, self.injector);
+                } else {
+                    let prev = self.in_parallel_chain;
+                    self.in_parallel_chain = false;
+                    self.visit_expr(arg);
+                    self.in_parallel_chain = prev;
                 }
-            } else if (chain_active && !is_par) || is_spawn {
-                // Worker closures: inject adopt, then recurse body.
-                for arg in &mc.args {
-                    if let syn::Expr::Closure(closure) = arg {
-                        collect_adopt_at_closure_start(closure, source, injector);
-                        if let syn::Expr::Block(block) = &*closure.body {
-                            collect_adopt_in_block_stmts(
-                                &block.block.stmts,
-                                false,
-                                in_scope_body,
-                                source,
-                                injector,
-                            );
+            }
+        } else if (chain_active && !is_par) || is_spawn {
+            // Worker closures: inject adopt, then recurse body.
+            for arg in &mc.args {
+                if let syn::Expr::Closure(closure) = arg {
+                    collect_adopt_at_closure_start(closure, self.source, self.injector);
+                    if let syn::Expr::Block(block) = &*closure.body {
+                        let prev_chain = self.in_parallel_chain;
+                        self.in_parallel_chain = false;
+                        for stmt in &block.block.stmts {
+                            self.visit_stmt(stmt);
                         }
-                    } else {
-                        collect_adopt_in_expr(arg, false, in_scope_body, source, injector);
+                        self.in_parallel_chain = prev_chain;
                     }
-                }
-            } else {
-                for arg in &mc.args {
-                    collect_adopt_in_expr(arg, chain_active, in_scope_body, source, injector);
-                }
-            }
-        }
-        syn::Expr::Call(call) => {
-            let func_name = call_func_name(call);
-            let is_spawn = func_name
-                .as_ref()
-                .is_some_and(|n| ADOPT_INJECTION_TARGETS.contains(&n.as_str()));
-            let is_scope = func_name
-                .as_ref()
-                .is_some_and(|n| SCOPE_FUNCTIONS.contains(&n.as_str()));
-            let is_detached = func_name.as_deref() == Some("spawn");
-
-            if is_scope {
-                for arg in &call.args {
-                    if let syn::Expr::Closure(closure) = arg {
-                        collect_adopt_in_scope_closure(closure, source, injector);
-                    } else {
-                        collect_adopt_in_expr(arg, false, in_scope_body, source, injector);
-                    }
-                }
-            } else if is_spawn && !is_detached {
-                for arg in &call.args {
-                    if let syn::Expr::Closure(closure) = arg {
-                        collect_adopt_at_closure_start(closure, source, injector);
-                        if let syn::Expr::Block(block) = &*closure.body {
-                            collect_adopt_in_block_stmts(
-                                &block.block.stmts,
-                                false,
-                                in_scope_body,
-                                source,
-                                injector,
-                            );
-                        }
-                    } else {
-                        collect_adopt_in_expr(arg, false, in_scope_body, source, injector);
-                    }
-                }
-            } else if is_detached {
-                // Detached spawn -- don't recurse.
-            } else {
-                for arg in &call.args {
-                    collect_adopt_in_expr(arg, false, in_scope_body, source, injector);
+                } else {
+                    let prev = self.in_parallel_chain;
+                    self.in_parallel_chain = false;
+                    self.visit_expr(arg);
+                    self.in_parallel_chain = prev;
                 }
             }
-        }
-        syn::Expr::Block(b) => {
-            collect_adopt_in_block_stmts(
-                &b.block.stmts,
-                in_parallel_chain,
-                in_scope_body,
-                source,
-                injector,
-            );
-        }
-        syn::Expr::ForLoop(f) => {
-            collect_adopt_in_block_stmts(
-                &f.body.stmts,
-                in_parallel_chain,
-                in_scope_body,
-                source,
-                injector,
-            );
-        }
-        syn::Expr::While(w) => {
-            collect_adopt_in_block_stmts(
-                &w.body.stmts,
-                in_parallel_chain,
-                in_scope_body,
-                source,
-                injector,
-            );
-        }
-        syn::Expr::Loop(l) => {
-            collect_adopt_in_block_stmts(
-                &l.body.stmts,
-                in_parallel_chain,
-                in_scope_body,
-                source,
-                injector,
-            );
-        }
-        syn::Expr::If(i) => {
-            collect_adopt_in_block_stmts(
-                &i.then_branch.stmts,
-                in_parallel_chain,
-                in_scope_body,
-                source,
-                injector,
-            );
-            if let Some((_, else_branch)) = &i.else_branch {
-                collect_adopt_in_expr(
-                    else_branch,
-                    in_parallel_chain,
-                    in_scope_body,
-                    source,
-                    injector,
-                );
+        } else {
+            // Non-special method: propagate chain state through args.
+            for arg in &mc.args {
+                self.visit_with_chain(arg, chain_active);
             }
         }
-        syn::Expr::Match(m) => {
-            collect_adopt_in_expr(&m.expr, in_parallel_chain, in_scope_body, source, injector);
-            for arm in &m.arms {
-                if let Some((_, guard)) = &arm.guard {
-                    collect_adopt_in_expr(
-                        guard,
-                        in_parallel_chain,
-                        in_scope_body,
-                        source,
-                        injector,
-                    );
-                }
-                collect_adopt_in_expr(
-                    &arm.body,
-                    in_parallel_chain,
-                    in_scope_body,
-                    source,
-                    injector,
-                );
-            }
-        }
-        syn::Expr::Unsafe(u) => {
-            collect_adopt_in_block_stmts(
-                &u.block.stmts,
-                in_parallel_chain,
-                in_scope_body,
-                source,
-                injector,
-            );
-        }
-        _ => {}
     }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        let func_name = call_func_name(call);
+        let is_spawn = func_name
+            .as_ref()
+            .is_some_and(|n| ADOPT_INJECTION_TARGETS.contains(&n.as_str()));
+        let is_scope = func_name
+            .as_ref()
+            .is_some_and(|n| SCOPE_FUNCTIONS.contains(&n.as_str()));
+        let is_detached = func_name.as_deref() == Some("spawn");
+
+        if is_scope {
+            for arg in &call.args {
+                if let syn::Expr::Closure(closure) = arg {
+                    collect_adopt_in_scope_closure(closure, self.source, self.injector);
+                } else {
+                    let prev = self.in_parallel_chain;
+                    self.in_parallel_chain = false;
+                    self.visit_expr(arg);
+                    self.in_parallel_chain = prev;
+                }
+            }
+        } else if is_spawn && !is_detached {
+            for arg in &call.args {
+                if let syn::Expr::Closure(closure) = arg {
+                    collect_adopt_at_closure_start(closure, self.source, self.injector);
+                    if let syn::Expr::Block(block) = &*closure.body {
+                        let prev_chain = self.in_parallel_chain;
+                        self.in_parallel_chain = false;
+                        for stmt in &block.block.stmts {
+                            self.visit_stmt(stmt);
+                        }
+                        self.in_parallel_chain = prev_chain;
+                    }
+                } else {
+                    let prev = self.in_parallel_chain;
+                    self.in_parallel_chain = false;
+                    self.visit_expr(arg);
+                    self.in_parallel_chain = prev;
+                }
+            }
+        } else if is_detached {
+            // Detached spawn -- don't recurse into args.
+        } else {
+            // Default: recurse into func and args, no chain propagation.
+            for arg in &call.args {
+                let prev = self.in_parallel_chain;
+                self.in_parallel_chain = false;
+                self.visit_expr(arg);
+                self.in_parallel_chain = prev;
+            }
+        }
+    }
+
+    // Boundaries: closures and async blocks are separate scopes.
+    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
 }
 
 /// Inject adopt at the start of a closure body.
@@ -849,14 +711,17 @@ fn collect_adopt_in_scope_closure(
     injector: &mut StringInjector,
 ) {
     if let syn::Expr::Block(block) = &*closure.body {
-        collect_adopt_in_block_stmts(&block.block.stmts, false, true, source, injector);
+        let mut adopt = AdoptCollector {
+            in_parallel_chain: false,
+            in_scope_body: true,
+            source,
+            injector,
+        };
+        for stmt in &block.block.stmts {
+            adopt.visit_stmt(stmt);
+        }
     }
 }
-
-// The old AST-mutation adopt injection functions (inject_adopt_in_concurrency_closures,
-// inject_adopt_at_closure_start, recurse_closure_body_for_spawns, inject_adopt_in_stmts)
-// have been replaced by the string-injection equivalents above (collect_adopt_in_expr,
-// collect_adopt_at_closure_start, collect_adopt_in_scope_closure, collect_adopt_in_block_stmts).
 
 fn receiver_has_parallel_method(expr: &syn::Expr) -> bool {
     match expr {
@@ -865,6 +730,7 @@ fn receiver_has_parallel_method(expr: &syn::Expr) -> bool {
             PARALLEL_ITER_METHODS.contains(&method.as_str())
                 || receiver_has_parallel_method(&mc.receiver)
         }
+        syn::Expr::Paren(p) => receiver_has_parallel_method(&p.expr),
         _ => false,
     }
 }
@@ -1289,6 +1155,37 @@ fn work() {
         assert!(
             result.concurrency.is_empty(),
             "nested scope inside detached spawn should not report concurrency. Got: {:?}",
+            result.concurrency
+        );
+    }
+
+    #[test]
+    fn par_iter_inside_async_block_not_detected() {
+        // par_iter inside an async block is a separate scope -- it should NOT
+        // cause fork/adopt injection in the enclosing function.
+        let source = r#"
+fn outer() {
+    async {
+        items.par_iter().for_each(|x| process(x));
+    };
+}
+"#;
+        let targets: HashSet<String> = ["outer".to_string()].into();
+        let result = instrument_source(source, &targets, false, "").unwrap();
+
+        assert!(
+            !result.source.contains("piano_runtime::fork()"),
+            "should NOT inject fork for par_iter inside async block. Got:\n{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("piano_runtime::adopt"),
+            "should NOT inject adopt for par_iter inside async block. Got:\n{}",
+            result.source
+        );
+        assert!(
+            result.concurrency.is_empty(),
+            "par_iter inside async block should not report concurrency. Got: {:?}",
             result.concurrency
         );
     }
@@ -2433,6 +2330,207 @@ fn work() -> u64 {
         assert!(
             s.starts_with("#![cfg_attr"),
             "inner attrs must stay at top. Got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn detects_concurrency_in_try_expr() {
+        // par_iter inside a ? expression -- previously missed by wildcard
+        let source = r#"
+fn work(items: &[Item]) -> Result<()> {
+    items.par_iter().map(|x| process(x)).collect::<Result<Vec<_>>>()?;
+    Ok(())
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false, "").unwrap();
+        assert!(
+            !result.concurrency.is_empty(),
+            "should detect par_iter inside Try expr. Got: {:?}\n{}",
+            result.concurrency,
+            result.source
+        );
+    }
+
+    #[test]
+    fn detects_concurrency_in_reference_expr() {
+        // scope inside a & reference -- previously missed
+        let source = r#"
+fn work() {
+    let r = &rayon::scope(|s| {
+        s.spawn(|_| { do_work(); });
+    });
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false, "").unwrap();
+        assert!(
+            !result.concurrency.is_empty(),
+            "should detect scope inside Reference expr. Got: {:?}\n{}",
+            result.concurrency,
+            result.source
+        );
+    }
+
+    #[test]
+    fn detects_concurrency_in_tuple_expr() {
+        let source = r#"
+fn work(items: &[Item]) {
+    let _ = (items.par_iter().for_each(|x| process(x)), 42);
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false, "").unwrap();
+        assert!(
+            !result.concurrency.is_empty(),
+            "should detect par_iter inside Tuple expr. Got: {:?}\n{}",
+            result.concurrency,
+            result.source
+        );
+    }
+
+    #[test]
+    fn detects_concurrency_in_if_expr() {
+        let source = r#"
+fn work(items: &[Item], flag: bool) {
+    if flag {
+        items.par_iter().for_each(|x| process(x));
+    }
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false, "").unwrap();
+        assert!(
+            !result.concurrency.is_empty(),
+            "should detect par_iter inside If expr. Got: {:?}\n{}",
+            result.concurrency,
+            result.source
+        );
+    }
+
+    #[test]
+    fn detects_concurrency_in_assign_expr() {
+        let source = r#"
+fn work(items: &[Item]) {
+    let mut result = Vec::new();
+    result = items.par_iter().map(|x| process(x)).collect();
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false, "").unwrap();
+        assert!(
+            !result.concurrency.is_empty(),
+            "should detect par_iter inside Assign expr. Got: {:?}\n{}",
+            result.concurrency,
+            result.source
+        );
+    }
+
+    #[test]
+    fn wraps_return_inside_assign_in_boxed_future() {
+        // `return` inside an assignment expression -- previously missed by wildcard.
+        // The Assign expr is not handled by the old walker, so the return inside
+        // the if-else (which is the Assign's right-hand side) is never wrapped.
+        let source = r#"
+fn fetch(flag: bool) -> Pin<Box<dyn Future<Output = i32>>> {
+    let mut x = 0;
+    x = if flag { return Box::pin(async { 0 }); } else { 1 };
+    Box::pin(async { x })
+}
+"#;
+        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
+        // The return value should be wrapped with PianoFuture.
+        // Count PianoFuture occurrences: one for the trailing expr, one for the return.
+        let future_count = result.matches("PianoFuture::new").count();
+        assert!(
+            future_count >= 2,
+            "should wrap return inside Assign with PianoFuture (expected >= 2, got {future_count}). Got:\n{result}"
+        );
+        let parsed: syn::File = syn::parse_str(&result)
+            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
+        assert!(!parsed.items.is_empty());
+    }
+
+    #[test]
+    fn injects_adopt_in_try_expr_inside_scope() {
+        // s.spawn wrapped in a Try (?) expression -- previously missed by wildcard.
+        // The spawn is directly inside Ok(...)?, not behind a closure boundary.
+        let source = r#"
+fn work() {
+    rayon::scope(|s| {
+        Ok::<_, ()>(s.spawn(|_| { do_work(); })).unwrap();
+    });
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains("piano_runtime::adopt"),
+            "should inject adopt inside spawn closure in unwrap() expr. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn injects_adopt_in_tuple_inside_scope() {
+        // s.spawn inside a tuple expression -- previously missed.
+        let source = r#"
+fn work() {
+    rayon::scope(|s| {
+        let _ = (s.spawn(|_| { work_a(); }), s.spawn(|_| { work_b(); }));
+    });
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
+        let adopt_count = result.matches("piano_runtime::adopt").count();
+        assert_eq!(
+            adopt_count, 2,
+            "should inject adopt in both spawn closures inside tuple. Got {adopt_count} in:\n{result}"
+        );
+    }
+
+    #[test]
+    fn injects_adopt_in_reference_inside_scope() {
+        // s.spawn inside a & expression -- previously missed.
+        let source = r#"
+fn work() {
+    rayon::scope(|s| {
+        let r = &s.spawn(|_| { do_work(); });
+    });
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains("piano_runtime::adopt"),
+            "should inject adopt inside spawn closure in Reference expr. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn propagates_parallel_chain_through_paren_expr() {
+        // par_iter chain wrapped in parentheses -- previously missed.
+        let source = r#"
+fn work(items: &[Item]) {
+    (items.par_iter()).for_each(|item| process(item));
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains("piano_runtime::adopt"),
+            "should inject adopt in for_each closure with parenthesized par_iter. Got:\n{result}"
         );
     }
 }
