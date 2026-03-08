@@ -382,134 +382,147 @@ thread_local! {
 /// while all dependencies are still alive.
 struct TlsFlushGuard;
 
+/// Drain in-flight STACK entries into RECORDS_BUF and FRAME_BUFFER, then
+/// flush both buffers into their Arc-backed global registries.
+///
+/// Called from `shutdown_impl_inner()` to recover timing data when guards
+/// haven't dropped (SIGTERM / process::exit), and from `TlsFlushGuard::drop`
+/// during TLS destruction. Idempotent: clears STACK after draining, so a
+/// second call is a no-op.
+///
+/// Uses `try_with` (not `with_stack_mut`) because this may run during TLS
+/// destruction when `STACK_BORROW_COUNT` is already destroyed.
+fn drain_inflight_stack() {
+    // Drain in-flight STACK entries for functions whose Guards never
+    // dropped (process::exit). Read current TSC as the end time.
+    // Must happen before RECORDS_BUF/FRAME_BUFFER drains below,
+    // because we merge into those buffers here.
+    // NOTE: Cannot use with_stack_mut here — during TLS destruction,
+    // STACK_BORROW_COUNT (also TLS) may already be destroyed.
+    let _ = STACK.try_with(|stack| {
+        // SAFETY: TLS destruction is single-threaded; no concurrent borrows possible.
+        let s = unsafe { &mut *stack.get() };
+        if s.is_empty() {
+            return;
+        }
+        let end_tsc = crate::tsc::read();
+        #[cfg(feature = "cpu-time")]
+        let cpu_end_ns = crate::cpu_clock::cpu_now_ns();
+
+        // Read current ALLOC_COUNTERS for the innermost scope's alloc delta.
+        // Cell<AllocSnapshot> has no destructor, so TLS is still accessible.
+        let current_alloc = crate::alloc::ALLOC_COUNTERS
+            .try_with(|cell| cell.get())
+            .unwrap_or_default();
+
+        // Process all in-flight entries. Skip entries with start_tsc == 0
+        // (synthetic adopt anchors that are not real timed functions).
+        // Note: forward-order iteration does not propagate elapsed_ns to parent
+        // children_ns, so self_ns for outer in-flight entries may be overstated
+        // when multiple nested functions are in-flight. This is acceptable for
+        // best-effort recovery.
+        //
+        // Alloc deltas: enter() saves counters into saved_alloc and zeroes them,
+        // so entry[i]'s accumulated allocs = entry[i+1].saved_alloc (what the
+        // child saw as the parent's accumulation), or current_alloc for the
+        // innermost entry. StackEntry is Copy, so index-based access works
+        // without allocation.
+        let len = s.len();
+        for i in 0..len {
+            let entry = s[i];
+            if entry.start_tsc == 0 {
+                continue;
+            }
+            let name = lookup_name(unpack_name_id(entry.packed));
+            let raw_ticks = end_tsc.wrapping_sub(entry.start_tsc);
+            let corrected_ticks = raw_ticks.saturating_sub(crate::tsc::bias_ticks());
+            let elapsed_ns = crate::tsc::ticks_to_ns(corrected_ticks);
+            let children_ns = entry.children_ns;
+            let self_ns = elapsed_ns.saturating_sub(children_ns);
+
+            #[cfg(feature = "cpu-time")]
+            let cpu_elapsed_ns = cpu_end_ns
+                .saturating_sub(entry.cpu_start_ns)
+                .saturating_sub(crate::cpu_clock::bias_ns());
+            #[cfg(feature = "cpu-time")]
+            let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
+
+            let scope_alloc = if i + 1 < len {
+                s[i + 1].saved_alloc
+            } else {
+                current_alloc
+            };
+
+            let _ = RECORDS_BUF.try_with(|buf| {
+                merge_into_fnagg_vec(
+                    &mut buf.borrow_mut(),
+                    name,
+                    elapsed_ns,
+                    children_ns,
+                    #[cfg(feature = "cpu-time")]
+                    cpu_self_ns,
+                    scope_alloc.alloc_count,
+                    scope_alloc.alloc_bytes,
+                    scope_alloc.free_count,
+                    scope_alloc.free_bytes,
+                );
+            });
+
+            let _ = FRAME_BUFFER.try_with(|buf| {
+                merge_into_frame_buf(
+                    &mut buf.borrow_mut(),
+                    name,
+                    self_ns,
+                    #[cfg(feature = "cpu-time")]
+                    cpu_self_ns,
+                    scope_alloc.alloc_count,
+                    scope_alloc.alloc_bytes,
+                    scope_alloc.free_count,
+                    scope_alloc.free_bytes,
+                );
+            });
+        }
+        s.clear();
+    });
+    // Drain RECORDS_BUF -> RECORDS Arc (survives via THREAD_RECORDS).
+    let _ = RECORDS_BUF.try_with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if buf.is_empty() {
+            return;
+        }
+        let _ = RECORDS.try_with(|records| {
+            let mut recs = records.lock().unwrap_or_else(|e| e.into_inner());
+            for local in buf.drain(..) {
+                if let Some(entry) = recs.iter_mut().find(|e| std::ptr::eq(e.name, local.name)) {
+                    entry.absorb(&local);
+                } else {
+                    recs.push(local);
+                }
+            }
+        });
+    });
+    // Drain FRAME_BUFFER -> FRAMES Arc (survives via THREAD_FRAMES).
+    let _ = FRAME_BUFFER.try_with(|buf| {
+        let mut b = buf.borrow_mut();
+        if b.is_empty() {
+            return;
+        }
+        let _ = FRAMES.try_with(|frames| {
+            frames
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(std::mem::take(&mut *b));
+        });
+    });
+}
+
 impl Drop for TlsFlushGuard {
     // Skipped by cargo-mutants (see mutants.toml). Only exercised during TLS
     // destruction via process::exit(); tested by tests/process_exit.rs at the
     // workspace level, but not reachable from piano-runtime unit tests because
     // process::exit() would kill the test runner.
     fn drop(&mut self) {
-        // Drain in-flight STACK entries for functions whose Guards never
-        // dropped (process::exit). Read current TSC as the end time.
-        // Must happen before RECORDS_BUF/FRAME_BUFFER drains below,
-        // because we merge into those buffers here.
-        // NOTE: Cannot use with_stack_mut here — during TLS destruction,
-        // STACK_BORROW_COUNT (also TLS) may already be destroyed.
-        let _ = STACK.try_with(|stack| {
-            // SAFETY: TLS destruction is single-threaded; no concurrent borrows possible.
-            let s = unsafe { &mut *stack.get() };
-            if s.is_empty() {
-                return;
-            }
-            let end_tsc = crate::tsc::read();
-            #[cfg(feature = "cpu-time")]
-            let cpu_end_ns = crate::cpu_clock::cpu_now_ns();
-
-            // Read current ALLOC_COUNTERS for the innermost scope's alloc delta.
-            // Cell<AllocSnapshot> has no destructor, so TLS is still accessible.
-            let current_alloc = crate::alloc::ALLOC_COUNTERS
-                .try_with(|cell| cell.get())
-                .unwrap_or_default();
-
-            // Process all in-flight entries. Skip entries with start_tsc == 0
-            // (synthetic adopt anchors that are not real timed functions).
-            // Note: forward-order iteration does not propagate elapsed_ns to parent
-            // children_ns, so self_ns for outer in-flight entries may be overstated
-            // when multiple nested functions are in-flight. This is acceptable for
-            // best-effort recovery.
-            //
-            // Alloc deltas: enter() saves counters into saved_alloc and zeroes them,
-            // so entry[i]'s accumulated allocs = entry[i+1].saved_alloc (what the
-            // child saw as the parent's accumulation), or current_alloc for the
-            // innermost entry. StackEntry is Copy, so index-based access works
-            // without allocation.
-            let len = s.len();
-            for i in 0..len {
-                let entry = s[i];
-                if entry.start_tsc == 0 {
-                    continue;
-                }
-                let name = lookup_name(unpack_name_id(entry.packed));
-                let raw_ticks = end_tsc.wrapping_sub(entry.start_tsc);
-                let corrected_ticks = raw_ticks.saturating_sub(crate::tsc::bias_ticks());
-                let elapsed_ns = crate::tsc::ticks_to_ns(corrected_ticks);
-                let children_ns = entry.children_ns;
-                let self_ns = elapsed_ns.saturating_sub(children_ns);
-
-                #[cfg(feature = "cpu-time")]
-                let cpu_elapsed_ns = cpu_end_ns
-                    .saturating_sub(entry.cpu_start_ns)
-                    .saturating_sub(crate::cpu_clock::bias_ns());
-                #[cfg(feature = "cpu-time")]
-                let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
-
-                let scope_alloc = if i + 1 < len {
-                    s[i + 1].saved_alloc
-                } else {
-                    current_alloc
-                };
-
-                let _ = RECORDS_BUF.try_with(|buf| {
-                    merge_into_fnagg_vec(
-                        &mut buf.borrow_mut(),
-                        name,
-                        elapsed_ns,
-                        children_ns,
-                        #[cfg(feature = "cpu-time")]
-                        cpu_self_ns,
-                        scope_alloc.alloc_count,
-                        scope_alloc.alloc_bytes,
-                        scope_alloc.free_count,
-                        scope_alloc.free_bytes,
-                    );
-                });
-
-                let _ = FRAME_BUFFER.try_with(|buf| {
-                    merge_into_frame_buf(
-                        &mut buf.borrow_mut(),
-                        name,
-                        self_ns,
-                        #[cfg(feature = "cpu-time")]
-                        cpu_self_ns,
-                        scope_alloc.alloc_count,
-                        scope_alloc.alloc_bytes,
-                        scope_alloc.free_count,
-                        scope_alloc.free_bytes,
-                    );
-                });
-            }
-            s.clear();
-        });
-        // Drain RECORDS_BUF -> RECORDS Arc (survives via THREAD_RECORDS).
-        let _ = RECORDS_BUF.try_with(|buf| {
-            let mut buf = buf.borrow_mut();
-            if buf.is_empty() {
-                return;
-            }
-            let _ = RECORDS.try_with(|records| {
-                let mut recs = records.lock().unwrap_or_else(|e| e.into_inner());
-                for local in buf.drain(..) {
-                    if let Some(entry) = recs.iter_mut().find(|e| std::ptr::eq(e.name, local.name))
-                    {
-                        entry.absorb(&local);
-                    } else {
-                        recs.push(local);
-                    }
-                }
-            });
-        });
-        // Drain FRAME_BUFFER -> FRAMES Arc (survives via THREAD_FRAMES).
-        let _ = FRAME_BUFFER.try_with(|buf| {
-            let mut b = buf.borrow_mut();
-            if b.is_empty() {
-                return;
-            }
-            let _ = FRAMES.try_with(|frames| {
-                frames
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(std::mem::take(&mut *b));
-            });
-        });
+        drain_inflight_stack();
     }
 }
 
@@ -1241,13 +1254,28 @@ fn synthesize_frame_from_agg(agg: &[FnAgg]) -> Vec<FrameFnSummary> {
 /// Returns `true` if any write failed. Does NOT check `SHUTDOWN_DONE` --
 /// callers are responsible for the guard.
 fn shutdown_impl_inner(dir: &std::path::Path) -> bool {
+    // Recover in-flight data from the current thread's STACK. When shutdown
+    // is triggered by SIGTERM (or process::exit), guards haven't dropped yet,
+    // so RECORDS_BUF and FRAME_BUFFER are empty. This drains STACK into those
+    // buffers and flushes them to the Arc-backed registries. No-op when STACK
+    // is already empty (normal shutdown where guards dropped naturally).
+    drain_inflight_stack();
+
     let mut write_failed = false;
 
     if STREAMING_ENABLED.load(Ordering::Relaxed) {
-        // Streaming path: frames are already on disk. Just write the trailer.
+        // Streaming path: frames are already on disk. Stream any remaining
+        // in-flight frames (recovered by drain_inflight_stack above), then
+        // write the trailer.
         let has_stream = {
             let mut state = stream_file().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref mut s) = *state {
+                // Flush any in-flight frames that drain_inflight_stack pushed
+                // to FRAMES Arcs. These haven't been streamed yet.
+                let remaining = collect_frames_with_tid();
+                for (_, frame) in &remaining {
+                    ndjson::stream_frame_to_writer(s, frame);
+                }
                 if let Err(e) = write_stream_trailer(s) {
                     eprintln!(
                         "piano: failed to write trailer to {}: {e}",
@@ -2910,6 +2938,121 @@ mod tests {
             entry.alloc_bytes, 0,
             "non-allocating recursive function should have 0 alloc_bytes, got {}",
             entry.alloc_bytes
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn drain_inflight_stack_recovers_forgotten_guards() {
+        // Simulate SIGTERM: enter two functions, forget their guards (so they
+        // never drop), then call drain_inflight_stack to recover the data.
+        reset();
+
+        register("outer_fn");
+        register("inner_fn");
+
+        let g_outer = enter("outer_fn");
+        burn_cpu(5_000);
+        let g_inner = enter("inner_fn");
+        burn_cpu(5_000);
+
+        // Forget guards to simulate SIGTERM (guards never drop).
+        std::mem::forget(g_inner);
+        std::mem::forget(g_outer);
+
+        drain_inflight_stack();
+
+        let all = collect_all();
+        assert!(
+            all.len() >= 2,
+            "expected at least 2 functions recovered, got {}",
+            all.len()
+        );
+        let outer = all
+            .iter()
+            .find(|r| r.name == "outer_fn")
+            .expect("outer_fn not found");
+        let inner = all
+            .iter()
+            .find(|r| r.name == "inner_fn")
+            .expect("inner_fn not found");
+
+        assert!(outer.calls > 0, "outer_fn should have calls > 0");
+        assert!(inner.calls > 0, "inner_fn should have calls > 0");
+        assert!(outer.self_ms > 0.0, "outer_fn should have positive self_ms");
+        assert!(inner.self_ms > 0.0, "inner_fn should have positive self_ms");
+    }
+
+    #[test]
+    #[serial]
+    fn drain_inflight_stack_alloc_attribution() {
+        // Verify that drain_inflight_stack assigns the correct alloc counts
+        // to each in-flight entry: entry[i] gets entry[i+1].saved_alloc,
+        // and the innermost entry gets current ALLOC_COUNTERS.
+        reset();
+
+        register("drain_outer");
+        register("drain_inner");
+
+        // enter("drain_outer") saves+zeroes ALLOC_COUNTERS into outer's saved_alloc.
+        let g_outer = enter("drain_outer");
+
+        // Simulate 3 allocations while outer is running (before inner enters).
+        // These accumulate in ALLOC_COUNTERS and will be saved into inner's
+        // saved_alloc when enter("drain_inner") is called.
+        crate::alloc::track_alloc(100);
+        crate::alloc::track_alloc(100);
+        crate::alloc::track_alloc(100);
+
+        // enter("drain_inner") saves current counters (3 allocs, 300 bytes)
+        // into inner's saved_alloc, then zeroes ALLOC_COUNTERS.
+        let g_inner = enter("drain_inner");
+
+        // Simulate 5 allocations while inner is running.
+        // These remain in ALLOC_COUNTERS (current_alloc at drain time).
+        for _ in 0..5 {
+            crate::alloc::track_alloc(200);
+        }
+
+        std::mem::forget(g_inner);
+        std::mem::forget(g_outer);
+
+        drain_inflight_stack();
+        flush_records_buf();
+
+        let agg = RECORDS.with(|records| records.lock().unwrap().clone());
+        let outer = agg
+            .iter()
+            .find(|e| e.name == "drain_outer")
+            .expect("drain_outer not in RECORDS");
+        let inner = agg
+            .iter()
+            .find(|e| e.name == "drain_inner")
+            .expect("drain_inner not in RECORDS");
+
+        // outer (i=0) should get s[1].saved_alloc = inner's saved snapshot
+        // = 3 allocs / 300 bytes (what accumulated between outer enter and inner enter).
+        assert_eq!(
+            outer.alloc_count, 3,
+            "outer should have 3 allocs from s[i+1].saved_alloc, got {}",
+            outer.alloc_count
+        );
+        assert_eq!(
+            outer.alloc_bytes, 300,
+            "outer should have 300 alloc bytes, got {}",
+            outer.alloc_bytes
+        );
+
+        // inner (i=1, innermost) should get current_alloc = 5 allocs / 1000 bytes.
+        assert_eq!(
+            inner.alloc_count, 5,
+            "inner should have 5 allocs from current_alloc, got {}",
+            inner.alloc_count
+        );
+        assert_eq!(
+            inner.alloc_bytes, 1000,
+            "inner should have 1000 alloc bytes, got {}",
+            inner.alloc_bytes
         );
     }
 }
