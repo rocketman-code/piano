@@ -103,7 +103,7 @@ pub fn resolve_targets(
                 path: file.clone(),
                 source,
             })?;
-            let (all_fns, file_skipped) = extract_functions(&source, file, rel_path(file));
+            let (all_fns, file_skipped) = extract_functions(&source, rel_path(file));
             if !all_fns.is_empty() {
                 merge_into(&mut results, file, all_fns);
             }
@@ -120,8 +120,7 @@ pub fn resolve_targets(
                                 source,
                             }
                         })?;
-                        let (all_fns, file_skipped) =
-                            extract_functions(&source, file, rel_path(file));
+                        let (all_fns, file_skipped) = extract_functions(&source, rel_path(file));
                         all_seen_names.extend(all_fns.iter().map(|qf| qf.minimal.clone()));
                         let matched: Vec<crate::naming::QualifiedFunction> = all_fns
                             .into_iter()
@@ -166,8 +165,7 @@ pub fn resolve_targets(
                                 source,
                             }
                         })?;
-                        let (all_fns, file_skipped) =
-                            extract_functions(&source, file, rel_path(file));
+                        let (all_fns, file_skipped) = extract_functions(&source, rel_path(file));
                         all_seen_names.extend(all_fns.iter().map(|qf| qf.minimal.clone()));
                         if !all_fns.is_empty() {
                             merge_into(&mut results, file, all_fns);
@@ -197,8 +195,7 @@ pub fn resolve_targets(
                                 source,
                             }
                         })?;
-                        let (all_fns, file_skipped) =
-                            extract_functions(&source, file, rel_path(file));
+                        let (all_fns, file_skipped) = extract_functions(&source, rel_path(file));
                         all_seen_names.extend(all_fns.iter().map(|qf| qf.minimal.clone()));
                         if !all_fns.is_empty() {
                             merge_into(&mut results, file, all_fns);
@@ -304,13 +301,12 @@ fn walk_rs_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> 
 /// are excluded -- they are not useful instrumentation targets.
 pub(crate) fn extract_functions(
     source: &str,
-    path: &Path,
     rel_path: PathBuf,
 ) -> (Vec<crate::naming::QualifiedFunction>, Vec<SkippedFunction>) {
     let syntax = match syn::parse_file(source) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("warning: skipping {}: {e}", path.display());
+            eprintln!("warning: skipping {}: {e}", rel_path.display());
             return (Vec::new(), Vec::new());
         }
     };
@@ -1476,8 +1472,7 @@ mod inner {
 
 fn top_level() {}
 "#;
-        let (fns, _skipped) =
-            extract_functions(source, Path::new("src/lib.rs"), PathBuf::from("src/lib.rs"));
+        let (fns, _skipped) = extract_functions(source, PathBuf::from("src/lib.rs"));
         let names: Vec<&str> = fns.iter().map(|qf| qf.minimal.as_str()).collect();
         assert!(
             names.contains(&"inner::foo"),
@@ -1505,8 +1500,7 @@ fn outer_b() {
     impl S { fn method(&self) {} }
 }
 "#;
-        let (fns, _skipped) =
-            extract_functions(source, Path::new("src/lib.rs"), PathBuf::from("src/lib.rs"));
+        let (fns, _skipped) = extract_functions(source, PathBuf::from("src/lib.rs"));
         let minimal_names: Vec<&str> = fns.iter().map(|qf| qf.minimal.as_str()).collect();
         let full_names: Vec<&str> = fns.iter().map(|qf| qf.full.as_str()).collect();
 

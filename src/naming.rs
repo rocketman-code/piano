@@ -467,9 +467,7 @@ mod tests {
             p.push(format!("{}.rs", parts.last().unwrap()));
             p
         };
-        let dummy_path = PathBuf::from("dummy.rs");
-        let (functions, _skipped) =
-            crate::resolve::extract_functions(source, &dummy_path, rel_path.clone());
+        let (functions, _skipped) = crate::resolve::extract_functions(source, rel_path.clone());
 
         // Apply module prefix (same as main.rs does).
         let prefix = crate::resolve::module_prefix(&rel_path);
