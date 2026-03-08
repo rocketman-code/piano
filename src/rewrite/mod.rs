@@ -9,7 +9,7 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
-use crate::resolve::is_instrumentable;
+use crate::resolve::{Classification, classify};
 use crate::source_map::{SourceMap, StringInjector, skip_inner_attrs};
 
 pub use allocator::{AllocatorKind, detect_allocator_kind, inject_global_allocator};
@@ -737,7 +737,7 @@ fn receiver_has_parallel_method(expr: &syn::Expr) -> bool {
 
 impl<'s> Visit<'s> for InjectionCollector<'s> {
     fn visit_item_fn(&mut self, node: &'s syn::ItemFn) {
-        if is_instrumentable(&node.sig) {
+        if matches!(classify(&node.sig), Classification::Instrumentable) {
             let name = node.sig.ident.to_string();
             self.collect_guard(&node.block, &name, &node.sig);
         }
@@ -765,7 +765,7 @@ impl<'s> Visit<'s> for InjectionCollector<'s> {
     }
 
     fn visit_impl_item_fn(&mut self, node: &'s syn::ImplItemFn) {
-        if is_instrumentable(&node.sig) {
+        if matches!(classify(&node.sig), Classification::Instrumentable) {
             let method = node.sig.ident.to_string();
             let qualified = match &self.current_impl {
                 Some(ty) => format!("{ty}::{method}"),
@@ -786,7 +786,7 @@ impl<'s> Visit<'s> for InjectionCollector<'s> {
 
     fn visit_trait_item_fn(&mut self, node: &'s syn::TraitItemFn) {
         if let Some(block) = &node.default {
-            if is_instrumentable(&node.sig) {
+            if matches!(classify(&node.sig), Classification::Instrumentable) {
                 let method = node.sig.ident.to_string();
                 let qualified = match &self.current_trait {
                     Some(trait_name) => format!("{trait_name}::{method}"),

@@ -380,7 +380,7 @@ fn skip_non_instrumentable_fn(tokens: &[proc_macro2::TokenTree], i: usize) -> Op
 /// Try to match a fn pattern starting at position `start`:
 ///   [pub [( ... )]]? [extern "Rust"]? [async]? fn NAME ( ... ) [-> ...]? { ... }
 ///
-/// Rejects const fn, unsafe fn, and extern fn with non-Rust ABI (matching is_instrumentable).
+/// Rejects const fn, unsafe fn, and extern fn with non-Rust ABI (matching classify()).
 /// NAME can be an Ident (literal name) or $metavar (Punct('$') + Ident).
 fn match_fn_pattern(tokens: &[proc_macro2::TokenTree], start: usize) -> Option<FnMatch> {
     let len = tokens.len();
