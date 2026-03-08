@@ -40,4 +40,10 @@ exclude_re = [
     # calibrate_bias trim: N/50 vs N%50 yields nearly identical means on
     # well-behaved data (2% trim vs 0% trim). Unkillable by test.
     "replace / with % in calibrate_bias",
+    # drop_cold flush optimization: remaining_all_base / is_frame_boundary
+    # control WHEN flush_records_buf() fires, not WHETHER data is flushed.
+    # Records always reach RECORDS via collect() or TlsFlushGuard. Mutations
+    # change timing but not correctness.
+    "replace == with != in drop_cold",
+    "replace \\|\\| with && in drop_cold",
 ]
