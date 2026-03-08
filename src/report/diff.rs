@@ -19,7 +19,7 @@ pub struct JsonDiffEntry {
     pub self_ms_a: f64,
     pub self_ms_b: f64,
     pub delta_ms: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub delta_pct: Option<f64>,
     pub calls_a: u64,
     pub calls_b: u64,
@@ -56,6 +56,8 @@ pub fn diff_runs_json(a: &Run, b: &Run) -> String {
             let delta = self_b - self_a;
             let delta_pct = if self_a > 0.0 {
                 Some(delta / self_a * 100.0)
+            } else if delta == 0.0 {
+                Some(0.0)
             } else {
                 None
             };
@@ -662,11 +664,52 @@ mod tests {
             }],
         };
         let json = diff_runs_json(&run_a, &run_b);
+        // Verify delta_pct is present as null (not omitted) via Value parse.
+        let raw: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert!(
+            raw[0].get("delta_pct").unwrap().is_null(),
+            "delta_pct should serialize as null, not be omitted. Got:\n{json}"
+        );
         let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "new_fn");
         assert!((entries[0].self_ms_a).abs() < f64::EPSILON);
         assert!(entries[0].delta_pct.is_none());
+    }
+
+    #[test]
+    fn diff_runs_json_zero_zero_has_zero_pct() {
+        let run_a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "idle".into(),
+                calls: 5,
+                self_ms: 0.0,
+                ..Default::default()
+            }],
+        };
+        let run_b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "idle".into(),
+                calls: 5,
+                self_ms: 0.0,
+                ..Default::default()
+            }],
+        };
+        let json = diff_runs_json(&run_a, &run_b);
+        let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "idle");
+        assert_eq!(
+            entries[0].delta_pct,
+            Some(0.0),
+            "0/0 case should produce Some(0.0), not None"
+        );
     }
 
     #[test]
