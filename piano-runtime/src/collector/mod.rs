@@ -1336,6 +1336,31 @@ fn collect_all_fnagg() -> Vec<FnAgg> {
     merged
 }
 
+/// Like `collect_all_fnagg` but without `flush_records_buf()`.
+///
+/// Used in shutdown phase 2 where all data is already in the RECORDS Arcs:
+/// - Normal exit: depth-0 guard drops flushed RECORDS_BUF during drop_cold.
+/// - Abnormal exit (process::exit / SIGTERM): drain_inflight_stack (phase 1)
+///   merged STACK -> RECORDS_BUF -> RECORDS Arc.
+///
+/// Calling flush_records_buf here would be phase leakage -- reaching into
+/// TLS during a globals-only phase.
+fn collect_all_fnagg_no_flush() -> Vec<FnAgg> {
+    let registry = thread_records().lock().unwrap_or_else(|e| e.into_inner());
+    let mut merged: Vec<FnAgg> = Vec::new();
+    for arc in registry.iter() {
+        let records = arc.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in records.iter() {
+            if let Some(dst) = merged.iter_mut().find(|e| std::ptr::eq(e.name, entry.name)) {
+                dst.absorb(entry);
+            } else {
+                merged.push(entry.clone());
+            }
+        }
+    }
+    merged
+}
+
 /// Synthesize a single NDJSON frame from aggregate FnAgg data.
 /// Used as fallback when no depth-0 frames were recorded (e.g., program crashed
 /// mid-function, or all work happened in contexts that don't produce frames).
@@ -1357,108 +1382,76 @@ fn synthesize_frame_from_agg(agg: &[FnAgg]) -> Vec<FrameFnSummary> {
 
 /// Core write logic shared by `shutdown()` and the signal handler.
 ///
-/// When streaming is enabled: writes the trailer line (function name table)
-/// to the existing stream file and closes it. When streaming is not enabled
-/// (or no stream file was opened): collects frames from THREAD_FRAMES and
-/// writes a complete NDJSON file. In either case, when no frames exist but
-/// aggregate records do, synthesizes a single frame from aggregate data.
+/// Three strict phases with no leakage between them:
+///   Phase 1 -- Drain: TLS -> globals (drain_inflight_stack)
+///   Phase 2 -- Collect: read globals only, returns values
+///   Phase 3 -- Write: data-driven decisions, no mode flags
 ///
 /// Returns `true` if any write failed. Does NOT check `SHUTDOWN_DONE` --
 /// callers are responsible for the guard.
 fn shutdown_impl_inner(dir: &std::path::Path) -> bool {
-    // Recover in-flight data from the current thread's STACK. When shutdown
-    // is triggered by SIGTERM (or process::exit), guards haven't dropped yet,
-    // so RECORDS_BUF and FRAME_BUFFER are empty. This drains STACK into those
-    // buffers and flushes them to the Arc-backed registries. No-op when STACK
-    // is already empty (normal shutdown where guards dropped naturally).
+    // Phase 1: Drain (impure, TLS -> globals).
+    // Moves STACK -> RECORDS_BUF -> RECORDS Arc,
+    // and FRAME_BUFFER -> FRAMES Arc.
+    // After this, TLS is irrelevant.
     drain_inflight_stack();
 
+    // Phase 2: Collect (globals-only, returns values).
+    // No flush_records_buf -- drain already emptied RECORDS_BUF.
+    // No mode flags consulted.
+    let frames = collect_frames_with_tid();
+    let records = collect_all_fnagg_no_flush();
+
+    // Phase 3: Write (data-driven decisions).
     let mut write_failed = false;
 
-    if STREAMING_ENABLED.load(Ordering::Relaxed) {
-        // Streaming path: frames are already on disk. Stream any remaining
-        // in-flight frames (recovered by drain_inflight_stack above), then
-        // write the trailer.
-        let has_stream = {
-            let mut state = stream_file().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(ref mut s) = *state {
-                // Flush any in-flight frames that drain_inflight_stack pushed
-                // to FRAMES Arcs. These haven't been streamed yet.
-                // Uses write_shutdown_frames (global-only, no TLS) because
-                // process::exit() may have destroyed TLS before atexit runs.
-                let remaining = collect_frames_with_tid();
-                ndjson::write_shutdown_frames(s, &remaining);
-                if let Err(e) = write_stream_trailer(s) {
-                    eprintln!(
-                        "piano: failed to write trailer to {}: {e}",
-                        s.path.display()
-                    );
-                    write_failed = true;
-                }
-                // Close the stream file (drop the BufWriter/File).
-                *state = None;
-                true
-            } else {
-                false
-            }
-        };
-        if !has_stream {
-            // No stream file opened (no frames ever completed).
-            // Try synthesizing from aggregates (process::exit mid-function case).
-            flush_records_buf();
-            let agg = collect_all_fnagg();
-            if !agg.is_empty() {
-                let frames = vec![(0, synthesize_frame_from_agg(&agg))];
-                let mut seen = HashSet::new();
-                let mut fn_names: Vec<&str> = Vec::new();
-                for (_, frame) in &frames {
-                    for s in frame {
-                        if seen.insert(s.name) {
-                            fn_names.push(s.name);
-                        }
-                    }
-                }
-                let path = dir.join(format!("{}.ndjson", timestamp_ms()));
-                if let Err(e) = write_ndjson(&frames, &fn_names, &path) {
-                    eprintln!(
-                        "piano: failed to write profiling data to {}: {e}",
-                        path.display()
-                    );
-                    write_failed = true;
-                }
-            }
-        }
-    } else {
-        // Non-streaming path (tests, no init() call) -- existing behavior
-        let ts = timestamp_ms();
-        let mut frames = collect_frames_with_tid();
-        if frames.is_empty() {
-            let agg = collect_all_fnagg();
-            if !agg.is_empty() {
-                frames.push((0, synthesize_frame_from_agg(&agg)));
-            }
-        }
-        if !frames.is_empty() {
-            let mut seen = HashSet::new();
-            let mut fn_names: Vec<&str> = Vec::new();
-            for (_, frame) in &frames {
-                for s in frame {
-                    if seen.insert(s.name) {
-                        fn_names.push(s.name);
-                    }
-                }
-            }
-            let path = dir.join(format!("{ts}.ndjson"));
-            if let Err(e) = write_ndjson(&frames, &fn_names, &path) {
+    // Stream file: append remaining frames + trailer if handle exists.
+    // This is a file-handle fact, not a mode-flag check.
+    {
+        let mut state = stream_file().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref mut s) = *state {
+            ndjson::write_shutdown_frames(s, &frames);
+            if let Err(e) = write_stream_trailer(s) {
                 eprintln!(
-                    "piano: failed to write profiling data to {}: {e}",
-                    path.display()
+                    "piano: failed to write trailer to {}: {e}",
+                    s.path.display()
                 );
                 write_failed = true;
             }
+            // Close the stream file.
+            *state = None;
+            // Stream file is the artifact. Done.
+            return write_failed;
         }
     }
 
+    // No stream file: write fresh NDJSON from collected data.
+    // Frames first, fall back to synthesized from records.
+    let output_frames = if !frames.is_empty() {
+        frames
+    } else if !records.is_empty() {
+        vec![(0, synthesize_frame_from_agg(&records))]
+    } else {
+        return write_failed;
+    };
+
+    let mut seen = HashSet::new();
+    let mut fn_names: Vec<&str> = Vec::new();
+    for (_, frame) in &output_frames {
+        for s in frame {
+            if seen.insert(s.name) {
+                fn_names.push(s.name);
+            }
+        }
+    }
+    let path = dir.join(format!("{}.ndjson", timestamp_ms()));
+    if let Err(e) = write_ndjson(&output_frames, &fn_names, &path) {
+        eprintln!(
+            "piano: failed to write profiling data to {}: {e}",
+            path.display()
+        );
+        write_failed = true;
+    }
     write_failed
 }
 
@@ -2848,6 +2841,117 @@ mod tests {
 
     #[test]
     #[serial]
+    fn collect_all_fnagg_no_flush_reads_globals_only() {
+        // Phase 2 of shutdown must not reach into TLS.
+        // collect_all_fnagg_no_flush should read THREAD_RECORDS
+        // without calling flush_records_buf.
+        reset_all();
+
+        // Put data directly into RECORDS Arc (simulating post-drain state).
+        RECORDS.with(|records| {
+            records.lock().unwrap().push(FnAgg {
+                name: "global_fn",
+                calls: 3,
+                total_ms: 10.0,
+                self_ms: 8.0,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 8_000_000,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            });
+        });
+
+        // Put data in RECORDS_BUF (TLS) -- this should NOT be picked up.
+        RECORDS_BUF.with(|buf| {
+            buf.borrow_mut().push(FnAgg {
+                name: "tls_only_fn",
+                calls: 1,
+                total_ms: 2.0,
+                self_ms: 2.0,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 2_000_000,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            });
+        });
+
+        let result = collect_all_fnagg_no_flush();
+        assert_eq!(result.len(), 1, "should only contain global data");
+        assert_eq!(result[0].name, "global_fn");
+        assert_eq!(result[0].calls, 3);
+
+        // Verify RECORDS_BUF was NOT drained.
+        RECORDS_BUF.with(|buf| {
+            assert_eq!(buf.borrow().len(), 1, "RECORDS_BUF should be untouched");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn shutdown_streaming_no_file_preserves_frames_bug_533() {
+        // Bug #533: when STREAMING_ENABLED=true but no stream file exists,
+        // shutdown_impl_inner falls through to aggregate-only synthesis,
+        // losing any frames in the FRAMES Arc.
+        //
+        // Phase-separated shutdown fixes this: the write phase checks
+        // FRAMES first regardless of streaming mode.
+        reset_all();
+
+        // Simulate post-drain state: frames exist in FRAMES Arc.
+        FRAMES.with(|frames| {
+            frames.lock().unwrap().push(vec![FrameFnSummary {
+                name: "bug_533_fn",
+                calls: 1,
+                self_ns: 5_000_000,
+                #[cfg(feature = "cpu-time")]
+                cpu_self_ns: 5_000_000,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
+            }]);
+        });
+
+        // Enable streaming but do NOT open a stream file.
+        // This is the #533 scenario: streaming was configured but
+        // no frame ever completed to trigger file creation.
+        STREAMING_ENABLED.store(true, Ordering::Relaxed);
+
+        let tmp = std::env::temp_dir().join(format!("piano_bug533_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let failed = shutdown_impl_inner(&tmp);
+
+        // Reset streaming flag for other tests.
+        STREAMING_ENABLED.store(false, Ordering::Relaxed);
+
+        assert!(!failed, "shutdown should succeed");
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+        assert!(
+            !files.is_empty(),
+            "shutdown should write NDJSON even with streaming enabled but no stream file"
+        );
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        assert!(
+            content.contains("bug_533_fn"),
+            "NDJSON should contain the frame data: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[serial]
     fn shutdown_streaming_synthesizes_frame_from_agg_when_no_stream_opened() {
         // Kills: delete ! in `if !agg.is_empty()` in the streaming branch
         // of shutdown_impl_inner. Same scenario as the non-streaming test
@@ -2906,6 +3010,7 @@ mod tests {
         // depth-0 frame boundaries must NOT write to disk. Shutdown should
         // fall through to synthesize_frame_from_agg and produce a valid
         // aggregate-only NDJSON file.
+        reset_all();
         let tmp =
             std::env::temp_dir().join(format!("piano_no_stream_frames_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
