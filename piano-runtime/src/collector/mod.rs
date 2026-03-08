@@ -400,7 +400,11 @@ fn drain_inflight_stack() {
     // NOTE: Cannot use with_stack_mut here — during TLS destruction,
     // STACK_BORROW_COUNT (also TLS) may already be destroyed.
     let _ = STACK.try_with(|stack| {
-        // SAFETY: TLS destruction is single-threaded; no concurrent borrows possible.
+        // SAFETY: When called from TlsFlushGuard::drop, TLS destruction is
+        // single-threaded so no concurrent borrows are possible. When called
+        // from a signal handler, this may alias a &mut from an interrupted
+        // enter()/drop_cold() — accepted per signal.rs rationale (best-effort
+        // recovery over data loss).
         let s = unsafe { &mut *stack.get() };
         if s.is_empty() {
             return;
