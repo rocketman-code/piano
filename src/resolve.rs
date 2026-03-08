@@ -394,7 +394,17 @@ impl<'ast> Visit<'ast> for FnCollector {
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
         let type_name = type_name_from_type(&node.self_ty);
-        let prev = self.current_impl.replace(type_name);
+        // For trait impls, include trait name for disambiguation.
+        let impl_name = if let Some((_, ref trait_path, _)) = node.trait_ {
+            if let Some(seg) = trait_path.segments.last() {
+                format!("<{} as {}>", type_name, seg.ident)
+            } else {
+                type_name
+            }
+        } else {
+            type_name
+        };
+        let prev = self.current_impl.replace(impl_name);
         syn::visit::visit_item_impl(self, node);
         self.current_impl = prev;
     }
@@ -1268,6 +1278,57 @@ mod tests {
         assert_eq!(
             qualify("api", "Handler::validate_input"),
             "api::Handler::validate_input"
+        );
+    }
+
+    #[test]
+    fn trait_impl_methods_get_disambiguated_names() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("main.rs"),
+            r#"
+use std::fmt;
+
+struct Point;
+
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "point")
+    }
+}
+
+impl fmt::Debug for Point {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "point")
+    }
+}
+
+fn main() {}
+"#,
+        )
+        .unwrap();
+
+        let result = resolve_targets(&src, &[], false).unwrap();
+        let names: Vec<&str> = result
+            .targets
+            .iter()
+            .flat_map(|t| t.functions.iter().map(|s| s.as_str()))
+            .collect();
+        assert!(
+            names.contains(&"<Point as Display>::fmt"),
+            "should have Display-qualified name: {names:?}"
+        );
+        assert!(
+            names.contains(&"<Point as Debug>::fmt"),
+            "should have Debug-qualified name: {names:?}"
+        );
+        // There should be two separate entries, not one merged "Point::fmt"
+        let fmt_count = names.iter().filter(|n| n.ends_with("fmt")).count();
+        assert_eq!(
+            fmt_count, 2,
+            "should have 2 distinct fmt entries: {names:?}"
         );
     }
 }
