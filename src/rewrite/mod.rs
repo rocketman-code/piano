@@ -880,7 +880,19 @@ impl<'s> Visit<'s> for InjectionCollector<'s> {
     fn visit_item_impl(&mut self, node: &'s syn::ItemImpl) {
         let type_name = type_ident(&node.self_ty);
         let prev = self.current_impl.take();
-        self.current_impl = Some(type_name);
+        // For trait impls (impl Trait for Type), include trait name for disambiguation.
+        // Format: "<Type as Trait>" so methods become "<Type as Trait>::method".
+        // For inherent impls (plain impl Type), use just the type name.
+        let impl_name = if let Some((_, ref trait_path, _)) = node.trait_ {
+            if let Some(seg) = trait_path.segments.last() {
+                format!("<{} as {}>", type_name, seg.ident)
+            } else {
+                type_name
+            }
+        } else {
+            type_name
+        };
+        self.current_impl = Some(impl_name);
         syn::visit::visit_item_impl(self, node);
         self.current_impl = prev;
     }
@@ -2275,6 +2287,64 @@ fn process_all(data: &[i32]) {
             result.concurrency.first().map(|(name, _)| name.as_str()),
             Some("worker::process_all"),
             "concurrency info should use qualified name",
+        );
+    }
+
+    #[test]
+    fn trait_impl_methods_disambiguated() {
+        let source = r#"
+use std::fmt;
+
+struct Point { x: i32, y: i32 }
+
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
+    }
+}
+
+impl fmt::Debug for Point {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Point({}, {})", self.x, self.y)
+    }
+}
+"#;
+        let targets: HashSet<String> = [
+            "<Point as Display>::fmt".to_string(),
+            "<Point as Debug>::fmt".to_string(),
+        ]
+        .into();
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains(r#"piano_runtime::enter("<Point as Display>::fmt")"#),
+            "Display::fmt should be instrumented with trait-qualified name"
+        );
+        assert!(
+            result.contains(r#"piano_runtime::enter("<Point as Debug>::fmt")"#),
+            "Debug::fmt should be instrumented with trait-qualified name"
+        );
+    }
+
+    #[test]
+    fn inherent_impl_methods_unchanged() {
+        let source = r#"
+struct Walker;
+
+impl Walker {
+    fn walk(&self) {
+        // inherent method
+    }
+}
+"#;
+        let targets: HashSet<String> = ["Walker::walk".to_string()].into();
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains(r#"piano_runtime::enter("Walker::walk")"#),
+            "inherent methods should use Type::method format"
         );
     }
 }
