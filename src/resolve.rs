@@ -547,7 +547,7 @@ pub fn module_prefix(relative: &Path) -> String {
         .parent()
         .map(|p| {
             p.components()
-                .map(|c| c.as_os_str().to_str().unwrap())
+                .map(|c| c.as_os_str().to_str().unwrap_or("_"))
                 .collect()
         })
         .unwrap_or_default();
