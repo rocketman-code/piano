@@ -157,6 +157,47 @@ fn epoch() -> Instant {
     })
 }
 
+/// Calibrate guard instrumentation overhead. Called once from enter_cold
+/// after epoch is initialized. Uses AtomicBool try-set to avoid deadlock
+/// (Once would deadlock on re-entrant calls from the calibration loop).
+#[cfg(feature = "cpu-time")]
+fn calibrate_guard_cost_once() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    if DONE
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    calibrate_guard_cost();
+}
+
+/// Measure the total CPU cost of one enter()/drop() cycle with empty body,
+/// then compute guard_overhead = guard_cost - bias.
+#[cfg(feature = "cpu-time")]
+fn calibrate_guard_cost() {
+    const N: usize = 10_000;
+    let start = crate::cpu_clock::cpu_now_ns();
+    for _ in 0..N {
+        let _g = enter("__piano_cal__");
+    }
+    let end = crate::cpu_clock::cpu_now_ns();
+    let guard_cost = (end - start) as f64 / N as f64;
+    let overhead = (guard_cost - crate::cpu_clock::bias_f64()).max(0.0);
+    crate::cpu_clock::store_guard_overhead(overhead);
+
+    // Clean up calibration records from RECORDS_BUF to avoid polluting output.
+    RECORDS_BUF.with(|buf| {
+        buf.borrow_mut().retain(|e| e.name != "__piano_cal__");
+    });
+    // Clean up invocation records in test builds.
+    #[cfg(any(test, feature = "_test_internals"))]
+    INVOCATIONS.with(|inv| inv.borrow_mut().clear());
+}
+
 /// Aggregated timing data for a single function.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -444,10 +485,16 @@ fn drain_inflight_stack() {
             let children_ns = entry.children_ns;
             let self_ns = elapsed_ns.saturating_sub(children_ns);
 
+            // cpu_start_ns == 0 means enter() never completed (process::exit
+            // between enter_cold and the cpu_start_ns patch). Report 0.
             #[cfg(feature = "cpu-time")]
-            let cpu_elapsed_ns = cpu_end_ns
-                .saturating_sub(entry.cpu_start_ns)
-                .saturating_sub(crate::cpu_clock::bias_ns());
+            let cpu_elapsed_ns = if entry.cpu_start_ns == 0 {
+                0
+            } else {
+                cpu_end_ns
+                    .saturating_sub(entry.cpu_start_ns)
+                    .saturating_sub(crate::cpu_clock::bias_ns())
+            };
             #[cfg(feature = "cpu-time")]
             let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
 
@@ -706,18 +753,28 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             let children_ns = entry.children_ns;
             let self_ns = elapsed_ns.saturating_sub(children_ns);
 
+            // Raw CPU elapsed: no per-call bias subtraction. Amortized correction
+            // is applied at aggregation (raw_total - calls * bias), allowing
+            // positive/negative quantization noise to cancel for sub-ns precision.
             #[cfg(feature = "cpu-time")]
-            let cpu_elapsed_ns = cpu_end_ns
-                .saturating_sub(entry.cpu_start_ns)
-                .saturating_sub(crate::cpu_clock::bias_ns());
+            let cpu_raw_elapsed = cpu_end_ns.saturating_sub(entry.cpu_start_ns);
             #[cfg(feature = "cpu-time")]
-            let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
+            let cpu_self_ns = cpu_raw_elapsed.saturating_sub(entry.cpu_children_ns);
 
             if let Some(parent) = s.last_mut() {
                 parent.children_ns += elapsed_ns;
                 #[cfg(feature = "cpu-time")]
                 {
-                    parent.cpu_children_ns += cpu_elapsed_ns;
+                    // Add guard_overhead: the portion of per-call instrumentation
+                    // cost that falls inside the parent's CPU bracket but outside
+                    // the child's raw elapsed. Without this, N child calls inflate
+                    // the parent's cpu_self by N * guard_overhead.
+                    //
+                    // Truncation to u64 loses ~0.5ns/call (<0.1% of typical ~50ns
+                    // guard_overhead). Acceptable for now; aggregation-time f64
+                    // correction would need a children_calls counter in FnAgg.
+                    parent.cpu_children_ns +=
+                        cpu_raw_elapsed + crate::cpu_clock::guard_overhead_ns();
                 }
             }
 
@@ -779,12 +836,20 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             }
             if unpack_depth(entry.packed) == 0 {
                 FRAME_BUFFER.with(|buf| {
-                    let b = buf.borrow();
+                    let mut b = buf.borrow_mut();
+                    // Apply amortized CPU bias correction before streaming.
+                    #[cfg(feature = "cpu-time")]
+                    {
+                        let bias = crate::cpu_clock::bias_f64();
+                        for fe in b.iter_mut() {
+                            let corrected = fe.cpu_self_ns as f64 - fe.calls as f64 * bias;
+                            fe.cpu_self_ns = if corrected > 0.0 { corrected as u64 } else { 0 };
+                        }
+                    }
                     if !b.is_empty() {
                         stream_frame(&b);
                     }
-                    drop(b);
-                    buf.borrow_mut().clear();
+                    b.clear();
                 });
             }
 
@@ -822,6 +887,9 @@ impl Drop for Guard {
 fn enter_cold(name: &'static str) {
     let _ = epoch();
 
+    #[cfg(feature = "cpu-time")]
+    calibrate_guard_cost_once();
+
     // Wrap in ALLOC_COUNTERS.try_with so we hold the Cell reference across
     // all infra operations. Snapshot parent state FIRST, then do infra work
     // (TLS init, interning, Vec push), then zero the counters — discarding
@@ -833,9 +901,9 @@ fn enter_cold(name: &'static str) {
 
         let name_id = intern_name(name);
 
-        #[cfg(feature = "cpu-time")]
-        let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
-
+        // cpu_start_ns is set to 0 here (placeholder). The real value is
+        // captured in enter() after all bookkeeping, right at the function
+        // body boundary.
         with_stack_mut(|s| {
             let depth = s.len() as u16;
             let packed = pack_name_depth(name_id, depth);
@@ -845,7 +913,7 @@ fn enter_cold(name: &'static str) {
                 #[cfg(feature = "cpu-time")]
                 cpu_children_ns: 0,
                 #[cfg(feature = "cpu-time")]
-                cpu_start_ns,
+                cpu_start_ns: 0,
                 saved_alloc,
                 packed,
             });
@@ -861,15 +929,26 @@ fn enter_cold(name: &'static str) {
 /// site as a single inline instruction — no function call, no vDSO overhead.
 ///
 /// Guard is 8 bytes: fits in one register, zero memory stores inside the
-/// measurement window.
+/// measurement window. cpu_start_ns is captured as the last thing before
+/// returning, right at the function body boundary, minimizing
+/// instrumentation overhead inside the CPU time bracket.
 #[inline(always)]
 pub fn enter(name: &'static str) -> Guard {
     enter_cold(name);
     let start_tsc = crate::tsc::read();
-    // Write start_tsc to StackEntry for process::exit recovery (~0.3ns overhead).
+    // Capture cpu_start_ns AFTER all bookkeeping (enter_cold, tsc::read).
+    // This is the tightest possible placement — right at the body boundary.
+    #[cfg(feature = "cpu-time")]
+    let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
+    // Write start_tsc (and cpu_start_ns) to StackEntry for process::exit
+    // recovery and PianoFuture save/restore.
     with_stack_mut(|s| {
         if let Some(entry) = s.last_mut() {
             entry.start_tsc = start_tsc;
+            #[cfg(feature = "cpu-time")]
+            {
+                entry.cpu_start_ns = cpu_start_ns;
+            }
         }
     });
     Guard { start_tsc }
@@ -904,7 +983,19 @@ fn aggregate(agg: &[FnAgg], registered: &[&str]) -> Vec<FunctionRecord> {
             total_ms: e.total_ms,
             self_ms: e.self_ms,
             #[cfg(feature = "cpu-time")]
-            cpu_self_ms: e.cpu_self_ns as f64 / 1_000_000.0,
+            cpu_self_ms: {
+                // Amortized bias correction: raw_total - calls * bias.
+                // Positive/negative quantization noise cancels over many
+                // calls, achieving sub-ns mean precision. Clamped to 0.0
+                // for single-call fast functions where raw < bias.
+                let raw = e.cpu_self_ns as f64;
+                let corrected = raw - e.calls as f64 * crate::cpu_clock::bias_f64();
+                if corrected > 0.0 {
+                    corrected / 1_000_000.0
+                } else {
+                    0.0
+                }
+            },
         })
         .collect();
 
@@ -2985,6 +3076,24 @@ mod tests {
         assert!(inner.calls > 0, "inner_fn should have calls > 0");
         assert!(outer.self_ms > 0.0, "outer_fn should have positive self_ms");
         assert!(inner.self_ms > 0.0, "inner_fn should have positive self_ms");
+
+        // Verify cpu_self_ms is positive for normally-entered functions.
+        // Catches mutations that invert the cpu_start_ns == 0 guard in
+        // drain_inflight_stack (the guard handles partial enter(); normal
+        // entries must produce non-zero CPU time).
+        #[cfg(feature = "cpu-time")]
+        {
+            assert!(
+                outer.cpu_self_ms > 0.0,
+                "outer_fn should have positive cpu_self_ms, got {}",
+                outer.cpu_self_ms
+            );
+            assert!(
+                inner.cpu_self_ms > 0.0,
+                "inner_fn should have positive cpu_self_ms, got {}",
+                inner.cpu_self_ms
+            );
+        }
     }
 
     #[test]
