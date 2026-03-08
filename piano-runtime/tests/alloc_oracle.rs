@@ -109,10 +109,10 @@ fn nested_functions_alloc_attribution() {
         "inner should have exactly 7 self allocs, got {}",
         inner.alloc_count
     );
-    // Outer sees its 4 user allocs plus possible bookkeeping from enter("inner").
-    assert!(
-        outer.alloc_count >= 4,
-        "outer should have at least 4 self allocs, got {}",
+    // Outer sees exactly its 4 user allocs (no bookkeeping leakage).
+    assert_eq!(
+        outer.alloc_count, 4,
+        "outer should have exactly 4 self allocs, got {}",
         outer.alloc_count
     );
 
@@ -211,6 +211,49 @@ fn async_alloc_count_across_yields() {
         rec.alloc_count, 5,
         "expected 3+2=5 allocs across yield, got {}",
         rec.alloc_count
+    );
+
+    piano_runtime::reset();
+}
+
+#[test]
+#[serial]
+fn recursive_pure_math_reports_zero_allocs() {
+    warmup();
+
+    fn fib(n: u32) -> u64 {
+        let _g = piano_runtime::enter("fib_pure");
+        if n <= 1 {
+            return n as u64;
+        }
+        fib(n - 1) + fib(n - 2)
+    }
+
+    piano_runtime::register("fib_pure");
+    let result = fib(20);
+    std::hint::black_box(result);
+
+    let frames = piano_runtime::collect_frames();
+    let rec = find_summary(&frames, "fib_pure");
+    assert_eq!(
+        rec.alloc_count, 0,
+        "pure recursive function should have 0 alloc_count, got {}",
+        rec.alloc_count
+    );
+    assert_eq!(
+        rec.alloc_bytes, 0,
+        "pure recursive function should have 0 alloc_bytes, got {}",
+        rec.alloc_bytes
+    );
+    assert_eq!(
+        rec.free_count, 0,
+        "pure recursive function should have 0 free_count, got {}",
+        rec.free_count
+    );
+    assert_eq!(
+        rec.free_bytes, 0,
+        "pure recursive function should have 0 free_bytes, got {}",
+        rec.free_bytes
     );
 
     piano_runtime::reset();

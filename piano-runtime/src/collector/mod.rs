@@ -665,117 +665,114 @@ const _: () = {
 /// recording. Kept out-of-line so the inlined drop is just a counter read + call.
 #[inline(never)]
 fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_ns: u64) {
-    let scope_alloc = crate::alloc::ALLOC_COUNTERS
-        .try_with(|cell| cell.get())
-        .unwrap_or_default();
+    // Wrap in ALLOC_COUNTERS.try_with so we hold the Cell reference across
+    // all infra operations. Read scope allocs FIRST, do all work (merge,
+    // flush, stream), then restore parent counters LAST — overwriting any
+    // infra allocs that accumulated in the cell.
+    let _ = crate::alloc::ALLOC_COUNTERS.try_with(|alloc_cell| {
+        let scope_alloc = alloc_cell.get();
 
-    with_stack_mut(|s| {
-        let entry = match s.pop() {
-            Some(e) => e,
-            None => {
-                eprintln!("piano-runtime: guard dropped without matching stack entry (bug)");
-                return;
-            }
-        };
+        with_stack_mut(|s| {
+            let entry = match s.pop() {
+                Some(e) => e,
+                None => {
+                    eprintln!("piano-runtime: guard dropped without matching stack entry (bug)");
+                    return;
+                }
+            };
 
-        // Resolve name once from the interned table.
-        let name = lookup_name(unpack_name_id(entry.packed));
+            let name = lookup_name(unpack_name_id(entry.packed));
 
-        // Restore parent's saved alloc counters.
-        let _ = crate::alloc::ALLOC_COUNTERS.try_with(|cell| {
-            cell.set(entry.saved_alloc);
-        });
+            let raw_ticks = end_tsc.wrapping_sub(guard.start_tsc);
+            let corrected_ticks = raw_ticks.saturating_sub(crate::tsc::bias_ticks());
+            let elapsed_ns = crate::tsc::ticks_to_ns(corrected_ticks);
+            let children_ns = entry.children_ns;
+            let self_ns = elapsed_ns.saturating_sub(children_ns);
 
-        let raw_ticks = end_tsc.wrapping_sub(guard.start_tsc);
-        let corrected_ticks = raw_ticks.saturating_sub(crate::tsc::bias_ticks());
-        let elapsed_ns = crate::tsc::ticks_to_ns(corrected_ticks);
-        let children_ns = entry.children_ns;
-        let self_ns = elapsed_ns.saturating_sub(children_ns);
-
-        #[cfg(feature = "cpu-time")]
-        let cpu_elapsed_ns = cpu_end_ns
-            .saturating_sub(entry.cpu_start_ns)
-            .saturating_sub(crate::cpu_clock::bias_ns());
-        #[cfg(feature = "cpu-time")]
-        let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
-
-        if let Some(parent) = s.last_mut() {
-            parent.children_ns += elapsed_ns;
             #[cfg(feature = "cpu-time")]
-            {
-                parent.cpu_children_ns += cpu_elapsed_ns;
-            }
-        }
+            let cpu_elapsed_ns = cpu_end_ns
+                .saturating_sub(entry.cpu_start_ns)
+                .saturating_sub(crate::cpu_clock::bias_ns());
+            #[cfg(feature = "cpu-time")]
+            let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
 
-        RECORDS_BUF.with(|buf| {
-            merge_into_fnagg_vec(
-                &mut buf.borrow_mut(),
-                name,
-                elapsed_ns,
-                children_ns,
+            if let Some(parent) = s.last_mut() {
+                parent.children_ns += elapsed_ns;
                 #[cfg(feature = "cpu-time")]
-                cpu_self_ns,
-                scope_alloc.alloc_count,
-                scope_alloc.alloc_bytes,
-                scope_alloc.free_count,
-                scope_alloc.free_bytes,
-            );
-        });
+                {
+                    parent.cpu_children_ns += cpu_elapsed_ns;
+                }
+            }
 
-        #[cfg(any(test, feature = "_test_internals"))]
-        {
-            let start_ns = crate::tsc::ticks_to_epoch_ns(guard.start_tsc, crate::tsc::epoch_tsc());
-            INVOCATIONS.with(|inv| {
-                inv.borrow_mut().push(InvocationRecord {
+            RECORDS_BUF.with(|buf| {
+                merge_into_fnagg_vec(
+                    &mut buf.borrow_mut(),
                     name,
-                    start_ns,
                     elapsed_ns,
+                    children_ns,
+                    #[cfg(feature = "cpu-time")]
+                    cpu_self_ns,
+                    scope_alloc.alloc_count,
+                    scope_alloc.alloc_bytes,
+                    scope_alloc.free_count,
+                    scope_alloc.free_bytes,
+                );
+            });
+
+            #[cfg(any(test, feature = "_test_internals"))]
+            {
+                let start_ns =
+                    crate::tsc::ticks_to_epoch_ns(guard.start_tsc, crate::tsc::epoch_tsc());
+                INVOCATIONS.with(|inv| {
+                    inv.borrow_mut().push(InvocationRecord {
+                        name,
+                        start_ns,
+                        elapsed_ns,
+                        self_ns,
+                        #[cfg(feature = "cpu-time")]
+                        cpu_self_ns,
+                        alloc_count: scope_alloc.alloc_count,
+                        alloc_bytes: scope_alloc.alloc_bytes,
+                        free_count: scope_alloc.free_count,
+                        free_bytes: scope_alloc.free_bytes,
+                        depth: unpack_depth(entry.packed),
+                    });
+                });
+            }
+
+            FRAME_BUFFER.with(|buf| {
+                merge_into_frame_buf(
+                    &mut buf.borrow_mut(),
+                    name,
                     self_ns,
                     #[cfg(feature = "cpu-time")]
                     cpu_self_ns,
-                    alloc_count: scope_alloc.alloc_count,
-                    alloc_bytes: scope_alloc.alloc_bytes,
-                    free_count: scope_alloc.free_count,
-                    free_bytes: scope_alloc.free_bytes,
-                    depth: unpack_depth(entry.packed),
+                    scope_alloc.alloc_count,
+                    scope_alloc.alloc_bytes,
+                    scope_alloc.free_count,
+                    scope_alloc.free_bytes,
+                );
+            });
+
+            let remaining_all_base = s.iter().all(|e| unpack_depth(e.packed) == 0);
+            let is_frame_boundary = unpack_depth(entry.packed) == 0 || remaining_all_base;
+
+            if is_frame_boundary {
+                flush_records_buf();
+            }
+            if unpack_depth(entry.packed) == 0 {
+                FRAME_BUFFER.with(|buf| {
+                    let b = buf.borrow();
+                    if !b.is_empty() {
+                        stream_frame(&b);
+                    }
+                    drop(b);
+                    buf.borrow_mut().clear();
                 });
-            });
-        }
+            }
 
-        FRAME_BUFFER.with(|buf| {
-            merge_into_frame_buf(
-                &mut buf.borrow_mut(),
-                name,
-                self_ns,
-                #[cfg(feature = "cpu-time")]
-                cpu_self_ns,
-                scope_alloc.alloc_count,
-                scope_alloc.alloc_bytes,
-                scope_alloc.free_count,
-                scope_alloc.free_bytes,
-            );
+            alloc_cell.set(entry.saved_alloc);
         });
-
-        // Flush RECORDS_BUF at frame boundaries. Normally this is depth 0,
-        // but fork/adopt places an entry at depth 0 on worker threads,
-        // pushing real functions to depth 1+. Flush when all remaining
-        // stack entries are at depth 0 (all real work for this frame done).
-        let remaining_all_base = s.iter().all(|e| unpack_depth(e.packed) == 0);
-        let is_frame_boundary = unpack_depth(entry.packed) == 0 || remaining_all_base;
-
-        if is_frame_boundary {
-            flush_records_buf();
-        }
-        if unpack_depth(entry.packed) == 0 {
-            FRAME_BUFFER.with(|buf| {
-                let b = buf.borrow();
-                if !b.is_empty() {
-                    stream_frame(&b);
-                }
-                drop(b);
-                buf.borrow_mut().clear();
-            });
-        }
     });
 }
 
@@ -808,51 +805,36 @@ impl Drop for Guard {
 fn enter_cold(name: &'static str) {
     let _ = epoch();
 
-    // Ensure the TLS flush guard is registered on this thread so that
-    // on process::exit(), buffers are drained into global Arcs before
-    // TLS destruction completes and the atexit handler fires.
-    TLS_FLUSH_GUARD.with(|_| ());
+    // Wrap in ALLOC_COUNTERS.try_with so we hold the Cell reference across
+    // all infra operations. Snapshot parent state FIRST, then do infra work
+    // (TLS init, interning, Vec push), then zero the counters — discarding
+    // any infra allocs that accumulated in the cell.
+    let _ = crate::alloc::ALLOC_COUNTERS.try_with(|alloc_cell| {
+        let saved_alloc = alloc_cell.get();
 
-    let name_id = intern_name(name);
+        TLS_FLUSH_GUARD.with(|_| ());
 
-    #[cfg(feature = "cpu-time")]
-    let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
+        let name_id = intern_name(name);
 
-    // Push onto stack BEFORE snapshotting alloc counters. This ensures
-    // any allocation caused by Vec growth is attributed to the runtime,
-    // not to the user's function (fixes phantom alloc in recursion).
-    //
-    // Snapshot and zero alloc counters inside the same closure to avoid
-    // a second with_stack_mut TLS access. ALLOC_COUNTERS is a separate
-    // TLS from STACK, so reading it here is safe.
-    with_stack_mut(|s| {
-        let depth = s.len() as u16;
-        let packed = pack_name_depth(name_id, depth);
-        s.push(StackEntry {
-            start_tsc: 0,
-            children_ns: 0,
-            #[cfg(feature = "cpu-time")]
-            cpu_children_ns: 0,
-            #[cfg(feature = "cpu-time")]
-            cpu_start_ns,
-            saved_alloc: Default::default(), // placeholder until Vec growth settles
-            packed,
+        #[cfg(feature = "cpu-time")]
+        let cpu_start_ns = crate::cpu_clock::cpu_now_ns();
+
+        with_stack_mut(|s| {
+            let depth = s.len() as u16;
+            let packed = pack_name_depth(name_id, depth);
+            s.push(StackEntry {
+                start_tsc: 0,
+                children_ns: 0,
+                #[cfg(feature = "cpu-time")]
+                cpu_children_ns: 0,
+                #[cfg(feature = "cpu-time")]
+                cpu_start_ns,
+                saved_alloc,
+                packed,
+            });
         });
 
-        // Now snapshot and zero alloc counters — any Vec growth above is
-        // already counted in the parent's accumulator, not ours.
-        let saved_alloc = crate::alloc::ALLOC_COUNTERS
-            .try_with(|cell| {
-                let snap = cell.get();
-                cell.set(crate::alloc::AllocSnapshot::new());
-                snap
-            })
-            .unwrap_or_default();
-
-        // Patch the entry we just pushed with the real snapshot.
-        if let Some(entry) = s.last_mut() {
-            entry.saved_alloc = saved_alloc;
-        }
+        alloc_cell.set(crate::alloc::AllocSnapshot::new());
     });
 }
 
