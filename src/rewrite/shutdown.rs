@@ -2,7 +2,7 @@ use quote::quote;
 use syn::spanned::Spanned;
 
 use super::line_col_to_byte;
-use crate::source_map::{SourceMap, StringInjector};
+use crate::source_map::{SourceMap, StringInjector, skip_inner_attrs};
 
 /// Wrap `fn main`'s body in `catch_unwind` and inject `piano_runtime::shutdown()`.
 ///
@@ -27,7 +27,7 @@ pub fn inject_shutdown(
 
             let open = func.block.brace_token.span.open().start();
             let close = func.block.brace_token.span.close().start();
-            let open_byte = line_col_to_byte(source, open) + 1;
+            let open_byte = skip_inner_attrs(source, line_col_to_byte(source, open) + 1);
             let close_byte = line_col_to_byte(source, close);
 
             // Build shutdown call text.
@@ -328,6 +328,31 @@ async fn main() {
         assert!(
             set_pos < stuff_pos,
             "set_runs_dir should come before user code. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn injects_shutdown_preserving_inner_attrs_in_main() {
+        let source = r#"
+fn main() {
+    #![allow(unused)]
+    do_stuff();
+}
+"#;
+        let (result, _map) = inject_shutdown(source, None).unwrap();
+        // The rewritten source must parse successfully.
+        syn::parse_str::<syn::File>(&result)
+            .unwrap_or_else(|e| panic!("rewritten source should parse: {e}\n\n{result}"));
+        assert!(
+            result.contains("piano_runtime::init()"),
+            "should inject init(). Got:\n{result}"
+        );
+        // Inner attr must come before injected code in the body.
+        let attr_pos = result.find("#![allow(unused)]").unwrap();
+        let init_pos = result.find("piano_runtime::init()").unwrap();
+        assert!(
+            attr_pos < init_pos,
+            "inner attr must precede injected init. Got:\n{result}"
         );
     }
 }

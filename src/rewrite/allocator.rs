@@ -2,7 +2,7 @@ use quote::quote;
 use syn::spanned::Spanned;
 
 use super::line_col_to_byte;
-use crate::source_map::{SourceMap, StringInjector};
+use crate::source_map::{SourceMap, StringInjector, skip_inner_attrs};
 
 /// Classification of the user's `#[global_allocator]` declaration.
 pub enum AllocatorKind {
@@ -175,7 +175,7 @@ pub fn inject_global_allocator(
         AllocatorKind::Absent => {
             let text = "\n#[global_allocator]\nstatic _PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>\n    = piano_runtime::PianoAllocator::new(std::alloc::System);\n";
             let mut injector = StringInjector::new();
-            injector.insert(0, text);
+            injector.insert(skip_inner_attrs(source, 0), text);
             Ok(injector.apply(source))
         }
         AllocatorKind::Unconditional => {
@@ -214,21 +214,30 @@ pub fn inject_global_allocator(
                 "\n#[cfg({negated_str})]\n#[global_allocator]\nstatic _PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>\n    = piano_runtime::PianoAllocator::new(std::alloc::System);\n"
             );
 
-            // Apply type/expr replacements first, then prepend fallback.
+            // Apply type/expr replacements first, then insert fallback after
+            // any inner attributes so `#![...]` stays at the top of the file.
             let replaced = apply_replacements(source, &edits);
-            // Track the prepended fallback lines in the SourceMap so error
-            // remapping knows original lines shifted down.
+            let insert_pos = skip_inner_attrs(&replaced, 0);
+
             let fallback_newlines = fallback.bytes().filter(|&b| b == b'\n').count() as u32;
             let mut map = SourceMap::new();
             if fallback_newlines > 0 {
+                let line_at_insert = replaced[..insert_pos]
+                    .bytes()
+                    .filter(|&b| b == b'\n')
+                    .count() as u32
+                    + 1;
                 let none_span = if fallback.ends_with('\n') {
                     fallback_newlines - 1
                 } else {
                     fallback_newlines
                 };
-                map.record(1, fallback_newlines, none_span);
+                map.record(line_at_insert, fallback_newlines, none_span);
             }
-            let result = format!("{fallback}{replaced}");
+            let mut result = String::with_capacity(replaced.len() + fallback.len());
+            result.push_str(&replaced[..insert_pos]);
+            result.push_str(&fallback);
+            result.push_str(&replaced[insert_pos..]);
             Ok((result, map))
         }
     }
@@ -429,5 +438,53 @@ fn main() {}
             matches!(kind, AllocatorKind::Unconditional),
             "unconditional allocator should take precedence over cfg-gated. Got: {kind:?}"
         );
+    }
+
+    #[test]
+    fn absent_allocator_preserves_inner_attrs() {
+        let source = r#"#![cfg_attr(test, feature(test))]
+#![allow(unused)]
+
+fn main() {
+    println!("hello");
+}
+"#;
+        let (result, _map) = inject_global_allocator(source, AllocatorKind::Absent).unwrap();
+        // Inner attrs must remain at the top of the file.
+        assert!(
+            result.starts_with("#![cfg_attr"),
+            "inner attrs must stay at top. Got:\n{result}"
+        );
+        assert!(
+            result.contains("PianoAllocator"),
+            "should inject allocator. Got:\n{result}"
+        );
+        // The result must re-parse successfully.
+        syn::parse_str::<syn::File>(&result)
+            .unwrap_or_else(|e| panic!("rewritten source should parse: {e}\n\n{result}"));
+    }
+
+    #[test]
+    fn cfg_gated_fallback_preserves_inner_attrs() {
+        let source = r#"#![cfg_attr(test, feature(test))]
+
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: Jemalloc = Jemalloc;
+
+fn main() {}
+"#;
+        let kind = detect_allocator_kind(source).unwrap();
+        let (result, _map) = inject_global_allocator(source, kind).unwrap();
+        assert!(
+            result.starts_with("#![cfg_attr"),
+            "inner attrs must stay at top. Got:\n{result}"
+        );
+        assert!(
+            result.contains("_PIANO_ALLOC"),
+            "fallback should be injected. Got:\n{result}"
+        );
+        syn::parse_str::<syn::File>(&result)
+            .unwrap_or_else(|e| panic!("rewritten source should parse: {e}\n\n{result}"));
     }
 }

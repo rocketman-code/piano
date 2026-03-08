@@ -176,6 +176,56 @@ impl StringInjector {
     }
 }
 
+/// Skip past inner attributes (`#![...]`) starting from `offset` in `source`.
+///
+/// Returns the byte offset just after the last inner attribute (and any
+/// trailing whitespace between attributes), or `offset` unchanged if no
+/// inner attributes are found at that position.
+///
+/// This handles nested brackets within attributes (e.g. `#![cfg_attr(a, b)]`).
+///
+/// Limitation: bracket counting does not skip string literals or comments, so
+/// an inner attribute containing an unbalanced `]` inside a string (e.g.
+/// `#![doc = "text ]"]`) would cause early termination. This is acceptable
+/// because real-world inner attributes (`allow`, `deny`, `feature`, `cfg_attr`,
+/// `no_std`) never contain unbalanced brackets.
+pub fn skip_inner_attrs(source: &str, offset: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut pos = offset;
+
+    loop {
+        // Speculatively skip whitespace to check for `#![`.
+        let mut probe = pos;
+        while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
+            probe += 1;
+        }
+
+        // Check for `#![`
+        if probe + 2 < bytes.len()
+            && bytes[probe] == b'#'
+            && bytes[probe + 1] == b'!'
+            && bytes[probe + 2] == b'['
+        {
+            probe += 3; // skip `#![`
+            let mut bracket_depth = 1u32;
+            while probe < bytes.len() && bracket_depth > 0 {
+                match bytes[probe] {
+                    b'[' => bracket_depth += 1,
+                    b']' => bracket_depth -= 1,
+                    _ => {}
+                }
+                probe += 1;
+            }
+            // probe is now just after the closing `]`; commit and loop.
+            pos = probe;
+        } else {
+            break;
+        }
+    }
+
+    pos
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +494,77 @@ mod tests {
             .map(|(i, _)| (i + 1) as u32)
             .unwrap();
         assert_eq!(map.remap_line(bad_line), Some(8));
+    }
+
+    #[test]
+    fn skip_inner_attrs_no_attrs() {
+        assert_eq!(skip_inner_attrs("fn main() {}", 0), 0);
+        assert_eq!(skip_inner_attrs("  fn main() {}", 0), 0);
+    }
+
+    #[test]
+    fn skip_inner_attrs_single() {
+        let src = "#![allow(unused)]\nfn main() {}";
+        let pos = skip_inner_attrs(src, 0);
+        assert!(
+            src[pos..].trim_start().starts_with("fn"),
+            "should skip past inner attr. Rest: {:?}",
+            &src[pos..]
+        );
+    }
+
+    #[test]
+    fn skip_inner_attrs_multiple() {
+        let src = "#![allow(unused)]\n#![cfg_attr(test, feature(test))]\nfn main() {}";
+        let pos = skip_inner_attrs(src, 0);
+        assert!(
+            src[pos..].trim_start().starts_with("fn"),
+            "should skip past both inner attrs. Rest: {:?}",
+            &src[pos..]
+        );
+    }
+
+    #[test]
+    fn skip_inner_attrs_nested_brackets() {
+        let src = "#![cfg_attr(all(target_os = \"linux\"), feature(test))]\nuse foo;";
+        let pos = skip_inner_attrs(src, 0);
+        assert!(
+            src[pos..].trim_start().starts_with("use"),
+            "should handle nested parens. Rest: {:?}",
+            &src[pos..]
+        );
+    }
+
+    #[test]
+    fn skip_inner_attrs_in_block() {
+        // After opening brace of a function body.
+        let src = "fn main() {\n    #![allow(unused)]\n    body();\n}";
+        let brace_pos = src.find('{').unwrap();
+        let pos = skip_inner_attrs(src, brace_pos + 1);
+        assert!(
+            src[pos..].trim_start().starts_with("body"),
+            "should skip inner attr in block body. Got: {:?}",
+            &src[pos..]
+        );
+    }
+
+    #[test]
+    fn skip_inner_attrs_ignores_outer_attrs() {
+        // #[derive(Debug)] is an outer attribute, not #![...]
+        let src = "#[derive(Debug)]\nstruct Foo;";
+        let pos = skip_inner_attrs(src, 0);
+        assert_eq!(pos, 0, "outer attrs should not be skipped");
+    }
+
+    #[test]
+    fn skip_inner_attrs_at_offset() {
+        let src = "prefix\n#![allow(dead_code)]\nfn foo() {}";
+        let offset = src.find("#![").unwrap();
+        let pos = skip_inner_attrs(src, offset);
+        assert!(
+            src[pos..].trim_start().starts_with("fn"),
+            "should skip attr at offset. Rest: {:?}",
+            &src[pos..]
+        );
     }
 }

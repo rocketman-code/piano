@@ -10,7 +10,7 @@ use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
 use crate::resolve::is_instrumentable;
-use crate::source_map::{SourceMap, StringInjector};
+use crate::source_map::{SourceMap, StringInjector, skip_inner_attrs};
 
 pub use allocator::{AllocatorKind, detect_allocator_kind, inject_global_allocator};
 pub use shutdown::inject_shutdown;
@@ -254,7 +254,7 @@ impl<'s> InjectionCollector<'s> {
         }
 
         let open_pos = block.brace_token.span.open().start();
-        let open_byte = line_col_to_byte(self.source, open_pos) + 1; // after '{'
+        let open_byte = skip_inner_attrs(self.source, line_col_to_byte(self.source, open_pos) + 1);
 
         // Check for concurrency patterns.
         if let Some(pattern) = find_concurrency_pattern(block) {
@@ -346,7 +346,8 @@ impl<'s> InjectionCollector<'s> {
         let Some(syn::Stmt::Expr(trailing_expr, None)) = block.stmts.last() else {
             // No trailing expression -- fall back to sync guard.
             let open_pos = block.brace_token.span.open().start();
-            let open_byte = line_col_to_byte(self.source, open_pos) + 1;
+            let open_byte =
+                skip_inner_attrs(self.source, line_col_to_byte(self.source, open_pos) + 1);
             self.injector.insert(
                 open_byte,
                 format!("\n    let __piano_guard = piano_runtime::enter({guard_name:?});"),
@@ -827,7 +828,7 @@ fn collect_adopt_at_closure_start(
     match &*closure.body {
         syn::Expr::Block(block) => {
             let open_pos = block.block.brace_token.span.open().start();
-            let open_byte = line_col_to_byte(source, open_pos) + 1;
+            let open_byte = skip_inner_attrs(source, line_col_to_byte(source, open_pos) + 1);
             injector.insert(open_byte, ADOPT_STMT_TEXT);
         }
         other => {
@@ -946,7 +947,7 @@ pub fn inject_registrations(
         if let syn::Item::Fn(func) = item {
             if func.sig.ident == "main" {
                 let open = func.block.brace_token.span.open().start();
-                let byte_offset = line_col_to_byte(source, open) + 1;
+                let byte_offset = skip_inner_attrs(source, line_col_to_byte(source, open) + 1);
                 let mut text = String::new();
                 for name in names {
                     text.push_str(&format!("\n    piano_runtime::register(\"{name}\");"));
@@ -2345,6 +2346,93 @@ impl Walker {
         assert!(
             result.contains(r#"piano_runtime::enter("Walker::walk")"#),
             "inherent methods should use Type::method format"
+        );
+    }
+
+    #[test]
+    fn guard_injection_preserves_inner_attrs_in_fn_body() {
+        let source = r#"
+fn work() {
+    #![allow(unused_variables)]
+    let x = 42;
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
+
+        // Must re-parse successfully.
+        syn::parse_str::<syn::File>(&result)
+            .unwrap_or_else(|e| panic!("rewritten source should parse: {e}\n\n{result}"));
+
+        // Inner attr must precede the guard.
+        let attr_pos = result.find("#![allow(unused_variables)]").unwrap();
+        let guard_pos = result.find("piano_runtime::enter").unwrap();
+        assert!(
+            attr_pos < guard_pos,
+            "inner attr must precede guard. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn registrations_preserve_inner_attrs_in_main() {
+        let source = r#"
+fn main() {
+    #![allow(unused)]
+    do_stuff();
+}
+"#;
+        let (result, _map) = inject_registrations(source, &["work".to_string()]).unwrap();
+
+        syn::parse_str::<syn::File>(&result)
+            .unwrap_or_else(|e| panic!("rewritten source should parse: {e}\n\n{result}"));
+
+        let attr_pos = result.find("#![allow(unused)]").unwrap();
+        let reg_pos = result.find("piano_runtime::register").unwrap();
+        assert!(
+            attr_pos < reg_pos,
+            "inner attr must precede registration. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn file_level_inner_attrs_survive_full_pipeline() {
+        let source = r#"#![cfg_attr(test, feature(test))]
+#![allow(dead_code)]
+
+fn main() {
+    let _ = work();
+}
+
+fn work() -> u64 {
+    42
+}
+"#;
+        let targets: HashSet<String> = ["work".to_string()].into();
+        let result = instrument_source(source, &targets, false, "").unwrap();
+        let mut map = result.source_map;
+        let mut current = result.source;
+
+        let (s, m) = inject_registrations(&current, &["work".to_string()]).unwrap();
+        map.merge(m);
+        current = s;
+
+        let (s, m) = inject_global_allocator(&current, AllocatorKind::Absent).unwrap();
+        map.merge(m);
+        current = s;
+
+        let (s, m) = inject_shutdown(&current, None).unwrap();
+        map.merge(m);
+
+        // The final source must parse.
+        syn::parse_str::<syn::File>(&s)
+            .unwrap_or_else(|e| panic!("full pipeline output should parse: {e}\n\n{s}"));
+
+        // Inner attrs must be at the top.
+        assert!(
+            s.starts_with("#![cfg_attr"),
+            "inner attrs must stay at top. Got:\n{s}"
         );
     }
 }
