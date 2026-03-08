@@ -314,6 +314,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn piano_future_with_fork_adopt() {
         collector::reset();
         run(async {
