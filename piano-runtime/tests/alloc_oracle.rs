@@ -258,3 +258,49 @@ fn recursive_pure_math_reports_zero_allocs() {
 
     piano_runtime::reset();
 }
+
+/// CPU-bound workload for cpu-time tests.
+#[cfg(feature = "cpu-time")]
+fn burn_cpu(iterations: u64) {
+    let mut buf = [0x42u8; 4096];
+    for i in 0..iterations {
+        for b in &mut buf {
+            *b = b.wrapping_add(i as u8).wrapping_mul(31);
+        }
+    }
+    std::hint::black_box(&buf);
+}
+
+#[test]
+#[serial]
+#[cfg(feature = "cpu-time")]
+fn nested_cpu_children_ns_accumulation() {
+    warmup();
+
+    {
+        let _outer = piano_runtime::enter("cpu_parent");
+        piano_runtime::register("cpu_parent");
+        burn_cpu(1_000);
+        {
+            let _inner = piano_runtime::enter("cpu_child");
+            piano_runtime::register("cpu_child");
+            burn_cpu(50_000);
+        }
+    }
+
+    let frames = piano_runtime::collect_frames();
+    let parent = find_summary(&frames, "cpu_parent");
+    let child = find_summary(&frames, "cpu_child");
+
+    // Parent's cpu_self_ns must exclude the child's CPU time.
+    // If cpu_children_ns accumulation is wrong (e.g. *= instead of +=),
+    // parent would claim all the CPU time.
+    assert!(
+        parent.cpu_self_ns < child.cpu_self_ns,
+        "parent cpu_self_ns ({}) should be less than child cpu_self_ns ({})",
+        parent.cpu_self_ns,
+        child.cpu_self_ns
+    );
+
+    piano_runtime::reset();
+}
