@@ -129,6 +129,14 @@ static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
 /// and write to STREAM_FILE instead of buffering in FRAMES.
 static STREAMING_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Whether per-frame data should be streamed to disk.
+///
+/// When false (default), depth-0 frame boundaries skip `stream_frame()`,
+/// and shutdown writes a single aggregate frame via `synthesize_frame_from_agg`.
+/// Set to true by `init()` when `PIANO_STREAM_FRAMES=1` is in the environment
+/// (i.e., `piano profile --frames` was used).
+static STREAM_FRAMES: AtomicBool = AtomicBool::new(false);
+
 /// Global streaming file handle, lazily opened on first frame.
 ///
 /// All threads serialize frame writes through this single mutex. For typical
@@ -1253,6 +1261,12 @@ pub fn flush_to(dir: &std::path::Path) {
     flush_impl(dir);
 }
 
+/// Returns true when the given env var result represents an opt-in ("1").
+#[inline]
+fn env_is_opt_in(val: Result<String, std::env::VarError>) -> bool {
+    val.as_deref() == Ok("1")
+}
+
 /// Initialize the runtime: install handlers for data recovery.
 ///
 /// Called at the start of instrumented main(). Registers:
@@ -1263,6 +1277,9 @@ pub fn init() {
     signal::install_handlers();
     signal::register_atexit();
     STREAMING_ENABLED.store(true, Ordering::Relaxed);
+    if env_is_opt_in(std::env::var("PIANO_STREAM_FRAMES")) {
+        STREAM_FRAMES.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Flush all collected timing data from ALL threads and write to disk.
@@ -2314,7 +2331,9 @@ mod tests {
             let g = enter("immediate_fn");
             burn_cpu(5_000);
             STREAMING_ENABLED.store(true, Ordering::SeqCst);
+            STREAM_FRAMES.store(true, Ordering::SeqCst);
             drop(g);
+            STREAM_FRAMES.store(false, Ordering::SeqCst);
             STREAMING_ENABLED.store(false, Ordering::SeqCst);
         });
         handle.join().unwrap();
@@ -2877,6 +2896,89 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // Issue #523: stream_frames flag suppresses per-frame streaming
+    // ---------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn stream_frames_off_skips_disk_writes_and_shutdown_synthesizes_aggregate() {
+        // When STREAMING_ENABLED=true but STREAM_FRAMES=false (default),
+        // depth-0 frame boundaries must NOT write to disk. Shutdown should
+        // fall through to synthesize_frame_from_agg and produce a valid
+        // aggregate-only NDJSON file.
+        let tmp =
+            std::env::temp_dir().join(format!("piano_no_stream_frames_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        set_runs_dir(&tmp);
+
+        // Enable streaming but keep STREAM_FRAMES off (the new default).
+        STREAMING_ENABLED.store(true, Ordering::SeqCst);
+        STREAM_FRAMES.store(false, Ordering::SeqCst);
+
+        let handle = std::thread::spawn(|| {
+            reset();
+            // Two depth-0 calls — would normally produce 2 NDJSON frame lines.
+            {
+                let _g = enter("no_frames_fn");
+                burn_cpu(5_000);
+            }
+            {
+                let _g = enter("no_frames_fn");
+                burn_cpu(5_000);
+            }
+        });
+        handle.join().unwrap();
+
+        // No stream file should have been opened.
+        assert!(
+            stream_file().lock().unwrap().is_none(),
+            "stream file should not be opened when STREAM_FRAMES is false"
+        );
+
+        // Shutdown should produce an aggregate-only NDJSON file.
+        let failed = shutdown_impl_inner(&tmp);
+
+        // Restore before assertions.
+        STREAMING_ENABLED.store(false, Ordering::SeqCst);
+        clear_runs_dir();
+
+        assert!(!failed, "shutdown should succeed");
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("ndjson"))
+            .collect();
+        assert_eq!(files.len(), 1, "should write exactly one NDJSON file");
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+
+        // Should be: header + 1 aggregate frame + trailer = 3 lines.
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected header + 1 aggregate frame + trailer, got {lines:?}"
+        );
+        assert!(lines[0].contains("\"format_version\":4"), "header");
+        // Frame line uses fn_id references, function names are in the trailer.
+        assert!(
+            lines[1].contains("\"fns\":["),
+            "aggregate frame should contain function entries"
+        );
+        assert!(
+            lines[1].contains("\"calls\":2"),
+            "aggregate should sum both calls, got: {}",
+            lines[1]
+        );
+        assert!(lines[2].contains("\"functions\""), "trailer");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---------------------------------------------------------------
     // Issue #486: FnAgg must carry alloc data
     // ---------------------------------------------------------------
 
@@ -3167,5 +3269,26 @@ mod tests {
             "inner should have 1000 alloc bytes, got {}",
             inner.alloc_bytes
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #527: env_is_opt_in parsing (kills == → != mutant)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn env_opt_in_returns_true_for_one() {
+        assert!(env_is_opt_in(Ok("1".into())));
+    }
+
+    #[test]
+    fn env_opt_in_returns_false_for_missing_var() {
+        assert!(!env_is_opt_in(Err(std::env::VarError::NotPresent)));
+    }
+
+    #[test]
+    fn env_opt_in_returns_false_for_other_values() {
+        assert!(!env_is_opt_in(Ok("0".into())));
+        assert!(!env_is_opt_in(Ok("true".into())));
+        assert!(!env_is_opt_in(Ok("".into())));
     }
 }

@@ -693,12 +693,13 @@ fn frame_pipeline_build_run_report() {
         "built binary should exist at: {binary_path}"
     );
 
-    // Run the instrumented binary.
+    // Run the instrumented binary with frame streaming enabled.
     let runs_dir = tmp.path().join("runs");
     fs::create_dir_all(&runs_dir).unwrap();
 
     let run_output = Command::new(binary_path)
         .env("PIANO_RUNS_DIR", &runs_dir)
+        .env("PIANO_STREAM_FRAMES", "1")
         .output()
         .expect("failed to run instrumented binary");
 
