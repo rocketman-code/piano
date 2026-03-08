@@ -23,6 +23,14 @@ pub struct JsonDiffEntry {
     pub delta_pct: Option<f64>,
     pub calls_a: u64,
     pub calls_b: u64,
+    pub alloc_count_a: u64,
+    pub alloc_count_b: u64,
+    pub alloc_bytes_a: u64,
+    pub alloc_bytes_b: u64,
+    #[serde(default)]
+    pub cpu_self_ms_a: Option<f64>,
+    #[serde(default)]
+    pub cpu_self_ms_b: Option<f64>,
 }
 
 /// Serialize a diff between two runs as a JSON array.
@@ -69,6 +77,12 @@ pub fn diff_runs_json(a: &Run, b: &Run) -> String {
                 delta_pct,
                 calls_a: a_map.get(name).map_or(0, |e| e.calls),
                 calls_b: b_map.get(name).map_or(0, |e| e.calls),
+                alloc_count_a: a_map.get(name).map_or(0, |e| e.alloc_count),
+                alloc_count_b: b_map.get(name).map_or(0, |e| e.alloc_count),
+                alloc_bytes_a: a_map.get(name).map_or(0, |e| e.alloc_bytes),
+                alloc_bytes_b: b_map.get(name).map_or(0, |e| e.alloc_bytes),
+                cpu_self_ms_a: a_map.get(name).and_then(|e| e.cpu_self_ms),
+                cpu_self_ms_b: b_map.get(name).and_then(|e| e.cpu_self_ms),
             }
         })
         .collect();
@@ -782,5 +796,59 @@ mod tests {
             diff.contains("+3.00"),
             "diff should show +3.00ms delta (8.0 - 5.0): {diff}"
         );
+    }
+
+    #[test]
+    fn diff_runs_json_includes_alloc_and_cpu_fields() {
+        let run_a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 5,
+                total_ms: Some(20.0),
+                self_ms: 15.0,
+                cpu_self_ms: Some(12.0),
+                alloc_count: 100,
+                alloc_bytes: 8192,
+            }],
+        };
+        let run_b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "work".into(),
+                calls: 7,
+                total_ms: Some(25.0),
+                self_ms: 18.0,
+                cpu_self_ms: Some(14.0),
+                alloc_count: 200,
+                alloc_bytes: 16384,
+            }],
+        };
+
+        let json = diff_runs_json(&run_a, &run_b);
+        let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 1);
+
+        let e = &entries[0];
+        assert_eq!(e.alloc_count_a, 100);
+        assert_eq!(e.alloc_count_b, 200);
+        assert_eq!(e.alloc_bytes_a, 8192);
+        assert_eq!(e.alloc_bytes_b, 16384);
+        assert_eq!(e.cpu_self_ms_a, Some(12.0));
+        assert_eq!(e.cpu_self_ms_b, Some(14.0));
+
+        // Verify JSON keys are present via raw Value parse.
+        let raw: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let obj = &raw[0];
+        assert!(obj.get("alloc_count_a").is_some(), "missing alloc_count_a");
+        assert!(obj.get("alloc_count_b").is_some(), "missing alloc_count_b");
+        assert!(obj.get("alloc_bytes_a").is_some(), "missing alloc_bytes_a");
+        assert!(obj.get("alloc_bytes_b").is_some(), "missing alloc_bytes_b");
+        assert!(obj.get("cpu_self_ms_a").is_some(), "missing cpu_self_ms_a");
+        assert!(obj.get("cpu_self_ms_b").is_some(), "missing cpu_self_ms_b");
     }
 }
