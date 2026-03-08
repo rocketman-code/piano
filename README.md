@@ -77,6 +77,39 @@ These flags work with `piano profile` too: `piano profile --fn parse -- --input 
 
 Add `--cpu-time` to measure per-thread CPU time alongside wall time (Linux + macOS, 64-bit only).
 
+### Timed profiling
+
+Run the profiled program for a fixed duration, then stop and report:
+
+```
+$ piano profile --duration 10                   # stop after 10 seconds
+$ piano profile --duration 2.5                  # fractional seconds supported
+```
+
+### Structured output
+
+```
+$ piano profile --json                          # JSON to stdout (pipeable)
+$ piano report --json                           # same for report
+$ piano diff baseline current --json            # same for diff
+```
+
+### Multi-binary projects
+
+For workspace crates with multiple binaries:
+
+```
+$ piano profile --bin my-server                 # profile a specific binary
+```
+
+Piano discovers binaries from `[[bin]]` entries and from `src/bin/` automatically.
+
+### Per-thread breakdown
+
+```
+$ piano report --threads                        # show per-thread timing
+```
+
 ### Compare runs
 
 Tag a run, make changes, profile again, diff:
@@ -113,7 +146,7 @@ $ piano report --frames
 
 1. Copies your project to `target/piano/staging/` (your source is never modified). The staging directory lives inside `target/` so `cargo clean` removes it. Because the path is stable across runs, cargo caches incremental builds there -- dependencies compile once and only instrumented source files recompile.
 2. Adds `piano-runtime` as a dependency in the staged Cargo.toml
-3. Parses source with `syn` and injects timing guards into matched functions
+3. Parses source with `syn` and injects timing guards into matched functions (including `impl Future` functions, trait implementations, and functions defined inside `macro_rules!`)
 4. Wraps your global allocator for heap tracking. If the allocator is behind `#[cfg(...)]` (e.g., tikv-jemallocator on Linux only), piano wraps it under the same cfg gate and injects a fallback wrapper for all other platforms automatically.
 5. Builds with `cargo build --release`, outputs to `target/piano/`
 
@@ -121,11 +154,11 @@ The runtime has zero external dependencies to avoid conflicts with your project.
 
 ## When to use something else
 
-`piano` adds ~69ns/call overhead on Apple Silicon and ~303ns/call on x86-64. You can narrow instrumentation with `--fn`, `--file`, or `--mod` to reduce this. For programs with millions of short function calls, a sampling profiler like `perf` or `cargo-flamegraph` will add less overhead. `piano` is a better fit when you want exact call counts, self-time breakdowns, or allocation tracking without configuring OS-level tooling.
+`piano` adds ~48ns/call overhead on Apple Silicon and ~227ns/call on x86-64. You can narrow instrumentation with `--fn`, `--file`, or `--mod` to reduce this. For programs with millions of short function calls, a sampling profiler like `perf` or `cargo-flamegraph` will add less overhead. `piano` is a better fit when you want exact call counts, self-time breakdowns, or allocation tracking without configuring OS-level tooling.
 
 ## Limitations
 
-- Measurement bias is calibrated at startup; residual bias is ~0.3ns Apple Silicon, ~1.8ns x86-64. Functions faster than the residual floor will show inflated times.
+- Measurement bias is calibrated at startup; residual bias is ~0.8ns Apple Silicon, ~3.3ns x86-64. Functions faster than the residual floor will show inflated times.
 - `const fn`, `unsafe fn`, and `extern fn` are skipped (use `piano build --list-skipped` to see them)
 - Allocation tracking covers heap operations only (stack allocations are not tracked)
 - Binary crates only (no libraries)
