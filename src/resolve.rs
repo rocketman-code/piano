@@ -40,6 +40,18 @@ impl std::fmt::Display for SkipReason {
     }
 }
 
+/// Whether a function signature is safe to instrument.
+///
+/// Explicit enum — no implicit "everything else is fine" default.
+/// Every code path through `classify()` returns a named variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Classification {
+    /// Safe to instrument with standard guard or PianoFuture.
+    Instrumentable,
+    /// Must not be instrumented, with reason.
+    Skip(SkipReason),
+}
+
 /// A function that was in the target set but excluded from instrumentation.
 #[derive(Debug, Clone)]
 pub struct SkippedFunction {
@@ -326,35 +338,57 @@ fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
-/// Returns false for function signatures that should not be instrumented.
+/// Classify whether a function signature is safe to instrument.
 ///
-/// Technical limitations (instrumentation would not compile):
-/// - const fn: `enter()` is not a const fn
-/// - extern fn: non-Rust ABI, cannot call into the runtime
+/// Uses exhaustive destructuring of `syn::Signature` so that adding a new
+/// field to `Signature` (e.g., for `gen fn`) causes a compile error here,
+/// forcing an explicit decision about the new modifier's instrumentability.
 ///
-/// Design choices (instrumentation is possible but intentionally avoided):
-/// - unsafe fn: `enter()` is safe and callable inside unsafe blocks, but we
-///   avoid injecting code into unsafe functions as a conservative policy
-pub(crate) fn is_instrumentable(sig: &syn::Signature) -> bool {
-    classify_skip(sig).is_none()
-}
+/// NEVER use `..` in this destructuring — it defeats the compile-time safety.
+///
+/// Checkpoint coverage for the "wrong function filtering" bug class:
+/// - CP1 (this function): signature modifiers via exhaustive destructuring
+/// - CP2: return type via `returns_future()` in the strategy layer (rewrite/mod.rs)
+/// - CP3: attributes via caller-level checks (#[test]) + structural coverage
+///   (all dangerous built-in attrs require unsafe/extern, caught here)
+/// - CP4: syntactic context via Visit method selection (FnCollector/InjectionCollector)
+///
+/// Built-in attribute audit (Rust 1.88, 26 attrs on functions):
+///   Safe: cfg, cfg_attr, ignore, should_panic, allow, expect, warn, deny,
+///     forbid, deprecated, must_use, inline, cold, track_caller,
+///     instruction_set, no_mangle, export_name, link_section, doc
+///   Policy skip: test (handled by caller)
+///   Caught by signature: naked (unsafe+extern), target_feature (unsafe)
+///   Unreachable: proc_macro, proc_macro_derive, proc_macro_attribute,
+///     panic_handler (no_std only)
+pub(crate) fn classify(sig: &syn::Signature) -> Classification {
+    let syn::Signature {
+        constness,
+        asyncness: _, // strategy concern, not filtering (PianoFuture wrapping)
+        unsafety,
+        abi,
+        fn_token: _,    // syntax token, irrelevant to instrumentability
+        ident: _,       // function name, irrelevant to instrumentability
+        generics: _,    // guard is monomorphic, works with any generics
+        paren_token: _, // syntax token, irrelevant to instrumentability
+        inputs: _,      // parameter types don't affect guard injection
+        variadic: _,    // only valid in extern fns, already caught by abi check
+        output: _,      // strategy concern (returns_future), not filtering
+    } = sig;
 
-/// Classify why a function signature should not be instrumented.
-/// Returns None if the function is instrumentable.
-pub(crate) fn classify_skip(sig: &syn::Signature) -> Option<SkipReason> {
-    if sig.unsafety.is_some() {
-        return Some(SkipReason::Unsafe);
+    if unsafety.is_some() {
+        return Classification::Skip(SkipReason::Unsafe);
     }
-    if sig.constness.is_some() {
-        return Some(SkipReason::Const);
+    if constness.is_some() {
+        return Classification::Skip(SkipReason::Const);
     }
-    if let Some(abi) = &sig.abi {
+    if let Some(abi) = abi {
         let is_rust_abi = abi.name.as_ref().is_some_and(|name| name.value() == "Rust");
         if !is_rust_abi {
-            return Some(SkipReason::ExternAbi);
+            return Classification::Skip(SkipReason::ExternAbi);
         }
     }
-    None
+    Classification::Instrumentable
 }
 
 /// AST visitor that collects function names from a parsed Rust file.
@@ -379,14 +413,18 @@ impl<'ast> Visit<'ast> for FnCollector {
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         if !has_attr(&node.attrs, "test") {
-            if let Some(reason) = classify_skip(&node.sig) {
-                self.skipped.push(SkippedFunction {
-                    name: node.sig.ident.to_string(),
-                    reason,
-                    path: self.path.clone(),
-                });
-            } else {
-                self.functions.push(node.sig.ident.to_string());
+            let name = node.sig.ident.to_string();
+            match classify(&node.sig) {
+                Classification::Skip(reason) => {
+                    self.skipped.push(SkippedFunction {
+                        name,
+                        reason,
+                        path: self.path.clone(),
+                    });
+                }
+                Classification::Instrumentable => {
+                    self.functions.push(name);
+                }
             }
         }
         syn::visit::visit_item_fn(self, node);
@@ -417,14 +455,17 @@ impl<'ast> Visit<'ast> for FnCollector {
             } else {
                 method_name
             };
-            if let Some(reason) = classify_skip(&node.sig) {
-                self.skipped.push(SkippedFunction {
-                    name: qualified,
-                    reason,
-                    path: self.path.clone(),
-                });
-            } else {
-                self.functions.push(qualified);
+            match classify(&node.sig) {
+                Classification::Skip(reason) => {
+                    self.skipped.push(SkippedFunction {
+                        name: qualified,
+                        reason,
+                        path: self.path.clone(),
+                    });
+                }
+                Classification::Instrumentable => {
+                    self.functions.push(qualified);
+                }
             }
         }
         syn::visit::visit_impl_item_fn(self, node);
@@ -445,14 +486,17 @@ impl<'ast> Visit<'ast> for FnCollector {
             } else {
                 method_name
             };
-            if let Some(reason) = classify_skip(&node.sig) {
-                self.skipped.push(SkippedFunction {
-                    name: qualified,
-                    reason,
-                    path: self.path.clone(),
-                });
-            } else {
-                self.functions.push(qualified);
+            match classify(&node.sig) {
+                Classification::Skip(reason) => {
+                    self.skipped.push(SkippedFunction {
+                        name: qualified,
+                        reason,
+                        path: self.path.clone(),
+                    });
+                }
+                Classification::Instrumentable => {
+                    self.functions.push(qualified);
+                }
             }
         }
         syn::visit::visit_trait_item_fn(self, node);
@@ -1330,5 +1374,59 @@ fn main() {}
             fmt_count, 2,
             "should have 2 distinct fmt entries: {names:?}"
         );
+    }
+
+    #[test]
+    fn classify_returns_explicit_classification() {
+        use syn::parse_quote;
+
+        // Normal fn -> Instrumentable
+        let sig: syn::Signature = parse_quote! { fn foo() };
+        assert!(matches!(classify(&sig), Classification::Instrumentable));
+
+        // const fn -> Skip(Const)
+        let sig: syn::Signature = parse_quote! { const fn foo() };
+        assert!(matches!(
+            classify(&sig),
+            Classification::Skip(SkipReason::Const)
+        ));
+
+        // unsafe fn -> Skip(Unsafe)
+        let sig: syn::Signature = parse_quote! { unsafe fn foo() };
+        assert!(matches!(
+            classify(&sig),
+            Classification::Skip(SkipReason::Unsafe)
+        ));
+
+        // extern "C" fn -> Skip(ExternAbi)
+        let sig: syn::Signature = parse_quote! { extern "C" fn foo() };
+        assert!(matches!(
+            classify(&sig),
+            Classification::Skip(SkipReason::ExternAbi)
+        ));
+
+        // extern fn (bare extern = C ABI) -> Skip(ExternAbi)
+        let sig: syn::Signature = parse_quote! { extern fn foo() };
+        assert!(matches!(
+            classify(&sig),
+            Classification::Skip(SkipReason::ExternAbi)
+        ));
+
+        // extern "Rust" fn -> Instrumentable (explicit Rust ABI is fine)
+        let sig: syn::Signature = parse_quote! { extern "Rust" fn foo() };
+        assert!(matches!(classify(&sig), Classification::Instrumentable));
+
+        // async fn -> Instrumentable (async affects strategy, not filtering)
+        let sig: syn::Signature = parse_quote! { async fn foo() };
+        assert!(matches!(classify(&sig), Classification::Instrumentable));
+
+        // fn with generics -> Instrumentable
+        let sig: syn::Signature = parse_quote! { fn foo<T: Clone>(x: T) -> T };
+        assert!(matches!(classify(&sig), Classification::Instrumentable));
+
+        // fn returning impl Future -> Instrumentable (strategy concern, not filter)
+        let sig: syn::Signature =
+            parse_quote! { fn foo() -> impl std::future::Future<Output = i32> };
+        assert!(matches!(classify(&sig), Classification::Instrumentable));
     }
 }
