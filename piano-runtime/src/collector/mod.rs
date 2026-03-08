@@ -228,6 +228,10 @@ struct FnAgg {
     self_ms: f64,
     #[cfg(feature = "cpu-time")]
     cpu_self_ns: u64,
+    alloc_count: u64,
+    alloc_bytes: u64,
+    free_count: u64,
+    free_bytes: u64,
 }
 
 impl FnAgg {
@@ -240,6 +244,10 @@ impl FnAgg {
         {
             self.cpu_self_ns += other.cpu_self_ns;
         }
+        self.alloc_count += other.alloc_count;
+        self.alloc_bytes += other.alloc_bytes;
+        self.free_count += other.free_count;
+        self.free_bytes += other.free_bytes;
     }
 }
 
@@ -394,13 +402,27 @@ impl Drop for TlsFlushGuard {
             #[cfg(feature = "cpu-time")]
             let cpu_end_ns = crate::cpu_clock::cpu_now_ns();
 
+            // Read current ALLOC_COUNTERS for the innermost scope's alloc delta.
+            // Cell<AllocSnapshot> has no destructor, so TLS is still accessible.
+            let current_alloc = crate::alloc::ALLOC_COUNTERS
+                .try_with(|cell| cell.get())
+                .unwrap_or_default();
+
             // Process all in-flight entries. Skip entries with start_tsc == 0
             // (synthetic adopt anchors that are not real timed functions).
-            // Note: forward-order drain does not propagate elapsed_ns to parent
+            // Note: forward-order iteration does not propagate elapsed_ns to parent
             // children_ns, so self_ns for outer in-flight entries may be overstated
             // when multiple nested functions are in-flight. This is acceptable for
             // best-effort recovery.
-            for entry in s.drain(..) {
+            //
+            // Alloc deltas: enter() saves counters into saved_alloc and zeroes them,
+            // so entry[i]'s accumulated allocs = entry[i+1].saved_alloc (what the
+            // child saw as the parent's accumulation), or current_alloc for the
+            // innermost entry. StackEntry is Copy, so index-based access works
+            // without allocation.
+            let len = s.len();
+            for i in 0..len {
+                let entry = s[i];
                 if entry.start_tsc == 0 {
                     continue;
                 }
@@ -416,6 +438,12 @@ impl Drop for TlsFlushGuard {
                 #[cfg(feature = "cpu-time")]
                 let cpu_self_ns = cpu_elapsed_ns.saturating_sub(entry.cpu_children_ns);
 
+                let scope_alloc = if i + 1 < len {
+                    s[i + 1].saved_alloc
+                } else {
+                    current_alloc
+                };
+
                 let _ = RECORDS_BUF.try_with(|buf| {
                     merge_into_fnagg_vec(
                         &mut buf.borrow_mut(),
@@ -424,6 +452,10 @@ impl Drop for TlsFlushGuard {
                         children_ns,
                         #[cfg(feature = "cpu-time")]
                         cpu_self_ns,
+                        scope_alloc.alloc_count,
+                        scope_alloc.alloc_bytes,
+                        scope_alloc.free_count,
+                        scope_alloc.free_bytes,
                     );
                 });
 
@@ -434,13 +466,14 @@ impl Drop for TlsFlushGuard {
                         self_ns,
                         #[cfg(feature = "cpu-time")]
                         cpu_self_ns,
-                        0,
-                        0,
-                        0,
-                        0,
+                        scope_alloc.alloc_count,
+                        scope_alloc.alloc_bytes,
+                        scope_alloc.free_count,
+                        scope_alloc.free_bytes,
                     );
                 });
             }
+            s.clear();
         });
         // Drain RECORDS_BUF -> RECORDS Arc (survives via THREAD_RECORDS).
         let _ = RECORDS_BUF.try_with(|buf| {
@@ -492,12 +525,17 @@ thread_local! {
 }
 
 /// Merge a single invocation into a Vec<FnAgg> via linear scan on interned name pointer.
+#[allow(clippy::too_many_arguments)]
 fn merge_into_fnagg_vec(
     buf: &mut Vec<FnAgg>,
     name: &'static str,
     elapsed_ns: u64,
     children_ns: u64,
     #[cfg(feature = "cpu-time")] cpu_self_ns: u64,
+    alloc_count: u64,
+    alloc_bytes: u64,
+    free_count: u64,
+    free_bytes: u64,
 ) {
     let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
     let self_ms = elapsed_ns.saturating_sub(children_ns) as f64 / 1_000_000.0;
@@ -509,6 +547,10 @@ fn merge_into_fnagg_vec(
         {
             entry.cpu_self_ns += cpu_self_ns;
         }
+        entry.alloc_count += alloc_count;
+        entry.alloc_bytes += alloc_bytes;
+        entry.free_count += free_count;
+        entry.free_bytes += free_bytes;
     } else {
         buf.push(FnAgg {
             name,
@@ -517,6 +559,10 @@ fn merge_into_fnagg_vec(
             self_ms,
             #[cfg(feature = "cpu-time")]
             cpu_self_ns,
+            alloc_count,
+            alloc_bytes,
+            free_count,
+            free_bytes,
         });
     }
 }
@@ -663,6 +709,10 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                 children_ns,
                 #[cfg(feature = "cpu-time")]
                 cpu_self_ns,
+                scope_alloc.alloc_count,
+                scope_alloc.alloc_bytes,
+                scope_alloc.free_count,
+                scope_alloc.free_bytes,
             );
         });
 
@@ -1162,7 +1212,6 @@ fn collect_all_fnagg() -> Vec<FnAgg> {
 /// Synthesize a single NDJSON frame from aggregate FnAgg data.
 /// Used as fallback when no depth-0 frames were recorded (e.g., program crashed
 /// mid-function, or all work happened in contexts that don't produce frames).
-/// Alloc data is unavailable in aggregates, so alloc fields are zero.
 fn synthesize_frame_from_agg(agg: &[FnAgg]) -> Vec<FrameFnSummary> {
     agg.iter()
         .map(|e| FrameFnSummary {
@@ -1171,10 +1220,10 @@ fn synthesize_frame_from_agg(agg: &[FnAgg]) -> Vec<FrameFnSummary> {
             self_ns: (e.self_ms * 1_000_000.0).max(0.0) as u64,
             #[cfg(feature = "cpu-time")]
             cpu_self_ns: e.cpu_self_ns,
-            alloc_count: 0,
-            alloc_bytes: 0,
-            free_count: 0,
-            free_bytes: 0,
+            alloc_count: e.alloc_count,
+            alloc_bytes: e.alloc_bytes,
+            free_count: e.free_count,
+            free_bytes: e.free_bytes,
         })
         .collect()
 }
@@ -1604,6 +1653,10 @@ mod tests {
             self_ms: 0.0, // already clamped by merge_into_fnagg_vec
             #[cfg(feature = "cpu-time")]
             cpu_self_ns: 0,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
         }];
         let result = aggregate(&agg, &[]);
         assert_eq!(result.len(), 1);
@@ -2187,6 +2240,10 @@ mod tests {
                 self_ms: 75.5,
                 #[cfg(feature = "cpu-time")]
                 cpu_self_ns: 50_000_000,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
             },
             FnAgg {
                 name: "synth_fn_b",
@@ -2195,6 +2252,10 @@ mod tests {
                 self_ms: 10.0,
                 #[cfg(feature = "cpu-time")]
                 cpu_self_ns: 8_000_000,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
             },
         ];
 
@@ -2283,6 +2344,10 @@ mod tests {
             self_ms: 5.0,
             #[cfg(feature = "cpu-time")]
             cpu_self_ns: 100,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
         };
         let src = FnAgg {
             name: "f",
@@ -2291,6 +2356,10 @@ mod tests {
             self_ms: 3.0,
             #[cfg(feature = "cpu-time")]
             cpu_self_ns: 50,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
         };
         dst.absorb(&src);
         assert_eq!(dst.calls, 5, "calls: 3 + 2 = 5");
@@ -2324,6 +2393,10 @@ mod tests {
             500_000,   // 0.5ms children
             #[cfg(feature = "cpu-time")]
             100,
+            0,
+            0,
+            0,
+            0,
         );
         assert_eq!(buf.len(), 1);
         assert_eq!(buf[0].calls, 1);
@@ -2336,6 +2409,10 @@ mod tests {
             1_000_000, // 1ms children
             #[cfg(feature = "cpu-time")]
             200,
+            0,
+            0,
+            0,
+            0,
         );
         assert_eq!(buf.len(), 1, "same name should merge, not create new entry");
         assert_eq!(buf[0].calls, 2, "calls: 1 + 1 = 2");
@@ -2456,6 +2533,10 @@ mod tests {
             total_ms: 10.0,
             self_ms: 8.0,
             cpu_self_ns: 5_000_000, // 5ms
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
         }];
         let result = aggregate(&agg, &[]);
         assert_eq!(result.len(), 1);
@@ -2588,6 +2669,10 @@ mod tests {
                 self_ms: 5.0,
                 #[cfg(feature = "cpu-time")]
                 cpu_self_ns: 5_000_000,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
             });
         });
 
@@ -2634,6 +2719,10 @@ mod tests {
                 self_ms: 3.0,
                 #[cfg(feature = "cpu-time")]
                 cpu_self_ns: 3_000_000,
+                alloc_count: 0,
+                alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
             });
         });
 
@@ -2660,5 +2749,132 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #486: FnAgg must carry alloc data
+    // ---------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn fnagg_carries_alloc_data_through_synthesize() {
+        // FnAgg entries with alloc data should produce non-zero alloc
+        // fields in synthesize_frame_from_agg output.
+        let agg = vec![FnAgg {
+            name: "synth_alloc_fn",
+            calls: 3,
+            total_ms: 50.0,
+            self_ms: 40.0,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 30_000_000,
+            alloc_count: 100,
+            alloc_bytes: 4096,
+            free_count: 50,
+            free_bytes: 2048,
+        }];
+
+        let frames = synthesize_frame_from_agg(&agg);
+        assert_eq!(frames.len(), 1);
+        let f = &frames[0];
+        assert_eq!(f.alloc_count, 100, "alloc_count should come from FnAgg");
+        assert_eq!(f.alloc_bytes, 4096, "alloc_bytes should come from FnAgg");
+        assert_eq!(f.free_count, 50, "free_count should come from FnAgg");
+        assert_eq!(f.free_bytes, 2048, "free_bytes should come from FnAgg");
+    }
+
+    #[test]
+    #[serial]
+    fn fnagg_absorb_merges_alloc_fields() {
+        let mut a = FnAgg {
+            name: "absorb_fn",
+            calls: 1,
+            total_ms: 10.0,
+            self_ms: 8.0,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 5_000_000,
+            alloc_count: 10,
+            alloc_bytes: 1024,
+            free_count: 5,
+            free_bytes: 512,
+        };
+        let b = FnAgg {
+            name: "absorb_fn",
+            calls: 2,
+            total_ms: 20.0,
+            self_ms: 15.0,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 10_000_000,
+            alloc_count: 20,
+            alloc_bytes: 2048,
+            free_count: 8,
+            free_bytes: 768,
+        };
+        a.absorb(&b);
+        assert_eq!(a.alloc_count, 30);
+        assert_eq!(a.alloc_bytes, 3072);
+        assert_eq!(a.free_count, 13);
+        assert_eq!(a.free_bytes, 1280);
+    }
+
+    #[test]
+    #[serial]
+    fn merge_into_fnagg_vec_accumulates_alloc() {
+        let name: &'static str = "mifav_alloc_fn";
+        let mut buf: Vec<FnAgg> = Vec::new();
+        merge_into_fnagg_vec(
+            &mut buf,
+            name,
+            1_000_000,
+            0,
+            #[cfg(feature = "cpu-time")]
+            500_000,
+            10,
+            256,
+            3,
+            128,
+        );
+        assert_eq!(buf[0].alloc_count, 10);
+        assert_eq!(buf[0].alloc_bytes, 256);
+        assert_eq!(buf[0].free_count, 3);
+        assert_eq!(buf[0].free_bytes, 128);
+
+        // Second merge: alloc fields should accumulate
+        merge_into_fnagg_vec(
+            &mut buf,
+            name,
+            2_000_000,
+            0,
+            #[cfg(feature = "cpu-time")]
+            700_000,
+            5,
+            512,
+            2,
+            64,
+        );
+        assert_eq!(buf[0].alloc_count, 15, "alloc_count: 10 + 5");
+        assert_eq!(buf[0].alloc_bytes, 768, "alloc_bytes: 256 + 512");
+        assert_eq!(buf[0].free_count, 5, "free_count: 3 + 2");
+        assert_eq!(buf[0].free_bytes, 192, "free_bytes: 128 + 64");
+    }
+
+    #[test]
+    #[serial]
+    fn drop_cold_records_alloc_in_fnagg() {
+        // After a function completes, its alloc data should appear in
+        // FnAgg aggregates (not just FrameFnSummary).
+        reset();
+        {
+            let _g = enter("dc_alloc_fn");
+            crate::alloc::track_alloc(1024);
+            crate::alloc::track_alloc(512);
+            crate::alloc::track_dealloc(256);
+        }
+        flush_records_buf();
+        let agg = RECORDS.with(|records| records.lock().unwrap().clone());
+        let entry = agg.iter().find(|e| e.name == "dc_alloc_fn").unwrap();
+        assert_eq!(entry.alloc_count, 2, "should record 2 allocations");
+        assert_eq!(entry.alloc_bytes, 1536, "should record 1536 alloc bytes");
+        assert_eq!(entry.free_count, 1, "should record 1 free");
+        assert_eq!(entry.free_bytes, 256, "should record 256 free bytes");
     }
 }
