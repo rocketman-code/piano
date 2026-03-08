@@ -8,7 +8,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use piano::build::{
-    build_instrumented, find_bin_entry_point, find_project_root, find_workspace_root,
+    build_instrumented, cargo_metadata, find_bin_target, find_current_package, find_project_root,
     inject_runtime_dependency, inject_runtime_path_dependency, prepare_staging,
 };
 use piano::error::{Error, io_context};
@@ -295,14 +295,68 @@ fn build_project(
         specs.push(TargetSpec::Mod(m));
     }
 
-    // Resolve targets against the project source.
-    let src_dir = project.join("src");
-    if !src_dir.is_dir() {
-        return Err(Error::BuildFailed(format!(
-            "no src/ directory found in {} — is this a Rust project?",
-            project.display()
-        )));
-    }
+    // Use cargo metadata for project discovery.
+    let metadata = cargo_metadata(&project)?;
+    let workspace_root = metadata.workspace_root.canonicalize().map_err(|e| {
+        Error::BuildFailed(format!(
+            "failed to canonicalize workspace root {}: {e}",
+            metadata.workspace_root.display()
+        ))
+    })?;
+
+    // Find the target package and binary.
+    // If the user specified --bin, look for it. Otherwise find the current
+    // package from the project directory.
+    let (package_name, bin_src_path) = if bin.is_some() || metadata.packages.len() == 1 {
+        let pkg_filter = if metadata.packages.len() == 1 {
+            None
+        } else {
+            find_current_package(&metadata, &project).map(|p| p.name.as_str())
+        };
+        find_bin_target(&metadata, pkg_filter, bin.as_deref())?
+    } else {
+        // Multiple packages, no --bin: find the package matching project dir.
+        let pkg = find_current_package(&metadata, &project).ok_or_else(|| {
+            Error::BuildFailed(format!(
+                "could not determine which package to build in workspace at {}",
+                workspace_root.display()
+            ))
+        })?;
+        find_bin_target(&metadata, Some(&pkg.name), None)?
+    };
+
+    // Derive source directory from the binary's src_path.
+    // The src_path points to the entry point (e.g., /ws/crates/core/src/main.rs).
+    // The package's source root is the parent of "src/" in the path, or the
+    // manifest_path parent.
+    let pkg = metadata
+        .packages
+        .iter()
+        .find(|p| p.name == package_name)
+        .expect("package must exist: find_bin_target returned it");
+    let pkg_root = pkg
+        .manifest_path
+        .parent()
+        .ok_or_else(|| Error::BuildFailed("package manifest has no parent directory".into()))?;
+    let pkg_root = pkg_root.canonicalize().map_err(|e| {
+        Error::BuildFailed(format!(
+            "failed to canonicalize package root {}: {e}",
+            pkg_root.display()
+        ))
+    })?;
+
+    // Determine the source directory. Use src/ if it exists, otherwise use the
+    // parent of the binary's src_path relative to the package root.
+    let src_dir = if pkg_root.join("src").is_dir() {
+        pkg_root.join("src")
+    } else {
+        // Derive from binary src_path: strip pkg_root prefix, take first component.
+        let bin_rel = bin_src_path
+            .canonicalize()
+            .unwrap_or_else(|_| bin_src_path.clone());
+        bin_rel.parent().unwrap_or(&pkg_root).to_path_buf()
+    };
+
     let ResolveResult { targets, skipped } = resolve_targets(&src_dir, &specs, exact)?;
 
     if list_skipped {
@@ -345,31 +399,18 @@ fn build_project(
         }
     }
 
-    // Detect workspace membership. If the project is a workspace member,
-    // stage from the workspace root so inherited fields and cross-member
+    // Stage from the workspace root so inherited fields and cross-member
     // path dependencies resolve correctly.
-    let workspace_root = find_workspace_root(&project);
-    let (staging_root, member_subdir, package_name) = if let Some(ref ws_root) = workspace_root {
-        let relative = project
-            .strip_prefix(ws_root)
-            .map_err(|e| std::io::Error::other(e.to_string()))?
-            .to_path_buf();
-        // Read package name from the member's Cargo.toml.
-        let member_cargo_toml = project.join("Cargo.toml");
-        let member_toml = std::fs::read_to_string(&member_cargo_toml)
-            .map_err(io_context("read", &member_cargo_toml))?;
-        let doc: toml_edit::DocumentMut = member_toml
-            .parse()
-            .map_err(|e| Error::BuildFailed(format!("failed to parse member Cargo.toml: {e}")))?;
-        let pkg_name = doc
-            .get("package")
-            .and_then(|p| p.get("name"))
-            .and_then(|n| n.as_str())
-            .ok_or_else(|| Error::BuildFailed("member Cargo.toml missing package.name".into()))?
-            .to_string();
-        (ws_root.clone(), Some(relative), Some(pkg_name))
+    let staging_root = workspace_root.clone();
+    let member_subdir = if pkg_root != workspace_root {
+        Some(
+            pkg_root
+                .strip_prefix(&workspace_root)
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .to_path_buf(),
+        )
     } else {
-        (project.clone(), None, None)
+        None
     };
 
     // Prepare staging directory.
@@ -398,14 +439,26 @@ fn build_project(
     }
 
     // Rewrite each target file in staging.
+    // Rebase source paths from the original project into the staging directory.
     let instrument_macros = specs.is_empty();
     let mut all_concurrency: Vec<(String, String)> = Vec::new();
     let mut source_maps: HashMap<PathBuf, SourceMap> = HashMap::new();
     let mut macro_fn_names: Vec<String> = Vec::new();
+
+    // The staging src dir corresponds to the original src_dir but within staging.
+    // Derive from src_dir relative to pkg_root (src_dir may not be "src/" when
+    // the fallback in the src_dir computation above triggers).
+    let src_rel = src_dir.strip_prefix(&pkg_root).unwrap_or(Path::new("src"));
+    let staging_src_dir = if let Some(ref sub) = member_subdir {
+        staging.join(sub).join(src_rel)
+    } else {
+        staging.join(src_rel)
+    };
+
     for target in &targets {
         let target_set: HashSet<String> = target.functions.iter().cloned().collect();
         let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
-        let staged_file = member_staging.join("src").join(relative);
+        let staged_file = staging_src_dir.join(relative);
         let display_path = PathBuf::from("src").join(relative);
         let source =
             std::fs::read_to_string(&staged_file).map_err(|source| Error::RunReadError {
@@ -437,8 +490,28 @@ fn build_project(
     }
 
     // Inject register calls into the binary entry point for all instrumented functions.
-    let bin_entry = find_bin_entry_point(&member_staging, bin.as_deref())?;
-    let main_file = member_staging.join(&bin_entry);
+    // Rebase the bin_src_path into the staging directory.
+    let bin_src_canonical = bin_src_path.canonicalize().map_err(|e| {
+        Error::BuildFailed(format!(
+            "failed to canonicalize binary source path {}: {e}",
+            bin_src_path.display()
+        ))
+    })?;
+    let bin_entry_relative = bin_src_canonical
+        .strip_prefix(&workspace_root)
+        .map_err(|_| {
+            Error::BuildFailed(format!(
+                "binary source {} is outside workspace root {}",
+                bin_src_canonical.display(),
+                workspace_root.display()
+            ))
+        })?;
+    let main_file = staging.join(bin_entry_relative);
+    // Display path is relative to the package root for error messages.
+    let bin_entry = bin_src_canonical
+        .strip_prefix(&pkg_root)
+        .unwrap_or(&bin_src_canonical)
+        .to_path_buf();
     let target_dir = project.join("target").join("piano");
     let runs_dir = target_dir.join("runs");
     std::fs::create_dir_all(&runs_dir).map_err(io_context("create directory", &runs_dir))?;
@@ -500,13 +573,13 @@ fn build_project(
     }
 
     // Build the instrumented binary.
-    let binary = build_instrumented(
-        &staging,
-        &target_dir,
-        package_name.as_deref(),
-        bin.as_deref(),
-        &source_maps,
-    )?;
+    // Pass the package name when in a workspace (member != root).
+    let pkg_arg = if member_subdir.is_some() {
+        Some(package_name.as_str())
+    } else {
+        None
+    };
+    let binary = build_instrumented(&staging, &target_dir, pkg_arg, bin.as_deref(), &source_maps)?;
 
     Ok(Some((binary, runs_dir, total_fns)))
 }
