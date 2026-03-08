@@ -541,13 +541,13 @@ fn build_suggestion_hint(specs: &[TargetSpec], seen_names: &[String]) -> String 
 /// - `mod.rs` -> parent directory components (e.g., `db/mod.rs` -> `"db"`)
 /// - other -> parent components + file stem (e.g., `db/query.rs` -> `"db::query"`)
 pub fn module_prefix(relative: &Path) -> String {
-    let stem = relative.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let stem = relative.file_stem().and_then(|s| s.to_str()).unwrap_or("_");
 
     let parent_components: Vec<&str> = relative
         .parent()
         .map(|p| {
             p.components()
-                .map(|c| c.as_os_str().to_str().unwrap())
+                .map(|c| c.as_os_str().to_str().unwrap_or("_"))
                 .collect()
         })
         .unwrap_or_default();
@@ -1232,6 +1232,24 @@ mod tests {
             module_prefix(Path::new("api/handlers/user.rs")),
             "api::handlers::user"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn module_prefix_non_utf8_fallback() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // 0x80 is not valid UTF-8; build a path like "<invalid>/valid.rs"
+        let bad_dir = OsStr::from_bytes(b"\x80");
+        let mut path = std::path::PathBuf::from(bad_dir);
+        path.push("query.rs");
+        assert_eq!(module_prefix(&path), "_::query");
+
+        // Non-UTF-8 file stem: "valid/<invalid>.rs"
+        let bad_stem = OsStr::from_bytes(b"\x80.rs");
+        let path2 = Path::new("api").join(bad_stem);
+        assert_eq!(module_prefix(&path2), "api::_");
     }
 
     #[test]
