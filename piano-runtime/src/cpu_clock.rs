@@ -72,8 +72,7 @@ pub(crate) fn bias_f64() -> f64 {
 }
 
 /// Return the calibrated CPU-time bias as integer nanoseconds.
-/// Used in TlsFlushGuard crash recovery (precision not required).
-#[cfg(feature = "cpu-time")]
+#[cfg(all(any(test, feature = "_test_internals"), feature = "cpu-time"))]
 #[inline(always)]
 pub(crate) fn bias_ns() -> u64 {
     bias_f64() as u64
