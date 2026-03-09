@@ -3,6 +3,7 @@
 #![allow(clippy::missing_const_for_thread_local)]
 
 mod alloc;
+pub(crate) mod channel;
 mod collector;
 mod cpu_clock;
 mod piano_future;
@@ -20,6 +21,16 @@ pub use collector::{
 };
 
 // Injection-only API: public for rewriter-generated code, hidden from docs
+#[cfg(feature = "channels-crossbeam")]
+#[doc(hidden)]
+pub use channel::crossbeam::{
+    wrap_bounded as wrap_crossbeam_bounded, wrap_unbounded as wrap_crossbeam_unbounded,
+    ProxyReceiver as CrossbeamProxyReceiver, ProxySender as CrossbeamProxySender,
+};
+#[doc(hidden)]
+pub use channel::{
+    collect_channel_stats, register_channel, ChannelKind, ChannelSnapshot, ChannelStats,
+};
 #[doc(hidden)]
 pub use collector::{
     adopt, flush, fork, init, register, reset, set_runs_dir, shutdown, shutdown_to, AdoptGuard,

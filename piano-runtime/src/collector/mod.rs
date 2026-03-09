@@ -52,7 +52,7 @@ use ndjson::{flush_impl, stream_frame, write_ndjson, write_stream_trailer, Strea
 /// Equivalent to `OnceLock` (stabilized in 1.70) but works on Rust 1.59+.
 /// The `Once` primitive guarantees single-writer semantics; after initialization
 /// the value is read-only, so there are no data races.
-pub(super) struct SyncOnceCell<T> {
+pub(crate) struct SyncOnceCell<T> {
     once: Once,
     value: UnsafeCell<Option<T>>,
 }
@@ -62,14 +62,14 @@ pub(super) struct SyncOnceCell<T> {
 unsafe impl<T: Send + Sync> Sync for SyncOnceCell<T> {}
 
 impl<T> SyncOnceCell<T> {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             once: Once::new(),
             value: UnsafeCell::new(None),
         }
     }
 
-    fn get_or_init(&self, f: impl FnOnce() -> T) -> &T {
+    pub(crate) fn get_or_init(&self, f: impl FnOnce() -> T) -> &T {
         self.once.call_once(|| {
             // SAFETY: `call_once` guarantees this runs exactly once, with
             // all subsequent callers blocking until it completes.
