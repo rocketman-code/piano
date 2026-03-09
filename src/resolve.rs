@@ -302,7 +302,7 @@ fn walk_rs_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Error> 
 ///
 /// Functions annotated with `#[test]` and items inside `#[cfg(test)]` modules
 /// are excluded -- they are not useful instrumentation targets.
-fn extract_functions(
+pub(crate) fn extract_functions(
     source: &str,
     path: &Path,
     rel_path: PathBuf,

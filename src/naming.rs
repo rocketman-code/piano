@@ -443,4 +443,232 @@ mod tests {
         assert!(!result[0].contains('{'));
         assert!(!result[0].contains("host::Unique"));
     }
+
+    // --- Cross-path agreement tests ---
+    //
+    // Verify that FnCollector (resolve.rs) and InjectionCollector (rewrite/mod.rs)
+    // agree on function names: every function FnCollector discovers must be found
+    // by InjectionCollector when given the corresponding target map.
+
+    /// Helper: run the full pipeline (extract -> disambiguate -> instrument) on a
+    /// source snippet and return (display_names, instrumented_source).
+    fn run_pipeline(source: &str, module_prefix: &str) -> (Vec<String>, String) {
+        use std::path::PathBuf;
+
+        let rel_path = if module_prefix.is_empty() {
+            PathBuf::from("src/lib.rs")
+        } else {
+            // Convert "db::query" prefix into a plausible relative path.
+            let parts: Vec<&str> = module_prefix.split("::").collect();
+            let mut p = PathBuf::from("src");
+            for part in &parts[..parts.len() - 1] {
+                p.push(part);
+            }
+            p.push(format!("{}.rs", parts.last().unwrap()));
+            p
+        };
+        let dummy_path = PathBuf::from("dummy.rs");
+        let (functions, _skipped) =
+            crate::resolve::extract_functions(source, &dummy_path, rel_path.clone());
+
+        // Apply module prefix (same as main.rs does).
+        let prefix = crate::resolve::module_prefix(&rel_path);
+        let qualified: Vec<QualifiedFunction> = functions
+            .iter()
+            .map(|qf| {
+                QualifiedFunction::new(
+                    &crate::resolve::qualify(&prefix, &qf.minimal),
+                    &crate::resolve::qualify(&prefix, &qf.medium),
+                    &crate::resolve::qualify(&prefix, &qf.full),
+                )
+            })
+            .collect();
+
+        let display_names = disambiguate(&qualified);
+
+        // Build target map: full_name -> display_name (same as main.rs).
+        let target_map: std::collections::HashMap<String, String> = qualified
+            .iter()
+            .zip(display_names.iter())
+            .map(|(qf, d)| (qf.full.clone(), d.clone()))
+            .collect();
+
+        let result = crate::rewrite::instrument_source(source, &target_map, false, &prefix)
+            .expect("instrument_source should succeed");
+
+        (display_names, result.source)
+    }
+
+    #[test]
+    fn cross_path_agreement_basic() {
+        let cases: Vec<(&str, &str, &str)> = vec![
+            ("fn walk() { let _ = 1; }", "", "bare function"),
+            (
+                "struct W; impl W { fn walk(&self) { let _ = 1; } }",
+                "",
+                "inherent impl",
+            ),
+            (
+                "struct W<T>(T); impl W<u32> { fn go(&self) { let _ = 1; } }",
+                "",
+                "generic impl",
+            ),
+            (
+                "trait D { fn draw(&self) { let _ = 1; } }",
+                "",
+                "trait default method",
+            ),
+            (
+                "mod inner { pub fn foo() { let _ = 1; } }",
+                "",
+                "inline mod",
+            ),
+            (
+                "struct W; impl W { fn walk(&self) { let _ = 1; } }",
+                "db::query",
+                "with file prefix",
+            ),
+        ];
+        for (source, prefix, desc) in &cases {
+            let (display_names, instrumented) = run_pipeline(source, prefix);
+            assert!(
+                !display_names.is_empty(),
+                "{desc}: expected at least one function"
+            );
+            for name in &display_names {
+                let guard = format!("piano_runtime::enter(\"{name}\")");
+                assert!(
+                    instrumented.contains(&guard),
+                    "{desc}: guard not found for '{name}' in:\n{instrumented}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cross_path_agreement_trait_impl() {
+        // Trait impl: impl D for Foo { fn draw() }
+        let source = r#"
+            trait D { fn draw(&self); }
+            struct Foo;
+            impl D for Foo { fn draw(&self) { let _ = 1; } }
+        "#;
+        let (display_names, instrumented) = run_pipeline(source, "");
+        // Only the impl method has a body (trait method is signature-only).
+        assert_eq!(display_names.len(), 1, "expected one function");
+        let guard = format!("piano_runtime::enter(\"{}\")", display_names[0]);
+        assert!(
+            instrumented.contains(&guard),
+            "guard not found in:\n{instrumented}"
+        );
+        // The display name should contain both the type and trait info.
+        assert!(
+            display_names[0].contains("Foo"),
+            "expected Foo in display name: {}",
+            display_names[0]
+        );
+    }
+
+    // --- Collision regression tests ---
+    //
+    // Each test covers a specific collision scenario (E1-E7 from the naming
+    // design, H1-H2 from hidden collisions). These serve as regression tests:
+    // if the naming system is changed, any regression that reintroduces a known
+    // collision class will break one of these.
+
+    /// E3: generic type parameters must produce distinct names.
+    #[test]
+    fn collision_regression_generic_types() {
+        // Two impl blocks on the same generic type with different type args.
+        let ty_u32: syn::Type = syn::parse_str("W<u32>").unwrap();
+        let ty_string: syn::Type = syn::parse_str("W<String>").unwrap();
+        let name_u32 = render_impl_name(&ty_u32, None);
+        let name_string = render_impl_name(&ty_string, None);
+        assert_ne!(name_u32, name_string, "generic args must distinguish impls");
+
+        // Full pipeline: two methods with same name in different generic impls.
+        let entries = vec![
+            QualifiedFunction::new(
+                &format!("{name_u32}::go"),
+                &format!("{name_u32}::go"),
+                &format!("{name_u32}::go"),
+            ),
+            QualifiedFunction::new(
+                &format!("{name_string}::go"),
+                &format!("{name_string}::go"),
+                &format!("{name_string}::go"),
+            ),
+        ];
+        let display = disambiguate(&entries);
+        assert_ne!(display[0], display[1]);
+        assert!(display[0].contains("u32"), "got: {}", display[0]);
+        assert!(display[1].contains("String"), "got: {}", display[1]);
+    }
+
+    /// E1: non-Path self types (references, tuples, etc.) must be preserved.
+    #[test]
+    fn collision_regression_non_path_type() {
+        let ty: syn::Type = syn::parse_str("&Foo").unwrap();
+        let trait_path: syn::Path = syn::parse_str("MyTrait").unwrap();
+        let name = render_impl_name(&ty, Some(&trait_path));
+        assert!(
+            name.contains("&") && name.contains("Foo") && name.contains("MyTrait"),
+            "expected & + Foo + MyTrait in: {name}"
+        );
+    }
+
+    /// H1: fn-local types in different functions must disambiguate.
+    #[test]
+    fn collision_regression_fn_local_types() {
+        // fn outer_a() { struct S; impl S { fn m() {} } }
+        // fn outer_b() { struct S; impl S { fn m() {} } }
+        let entries = vec![
+            QualifiedFunction::new("S::m", "outer_a::S::m", "outer_a::{0}::S::m"),
+            QualifiedFunction::new("S::m", "outer_b::S::m", "outer_b::{0}::S::m"),
+        ];
+        let display = disambiguate(&entries);
+        assert_ne!(display[0], display[1]);
+        assert!(display[0].contains("outer_a"), "got: {}", display[0]);
+        assert!(display[1].contains("outer_b"), "got: {}", display[1]);
+    }
+
+    /// H2: sibling blocks in same function must disambiguate via block index.
+    #[test]
+    fn collision_regression_sibling_blocks() {
+        // Two blocks in same fn with same type name.
+        let entries = vec![
+            QualifiedFunction::new("S::m", "host::S::m", "host::{0}::S::m"),
+            QualifiedFunction::new("S::m", "host::S::m", "host::{1}::S::m"),
+        ];
+        let display = disambiguate(&entries);
+        assert_ne!(display[0], display[1]);
+        assert!(display[0].contains("{0}"), "got: {}", display[0]);
+        assert!(display[1].contains("{1}"), "got: {}", display[1]);
+    }
+
+    /// E2: inline mod vs top-level must produce different names.
+    #[test]
+    fn collision_regression_inline_mod() {
+        let entries = vec![
+            QualifiedFunction::new("foo", "foo", "foo"),
+            QualifiedFunction::new("inner::foo", "inner::foo", "inner::foo"),
+        ];
+        let display = disambiguate(&entries);
+        assert_ne!(display[0], display[1]);
+        assert_eq!(display[0], "foo");
+        assert_eq!(display[1], "inner::foo");
+    }
+
+    /// T6: when there is no collision, the minimal name is used (no fn scope
+    /// or block index clutter).
+    #[test]
+    fn no_unnecessary_disambiguation() {
+        let entries = vec![
+            QualifiedFunction::new("Unique::m", "host::Unique::m", "host::{0}::Unique::m"),
+            QualifiedFunction::new("Other::m", "Other::m", "Other::m"),
+        ];
+        let display = disambiguate(&entries);
+        assert_eq!(display[0], "Unique::m");
+        assert_eq!(display[1], "Other::m");
+    }
 }
