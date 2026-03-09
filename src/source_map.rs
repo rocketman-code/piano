@@ -176,37 +176,46 @@ impl StringInjector {
     }
 }
 
-/// Skip past inner attributes (`#![...]`) starting from `offset` in `source`.
+/// Skip past inner attributes and inner doc comments starting from `offset` in
+/// `source`.
 ///
-/// Returns the byte offset just after the last inner attribute (and any
-/// trailing whitespace between attributes), or `offset` unchanged if no
-/// inner attributes are found at that position.
+/// Handles the following forms:
+/// - `#![...]` inner attributes (with nested bracket counting)
+/// - `/*!...*/` block inner doc comments (with nested `/* */` counting)
+/// - `//!` line inner doc comments
+/// - `//` and `/* */` regular comments interspersed between inner items
 ///
-/// This handles nested brackets within attributes (e.g. `#![cfg_attr(a, b)]`).
+/// Returns the byte offset just after the last skipped item (and any trailing
+/// whitespace between items), or `offset` unchanged if none of the above forms
+/// are found at that position.
 ///
-/// Limitation: bracket counting does not skip string literals or comments, so
-/// an inner attribute containing an unbalanced `]` inside a string (e.g.
-/// `#![doc = "text ]"]`) would cause early termination. This is acceptable
-/// because real-world inner attributes (`allow`, `deny`, `feature`, `cfg_attr`,
-/// `no_std`) never contain unbalanced brackets.
+/// Limitation: the `#![...]` branch uses bracket counting that does not skip
+/// string literals, so an inner attribute containing an unbalanced `]` inside a
+/// string (e.g. `#![doc = "text ]"]`) would cause early termination. This is
+/// acceptable because real-world inner attributes (`allow`, `deny`, `feature`,
+/// `cfg_attr`, `no_std`) never contain unbalanced brackets.
 pub fn skip_inner_attrs(source: &str, offset: usize) -> usize {
     let bytes = source.as_bytes();
     let mut pos = offset;
 
     loop {
-        // Speculatively skip whitespace to check for `#![`.
+        // Skip whitespace.
         let mut probe = pos;
         while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
             probe += 1;
         }
 
-        // Check for `#![`
+        if probe >= bytes.len() {
+            break;
+        }
+
+        // `#![...]` — inner attribute.
         if probe + 2 < bytes.len()
             && bytes[probe] == b'#'
             && bytes[probe + 1] == b'!'
             && bytes[probe + 2] == b'['
         {
-            probe += 3; // skip `#![`
+            probe += 3;
             let mut bracket_depth = 1u32;
             while probe < bytes.len() && bracket_depth > 0 {
                 match bytes[probe] {
@@ -216,11 +225,82 @@ pub fn skip_inner_attrs(source: &str, offset: usize) -> usize {
                 }
                 probe += 1;
             }
-            // probe is now just after the closing `]`; commit and loop.
             pos = probe;
-        } else {
-            break;
+            continue;
         }
+
+        // `/*!...*/` — block inner doc comment (Rust block comments nest).
+        if probe + 2 < bytes.len()
+            && bytes[probe] == b'/'
+            && bytes[probe + 1] == b'*'
+            && bytes[probe + 2] == b'!'
+        {
+            probe += 3;
+            let mut depth = 1u32;
+            while probe + 1 < bytes.len() && depth > 0 {
+                if bytes[probe] == b'/' && bytes[probe + 1] == b'*' {
+                    depth += 1;
+                    probe += 2;
+                } else if bytes[probe] == b'*' && bytes[probe + 1] == b'/' {
+                    depth -= 1;
+                    probe += 2;
+                } else {
+                    probe += 1;
+                }
+            }
+            pos = probe;
+            continue;
+        }
+
+        // `//!...` — line inner doc comment.
+        if probe + 2 < bytes.len()
+            && bytes[probe] == b'/'
+            && bytes[probe + 1] == b'/'
+            && bytes[probe + 2] == b'!'
+        {
+            probe += 3;
+            while probe < bytes.len() && bytes[probe] != b'\n' {
+                probe += 1;
+            }
+            if probe < bytes.len() {
+                probe += 1; // skip the newline
+            }
+            pos = probe;
+            continue;
+        }
+
+        // `//...` or `/*...*/` — regular comments between inner attrs.
+        // Skip these so we can find inner attrs/docs that follow them.
+        if probe + 1 < bytes.len() && bytes[probe] == b'/' && bytes[probe + 1] == b'/' {
+            probe += 2;
+            while probe < bytes.len() && bytes[probe] != b'\n' {
+                probe += 1;
+            }
+            if probe < bytes.len() {
+                probe += 1;
+            }
+            pos = probe;
+            continue;
+        }
+        if probe + 1 < bytes.len() && bytes[probe] == b'/' && bytes[probe + 1] == b'*' {
+            probe += 2;
+            let mut depth = 1u32;
+            while probe + 1 < bytes.len() && depth > 0 {
+                if bytes[probe] == b'/' && bytes[probe + 1] == b'*' {
+                    depth += 1;
+                    probe += 2;
+                } else if bytes[probe] == b'*' && bytes[probe + 1] == b'/' {
+                    depth -= 1;
+                    probe += 2;
+                } else {
+                    probe += 1;
+                }
+            }
+            pos = probe;
+            continue;
+        }
+
+        break;
     }
 
     pos
@@ -554,6 +634,61 @@ mod tests {
         let src = "#[derive(Debug)]\nstruct Foo;";
         let pos = skip_inner_attrs(src, 0);
         assert_eq!(pos, 0, "outer attrs should not be skipped");
+    }
+
+    #[test]
+    fn skip_inner_attrs_block_doc_comment() {
+        let src = "/*! block doc comment */\nfn main() {}";
+        let pos = skip_inner_attrs(src, 0);
+        assert!(
+            src[pos..].trim_start().starts_with("fn"),
+            "should skip block inner doc comment. Rest: {:?}",
+            &src[pos..]
+        );
+    }
+
+    #[test]
+    fn skip_inner_attrs_line_doc_comment() {
+        let src = "//! line doc comment\nfn main() {}";
+        let pos = skip_inner_attrs(src, 0);
+        assert!(
+            src[pos..].trim_start().starts_with("fn"),
+            "should skip line inner doc comment. Rest: {:?}",
+            &src[pos..]
+        );
+    }
+
+    #[test]
+    fn skip_inner_attrs_regular_line_comment_between_attrs() {
+        let src = "#![allow(unused)]\n// just a comment\n#![deny(warnings)]\nfn main() {}";
+        let pos = skip_inner_attrs(src, 0);
+        assert!(
+            src[pos..].trim_start().starts_with("fn"),
+            "should skip regular line comment between inner attrs. Rest: {:?}",
+            &src[pos..]
+        );
+    }
+
+    #[test]
+    fn skip_inner_attrs_regular_block_comment_between_attrs() {
+        let src = "#![allow(unused)]\n/* block comment */\n#![deny(warnings)]\nfn main() {}";
+        let pos = skip_inner_attrs(src, 0);
+        assert!(
+            src[pos..].trim_start().starts_with("fn"),
+            "should skip regular block comment between inner attrs. Rest: {:?}",
+            &src[pos..]
+        );
+    }
+
+    #[test]
+    fn skip_inner_attrs_line_doc_then_attr() {
+        let src = "//! doc comment\n#![allow(unused)]\nfn main() {}";
+        let pos = skip_inner_attrs(src, 0);
+        assert!(
+            src[pos..].trim_start().starts_with("fn"),
+            "should skip line doc comment followed by inner attr. Rest: {:?}",
+            &src[pos..]
+        );
     }
 
     #[test]
