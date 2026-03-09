@@ -316,6 +316,7 @@ fn extract_functions(
         path: rel_path,
         current_impl: None,
         current_trait: None,
+        mod_path: Vec::new(),
     };
     collector.visit_file(&syntax);
     (collector.functions, collector.skipped)
@@ -401,6 +402,18 @@ struct FnCollector {
     current_impl: Option<String>,
     /// When inside a `trait` block, holds the trait name.
     current_trait: Option<String>,
+    /// Inline module nesting path (e.g. ["inner", "detail"] for `mod inner { mod detail { ... } }`).
+    mod_path: Vec<String>,
+}
+
+impl FnCollector {
+    fn qualify_with_mod(&self, name: &str) -> String {
+        if self.mod_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{name}", self.mod_path.join("::"))
+        }
+    }
 }
 
 impl<'ast> Visit<'ast> for FnCollector {
@@ -408,12 +421,15 @@ impl<'ast> Visit<'ast> for FnCollector {
         if has_cfg_test(&node.attrs) {
             return; // skip entire #[cfg(test)] module
         }
+        self.mod_path.push(node.ident.to_string());
         syn::visit::visit_item_mod(self, node);
+        self.mod_path.pop();
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         if !has_attr(&node.attrs, "test") {
             let name = node.sig.ident.to_string();
+            let name = self.qualify_with_mod(&name);
             match classify(&node.sig) {
                 Classification::Skip(reason) => {
                     self.skipped.push(SkippedFunction {
@@ -448,6 +464,7 @@ impl<'ast> Visit<'ast> for FnCollector {
             } else {
                 method_name
             };
+            let qualified = self.qualify_with_mod(&qualified);
             match classify(&node.sig) {
                 Classification::Skip(reason) => {
                     self.skipped.push(SkippedFunction {
@@ -479,6 +496,7 @@ impl<'ast> Visit<'ast> for FnCollector {
             } else {
                 method_name
             };
+            let qualified = self.qualify_with_mod(&qualified);
             match classify(&node.sig) {
                 Classification::Skip(reason) => {
                     self.skipped.push(SkippedFunction {
@@ -1408,5 +1426,35 @@ fn main() {}
         let sig: syn::Signature =
             parse_quote! { fn foo() -> impl std::future::Future<Output = i32> };
         assert!(matches!(classify(&sig), Classification::Instrumentable));
+    }
+
+    #[test]
+    fn inline_mod_qualifies_fn_names() {
+        let source = r#"
+mod inner {
+    fn foo() {}
+
+    struct Bar;
+    impl Bar {
+        fn baz(&self) {}
+    }
+}
+
+fn top_level() {}
+"#;
+        let (fns, _skipped) =
+            extract_functions(source, Path::new("src/lib.rs"), PathBuf::from("src/lib.rs"));
+        assert!(
+            fns.contains(&"inner::foo".to_string()),
+            "inline mod should qualify fn name. Got: {fns:?}",
+        );
+        assert!(
+            fns.contains(&"inner::Bar::baz".to_string()),
+            "inline mod should qualify impl method. Got: {fns:?}",
+        );
+        assert!(
+            fns.contains(&"top_level".to_string()),
+            "top-level fn should be unqualified. Got: {fns:?}",
+        );
     }
 }
