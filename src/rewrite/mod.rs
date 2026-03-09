@@ -52,6 +52,7 @@ pub fn instrument_source(
         current_trait: None,
         concurrency: Vec::new(),
         module_prefix: module_prefix.to_string(),
+        inline_mod_path: Vec::new(),
     };
     collector.visit_file(&file);
 
@@ -230,11 +231,21 @@ struct InjectionCollector<'s> {
     /// Collected concurrency info: (function_name, pattern_name).
     concurrency: Vec<(String, String)>,
     module_prefix: String,
+    /// Inline module nesting path (e.g. ["inner"] for `mod inner { ... }`).
+    inline_mod_path: Vec<String>,
 }
 
 impl<'s> InjectionCollector<'s> {
     fn qualify_name(&self, name: &str) -> String {
         crate::resolve::qualify(&self.module_prefix, name)
+    }
+
+    fn inline_qualify(&self, name: &str) -> String {
+        if self.inline_mod_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{name}", self.inline_mod_path.join("::"))
+        }
     }
 
     fn collect_guard(&mut self, block: &syn::Block, name: &str, sig: &syn::Signature) {
@@ -735,9 +746,16 @@ fn receiver_has_parallel_method(expr: &syn::Expr) -> bool {
 }
 
 impl<'s> Visit<'s> for InjectionCollector<'s> {
+    fn visit_item_mod(&mut self, node: &'s syn::ItemMod) {
+        self.inline_mod_path.push(node.ident.to_string());
+        syn::visit::visit_item_mod(self, node);
+        self.inline_mod_path.pop();
+    }
+
     fn visit_item_fn(&mut self, node: &'s syn::ItemFn) {
         if matches!(classify(&node.sig), Classification::Instrumentable) {
             let name = node.sig.ident.to_string();
+            let name = self.inline_qualify(&name);
             self.collect_guard(&node.block, &name, &node.sig);
         }
         syn::visit::visit_item_fn(self, node);
@@ -761,6 +779,7 @@ impl<'s> Visit<'s> for InjectionCollector<'s> {
                 Some(ty) => format!("{ty}::{method}"),
                 None => method,
             };
+            let qualified = self.inline_qualify(&qualified);
             self.collect_guard(&node.block, &qualified, &node.sig);
         }
         syn::visit::visit_impl_item_fn(self, node);
@@ -782,6 +801,7 @@ impl<'s> Visit<'s> for InjectionCollector<'s> {
                     Some(trait_name) => format!("{trait_name}::{method}"),
                     None => method,
                 };
+                let qualified = self.inline_qualify(&qualified);
                 self.collect_guard(block, &qualified, &node.sig);
             }
         }
@@ -2521,6 +2541,25 @@ fn work(items: &[Item]) {
         assert!(
             result.contains("piano_runtime::adopt"),
             "should inject adopt in for_each closure with parenthesized par_iter. Got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn inline_mod_qualifies_guard_name() {
+        let source = r#"
+mod inner {
+    fn foo() {
+        do_stuff();
+    }
+}
+"#;
+        let targets: HashSet<String> = ["inner::foo".to_string()].into();
+        let result = instrument_source(source, &targets, false, "")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains(r#"piano_runtime::enter("inner::foo")"#),
+            "inline mod should qualify guard name. Got:\n{result}",
         );
     }
 }
