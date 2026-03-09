@@ -1,5 +1,6 @@
 pub mod build;
 pub mod error;
+pub mod naming;
 pub mod report;
 pub mod resolve;
 pub mod rewrite;
