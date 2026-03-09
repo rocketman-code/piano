@@ -2,7 +2,17 @@ use quote::quote;
 use syn::spanned::Spanned;
 
 use super::line_col_to_byte;
-use crate::source_map::{SourceMap, StringInjector, skip_inner_attrs};
+use crate::source_map::{SourceMap, StringInjector};
+
+/// Byte offset in `source` just after the last inner attribute of `file`.
+/// Uses the parsed AST rather than hand-parsing, so it correctly handles
+/// all inner-attribute forms: `#![...]`, `//!`, and `/*!...*/`.
+fn after_inner_attrs(source: &str, file: &syn::File) -> usize {
+    match file.attrs.last() {
+        Some(attr) => line_col_to_byte(source, attr.span().end()),
+        None => 0,
+    }
+}
 
 /// Classification of the user's `#[global_allocator]` declaration.
 pub enum AllocatorKind {
@@ -175,7 +185,7 @@ pub fn inject_global_allocator(
         AllocatorKind::Absent => {
             let text = "\n#[global_allocator]\nstatic _PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>\n    = piano_runtime::PianoAllocator::new(std::alloc::System);\n";
             let mut injector = StringInjector::new();
-            injector.insert(skip_inner_attrs(source, 0), text);
+            injector.insert(after_inner_attrs(source, &file), text);
             Ok(injector.apply(source))
         }
         AllocatorKind::Unconditional => {
@@ -216,8 +226,11 @@ pub fn inject_global_allocator(
 
             // Apply type/expr replacements first, then insert fallback after
             // any inner attributes so `#![...]` stays at the top of the file.
+            // The insertion offset is computed from the original parse — edits
+            // only touch allocator statics below inner attrs, so the offset
+            // is valid for the replaced string too.
             let replaced = apply_replacements(source, &edits);
-            let insert_pos = skip_inner_attrs(&replaced, 0);
+            let insert_pos = after_inner_attrs(source, &file);
 
             let fallback_newlines = fallback.bytes().filter(|&b| b == b'\n').count() as u32;
             let mut map = SourceMap::new();
@@ -486,5 +499,100 @@ fn main() {}
         );
         syn::parse_str::<syn::File>(&result)
             .unwrap_or_else(|e| panic!("rewritten source should parse: {e}\n\n{result}"));
+    }
+
+    #[test]
+    fn cfg_gated_qualified_path_allocator() {
+        // Reproduces issue #546: ripgrep uses tikv_jemallocator::Jemalloc (qualified path)
+        let source = r#"use std::process::ExitCode;
+
+#[cfg(all(target_env = "musl", target_pointer_width = "64"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+fn main() -> ExitCode {
+    ExitCode::SUCCESS
+}
+"#;
+        let kind = detect_allocator_kind(source).unwrap();
+        assert!(
+            matches!(&kind, AllocatorKind::CfgGated(preds) if preds.len() == 1),
+            "should detect CfgGated with 1 predicate. Got: {kind:?}"
+        );
+        let (result, _map) = inject_global_allocator(source, kind)
+            .unwrap_or_else(|e| panic!("inject_global_allocator failed: {e}\n\nSource:\n{source}"));
+        assert!(
+            result.contains("PianoAllocator<tikv_jemallocator::Jemalloc>"),
+            "should wrap qualified path allocator. Got:\n{result}"
+        );
+        // quote! adds spaces: "all (" instead of "all("
+        assert!(
+            result.contains("not(all"),
+            "should negate compound cfg predicate. Got:\n{result}"
+        );
+        syn::parse_str::<syn::File>(&result)
+            .unwrap_or_else(|e| panic!("rewritten source should parse: {e}\n\n{result}"));
+    }
+
+    #[test]
+    fn cfg_gated_with_inner_doc_comment() {
+        // Regression test for issue #546: inner doc comments (/*! ... */)
+        // must stay at the top of the file, before any injected items.
+        let source = r#"/*!
+Module-level documentation.
+*/
+use std::process::ExitCode;
+
+#[cfg(all(target_env = "musl", target_pointer_width = "64"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+fn main() -> ExitCode {
+    ExitCode::SUCCESS
+}
+"#;
+        let kind = detect_allocator_kind(source).unwrap();
+        let (result, _map) = inject_global_allocator(source, kind)
+            .unwrap_or_else(|e| panic!("inject_global_allocator failed: {e}"));
+        assert!(
+            result.starts_with("/*!"),
+            "inner doc comment must stay at top of file. Got:\n{result}"
+        );
+        syn::parse_str::<syn::File>(&result)
+            .unwrap_or_else(|e| panic!("result should re-parse: {e}\n\n{result}"));
+    }
+
+    #[test]
+    fn absent_allocator_with_inner_doc_comment() {
+        // Absent allocator + inner doc comment — the other code path.
+        let source = r#"/*!
+Module docs.
+*/
+
+fn main() {}
+"#;
+        let (result, _map) = inject_global_allocator(source, AllocatorKind::Absent).unwrap();
+        assert!(
+            result.starts_with("/*!"),
+            "inner doc comment must stay at top. Got:\n{result}"
+        );
+        assert!(
+            result.contains("PianoAllocator"),
+            "should inject allocator. Got:\n{result}"
+        );
+        syn::parse_str::<syn::File>(&result)
+            .unwrap_or_else(|e| panic!("result should re-parse: {e}\n\n{result}"));
+    }
+
+    #[test]
+    fn absent_allocator_with_line_inner_doc_comments() {
+        let source = "//! Line doc comment.\n//! Another line.\n\nfn main() {}\n";
+        let (result, _map) = inject_global_allocator(source, AllocatorKind::Absent).unwrap();
+        assert!(
+            result.starts_with("//!"),
+            "line doc comments must stay at top. Got:\n{result}"
+        );
+        syn::parse_str::<syn::File>(&result)
+            .unwrap_or_else(|e| panic!("result should re-parse: {e}\n\n{result}"));
     }
 }
