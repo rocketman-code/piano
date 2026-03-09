@@ -16,7 +16,6 @@ pub use allocator::{AllocatorKind, detect_allocator_kind, inject_global_allocato
 pub use shutdown::inject_shutdown;
 
 use macro_rules::MacroInstrumenter;
-use shutdown::type_ident;
 
 /// Result of instrumenting a source file.
 pub struct InstrumentResult {
@@ -745,20 +744,11 @@ impl<'s> Visit<'s> for InjectionCollector<'s> {
     }
 
     fn visit_item_impl(&mut self, node: &'s syn::ItemImpl) {
-        let type_name = type_ident(&node.self_ty);
         let prev = self.current_impl.take();
-        // For trait impls (impl Trait for Type), include trait name for disambiguation.
-        // Format: "<Type as Trait>" so methods become "<Type as Trait>::method".
-        // For inherent impls (plain impl Type), use just the type name.
-        let impl_name = if let Some((_, ref trait_path, _)) = node.trait_ {
-            if let Some(seg) = trait_path.segments.last() {
-                format!("<{} as {}>", type_name, seg.ident)
-            } else {
-                type_name
-            }
-        } else {
-            type_name
-        };
+        let impl_name = crate::naming::render_impl_name(
+            &node.self_ty,
+            node.trait_.as_ref().map(|(_, path, _)| path),
+        );
         self.current_impl = Some(impl_name);
         syn::visit::visit_item_impl(self, node);
         self.current_impl = prev;
