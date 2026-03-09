@@ -848,7 +848,7 @@ impl VisitMut for MacroInstrumenter {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     use crate::rewrite::instrument_source;
 
@@ -864,7 +864,7 @@ macro_rules! make_handler {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -891,7 +891,7 @@ macro_rules! setup {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -914,7 +914,7 @@ macro_rules! make_async {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -941,7 +941,7 @@ macro_rules! special_fns {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -969,7 +969,7 @@ macro_rules! abi_fns {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -999,7 +999,7 @@ macro_rules! with_const {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1021,7 +1021,7 @@ macro_rules! make_pair {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1046,7 +1046,7 @@ macro_rules! multi {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1068,7 +1068,7 @@ macro_rules! log {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1089,7 +1089,7 @@ macro_rules! make {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1110,7 +1110,7 @@ macro_rules! make {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -1133,7 +1133,7 @@ macro_rules! make_generic {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1156,7 +1156,7 @@ macro_rules! make {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1179,7 +1179,7 @@ macro_rules! make {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1204,7 +1204,7 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1229,7 +1229,7 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1253,7 +1253,7 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1277,7 +1277,7 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1303,7 +1303,7 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1327,7 +1327,7 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1357,7 +1357,7 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
@@ -1380,7 +1380,7 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "api")
             .unwrap()
             .source;
@@ -1400,7 +1400,7 @@ macro_rules! make_fn {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "worker")
             .unwrap()
             .source;
@@ -1428,7 +1428,7 @@ macro_rules! make_fn {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "api").unwrap();
         let mut names = result.macro_fn_names.clone();
         names.sort();
@@ -1453,7 +1453,7 @@ macro_rules! make_fn {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets: HashMap<String, String> = HashMap::new();
         let result = instrument_source(source, &targets, true, "").unwrap();
         assert!(
             result.macro_fn_names.is_empty(),

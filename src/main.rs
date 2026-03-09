@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -395,7 +395,7 @@ fn build_project(
         let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
         eprintln!("  {}:", relative.display());
         for f in &target.functions {
-            eprintln!("    {f}");
+            eprintln!("    {}", f.minimal);
         }
     }
 
@@ -455,8 +455,36 @@ fn build_project(
         staging.join(src_rel)
     };
 
+    // Collect all functions with file prefix for cross-file disambiguation.
+    let mut all_qualified: Vec<(PathBuf, piano::naming::QualifiedFunction)> = Vec::new();
     for target in &targets {
-        let target_set: HashSet<String> = target.functions.iter().cloned().collect();
+        let prefix = module_prefix(target.file.strip_prefix(&src_dir).unwrap_or(&target.file));
+        for qf in &target.functions {
+            all_qualified.push((
+                target.file.clone(),
+                piano::naming::QualifiedFunction::new(
+                    &qualify(&prefix, &qf.minimal),
+                    &qualify(&prefix, &qf.medium),
+                    &qualify(&prefix, &qf.full),
+                ),
+            ));
+        }
+    }
+    let just_fns: Vec<piano::naming::QualifiedFunction> =
+        all_qualified.iter().map(|(_, qf)| qf.clone()).collect();
+    let display_names = piano::naming::disambiguate(&just_fns);
+
+    // Build per-file target maps: HashMap<full_name, display_name>
+    let mut file_targets: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
+    for ((file, qf), display) in all_qualified.iter().zip(display_names.iter()) {
+        file_targets
+            .entry(file.clone())
+            .or_default()
+            .insert(qf.full.clone(), display.clone());
+    }
+
+    for target in &targets {
+        let target_map = file_targets.get(&target.file).cloned().unwrap_or_default();
         let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
         let staged_file = staging_src_dir.join(relative);
         let display_path = PathBuf::from("src").join(relative);
@@ -467,7 +495,7 @@ fn build_project(
             })?;
 
         let prefix = module_prefix(relative);
-        let result = instrument_source(&source, &target_set, instrument_macros, &prefix).map_err(
+        let result = instrument_source(&source, &target_map, instrument_macros, &prefix).map_err(
             |source| Error::ParseError {
                 path: display_path.clone(),
                 source,
@@ -516,13 +544,7 @@ fn build_project(
     let runs_dir = target_dir.join("runs");
     std::fs::create_dir_all(&runs_dir).map_err(io_context("create directory", &runs_dir))?;
     {
-        let mut all_fn_names: Vec<String> = targets
-            .iter()
-            .flat_map(|t| {
-                let prefix = module_prefix(t.file.strip_prefix(&src_dir).unwrap_or(&t.file));
-                t.functions.iter().map(move |f| qualify(&prefix, f))
-            })
-            .collect();
+        let mut all_fn_names: Vec<String> = display_names;
         all_fn_names.extend(macro_fn_names);
         let main_source =
             std::fs::read_to_string(&main_file).map_err(|source| Error::RunReadError {

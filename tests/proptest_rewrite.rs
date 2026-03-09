@@ -4,7 +4,7 @@
 //! decorators, then verifies the rewriter produces valid instrumented output.
 //! Targets the "pattern matching blindness" bug class (#237, #238, #249, #270).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use piano::rewrite::instrument_source;
 use proptest::prelude::*;
@@ -250,7 +250,7 @@ proptest! {
         if syn::parse_str::<syn::File>(&source).is_err() {
             return Ok(());
         }
-        let targets: HashSet<String> = names.iter().cloned().collect();
+        let targets: HashMap<String, String> = names.iter().map(|n| (n.clone(), n.clone())).collect();
         let result = instrument_source(&source, &targets, false, "")
             .expect("instrument_source should succeed on valid Rust input");
         // Core invariant: output must be parseable Rust.
@@ -269,7 +269,7 @@ proptest! {
         if syn::parse_str::<syn::File>(&source).is_err() {
             return Ok(());
         }
-        let targets: HashSet<String> = names.iter().cloned().collect();
+        let targets: HashMap<String, String> = names.iter().map(|n| (n.clone(), n.clone())).collect();
         let result = instrument_source(&source, &targets, false, "")
             .expect("instrument_source should succeed on valid Rust input");
         for name in &instrumentable {
@@ -299,7 +299,7 @@ proptest! {
         if syn::parse_str::<syn::File>(&source).is_err() {
             return Ok(());
         }
-        let targets: HashSet<String> = names.iter().cloned().collect();
+        let targets: HashMap<String, String> = names.iter().map(|n| (n.clone(), n.clone())).collect();
         let result = instrument_source(&source, &targets, false, "")
             .expect("instrument_source should succeed on valid Rust input");
         prop_assert!(
@@ -319,7 +319,7 @@ proptest! {
             return Ok(());
         }
         // Target only the first function, check the rest are untouched.
-        let targets: HashSet<String> = [names[0].clone()].into();
+        let targets: HashMap<String, String> = [(names[0].clone(), names[0].clone())].into();
         let result = instrument_source(&source, &targets, false, "")
             .expect("instrument_source should succeed on valid Rust input");
         for name in &names[1..] {
@@ -339,7 +339,7 @@ proptest! {
         if syn::parse_str::<syn::File>(&source).is_err() {
             return Ok(());
         }
-        let instrumentable_set: HashSet<&str> =
+        let instrumentable_set: std::collections::HashSet<&str> =
             instrumentable.iter().map(|s| s.as_str()).collect();
         let skipped: Vec<&str> = names
             .iter()
@@ -349,7 +349,7 @@ proptest! {
         if skipped.is_empty() {
             return Ok(());
         }
-        let targets: HashSet<String> = names.iter().cloned().collect();
+        let targets: HashMap<String, String> = names.iter().map(|n| (n.clone(), n.clone())).collect();
         let result = instrument_source(&source, &targets, false, "")
             .expect("instrument_source should succeed on valid Rust input");
         for name in &skipped {

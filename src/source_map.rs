@@ -503,7 +503,10 @@ mod tests {
             instrument_source,
         };
         let source = "fn main() {\n    let result = work();\n    println!(\"result: {result}\");\n}\n\nfn work() -> u64 {\n    let mut sum: u64 = 0;\n    let bad: i32 = \"hello\";\n    sum\n}\n";
-        let targets: std::collections::HashSet<String> = ["work".to_string()].into_iter().collect();
+        let targets: std::collections::HashMap<String, String> =
+            [("work".to_string(), "work".to_string())]
+                .into_iter()
+                .collect();
 
         let result = instrument_source(source, &targets, false, "").unwrap();
         let mut map = result.source_map;
@@ -548,7 +551,10 @@ mod tests {
             instrument_source,
         };
         let source = "fn main() {\n    let result = work();\n    println!(\"result: {result}\");\n}\n\nfn work() -> u64 {\n    let mut sum: u64 = 0;\n    let bad: i32 = \"hello\";\n    sum\n}\n";
-        let targets: std::collections::HashSet<String> = ["work".to_string()].into_iter().collect();
+        let targets: std::collections::HashMap<String, String> =
+            [("work".to_string(), "work".to_string())]
+                .into_iter()
+                .collect();
 
         let result = instrument_source(source, &targets, false, "").unwrap();
         let mut map = result.source_map;

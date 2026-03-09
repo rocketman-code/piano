@@ -19,7 +19,7 @@ pub enum TargetSpec {
 #[derive(Debug, Clone)]
 pub struct ResolvedTarget {
     pub file: PathBuf,
-    pub functions: Vec<String>,
+    pub functions: Vec<crate::naming::QualifiedFunction>,
 }
 
 /// Why a function was excluded from instrumentation.
@@ -122,11 +122,12 @@ pub fn resolve_targets(
                         })?;
                         let (all_fns, file_skipped) =
                             extract_functions(&source, file, rel_path(file));
-                        all_seen_names.extend(all_fns.iter().cloned());
-                        let matched: Vec<String> = all_fns
+                        all_seen_names.extend(all_fns.iter().map(|qf| qf.minimal.clone()));
+                        let matched: Vec<crate::naming::QualifiedFunction> = all_fns
                             .into_iter()
-                            .filter(|name| {
+                            .filter(|qf| {
                                 // Match against the bare function name (after any Type:: prefix).
+                                let name = &qf.minimal;
                                 let bare = name.rsplit("::").next().unwrap_or(name);
                                 if exact {
                                     bare == pattern.as_str() || name == pattern.as_str()
@@ -167,7 +168,7 @@ pub fn resolve_targets(
                         })?;
                         let (all_fns, file_skipped) =
                             extract_functions(&source, file, rel_path(file));
-                        all_seen_names.extend(all_fns.iter().cloned());
+                        all_seen_names.extend(all_fns.iter().map(|qf| qf.minimal.clone()));
                         if !all_fns.is_empty() {
                             merge_into(&mut results, file, all_fns);
                         }
@@ -198,7 +199,7 @@ pub fn resolve_targets(
                         })?;
                         let (all_fns, file_skipped) =
                             extract_functions(&source, file, rel_path(file));
-                        all_seen_names.extend(all_fns.iter().cloned());
+                        all_seen_names.extend(all_fns.iter().map(|qf| qf.minimal.clone()));
                         if !all_fns.is_empty() {
                             merge_into(&mut results, file, all_fns);
                         }
@@ -242,8 +243,8 @@ pub fn resolve_targets(
     // Sort by file path for deterministic output.
     results.sort_by(|a, b| a.file.cmp(&b.file));
     for r in &mut results {
-        r.functions.sort();
-        r.functions.dedup();
+        r.functions.sort_by(|a, b| a.full.cmp(&b.full));
+        r.functions.dedup_by(|a, b| a.full == b.full);
     }
 
     skipped.sort_by(|a, b| a.name.cmp(&b.name));
@@ -256,7 +257,11 @@ pub fn resolve_targets(
 }
 
 /// Merge matched functions into the results vec, coalescing by file path.
-fn merge_into(results: &mut Vec<ResolvedTarget>, file: &Path, functions: Vec<String>) {
+fn merge_into(
+    results: &mut Vec<ResolvedTarget>,
+    file: &Path,
+    functions: Vec<crate::naming::QualifiedFunction>,
+) {
     if let Some(existing) = results.iter_mut().find(|r| r.file == file) {
         existing.functions.extend(functions);
     } else {
@@ -301,7 +306,7 @@ fn extract_functions(
     source: &str,
     path: &Path,
     rel_path: PathBuf,
-) -> (Vec<String>, Vec<SkippedFunction>) {
+) -> (Vec<crate::naming::QualifiedFunction>, Vec<SkippedFunction>) {
     let syntax = match syn::parse_file(source) {
         Ok(f) => f,
         Err(e) => {
@@ -316,7 +321,7 @@ fn extract_functions(
         path: rel_path,
         current_impl: None,
         current_trait: None,
-        mod_path: Vec::new(),
+        scope: crate::naming::ScopeState::new(),
     };
     collector.visit_file(&syntax);
     (collector.functions, collector.skipped)
@@ -394,7 +399,7 @@ pub(crate) fn classify(sig: &syn::Signature) -> Classification {
 
 /// AST visitor that collects function names from a parsed Rust file.
 struct FnCollector {
-    functions: Vec<String>,
+    functions: Vec<crate::naming::QualifiedFunction>,
     skipped: Vec<SkippedFunction>,
     /// File path relative to the project root (e.g. "src/core.rs").
     path: PathBuf,
@@ -402,18 +407,8 @@ struct FnCollector {
     current_impl: Option<String>,
     /// When inside a `trait` block, holds the trait name.
     current_trait: Option<String>,
-    /// Inline module nesting path (e.g. ["inner", "detail"] for `mod inner { mod detail { ... } }`).
-    mod_path: Vec<String>,
-}
-
-impl FnCollector {
-    fn qualify_with_mod(&self, name: &str) -> String {
-        if self.mod_path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}::{name}", self.mod_path.join("::"))
-        }
-    }
+    /// Scope tracking (mod, fn, block).
+    scope: crate::naming::ScopeState,
 }
 
 impl<'ast> Visit<'ast> for FnCollector {
@@ -421,29 +416,38 @@ impl<'ast> Visit<'ast> for FnCollector {
         if has_cfg_test(&node.attrs) {
             return; // skip entire #[cfg(test)] module
         }
-        self.mod_path.push(node.ident.to_string());
+        self.scope.push_mod(&node.ident.to_string());
         syn::visit::visit_item_mod(self, node);
-        self.mod_path.pop();
+        self.scope.pop();
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         if !has_attr(&node.attrs, "test") {
             let name = node.sig.ident.to_string();
-            let name = self.qualify_with_mod(&name);
+            let minimal = self.scope.render_minimal(&name);
             match classify(&node.sig) {
                 Classification::Skip(reason) => {
                     self.skipped.push(SkippedFunction {
-                        name,
+                        name: minimal,
                         reason,
                         path: self.path.clone(),
                     });
                 }
                 Classification::Instrumentable => {
-                    self.functions.push(name);
+                    let medium = self.scope.render_medium(&name);
+                    let full = self.scope.render_full(&name);
+                    self.functions.push(crate::naming::QualifiedFunction::new(
+                        &minimal, &medium, &full,
+                    ));
                 }
             }
         }
-        syn::visit::visit_item_fn(self, node);
+        // Push fn scope for nested items, then visit ONLY the block body.
+        // Using the free function skips our visit_block override, so the
+        // fn body itself doesn't get a block scope.
+        self.scope.push_fn(&node.sig.ident.to_string());
+        syn::visit::visit_block(self, &node.block);
+        self.scope.pop();
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
@@ -459,26 +463,33 @@ impl<'ast> Visit<'ast> for FnCollector {
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         if !has_attr(&node.attrs, "test") {
             let method_name = node.sig.ident.to_string();
-            let qualified = if let Some(ref impl_name) = self.current_impl {
+            let impl_qualified = if let Some(ref impl_name) = self.current_impl {
                 format!("{impl_name}::{method_name}")
             } else {
                 method_name
             };
-            let qualified = self.qualify_with_mod(&qualified);
+            let minimal = self.scope.render_minimal(&impl_qualified);
             match classify(&node.sig) {
                 Classification::Skip(reason) => {
                     self.skipped.push(SkippedFunction {
-                        name: qualified,
+                        name: minimal,
                         reason,
                         path: self.path.clone(),
                     });
                 }
                 Classification::Instrumentable => {
-                    self.functions.push(qualified);
+                    let medium = self.scope.render_medium(&impl_qualified);
+                    let full = self.scope.render_full(&impl_qualified);
+                    self.functions.push(crate::naming::QualifiedFunction::new(
+                        &minimal, &medium, &full,
+                    ));
                 }
             }
         }
-        syn::visit::visit_impl_item_fn(self, node);
+        // Push fn scope for nested items.
+        self.scope.push_fn(&node.sig.ident.to_string());
+        syn::visit::visit_block(self, &node.block);
+        self.scope.pop();
     }
 
     fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
@@ -489,28 +500,43 @@ impl<'ast> Visit<'ast> for FnCollector {
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-        if node.default.is_some() {
+        if let Some(ref block) = node.default {
             let method_name = node.sig.ident.to_string();
-            let qualified = if let Some(ref trait_name) = self.current_trait {
+            let trait_qualified = if let Some(ref trait_name) = self.current_trait {
                 format!("{trait_name}::{method_name}")
             } else {
                 method_name
             };
-            let qualified = self.qualify_with_mod(&qualified);
+            let minimal = self.scope.render_minimal(&trait_qualified);
             match classify(&node.sig) {
                 Classification::Skip(reason) => {
                     self.skipped.push(SkippedFunction {
-                        name: qualified,
+                        name: minimal,
                         reason,
                         path: self.path.clone(),
                     });
                 }
                 Classification::Instrumentable => {
-                    self.functions.push(qualified);
+                    let medium = self.scope.render_medium(&trait_qualified);
+                    let full = self.scope.render_full(&trait_qualified);
+                    self.functions.push(crate::naming::QualifiedFunction::new(
+                        &minimal, &medium, &full,
+                    ));
                 }
             }
+            // Push fn scope for nested items.
+            self.scope.push_fn(&node.sig.ident.to_string());
+            syn::visit::visit_block(self, block);
+            self.scope.pop();
+        } else {
+            syn::visit::visit_trait_item_fn(self, node);
         }
-        syn::visit::visit_trait_item_fn(self, node);
+    }
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        self.scope.push_block();
+        syn::visit::visit_block(self, node);
+        self.scope.pop();
     }
 }
 
@@ -713,7 +739,7 @@ mod tests {
         let all_fns: Vec<&str> = result
             .targets
             .iter()
-            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
 
         assert!(all_fns.contains(&"walk"), "should match exact 'walk'");
@@ -736,7 +762,7 @@ mod tests {
         let all_fns: Vec<&str> = result
             .targets
             .iter()
-            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
 
         assert!(
@@ -758,10 +784,14 @@ mod tests {
         let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
         assert_eq!(result.targets.len(), 1);
-        let fns = &result.targets[0].functions;
-        assert!(fns.contains(&"helper".to_string()));
-        assert!(fns.contains(&"Resolver::internal_resolve".to_string()));
-        assert!(fns.contains(&"Resolver::resolve".to_string()));
+        let fns: Vec<&str> = result.targets[0]
+            .functions
+            .iter()
+            .map(|qf| qf.minimal.as_str())
+            .collect();
+        assert!(fns.contains(&"helper"));
+        assert!(fns.contains(&"Resolver::internal_resolve"));
+        assert!(fns.contains(&"Resolver::resolve"));
     }
 
     #[test]
@@ -773,9 +803,13 @@ mod tests {
         let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
         assert_eq!(result.targets.len(), 1);
-        let fns = &result.targets[0].functions;
-        assert!(fns.contains(&"walk_dir".to_string()));
-        assert!(fns.contains(&"scan".to_string()));
+        let fns: Vec<&str> = result.targets[0]
+            .functions
+            .iter()
+            .map(|qf| qf.minimal.as_str())
+            .collect();
+        assert!(fns.contains(&"walk_dir"));
+        assert!(fns.contains(&"scan"));
     }
 
     #[test]
@@ -813,7 +847,7 @@ mod tests {
         let all_fns: Vec<&str> = result
             .targets
             .iter()
-            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
 
         assert!(
@@ -854,7 +888,7 @@ mod tests {
         let all_fns: Vec<&str> = result
             .targets
             .iter()
-            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
 
         assert!(
@@ -878,7 +912,7 @@ mod tests {
         let all_fns: Vec<&str> = result
             .targets
             .iter()
-            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
 
         // Should find functions from all files: main.rs, resolver.rs, walker/mod.rs, with_tests.rs
@@ -924,7 +958,7 @@ mod tests {
         let all_fns: Vec<&str> = result
             .targets
             .iter()
-            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
 
         // Should include normal functions
@@ -959,7 +993,7 @@ mod tests {
         let all_fns: Vec<&str> = result
             .targets
             .iter()
-            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
 
         // Trait default methods that are instrumentable should be included
@@ -1084,7 +1118,7 @@ mod tests {
         let all_fns: Vec<&str> = result
             .targets
             .iter()
-            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
 
         assert!(
@@ -1113,7 +1147,7 @@ mod tests {
         let all_fns: Vec<&str> = result
             .targets
             .iter()
-            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
 
         assert!(all_fns.contains(&"walk"), "should match exact 'walk'");
@@ -1135,7 +1169,7 @@ mod tests {
         let all_fns: Vec<&str> = result
             .targets
             .iter()
-            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
 
         assert!(
@@ -1236,7 +1270,7 @@ mod tests {
         let all_fns: Vec<&str> = result
             .targets
             .iter()
-            .flat_map(|r| r.functions.iter().map(String::as_str))
+            .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
         assert!(all_fns.contains(&"normal_fn"));
         assert!(all_fns.contains(&"Widget::valid_method"));
@@ -1356,7 +1390,7 @@ fn main() {}
         let names: Vec<&str> = result
             .targets
             .iter()
-            .flat_map(|t| t.functions.iter().map(|s| s.as_str()))
+            .flat_map(|t| t.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
         assert!(
             names.contains(&"<Point as Display>::fmt"),
@@ -1444,17 +1478,68 @@ fn top_level() {}
 "#;
         let (fns, _skipped) =
             extract_functions(source, Path::new("src/lib.rs"), PathBuf::from("src/lib.rs"));
+        let names: Vec<&str> = fns.iter().map(|qf| qf.minimal.as_str()).collect();
         assert!(
-            fns.contains(&"inner::foo".to_string()),
-            "inline mod should qualify fn name. Got: {fns:?}",
+            names.contains(&"inner::foo"),
+            "inline mod should qualify fn name. Got: {names:?}",
         );
         assert!(
-            fns.contains(&"inner::Bar::baz".to_string()),
-            "inline mod should qualify impl method. Got: {fns:?}",
+            names.contains(&"inner::Bar::baz"),
+            "inline mod should qualify impl method. Got: {names:?}",
         );
         assert!(
-            fns.contains(&"top_level".to_string()),
-            "top-level fn should be unqualified. Got: {fns:?}",
+            names.contains(&"top_level"),
+            "top-level fn should be unqualified. Got: {names:?}",
+        );
+    }
+
+    #[test]
+    fn fn_local_types_get_different_full_names() {
+        let source = r#"
+fn outer_a() {
+    struct S;
+    impl S { fn method(&self) {} }
+}
+fn outer_b() {
+    struct S;
+    impl S { fn method(&self) {} }
+}
+"#;
+        let (fns, _skipped) =
+            extract_functions(source, Path::new("src/lib.rs"), PathBuf::from("src/lib.rs"));
+        let minimal_names: Vec<&str> = fns.iter().map(|qf| qf.minimal.as_str()).collect();
+        let full_names: Vec<&str> = fns.iter().map(|qf| qf.full.as_str()).collect();
+
+        // Both produce "S::method" at the minimal level (identical).
+        let sm_count = minimal_names.iter().filter(|n| **n == "S::method").count();
+        assert_eq!(
+            sm_count, 2,
+            "should find two S::method at minimal level: {minimal_names:?}"
+        );
+
+        // But they must have different full names (fn scope distinguishes them).
+        let sm_fulls: Vec<&&str> = full_names
+            .iter()
+            .filter(|n| n.contains("S::method"))
+            .collect();
+        assert_eq!(
+            sm_fulls.len(),
+            2,
+            "should find two S::method at full level: {full_names:?}"
+        );
+        assert_ne!(
+            sm_fulls[0], sm_fulls[1],
+            "full names must differ: {full_names:?}"
+        );
+        assert!(
+            sm_fulls[0].contains("outer_a"),
+            "first should contain outer_a: {}",
+            sm_fulls[0]
+        );
+        assert!(
+            sm_fulls[1].contains("outer_b"),
+            "second should contain outer_b: {}",
+            sm_fulls[1]
         );
     }
 }
