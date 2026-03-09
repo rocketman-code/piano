@@ -1,6 +1,8 @@
 pub(crate) mod allocator;
 pub(crate) mod macro_rules;
+pub(crate) mod select_inject;
 pub(crate) mod shutdown;
+mod token_util;
 
 use std::collections::HashMap;
 
@@ -57,6 +59,22 @@ pub fn instrument_source(
     collector.visit_file(&file);
 
     let (rewritten, source_map) = collector.injector.apply(source);
+
+    // Inject stats recording calls into crossbeam select! arm bodies.
+    // Only apply when the source contains crossbeam select macros to avoid
+    // unnecessary token round-tripping that changes whitespace.
+    //
+    // Note: the token round-trip may alter intra-line whitespace but preserves
+    // line structure, so `source_map` (which tracks line offsets) remains valid.
+    // If select injection ever adds or removes lines, this invariant breaks.
+    let rewritten = if select_inject::source_has_crossbeam_select(&rewritten) {
+        match rewritten.parse::<proc_macro2::TokenStream>() {
+            Ok(ts) => select_inject::inject_select_arm_stats(ts).to_string(),
+            Err(_) => rewritten,
+        }
+    } else {
+        rewritten
+    };
 
     // Macro instrumentation uses token-stream mutation (separate from the
     // string-injection path). Apply it on the rewritten source if needed.
