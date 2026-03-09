@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -168,7 +168,7 @@ fn main() {
 }
 "#;
 
-    let targets: HashSet<String> = HashSet::new();
+    let targets: HashMap<String, String> = HashMap::new();
     let result = piano::rewrite::instrument_source(source, &targets, true, "")
         .expect("instrument_source should succeed");
 
@@ -202,7 +202,7 @@ macro_rules! setup {
 setup!();
 fn main() {}
 "#;
-    let targets: HashSet<String> = HashSet::new();
+    let targets: HashMap<String, String> = HashMap::new();
     let result = piano::rewrite::instrument_source(source, &targets, true, "")
         .expect("instrument_source should succeed");
 

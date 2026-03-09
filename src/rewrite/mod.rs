@@ -2,7 +2,7 @@ pub(crate) mod allocator;
 pub(crate) mod macro_rules;
 pub(crate) mod shutdown;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use quote::quote;
 use syn::spanned::Spanned;
@@ -37,7 +37,7 @@ pub struct InstrumentResult {
 ///
 pub fn instrument_source(
     source: &str,
-    targets: &HashSet<String>,
+    targets: &HashMap<String, String>,
     instrument_macros: bool,
     module_prefix: &str,
 ) -> Result<InstrumentResult, syn::Error> {
@@ -52,7 +52,7 @@ pub fn instrument_source(
         current_trait: None,
         concurrency: Vec::new(),
         module_prefix: module_prefix.to_string(),
-        inline_mod_path: Vec::new(),
+        scope: crate::naming::ScopeState::new(),
     };
     collector.visit_file(&file);
 
@@ -224,15 +224,15 @@ pub(super) fn line_col_to_byte(source: &str, lc: proc_macro2::LineColumn) -> usi
 /// Read-only AST visitor that collects text injection points.
 struct InjectionCollector<'s> {
     source: &'s str,
-    targets: HashSet<String>,
+    targets: HashMap<String, String>,
     injector: StringInjector,
     current_impl: Option<String>,
     current_trait: Option<String>,
     /// Collected concurrency info: (function_name, pattern_name).
     concurrency: Vec<(String, String)>,
     module_prefix: String,
-    /// Inline module nesting path (e.g. ["inner"] for `mod inner { ... }`).
-    inline_mod_path: Vec<String>,
+    /// Scope tracking (mod, fn, block).
+    scope: crate::naming::ScopeState,
 }
 
 impl<'s> InjectionCollector<'s> {
@@ -240,25 +240,13 @@ impl<'s> InjectionCollector<'s> {
         crate::resolve::qualify(&self.module_prefix, name)
     }
 
-    fn inline_qualify(&self, name: &str) -> String {
-        if self.inline_mod_path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}::{name}", self.inline_mod_path.join("::"))
-        }
-    }
-
-    fn collect_guard(&mut self, block: &syn::Block, name: &str, sig: &syn::Signature) {
-        if !self.targets.contains(name) {
-            return;
-        }
-        let guard_name = self.qualify_name(name);
+    fn collect_guard(&mut self, block: &syn::Block, guard_name: &str, sig: &syn::Signature) {
         let is_async = sig.asyncness.is_some();
 
         // For non-async functions returning futures, wrap only the trailing expression.
         if !is_async {
             if let Some(kind) = returns_future(sig) {
-                self.collect_future_return_guard(block, name, sig, kind);
+                self.collect_future_return_guard(block, guard_name, sig, kind);
                 return;
             }
         }
@@ -268,7 +256,7 @@ impl<'s> InjectionCollector<'s> {
 
         // Check for concurrency patterns.
         if let Some(pattern) = find_concurrency_pattern(block) {
-            self.concurrency.push((guard_name.clone(), pattern));
+            self.concurrency.push((guard_name.to_string(), pattern));
 
             if is_async {
                 // Async + concurrency: wrap entire body in PianoFuture with
@@ -350,12 +338,10 @@ impl<'s> InjectionCollector<'s> {
     fn collect_future_return_guard(
         &mut self,
         block: &syn::Block,
-        name: &str,
+        guard_name: &str,
         sig: &syn::Signature,
         kind: FutureReturnKind,
     ) {
-        let guard_name = self.qualify_name(name);
-
         // Find trailing expression.
         let Some(syn::Stmt::Expr(trailing_expr, None)) = block.stmts.last() else {
             // No trailing expression -- fall back to sync guard.
@@ -392,7 +378,7 @@ impl<'s> InjectionCollector<'s> {
                 };
 
                 // For boxed-future returns, wrap early `return` expressions too.
-                self.collect_return_wrappers(block, &guard_name, &return_type);
+                self.collect_return_wrappers(block, guard_name, &return_type);
 
                 self.injector.insert(
                     trailing_start,
@@ -747,18 +733,25 @@ fn receiver_has_parallel_method(expr: &syn::Expr) -> bool {
 
 impl<'s> Visit<'s> for InjectionCollector<'s> {
     fn visit_item_mod(&mut self, node: &'s syn::ItemMod) {
-        self.inline_mod_path.push(node.ident.to_string());
+        self.scope.push_mod(&node.ident.to_string());
         syn::visit::visit_item_mod(self, node);
-        self.inline_mod_path.pop();
+        self.scope.pop();
     }
 
     fn visit_item_fn(&mut self, node: &'s syn::ItemFn) {
         if matches!(classify(&node.sig), Classification::Instrumentable) {
             let name = node.sig.ident.to_string();
-            let name = self.inline_qualify(&name);
-            self.collect_guard(&node.block, &name, &node.sig);
+            let scope_qualified = self.scope.render_full(&name);
+            let full_name = self.qualify_name(&scope_qualified);
+            if let Some(display_name) = self.targets.get(&full_name).cloned() {
+                self.collect_guard(&node.block, &display_name, &node.sig);
+            }
         }
-        syn::visit::visit_item_fn(self, node);
+        // Push fn scope for nested items, visit ONLY the block body.
+        // Using the free function skips our visit_block override.
+        self.scope.push_fn(&node.sig.ident.to_string());
+        syn::visit::visit_block(self, &node.block);
+        self.scope.pop();
     }
 
     fn visit_item_impl(&mut self, node: &'s syn::ItemImpl) {
@@ -775,14 +768,20 @@ impl<'s> Visit<'s> for InjectionCollector<'s> {
     fn visit_impl_item_fn(&mut self, node: &'s syn::ImplItemFn) {
         if matches!(classify(&node.sig), Classification::Instrumentable) {
             let method = node.sig.ident.to_string();
-            let qualified = match &self.current_impl {
+            let impl_qualified = match &self.current_impl {
                 Some(ty) => format!("{ty}::{method}"),
                 None => method,
             };
-            let qualified = self.inline_qualify(&qualified);
-            self.collect_guard(&node.block, &qualified, &node.sig);
+            let scope_qualified = self.scope.render_full(&impl_qualified);
+            let full_name = self.qualify_name(&scope_qualified);
+            if let Some(display_name) = self.targets.get(&full_name).cloned() {
+                self.collect_guard(&node.block, &display_name, &node.sig);
+            }
         }
-        syn::visit::visit_impl_item_fn(self, node);
+        // Push fn scope for nested items.
+        self.scope.push_fn(&node.sig.ident.to_string());
+        syn::visit::visit_block(self, &node.block);
+        self.scope.pop();
     }
 
     fn visit_item_trait(&mut self, node: &'s syn::ItemTrait) {
@@ -794,18 +793,32 @@ impl<'s> Visit<'s> for InjectionCollector<'s> {
     }
 
     fn visit_trait_item_fn(&mut self, node: &'s syn::TraitItemFn) {
-        if let Some(block) = &node.default {
+        if let Some(ref block) = node.default {
             if matches!(classify(&node.sig), Classification::Instrumentable) {
                 let method = node.sig.ident.to_string();
-                let qualified = match &self.current_trait {
+                let trait_qualified = match &self.current_trait {
                     Some(trait_name) => format!("{trait_name}::{method}"),
                     None => method,
                 };
-                let qualified = self.inline_qualify(&qualified);
-                self.collect_guard(block, &qualified, &node.sig);
+                let scope_qualified = self.scope.render_full(&trait_qualified);
+                let full_name = self.qualify_name(&scope_qualified);
+                if let Some(display_name) = self.targets.get(&full_name).cloned() {
+                    self.collect_guard(block, &display_name, &node.sig);
+                }
             }
+            // Push fn scope for nested items.
+            self.scope.push_fn(&node.sig.ident.to_string());
+            syn::visit::visit_block(self, block);
+            self.scope.pop();
+        } else {
+            syn::visit::visit_trait_item_fn(self, node);
         }
-        syn::visit::visit_trait_item_fn(self, node);
+    }
+
+    fn visit_block(&mut self, node: &'s syn::Block) {
+        self.scope.push_block();
+        syn::visit::visit_block(self, node);
+        self.scope.pop();
     }
 }
 
@@ -840,6 +853,13 @@ pub fn inject_registrations(
 mod tests {
     use super::*;
 
+    fn test_targets(names: &[&str]) -> HashMap<String, String> {
+        names
+            .iter()
+            .map(|&n| (n.to_string(), n.to_string()))
+            .collect()
+    }
+
     #[test]
     fn instruments_top_level_function() {
         let source = r#"
@@ -851,7 +871,7 @@ fn other() {
     do_other();
 }
 "#;
-        let targets: HashSet<String> = ["walk".to_string()].into();
+        let targets = test_targets(&["walk"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -877,7 +897,7 @@ impl Walker {
     }
 }
 "#;
-        let targets: HashSet<String> = ["Walker::walk".to_string()].into();
+        let targets = test_targets(&["Walker::walk"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -895,7 +915,7 @@ fn compute(x: i32, y: i32) -> i32 {
     x + y
 }
 "#;
-        let targets: HashSet<String> = ["compute".to_string()].into();
+        let targets = test_targets(&["compute"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -918,7 +938,7 @@ fn a() {}
 fn b() {}
 fn c() {}
 "#;
-        let targets: HashSet<String> = ["a".to_string(), "c".to_string()].into();
+        let targets = test_targets(&["a", "c"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -965,7 +985,7 @@ fn process_all(items: &[Item]) -> Vec<Result> {
          .collect()
 }
 "#;
-        let targets: HashSet<String> = ["process_all".to_string()].into();
+        let targets = test_targets(&["process_all"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -993,7 +1013,7 @@ fn do_work() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["do_work".to_string()].into();
+        let targets = test_targets(&["do_work"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
@@ -1031,7 +1051,7 @@ fn mixed() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["mixed".to_string()].into();
+        let targets = test_targets(&["mixed"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
 
         // Fork should be injected (rayon::scope triggers it)
@@ -1066,7 +1086,7 @@ fn do_work() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["do_work".to_string()].into();
+        let targets = test_targets(&["do_work"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
@@ -1083,7 +1103,7 @@ fn do_work() {
     std::thread::spawn(|| { work(); });
 }
 "#;
-        let targets: HashSet<String> = ["do_work".to_string()].into();
+        let targets = test_targets(&["do_work"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
@@ -1104,7 +1124,7 @@ fn do_work() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["do_work".to_string()].into();
+        let targets = test_targets(&["do_work"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
@@ -1144,7 +1164,7 @@ fn work() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
@@ -1180,7 +1200,7 @@ fn outer() {
     };
 }
 "#;
-        let targets: HashSet<String> = ["outer".to_string()].into();
+        let targets = test_targets(&["outer"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
@@ -1210,7 +1230,7 @@ fn parallel_work() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["parallel_work".to_string()].into();
+        let targets = test_targets(&["parallel_work"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -1240,7 +1260,7 @@ fn concurrent_discover() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["concurrent_discover".to_string()].into();
+        let targets = test_targets(&["concurrent_discover"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -1275,7 +1295,7 @@ fn work() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -1307,7 +1327,7 @@ fn work(kind: Kind) {
     });
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -1338,7 +1358,7 @@ fn work() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -1380,7 +1400,7 @@ fn work(items: &[Item]) {
     });
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -1404,7 +1424,7 @@ fn not_targeted() {
     items.par_iter().map(|x| x).collect()
 }
 "#;
-        let targets: HashSet<String> = HashSet::new();
+        let targets = test_targets(&[]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -1424,7 +1444,7 @@ fn process_all(items: &[Item]) -> Vec<Result> {
          .collect()
 }
 "#;
-        let targets: HashSet<String> = ["process_all".to_string()].into();
+        let targets = test_targets(&["process_all"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert_eq!(result.concurrency.len(), 1);
         assert_eq!(result.concurrency[0].0, "process_all");
@@ -1440,7 +1460,7 @@ fn concurrent_discover() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["concurrent_discover".to_string()].into();
+        let targets = test_targets(&["concurrent_discover"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert_eq!(result.concurrency.len(), 1);
         assert_eq!(result.concurrency[0].0, "concurrent_discover");
@@ -1454,7 +1474,7 @@ fn simple() {
     do_stuff();
 }
 "#;
-        let targets: HashSet<String> = ["simple".to_string()].into();
+        let targets = test_targets(&["simple"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(result.concurrency.is_empty());
     }
@@ -1466,7 +1486,7 @@ async fn fetch_data(id: u32) -> String {
     format!("data-{id}")
 }
 "#;
-        let targets: HashSet<String> = ["fetch_data".to_string()].into();
+        let targets = test_targets(&["fetch_data"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result
@@ -1494,7 +1514,7 @@ fn compute(x: u64) -> u64 {
     x * 2
 }
 "#;
-        let targets: HashSet<String> = ["compute".to_string()].into();
+        let targets = test_targets(&["compute"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
@@ -1515,7 +1535,7 @@ impl Client {
     }
 }
 "#;
-        let targets: HashSet<String> = ["Client::fetch".to_string()].into();
+        let targets = test_targets(&["Client::fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result
@@ -1540,7 +1560,7 @@ trait Service {
     }
 }
 "#;
-        let targets: HashSet<String> = ["Service::handle".to_string()].into();
+        let targets = test_targets(&["Service::handle"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result
@@ -1570,11 +1590,7 @@ trait Processor {
 }
 "#;
         // Only the safe default method is targeted
-        let targets: HashSet<String> = [
-            "Processor::default_method".to_string(),
-            "Processor::unsafe_default".to_string(),
-        ]
-        .into();
+        let targets = test_targets(&["Processor::default_method", "Processor::unsafe_default"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result
@@ -1600,7 +1616,7 @@ async fn handler(x: i32) -> String {
     format!("{result}")
 }
 "#;
-        let targets: HashSet<String> = ["handler".to_string()].into();
+        let targets = test_targets(&["handler"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(result.source.contains("piano_runtime::PianoFuture::new"));
         assert!(result.source.contains("async move"));
@@ -1619,7 +1635,7 @@ fn compute(x: u64) -> u64 {
     x * 2
 }
 "#;
-        let targets: HashSet<String> = ["compute".to_string()].into();
+        let targets = test_targets(&["compute"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::enter(\"compute\")"),
@@ -1634,7 +1650,7 @@ fn compute(x: u64) -> u64 {
 
     #[test]
     fn non_target_async_fn_not_wrapped() {
-        let targets: HashSet<String> = ["other".to_string()].into_iter().collect();
+        let targets = test_targets(&["other"]);
         let source = r#"
 async fn not_targeted() {
     fetch().await;
@@ -1759,7 +1775,7 @@ fn fetch() -> impl Future<Output = String> {
     async { "data".to_string() }
 }
 "#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let targets = test_targets(&["fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
@@ -1788,7 +1804,7 @@ fn fetch(x: i32) -> impl Future<Output = i32> {
     async move { doubled }
 }
 "#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let targets = test_targets(&["fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         let setup_pos = result.source.find("let doubled").unwrap();
         let piano_pos = result.source.find("PianoFuture::new").unwrap();
@@ -1808,7 +1824,7 @@ fn fetch() -> impl Future<Output = String> {
     async { "data".to_string() }
 }
 "#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let targets = test_targets(&["fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         let count = result.source.matches("piano_runtime::enter").count();
         assert_eq!(
@@ -1829,7 +1845,7 @@ fn delegator() -> impl Future<Output = i32> {
     helper()
 }
 "#;
-        let targets: HashSet<String> = ["delegator".to_string()].into();
+        let targets = test_targets(&["delegator"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
@@ -1847,7 +1863,7 @@ fn fetch() -> impl Future<Output = String> + Send {
     async { "data".to_string() }
 }
 "#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let targets = test_targets(&["fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
@@ -1866,7 +1882,7 @@ fn fetch() -> Pin<Box<dyn Future<Output = String> + Send>> {
     Box::pin(async { "data".to_string() })
 }
 "#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let targets = test_targets(&["fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
@@ -1896,7 +1912,7 @@ fn fetch() -> BoxFuture<'static, String> {
     Box::pin(async { "data".to_string() })
 }
 "#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let targets = test_targets(&["fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
@@ -1918,7 +1934,7 @@ impl Client {
     }
 }
 "#;
-        let targets: HashSet<String> = ["Client::fetch".to_string()].into();
+        let targets = test_targets(&["Client::fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
@@ -1945,7 +1961,7 @@ trait Service {
     }
 }
 "#;
-        let targets: HashSet<String> = ["Service::call".to_string()].into();
+        let targets = test_targets(&["Service::call"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::PianoFuture::new"),
@@ -1961,7 +1977,7 @@ fn compute(x: u64) -> u64 {
     x * 2
 }
 "#;
-        let targets: HashSet<String> = ["compute".to_string()].into();
+        let targets = test_targets(&["compute"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             result.source.contains("piano_runtime::enter(\"compute\")"),
@@ -1988,7 +2004,7 @@ fn fetch(flag: bool) -> Pin<Box<dyn Future<Output = String> + Send>> {
     Box::pin(async { "normal".to_string() })
 }
 "#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let targets = test_targets(&["fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         let piano_count = result
             .source
@@ -2014,7 +2030,7 @@ fn fetch(items: Vec<i32>) -> impl Future<Output = Vec<i32>> {
     async move { filtered }
 }
 "#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let targets = test_targets(&["fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         let piano_count = result
             .source
@@ -2040,7 +2056,7 @@ fn fetch() -> Pin<Box<dyn Future<Output = i32> + Send>> {
     })
 }
 "#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let targets = test_targets(&["fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         let piano_count = result
             .source
@@ -2070,7 +2086,7 @@ fn fetch(flag: bool) -> impl Future<Output = String> {
     async { "normal".to_string() }
 }
 "#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let targets = test_targets(&["fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         let piano_count = result
             .source
@@ -2092,7 +2108,7 @@ fn foo() -> impl Future<Output = ()> {
     return async {};
 }
 "#;
-        let targets: HashSet<String> = ["foo".to_string()].into();
+        let targets = test_targets(&["foo"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
 
         assert!(
@@ -2111,7 +2127,7 @@ fn foo() -> impl Future<Output = ()> {
     fn instrument_preserves_original_line_numbers() {
         let source =
             "fn target() {\n    let x = 1;\n    let y = 2;\n}\n\nfn other() {\n    let z = 3;\n}\n";
-        let targets: HashSet<String> = ["target".to_string()].into_iter().collect();
+        let targets = test_targets(&["target"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         let result_lines: Vec<&str> = result.source.lines().collect();
         // "fn other()" is on original line 6. With 1 guard line injected for target(),
@@ -2137,7 +2153,7 @@ fn validate_input(x: i32) -> bool {
     x > 0
 }
 "#;
-        let targets: HashSet<String> = ["validate_input".to_string()].into();
+        let targets = test_targets(&["db::query::validate_input"]);
         let result = instrument_source(source, &targets, false, "db::query")
             .unwrap()
             .source;
@@ -2155,7 +2171,7 @@ impl Handler {
     fn validate(&self) { }
 }
 "#;
-        let targets: HashSet<String> = ["Handler::validate".to_string()].into();
+        let targets = test_targets(&["api::Handler::validate"]);
         let result = instrument_source(source, &targets, false, "api")
             .unwrap()
             .source;
@@ -2172,7 +2188,7 @@ fn walk() {
     do_stuff();
 }
 "#;
-        let targets: HashSet<String> = ["walk".to_string()].into();
+        let targets = test_targets(&["walk"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -2189,7 +2205,7 @@ fn process_all(data: &[i32]) {
     data.par_iter().for_each(|x| { let _ = x; });
 }
 "#;
-        let targets: HashSet<String> = ["process_all".to_string()].into();
+        let targets = test_targets(&["worker::process_all"]);
         let result = instrument_source(source, &targets, false, "worker").unwrap();
         assert_eq!(
             result.concurrency.first().map(|(name, _)| name.as_str()),
@@ -2217,11 +2233,7 @@ impl fmt::Debug for Point {
     }
 }
 "#;
-        let targets: HashSet<String> = [
-            "<Point as Display>::fmt".to_string(),
-            "<Point as Debug>::fmt".to_string(),
-        ]
-        .into();
+        let targets = test_targets(&["<Point as Display>::fmt", "<Point as Debug>::fmt"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -2246,7 +2258,7 @@ impl Walker {
     }
 }
 "#;
-        let targets: HashSet<String> = ["Walker::walk".to_string()].into();
+        let targets = test_targets(&["Walker::walk"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -2264,7 +2276,7 @@ fn work() {
     let x = 42;
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -2316,7 +2328,7 @@ fn work() -> u64 {
     42
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         let mut map = result.source_map;
         let mut current = result.source;
@@ -2352,7 +2364,7 @@ fn work(items: &[Item]) -> Result<()> {
     Ok(())
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             !result.concurrency.is_empty(),
@@ -2372,7 +2384,7 @@ fn work() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             !result.concurrency.is_empty(),
@@ -2389,7 +2401,7 @@ fn work(items: &[Item]) {
     let _ = (items.par_iter().for_each(|x| process(x)), 42);
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             !result.concurrency.is_empty(),
@@ -2408,7 +2420,7 @@ fn work(items: &[Item], flag: bool) {
     }
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             !result.concurrency.is_empty(),
@@ -2426,7 +2438,7 @@ fn work(items: &[Item]) {
     result = items.par_iter().map(|x| process(x)).collect();
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
         assert!(
             !result.concurrency.is_empty(),
@@ -2448,7 +2460,7 @@ fn fetch(flag: bool) -> Pin<Box<dyn Future<Output = i32>>> {
     Box::pin(async { x })
 }
 "#;
-        let targets: HashSet<String> = ["fetch".to_string()].into();
+        let targets = test_targets(&["fetch"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -2475,7 +2487,7 @@ fn work() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -2495,7 +2507,7 @@ fn work() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -2516,7 +2528,7 @@ fn work() {
     });
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -2534,7 +2546,7 @@ fn work(items: &[Item]) {
     (items.par_iter()).for_each(|item| process(item));
 }
 "#;
-        let targets: HashSet<String> = ["work".to_string()].into();
+        let targets = test_targets(&["work"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
@@ -2553,7 +2565,7 @@ mod inner {
     }
 }
 "#;
-        let targets: HashSet<String> = ["inner::foo".to_string()].into();
+        let targets = test_targets(&["inner::foo"]);
         let result = instrument_source(source, &targets, false, "")
             .unwrap()
             .source;
