@@ -56,19 +56,7 @@ fn instrument_macro_tokens(
     }
 }
 
-/// Check if tokens[i..i+2] form a fat arrow `=>`.
-fn is_fat_arrow(tokens: &[proc_macro2::TokenTree], i: usize) -> bool {
-    if i + 1 >= tokens.len() {
-        return false;
-    }
-    matches!(
-        (&tokens[i], &tokens[i + 1]),
-        (
-            proc_macro2::TokenTree::Punct(eq),
-            proc_macro2::TokenTree::Punct(gt),
-        ) if eq.as_char() == '=' && eq.spacing() == proc_macro2::Spacing::Joint && gt.as_char() == '>'
-    )
-}
+use super::token_util::is_fat_arrow;
 
 /// Whether the impl block's Self type is a literal identifier or a metavar.
 enum MacroImplType {
