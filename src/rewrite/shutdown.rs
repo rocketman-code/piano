@@ -1,4 +1,3 @@
-use quote::quote;
 use syn::spanned::Spanned;
 
 use super::line_col_to_byte;
@@ -106,19 +105,6 @@ pub fn inject_shutdown(
     }
 
     Ok(injector.apply(source))
-}
-
-/// Extract the type name from a `syn::Type` for qualified method names.
-pub(super) fn type_ident(ty: &syn::Type) -> String {
-    match ty {
-        syn::Type::Path(tp) => tp
-            .path
-            .segments
-            .last()
-            .map(|seg| seg.ident.to_string())
-            .unwrap_or_else(|| quote!(#ty).to_string()),
-        _ => quote!(#ty).to_string(),
-    }
 }
 
 #[cfg(test)]

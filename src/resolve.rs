@@ -431,17 +431,10 @@ impl<'ast> Visit<'ast> for FnCollector {
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        let type_name = type_name_from_type(&node.self_ty);
-        // For trait impls, include trait name for disambiguation.
-        let impl_name = if let Some((_, ref trait_path, _)) = node.trait_ {
-            if let Some(seg) = trait_path.segments.last() {
-                format!("<{} as {}>", type_name, seg.ident)
-            } else {
-                type_name
-            }
-        } else {
-            type_name
-        };
+        let impl_name = crate::naming::render_impl_name(
+            &node.self_ty,
+            node.trait_.as_ref().map(|(_, path, _)| path),
+        );
         let prev = self.current_impl.replace(impl_name);
         syn::visit::visit_item_impl(self, node);
         self.current_impl = prev;
@@ -500,19 +493,6 @@ impl<'ast> Visit<'ast> for FnCollector {
             }
         }
         syn::visit::visit_trait_item_fn(self, node);
-    }
-}
-
-/// Extract a human-readable type name from a `syn::Type` (best-effort).
-fn type_name_from_type(ty: &syn::Type) -> String {
-    match ty {
-        syn::Type::Path(tp) => tp
-            .path
-            .segments
-            .last()
-            .map(|seg| seg.ident.to_string())
-            .unwrap_or_else(|| "_".to_string()),
-        _ => "_".to_string(),
     }
 }
 
