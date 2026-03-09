@@ -194,19 +194,23 @@ pub fn skip_inner_attrs(source: &str, offset: usize) -> usize {
     let mut pos = offset;
 
     loop {
-        // Speculatively skip whitespace to check for `#![`.
+        // Skip whitespace.
         let mut probe = pos;
         while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
             probe += 1;
         }
 
-        // Check for `#![`
+        if probe >= bytes.len() {
+            break;
+        }
+
+        // `#![...]` — inner attribute.
         if probe + 2 < bytes.len()
             && bytes[probe] == b'#'
             && bytes[probe + 1] == b'!'
             && bytes[probe + 2] == b'['
         {
-            probe += 3; // skip `#![`
+            probe += 3;
             let mut bracket_depth = 1u32;
             while probe < bytes.len() && bracket_depth > 0 {
                 match bytes[probe] {
@@ -216,11 +220,82 @@ pub fn skip_inner_attrs(source: &str, offset: usize) -> usize {
                 }
                 probe += 1;
             }
-            // probe is now just after the closing `]`; commit and loop.
             pos = probe;
-        } else {
-            break;
+            continue;
         }
+
+        // `/*!...*/` — block inner doc comment (Rust block comments nest).
+        if probe + 2 < bytes.len()
+            && bytes[probe] == b'/'
+            && bytes[probe + 1] == b'*'
+            && bytes[probe + 2] == b'!'
+        {
+            probe += 3;
+            let mut depth = 1u32;
+            while probe + 1 < bytes.len() && depth > 0 {
+                if bytes[probe] == b'/' && bytes[probe + 1] == b'*' {
+                    depth += 1;
+                    probe += 2;
+                } else if bytes[probe] == b'*' && bytes[probe + 1] == b'/' {
+                    depth -= 1;
+                    probe += 2;
+                } else {
+                    probe += 1;
+                }
+            }
+            pos = probe;
+            continue;
+        }
+
+        // `//!...` — line inner doc comment.
+        if probe + 2 < bytes.len()
+            && bytes[probe] == b'/'
+            && bytes[probe + 1] == b'/'
+            && bytes[probe + 2] == b'!'
+        {
+            probe += 3;
+            while probe < bytes.len() && bytes[probe] != b'\n' {
+                probe += 1;
+            }
+            if probe < bytes.len() {
+                probe += 1; // skip the newline
+            }
+            pos = probe;
+            continue;
+        }
+
+        // `//...` or `/*...*/` — regular comments between inner attrs.
+        // Skip these so we can find inner attrs/docs that follow them.
+        if probe + 1 < bytes.len() && bytes[probe] == b'/' && bytes[probe + 1] == b'/' {
+            probe += 2;
+            while probe < bytes.len() && bytes[probe] != b'\n' {
+                probe += 1;
+            }
+            if probe < bytes.len() {
+                probe += 1;
+            }
+            pos = probe;
+            continue;
+        }
+        if probe + 1 < bytes.len() && bytes[probe] == b'/' && bytes[probe + 1] == b'*' {
+            probe += 2;
+            let mut depth = 1u32;
+            while probe + 1 < bytes.len() && depth > 0 {
+                if bytes[probe] == b'/' && bytes[probe + 1] == b'*' {
+                    depth += 1;
+                    probe += 2;
+                } else if bytes[probe] == b'*' && bytes[probe + 1] == b'/' {
+                    depth -= 1;
+                    probe += 2;
+                } else {
+                    probe += 1;
+                }
+            }
+            pos = probe;
+            continue;
+        }
+
+        break;
     }
 
     pos
