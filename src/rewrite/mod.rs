@@ -266,7 +266,7 @@ impl<'s> InjectionCollector<'s> {
     fn collect_guard(&mut self, block: &syn::Block, guard_name: &str, sig: &syn::Signature) {
         let is_async = sig.asyncness.is_some();
 
-        // For non-async functions returning futures, wrap only the trailing expression.
+        // For non-async functions returning futures, apply future-aware wrapping.
         if !is_async {
             if let Some(kind) = returns_future(sig) {
                 self.collect_future_return_guard(block, guard_name, sig, kind);
@@ -365,36 +365,57 @@ impl<'s> InjectionCollector<'s> {
         sig: &syn::Signature,
         kind: FutureReturnKind,
     ) {
-        // Find trailing expression.
-        let Some(syn::Stmt::Expr(trailing_expr, None)) = block.stmts.last() else {
-            // No trailing expression -- fall back to sync guard.
-            let open_pos = block.brace_token.span.open().start();
-            let open_byte =
-                skip_inner_attrs(self.source, line_col_to_byte(self.source, open_pos) + 1);
-            self.injector.insert(
-                open_byte,
-                format!("\n    let __piano_guard = piano_runtime::enter({guard_name:?});"),
-            );
-            return;
-        };
-
-        let trailing_span = trailing_expr.span();
-        let trailing_start = line_col_to_byte(self.source, trailing_span.start());
-        let trailing_end = line_col_to_byte(self.source, trailing_span.end());
-
         match kind {
             FutureReturnKind::ImplFuture => {
+                // Whole-body wrapping: wrap the entire function body in
+                // PianoFuture::new(async move { ... }) so all code paths
+                // (including early returns) are instrumented.
+                let open_pos = block.brace_token.span.open().start();
+                let close_pos = block.brace_token.span.close().start();
+                let open_byte =
+                    skip_inner_attrs(self.source, line_col_to_byte(self.source, open_pos) + 1);
+                let close_byte = line_col_to_byte(self.source, close_pos);
+
                 self.injector.insert(
-                    trailing_start,
+                    open_byte,
                     format!(
-                        "piano_runtime::PianoFuture::new(async move {{\
-                         \n        let __piano_guard = piano_runtime::enter({guard_name:?});\
-                         \n        ("
+                        "\n    piano_runtime::PianoFuture::new(async move {{\
+                         \n        let __piano_guard = piano_runtime::enter({guard_name:?});"
                     ),
                 );
-                self.injector.insert(trailing_end, ").await\n    })");
+                self.injector.insert(close_byte, "\n    })\n");
+
+                // The body is now inside `async move { ... }`. Any `async { expr }`
+                // expressions (trailing or returned) would create nested futures.
+                // Add `.await` to unwrap them so the types align.
+                if let Some(syn::Stmt::Expr(trailing_expr, None)) = block.stmts.last() {
+                    if matches!(trailing_expr, syn::Expr::Async(_)) {
+                        let trailing_end =
+                            line_col_to_byte(self.source, trailing_expr.span().end());
+                        self.injector.insert(trailing_end, ".await");
+                    }
+                }
+                // Walk preceding statements for `return async { ... }` and add .await.
+                self.collect_async_return_awaits(block);
             }
             FutureReturnKind::PinBoxDynFuture | FutureReturnKind::KnownAlias => {
+                // Find trailing expression.
+                let Some(syn::Stmt::Expr(trailing_expr, None)) = block.stmts.last() else {
+                    // No trailing expression -- fall back to sync guard.
+                    let open_pos = block.brace_token.span.open().start();
+                    let open_byte =
+                        skip_inner_attrs(self.source, line_col_to_byte(self.source, open_pos) + 1);
+                    self.injector.insert(
+                        open_byte,
+                        format!("\n    let __piano_guard = piano_runtime::enter({guard_name:?});"),
+                    );
+                    return;
+                };
+
+                let trailing_span = trailing_expr.span();
+                let trailing_start = line_col_to_byte(self.source, trailing_span.start());
+                let trailing_end = line_col_to_byte(self.source, trailing_span.end());
+
                 let return_type = match &sig.output {
                     syn::ReturnType::Type(_, ty) => quote!(#ty).to_string(),
                     _ => unreachable!("returns_future already checked this"),
@@ -414,6 +435,21 @@ impl<'s> InjectionCollector<'s> {
                 self.injector
                     .insert(trailing_end, ";\n        __piano_inner.await\n    }))");
             }
+        }
+    }
+
+    /// Walk the block's statements for `return async { ... }` and add `.await`.
+    ///
+    /// Used by whole-body ImplFuture wrapping: the body is inside `async move { ... }`,
+    /// so `return async { expr }` would return a nested future. Adding `.await` unwraps
+    /// it to `return expr`.
+    fn collect_async_return_awaits(&mut self, block: &syn::Block) {
+        let mut visitor = AsyncReturnAwaiter {
+            source: self.source,
+            injector: &mut self.injector,
+        };
+        for stmt in &block.stmts {
+            visitor.visit_stmt(stmt);
         }
     }
 
@@ -462,6 +498,30 @@ impl<'ast, 'a> Visit<'ast> for ReturnWrapperCollector<'a> {
                 .insert(inner_end, ";\n            __piano_inner.await\n        }))");
         }
         // Don't recurse into the return's inner expression -- it's already wrapped.
+    }
+
+    // Boundaries: return inside closures/async blocks is not our function's return.
+    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+}
+
+/// Visitor that adds `.await` to `return async { ... }` expressions.
+///
+/// Used by whole-body ImplFuture wrapping to unwrap nested futures.
+struct AsyncReturnAwaiter<'a> {
+    source: &'a str,
+    injector: &'a mut StringInjector,
+}
+
+impl<'ast, 'a> Visit<'ast> for AsyncReturnAwaiter<'a> {
+    fn visit_expr_return(&mut self, ret: &'ast syn::ExprReturn) {
+        if let Some(inner) = &ret.expr {
+            if matches!(inner.as_ref(), syn::Expr::Async(_)) {
+                let inner_end = line_col_to_byte(self.source, inner.span().end());
+                self.injector.insert(inner_end, ".await");
+            }
+        }
+        // Don't recurse into the return's inner expression.
     }
 
     // Boundaries: return inside closures/async blocks is not our function's return.
@@ -1818,7 +1878,9 @@ fn fetch() -> impl Future<Output = String> {
     }
 
     #[test]
-    fn impl_future_preserves_setup_stmts() {
+    fn impl_future_whole_body_includes_setup_stmts() {
+        // With whole-body wrapping, setup code is inside the PianoFuture async
+        // block (deferred to first poll, same semantics as async fn).
         let source = r#"
 use std::future::Future;
 
@@ -1832,8 +1894,13 @@ fn fetch(x: i32) -> impl Future<Output = i32> {
         let setup_pos = result.source.find("let doubled").unwrap();
         let piano_pos = result.source.find("PianoFuture::new").unwrap();
         assert!(
-            setup_pos < piano_pos,
-            "setup stmt should precede PianoFuture wrapping. Got:\n{}",
+            piano_pos < setup_pos,
+            "PianoFuture should wrap entire body including setup. Got:\n{}",
+            result.source,
+        );
+        assert!(
+            result.source.contains(".await"),
+            "trailing async block should be awaited. Got:\n{}",
             result.source,
         );
     }
@@ -2093,12 +2160,8 @@ fn fetch() -> Pin<Box<dyn Future<Output = i32> + Send>> {
     }
 
     #[test]
-    fn impl_future_early_return_not_wrapped() {
-        // Known limitation: for `-> impl Future`, early returns are not wrapped
-        // in PianoFuture. Only the trailing expression is instrumented. This is
-        // because wrapping would change the concrete return type, potentially
-        // causing compilation errors when different return paths produce
-        // different opaque types.
+    fn impl_future_early_return_wrapped_via_whole_body() {
+        // Fixed: whole-body wrapping captures all code paths including early returns.
         let source = r#"
 use std::future::Future;
 
@@ -2111,19 +2174,26 @@ fn fetch(flag: bool) -> impl Future<Output = String> {
 "#;
         let targets = test_targets(&["fetch"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
+        // Whole body is wrapped in one PianoFuture. Early returns are inside it.
         let piano_count = result
             .source
             .matches("piano_runtime::PianoFuture::new")
             .count();
         assert_eq!(
             piano_count, 1,
-            "only trailing expr should be wrapped (early return is a known gap). Got {} in:\n{}",
+            "whole body should be wrapped in one PianoFuture. Got {} in:\n{}",
             piano_count, result.source,
+        );
+        // The guard should be inside the async move block.
+        assert!(
+            result.source.contains("piano_runtime::enter(\"fetch\")"),
+            "guard should be present. Got:\n{}",
+            result.source,
         );
     }
 
     #[test]
-    fn impl_future_no_trailing_expr_falls_back_to_sync_guard() {
+    fn impl_future_no_trailing_expr_wraps_whole_body() {
         let source = r#"
 use std::future::Future;
 
@@ -2134,14 +2204,40 @@ fn foo() -> impl Future<Output = ()> {
         let targets = test_targets(&["foo"]);
         let result = instrument_source(source, &targets, false, "").unwrap();
 
+        // Whole-body wrapping should capture even return-only bodies.
         assert!(
-            result.source.contains("piano_runtime::enter(\"foo\")"),
-            "should fall back to sync guard when no trailing expression. Got:\n{}",
+            result.source.contains("PianoFuture"),
+            "should wrap in PianoFuture even with only return statements. Got:\n{}",
             result.source,
         );
         assert!(
-            !result.source.contains("PianoFuture"),
-            "should NOT wrap in PianoFuture when no trailing expression. Got:\n{}",
+            result.source.contains("piano_runtime::enter(\"foo\")"),
+            "should have guard. Got:\n{}",
+            result.source,
+        );
+        assert!(
+            result.source.contains(".await"),
+            "return async {{}} should get .await appended. Got:\n{}",
+            result.source,
+        );
+        syn::parse_str::<syn::File>(&result.source).expect("rewritten source should parse");
+    }
+
+    #[test]
+    fn impl_future_send_whole_body_wrapped() {
+        let source = r#"
+use std::future::Future;
+
+fn fetch(x: i32) -> impl Future<Output = i32> + Send {
+    let doubled = x * 2;
+    async move { doubled }
+}
+"#;
+        let targets = test_targets(&["fetch"]);
+        let result = instrument_source(source, &targets, false, "").unwrap();
+        assert!(
+            result.source.contains("piano_runtime::PianoFuture::new"),
+            "should wrap in PianoFuture. Got:\n{}",
             result.source,
         );
     }
