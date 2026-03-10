@@ -1290,6 +1290,16 @@ pub fn init() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     signal::install_handlers();
     signal::register_atexit();
+
+    // Pre-intern all registered function names so NAME_TABLE is populated
+    // before the streaming file is opened. This lets the header include
+    // the function name table, making partial files self-contained.
+    REGISTERED.with(|reg| {
+        for &name in reg.borrow().iter() {
+            name_table::intern_name(name);
+        }
+    });
+
     STREAMING_ENABLED.store(true, Ordering::Relaxed);
     if env_is_opt_in(std::env::var("PIANO_STREAM_FRAMES")) {
         STREAM_FRAMES.store(true, Ordering::Relaxed);
@@ -1425,12 +1435,26 @@ fn shutdown_impl_inner(dir: &std::path::Path) -> bool {
         let mut state = stream_file().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut s) = *state {
             ndjson::write_shutdown_frames(s, &frames);
-            if let Err(e) = write_stream_trailer(s) {
-                eprintln!(
-                    "piano: failed to write trailer to {}: {e}",
-                    s.path.display()
-                );
-                write_failed = true;
+            // Skip trailer when function names were written in the header
+            // (pre-interned at init). The CLI parser takes the v3 path for
+            // headers with functions and would error on a trailer line.
+            if name_table::NAME_TABLE_LEN.load(Ordering::Acquire) == 0 {
+                if let Err(e) = write_stream_trailer(s) {
+                    eprintln!(
+                        "piano: failed to write trailer to {}: {e}",
+                        s.path.display()
+                    );
+                    write_failed = true;
+                }
+            } else {
+                // Flush without trailer.
+                if let Err(e) = s.file.flush() {
+                    eprintln!(
+                        "piano: failed to flush stream file {}: {e}",
+                        s.path.display()
+                    );
+                    write_failed = true;
+                }
             }
             // Close the stream file.
             *state = None;
@@ -3096,6 +3120,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    #[serial]
+    fn shutdown_skips_trailer_when_names_in_header() {
+        // Kills: mod.rs:1441 replace == with != in shutdown_impl_inner
+        // When NAME_TABLE_LEN > 0, function names are in the stream header.
+        // The trailer must be skipped (CLI v3 path errors on trailer line).
+        reset_all();
+
+        // Ensure names are interned (enter() does this internally).
+        {
+            let _g = enter("trailer_skip_fn");
+            burn_cpu(1_000);
+        }
+
+        let tmp = std::env::temp_dir().join(format!("piano_trailer_skip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        set_runs_dir(&tmp);
+
+        // Open the stream file (names are in header because NAME_TABLE_LEN > 0).
+        {
+            let mut state = stream_file().lock().unwrap();
+            *state = Some(open_stream_file(&tmp).unwrap());
+        }
+
+        let failed = shutdown_impl_inner(&tmp);
+
+        clear_runs_dir();
+        assert!(!failed, "shutdown should succeed");
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("ndjson"))
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one NDJSON file");
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+
+        // Header should have functions (names were interned before open).
+        assert!(
+            lines[0].contains("\"functions\""),
+            "header should have functions: {}",
+            lines[0]
+        );
+
+        // No other line should have "functions" -- trailer must be skipped.
+        for (i, line) in lines.iter().enumerate().skip(1) {
+            assert!(
+                !line.contains("\"functions\""),
+                "line {i} should not be a trailer (names are in header): {line}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     // ---------------------------------------------------------------
     // Issue #486: FnAgg must carry alloc data
     // ---------------------------------------------------------------
@@ -3408,5 +3491,31 @@ mod tests {
         assert!(!env_is_opt_in(Ok("0".into())));
         assert!(!env_is_opt_in(Ok("true".into())));
         assert!(!env_is_opt_in(Ok("".into())));
+    }
+
+    #[test]
+    #[serial]
+    fn init_pre_interns_registered_names() {
+        use super::name_table::{name_table_get, NAME_TABLE_LEN};
+
+        reset();
+        let baseline = NAME_TABLE_LEN.load(Ordering::Acquire);
+
+        register("preintern_a");
+        register("preintern_b");
+
+        // Before init, no new entries.
+        assert_eq!(NAME_TABLE_LEN.load(Ordering::Acquire), baseline);
+
+        init();
+
+        // After init, 2 new entries.
+        let after = NAME_TABLE_LEN.load(Ordering::Acquire);
+        assert_eq!(after, baseline + 2, "expected 2 new interned names");
+        assert_eq!(name_table_get(baseline), Some("preintern_a"));
+        assert_eq!(name_table_get(baseline + 1), Some("preintern_b"));
+
+        STREAMING_ENABLED.store(false, Ordering::Relaxed);
+        STREAM_FRAMES.store(false, Ordering::Relaxed);
     }
 }

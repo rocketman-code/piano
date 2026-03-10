@@ -31,7 +31,25 @@ pub(super) fn open_stream_file(dir: &std::path::Path) -> std::io::Result<StreamS
     )?;
     #[cfg(feature = "cpu-time")]
     write!(file, ",\"has_cpu_time\":true")?;
+
+    // Write pre-interned function names so the file is self-contained
+    // even without a trailer (crash recovery, SIGKILL).
+    let name_count = NAME_TABLE_LEN.load(Ordering::Acquire);
+    if name_count > 0 {
+        write!(file, ",\"functions\":[")?;
+        for i in 0..name_count {
+            if i > 0 {
+                write!(file, ",")?;
+            }
+            let name = name_table_get(i).unwrap_or("<unknown>");
+            let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+            write!(file, "\"{escaped}\"")?;
+        }
+        write!(file, "]")?;
+    }
+
     writeln!(file, "}}")?;
+    file.flush()?;
 
     Ok(StreamState {
         file,
@@ -70,6 +88,8 @@ pub(super) fn stream_frame_to_writer(state: &mut StreamState, buf: &[FrameFnSumm
     }
     let _ = writeln!(state.file, "]}}");
     state.frame_count += 1;
+    // Flush to kernel buffer so data survives SIGKILL.
+    let _ = state.file.flush();
 }
 
 /// Write remaining frames to the stream file during shutdown.
@@ -203,8 +223,9 @@ pub(super) fn write_stream_trailer(state: &mut StreamState) -> std::io::Result<(
 
 /// Write an NDJSON file with frame-level data.
 ///
-/// Line 1: header with metadata and function name table.
-/// Lines 2+: one line per frame with per-function summaries.
+/// Line 1: header with metadata (format version, run ID, timestamp).
+/// Lines 2..N: one line per frame with per-function summaries.
+/// Last line: trailer with function name table.
 pub(super) fn write_ndjson(
     frames: &[(usize, Vec<FrameFnSummary>)],
     fn_names: &[&str],
@@ -361,14 +382,13 @@ mod tests {
         let content = std::fs::read_to_string(files[0].path()).unwrap();
         let lines: Vec<&str> = content.lines().collect();
 
-        // Header (line 0): metadata, no functions
+        // Header (line 0): metadata (may include functions if names are pre-interned)
         assert!(
             lines[0].contains("\"format_version\":4"),
             "header should have format_version 4: {}",
             lines[0]
         );
         assert!(lines[0].contains("\"run_id\""));
-        assert!(!lines[0].contains("\"functions\""));
 
         // Frames (lines 1-3)
         assert!(lines[1].contains("\"frame\":0"));
@@ -501,6 +521,141 @@ mod tests {
         assert!(
             trailer.contains("roundtrip_fn"),
             "trailer should contain function name"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[serial]
+    fn stream_frame_flushes_to_disk() {
+        // Each frame write should flush the BufWriter so data survives
+        // process termination. Read the file BEFORE closing the StreamState
+        // to verify data is on disk, not just in the userspace buffer.
+        let tmp = std::env::temp_dir().join(format!("piano_flush_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut state = open_stream_file(&tmp).unwrap();
+        let frame = vec![FrameFnSummary {
+            name: "flush_proof_fn",
+            calls: 1,
+            self_ns: 1000,
+            #[cfg(feature = "cpu-time")]
+            cpu_self_ns: 500,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
+        }];
+
+        stream_frame_to_writer(&mut state, &frame);
+
+        // Read file WITHOUT dropping/closing state -- proves data was flushed
+        // past the BufWriter into the kernel buffer.
+        let content = std::fs::read_to_string(&state.path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert!(
+            lines.len() >= 2,
+            "expected header + frame on disk before close, got {} lines: {content:?}",
+            lines.len()
+        );
+        assert!(
+            lines[1].contains("\"frame\":0"),
+            "frame should be on disk: {content:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[serial]
+    fn header_includes_function_names() {
+        let tmp = std::env::temp_dir().join(format!("piano_header_names_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Pre-intern names (simulates what init() does after Task 4).
+        intern_name("header_fn_a");
+        intern_name("header_fn_b");
+
+        let state = open_stream_file(&tmp).unwrap();
+
+        // Drop state to flush BufWriter.
+        drop(state);
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        assert_eq!(files.len(), 1);
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let header = content.lines().next().unwrap();
+
+        assert!(
+            header.contains("\"functions\""),
+            "header should include functions field: {header}"
+        );
+        assert!(
+            header.contains("header_fn_a"),
+            "header should include pre-interned name: {header}"
+        );
+        assert!(
+            header.contains("header_fn_b"),
+            "header should include pre-interned name: {header}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[serial]
+    fn header_functions_comma_separation() {
+        // Kills: ndjson.rs:41 replace > with </==/>=
+        // Mutations produce malformed JSON in the functions array:
+        // >= 0: leading comma [,"a","b"], < 0: no commas ["a""b"],
+        // == 0: leading comma + no inner commas [,"a""b"].
+        let tmp = std::env::temp_dir().join(format!("piano_hdr_comma_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Ensure at least 2 names are interned.
+        intern_name("comma_hdr_a");
+        intern_name("comma_hdr_b");
+
+        let state = open_stream_file(&tmp).unwrap();
+        drop(state);
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "ndjson"))
+            .collect();
+        assert_eq!(files.len(), 1);
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let header = content.lines().next().unwrap();
+
+        // Extract the functions array content between [ and ].
+        let fns_key = "\"functions\":[";
+        let start = header.find(fns_key).expect("functions field missing") + fns_key.len();
+        let end = start + header[start..].find(']').expect("closing bracket missing");
+        let array_inner = &header[start..end];
+
+        // Must not start with comma (kills >= 0, == 0 mutations).
+        assert!(
+            !array_inner.starts_with(','),
+            "functions array has leading comma: [{array_inner}]"
+        );
+
+        // No adjacent quotes without comma separator (kills < 0 mutation).
+        // Correct: "a","b" -- between entries is ","
+        // Wrong:   "a""b" -- entries concatenated without comma
+        assert!(
+            !array_inner.contains("\"\""),
+            "functions array has entries without comma separator: [{array_inner}]"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
