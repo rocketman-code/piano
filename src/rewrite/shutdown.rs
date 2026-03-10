@@ -94,7 +94,7 @@ pub fn inject_shutdown(
                     );
                 } else {
                     suffix.push_str(
-                        "\n    if let Err(__piano_panic) = __piano_result {\n        std::panic::resume_unwind(__piano_panic);\n    }\n",
+                        "\n    #[allow(irrefutable_let_patterns)]\n    if let Err(__piano_panic) = __piano_result {\n        std::panic::resume_unwind(__piano_panic);\n    }\n",
                     );
                 }
                 injector.insert(close_byte, suffix);

@@ -4,7 +4,7 @@
 /// number of newlines in the injected text. Given a line number in the
 /// rewritten source, `remap_line` subtracts the injected newlines that
 /// precede it to recover the original line number.
-#[derive(Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SourceMap {
     /// Sorted by `original_line` ascending.
     /// Each entry: (original_line, offset, none_span).

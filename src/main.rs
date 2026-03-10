@@ -8,8 +8,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use piano::build::{
-    build_instrumented, cargo_metadata, find_bin_target, find_current_package, find_project_root,
-    inject_runtime_dependency, inject_runtime_path_dependency, prepare_staging,
+    build_instrumented, cargo_metadata, clean_stale_piano_files, find_bin_target,
+    find_current_package, find_project_root, prebuild_runtime, prebuild_runtime_from_path,
 };
 use piano::error::{Error, io_context};
 use piano::report::{
@@ -23,11 +23,6 @@ use piano::report::{
 use piano::resolve::{
     ResolveResult, SkippedFunction, TargetSpec, module_prefix, qualify, resolve_targets,
 };
-use piano::rewrite::{
-    detect_allocator_kind, inject_global_allocator, inject_registrations, inject_shutdown,
-    instrument_source,
-};
-use piano::source_map::SourceMap;
 
 #[derive(Parser)]
 #[command(
@@ -194,6 +189,12 @@ fn parse_duration_secs(s: &str) -> Result<f64, String> {
 }
 
 fn main() {
+    // Wrapper mode: when invoked as RUSTC_WORKSPACE_WRAPPER, Cargo passes
+    // the real rustc path as argv[1]. Detect via PIANO_WRAPPER_CONFIG env var.
+    if std::env::var_os(piano::wrapper::CONFIG_ENV).is_some() {
+        std::process::exit(piano::wrapper::run_wrapper());
+    }
+
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
         eprintln!("error: {e}");
@@ -399,9 +400,6 @@ fn build_project(
         }
     }
 
-    // Stage from the workspace root so inherited fields and cross-member
-    // path dependencies resolve correctly.
-    let staging_root = workspace_root.clone();
     let member_subdir = if pkg_root != workspace_root {
         Some(
             pkg_root
@@ -413,47 +411,8 @@ fn build_project(
         None
     };
 
-    // Prepare staging directory.
-    // Use a stable path so cargo can cache incremental builds across runs.
-    // Dependencies compile once; only instrumented source files recompile.
-    let staging = staging_root.join("target/piano/staging");
-    std::fs::create_dir_all(&staging).map_err(io_context("create directory", &staging))?;
-    prepare_staging(&staging_root, &staging)?;
-
-    // Determine the member directory within staging (workspace root for standalone).
-    let member_staging = match &member_subdir {
-        Some(sub) => staging.join(sub),
-        None => staging.clone(),
-    };
-
-    // Inject piano-runtime dependency.
-    let features: Vec<&str> = if cpu_time { vec!["cpu-time"] } else { vec![] };
-    match runtime_path {
-        Some(ref path) => {
-            let abs_path = std::fs::canonicalize(path).map_err(io_context("canonicalize", path))?;
-            inject_runtime_path_dependency(&member_staging, &abs_path, &features)?;
-        }
-        None => {
-            inject_runtime_dependency(&member_staging, env!("PIANO_RUNTIME_VERSION"), &features)?;
-        }
-    }
-
-    // Rewrite each target file in staging.
-    // Rebase source paths from the original project into the staging directory.
     let instrument_macros = specs.is_empty();
-    let mut all_concurrency: Vec<(String, String)> = Vec::new();
-    let mut source_maps: HashMap<PathBuf, SourceMap> = HashMap::new();
-    let mut macro_fn_names: Vec<String> = Vec::new();
-
-    // The staging src dir corresponds to the original src_dir but within staging.
-    // Derive from src_dir relative to pkg_root (src_dir may not be "src/" when
-    // the fallback in the src_dir computation above triggers).
     let src_rel = src_dir.strip_prefix(&pkg_root).unwrap_or(Path::new("src"));
-    let staging_src_dir = if let Some(ref sub) = member_subdir {
-        staging.join(sub).join(src_rel)
-    } else {
-        staging.join(src_rel)
-    };
 
     // Collect all functions with file prefix for cross-file disambiguation.
     let mut all_qualified: Vec<(PathBuf, piano::naming::QualifiedFunction)> = Vec::new();
@@ -483,42 +442,46 @@ fn build_project(
             .insert(qf.full.clone(), display.clone());
     }
 
-    for target in &targets {
-        let target_map = file_targets.get(&target.file).cloned().unwrap_or_default();
-        let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
-        let staged_file = staging_src_dir.join(relative);
-        let display_path = PathBuf::from("src").join(relative);
-        let source =
-            std::fs::read_to_string(&staged_file).map_err(|source| Error::RunReadError {
-                path: display_path.clone(),
-                source,
-            })?;
+    // Pre-build piano-runtime with the user's toolchain.
+    let target_dir = project.join("target").join("piano");
+    let features: Vec<&str> = if cpu_time { vec!["cpu-time"] } else { vec![] };
 
-        let prefix = module_prefix(relative);
-        let result = instrument_source(&source, &target_map, instrument_macros, &prefix).map_err(
-            |source| Error::ParseError {
-                path: display_path.clone(),
-                source,
-            },
-        )?;
-
-        all_concurrency.extend(result.concurrency);
-        macro_fn_names.extend(result.macro_fn_names);
-        source_maps.insert(display_path, result.source_map);
-        std::fs::write(&staged_file, result.source).map_err(io_context("write", &staged_file))?;
-    }
-
-    // Warn if parallel code was detected without --cpu-time.
-    if !cpu_time && !all_concurrency.is_empty() {
-        for (func, _pattern) in &all_concurrency {
-            eprintln!(
-                "warning: {func} spawns parallel work -- add --cpu-time to see computation time"
-            );
+    eprintln!("pre-building piano-runtime...");
+    let runtime = match runtime_path {
+        Some(ref path) => {
+            let abs_path = std::fs::canonicalize(path).map_err(io_context("canonicalize", path))?;
+            prebuild_runtime_from_path(&abs_path, &project, &target_dir, &features)?
         }
+        None => prebuild_runtime(&project, &target_dir, &features)?,
+    };
+
+    // Clean stale temp files from previous crashed runs.
+    clean_stale_piano_files(&src_dir)?;
+
+    let runs_dir = target_dir.join("runs");
+    std::fs::create_dir_all(&runs_dir).map_err(io_context("create directory", &runs_dir))?;
+
+    // Compute source paths relative to workspace root (matches what wrapper receives).
+    let mut targets_relative: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
+    let mut module_prefixes_relative: HashMap<PathBuf, String> = HashMap::new();
+
+    for target in &targets {
+        let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
+        let target_map = file_targets.get(&target.file).cloned().unwrap_or_default();
+
+        // Path relative to workspace root for the config
+        let ws_relative = if let Some(ref sub) = member_subdir {
+            PathBuf::from(sub).join(src_rel).join(relative)
+        } else {
+            PathBuf::from(src_rel).join(relative)
+        };
+
+        targets_relative.insert(ws_relative.clone(), target_map);
+        let prefix = module_prefix(relative);
+        module_prefixes_relative.insert(ws_relative, prefix);
     }
 
-    // Inject register calls into the binary entry point for all instrumented functions.
-    // Rebase the bin_src_path into the staging directory.
+    // Entry point path relative to workspace root
     let bin_src_canonical = bin_src_path.canonicalize().map_err(|e| {
         Error::BuildFailed(format!(
             "failed to canonicalize binary source path {}: {e}",
@@ -533,75 +496,47 @@ fn build_project(
                 bin_src_canonical.display(),
                 workspace_root.display()
             ))
-        })?;
-    let main_file = staging.join(bin_entry_relative);
-    // Display path is relative to the package root for error messages.
-    let bin_entry = bin_src_canonical
-        .strip_prefix(&pkg_root)
-        .unwrap_or(&bin_src_canonical)
+        })?
         .to_path_buf();
-    let target_dir = project.join("target").join("piano");
-    let runs_dir = target_dir.join("runs");
-    std::fs::create_dir_all(&runs_dir).map_err(io_context("create directory", &runs_dir))?;
-    {
-        let mut all_fn_names: Vec<String> = display_names;
-        all_fn_names.extend(macro_fn_names);
-        let main_source =
-            std::fs::read_to_string(&main_file).map_err(|source| Error::RunReadError {
-                path: bin_entry.clone(),
-                source,
-            })?;
-        let (rewritten, reg_map) =
-            inject_registrations(&main_source, &all_fn_names).map_err(|source| {
-                Error::ParseError {
-                    path: bin_entry.clone(),
-                    source,
-                }
-            })?;
 
-        // Inject global allocator for allocation tracking.
-        let alloc_kind = detect_allocator_kind(&rewritten).map_err(|source| Error::ParseError {
-            path: bin_entry.clone(),
-            source,
-        })?;
-        let (rewritten, alloc_map) =
-            inject_global_allocator(&rewritten, alloc_kind).map_err(|source| {
-                Error::ParseError {
-                    path: bin_entry.clone(),
-                    source,
-                }
-            })?;
+    // Macro function names are discovered by the wrapper during instrumentation
+    // and added to registrations there. The orchestrator only provides the
+    // statically-resolved display names.
+    let all_fn_names: Vec<String> = display_names;
 
-        let runs_dir_str = runs_dir.to_string_lossy().to_string();
-        let (rewritten, shutdown_map) =
-            inject_shutdown(&rewritten, Some(&runs_dir_str)).map_err(|source| {
-                Error::ParseError {
-                    path: bin_entry.clone(),
-                    source,
-                }
-            })?;
-        std::fs::write(&main_file, rewritten).map_err(io_context("write", &main_file))?;
+    // Write wrapper config
+    let config = piano::wrapper::WrapperConfig {
+        runtime_rlib: runtime.rlib_path,
+        runtime_deps_dir: runtime.deps_dir,
+        instrument_macros,
+        entry_point: piano::wrapper::EntryPointConfig {
+            source_path: bin_entry_relative,
+            fn_names: all_fn_names,
+            runs_dir: runs_dir.clone(),
+        },
+        targets: targets_relative,
+        module_prefixes: module_prefixes_relative,
+    };
 
-        // Merge registration/allocator/shutdown source maps into the bin
-        // entry's map. Each step's map was computed relative to its input
-        // (which already contains prior injections), so the line numbers
-        // are in shifted coordinates. Merging gives approximate remapping
-        // -- exact for guard injections, close enough for the few lines
-        // added by registration/allocator/shutdown boilerplate.
-        let entry_map = source_maps.entry(bin_entry.clone()).or_default();
-        entry_map.merge(reg_map);
-        entry_map.merge(alloc_map);
-        entry_map.merge(shutdown_map);
-    }
+    let config_path = target_dir.join("config.json");
+    let config_json = serde_json::to_string(&config)
+        .map_err(|e| Error::BuildFailed(format!("failed to serialize wrapper config: {e}")))?;
+    std::fs::write(&config_path, config_json)
+        .map_err(io_context("write wrapper config", &config_path))?;
 
-    // Build the instrumented binary.
-    // Pass the package name when in a workspace (member != root).
+    // Build with wrapper
     let pkg_arg = if member_subdir.is_some() {
         Some(package_name.as_str())
     } else {
         None
     };
-    let binary = build_instrumented(&staging, &target_dir, pkg_arg, bin.as_deref(), &source_maps)?;
+    let binary = build_instrumented(
+        &workspace_root,
+        &target_dir,
+        pkg_arg,
+        bin.as_deref(),
+        &config_path,
+    )?;
 
     Ok(Some((binary, runs_dir, total_fns)))
 }
