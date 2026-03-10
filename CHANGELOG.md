@@ -7,6 +7,28 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-03-10
+
+Piano's build pipeline is now compiler-integrated and its async timing model is more precise. The new `RUSTC_WORKSPACE_WRAPPER` pipeline lets the Rust compiler drive instrumentation directly, and async self-time now distinguishes execution from suspension.
+
+### Added
+
+- `--kill-timeout` flag for `--duration` mode -- controls the grace period between SIGTERM and SIGKILL when profiling long-running daemons (default: 10 seconds)
+- Profiling data streams durably to disk and the name table is written eagerly, so partial runs from signals or crashes produce usable reports
+- Concurrency detection warns when functions spawn parallel work and suggests `--cpu-time`
+
+### Changed
+
+- Build pipeline uses `RUSTC_WORKSPACE_WRAPPER` to intercept compilation directly instead of copying source to a staging directory. Source files are never modified or copied; instrumented temp files live alongside originals and are cleaned up after build. Dependencies are injected via `--extern` instead of editing Cargo.toml, leaving your Cargo.lock untouched.
+- Code generation uses `syn`'s `ToTokens` instead of `prettyplease`, preserving all attributes including `#[cfg(...)]` on match arms and block expressions
+
+### Fixed
+
+- Async self-time now excludes suspension gaps -- time spent awaiting (sleeping, I/O, channel receives) is no longer counted as self-time for the enclosing function
+- `impl Future` functions are now wrapped entirely in `PianoFuture`, so all execution time is attributed to the correct function instead of leaking to the parent scope
+- Thread-local storage cleanup no longer panics when thread-local storage is already destroyed during thread exit
+- Directory module pattern (`foo.rs` + `foo/`) now resolves correctly during instrumentation (#578)
+
 ## [0.12.0] - 2026-03-08
 
 Piano now instruments significantly more of your code -- functions returning `impl Future`, functions inside `macro_rules!`, and trait methods like `Display::fmt` vs `Debug::fmt` that previously collided into one entry. Four new CLI flags open up new workflows: `--json` for scripting, `--duration` for long-running programs, `--bin` for multi-binary crates, and `--threads` for per-thread breakdowns.
@@ -325,7 +347,8 @@ Per-frame allocation tracking, cross-thread instrumentation, NDJSON output, and 
 
 Initial tagged release.
 
-[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/rocketman-code/piano/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/rocketman-code/piano/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/rocketman-code/piano/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rocketman-code/piano/compare/v0.9.3...v0.10.0
