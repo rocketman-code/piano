@@ -472,8 +472,11 @@ fn drain_inflight_stack() {
         // (synthetic adopt anchors that are not real timed functions).
         // Note: forward-order iteration does not propagate elapsed_ns to parent
         // children_ns, so self_ns for outer in-flight entries may be overstated
-        // when multiple nested functions are in-flight. This is acceptable for
-        // best-effort recovery.
+        // when multiple nested functions are in-flight. For async entries,
+        // PianoFuture adjusts entry.start_tsc to encode accumulated poll time,
+        // so elapsed_ns here reflects active time rather than wall-clock lifetime
+        // (total_ms will be understated). Both are acceptable for best-effort
+        // recovery.
         //
         // Alloc deltas: enter() saves counters into saved_alloc and zeroes them,
         // so entry[i]'s accumulated allocs = entry[i+1].saved_alloc (what the
@@ -517,7 +520,7 @@ fn drain_inflight_stack() {
                     &mut buf.borrow_mut(),
                     name,
                     elapsed_ns,
-                    children_ns,
+                    self_ns,
                     #[cfg(feature = "cpu-time")]
                     cpu_self_ns,
                     scope_alloc.alloc_count,
@@ -605,19 +608,19 @@ thread_local! {
 fn merge_into_fnagg_vec(
     buf: &mut Vec<FnAgg>,
     name: &'static str,
-    elapsed_ns: u64,
-    children_ns: u64,
+    total_ns: u64,
+    self_ns: u64,
     #[cfg(feature = "cpu-time")] cpu_self_ns: u64,
     alloc_count: u64,
     alloc_bytes: u64,
     free_count: u64,
     free_bytes: u64,
 ) {
-    let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
-    let self_ms = elapsed_ns.saturating_sub(children_ns) as f64 / 1_000_000.0;
+    let total_ms = total_ns as f64 / 1_000_000.0;
+    let self_ms = self_ns as f64 / 1_000_000.0;
     if let Some(entry) = buf.iter_mut().find(|e| std::ptr::eq(e.name, name)) {
         entry.calls += 1;
-        entry.total_ms += elapsed_ms;
+        entry.total_ms += total_ms;
         entry.self_ms += self_ms;
         #[cfg(feature = "cpu-time")]
         {
@@ -631,7 +634,7 @@ fn merge_into_fnagg_vec(
         buf.push(FnAgg {
             name,
             calls: 1,
-            total_ms: elapsed_ms,
+            total_ms,
             self_ms,
             #[cfg(feature = "cpu-time")]
             cpu_self_ns,
@@ -755,11 +758,22 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
 
             let name = lookup_name(unpack_name_id(entry.packed));
 
-            let raw_ticks = end_tsc.wrapping_sub(guard.start_tsc);
-            let corrected_ticks = raw_ticks.saturating_sub(crate::tsc::bias_ticks());
-            let elapsed_ns = crate::tsc::ticks_to_ns(corrected_ticks);
+            // Lifetime: full wall-clock span from guard creation to drop.
+            // Used for total_ms (latency, includes I/O waits).
+            let lifetime_ticks = end_tsc.wrapping_sub(guard.start_tsc);
+            let corrected_lifetime = lifetime_ticks.saturating_sub(crate::tsc::bias_ticks());
+            let lifetime_ns = crate::tsc::ticks_to_ns(corrected_lifetime);
+
+            // Active time: accumulated poll time from virtual entry.start_tsc.
+            // For sync code, entry.start_tsc == guard.start_tsc, so active == lifetime.
+            // For async code, PianoFuture adjusts entry.start_tsc to encode
+            // accumulated poll time, excluding suspension gaps.
+            let active_ticks = end_tsc.wrapping_sub(entry.start_tsc);
+            let corrected_active = active_ticks.saturating_sub(crate::tsc::bias_ticks());
+            let active_ns = crate::tsc::ticks_to_ns(corrected_active);
+
             let children_ns = entry.children_ns;
-            let self_ns = elapsed_ns.saturating_sub(children_ns);
+            let self_ns = active_ns.saturating_sub(children_ns);
 
             // Raw CPU elapsed: no per-call bias subtraction. Amortized correction
             // is applied at aggregation (raw_total - calls * bias), allowing
@@ -770,7 +784,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             let cpu_self_ns = cpu_raw_elapsed.saturating_sub(entry.cpu_children_ns);
 
             if let Some(parent) = s.last_mut() {
-                parent.children_ns += elapsed_ns;
+                parent.children_ns += active_ns;
                 #[cfg(feature = "cpu-time")]
                 {
                     // Add guard_overhead: the portion of per-call instrumentation
@@ -790,8 +804,8 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                 merge_into_fnagg_vec(
                     &mut buf.borrow_mut(),
                     name,
-                    elapsed_ns,
-                    children_ns,
+                    lifetime_ns,
+                    self_ns,
                     #[cfg(feature = "cpu-time")]
                     cpu_self_ns,
                     scope_alloc.alloc_count,
@@ -809,7 +823,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                     inv.borrow_mut().push(InvocationRecord {
                         name,
                         start_ns,
-                        elapsed_ns,
+                        elapsed_ns: lifetime_ns,
                         self_ns,
                         #[cfg(feature = "cpu-time")]
                         cpu_self_ns,
@@ -2526,8 +2540,8 @@ mod tests {
         merge_into_fnagg_vec(
             &mut buf,
             name,
-            2_000_000, // 2ms elapsed
-            500_000,   // 0.5ms children
+            2_000_000, // 2ms total
+            1_500_000, // 1.5ms self (= 2ms - 0.5ms children)
             #[cfg(feature = "cpu-time")]
             100,
             0,
@@ -2542,8 +2556,8 @@ mod tests {
         merge_into_fnagg_vec(
             &mut buf,
             name,
-            3_000_000, // 3ms elapsed
-            1_000_000, // 1ms children
+            3_000_000, // 3ms total
+            2_000_000, // 2ms self (= 3ms - 1ms children)
             #[cfg(feature = "cpu-time")]
             200,
             0,
@@ -2561,8 +2575,7 @@ mod tests {
             buf[0].total_ms
         );
 
-        let expected_self = (2_000_000u64.saturating_sub(500_000)) as f64 / 1_000_000.0
-            + (3_000_000u64.saturating_sub(1_000_000)) as f64 / 1_000_000.0;
+        let expected_self = 1_500_000.0 / 1_000_000.0 + 2_000_000.0 / 1_000_000.0;
         assert!(
             (buf[0].self_ms - expected_self).abs() < 0.001,
             "self_ms should be sum: expected {expected_self}, got {}",

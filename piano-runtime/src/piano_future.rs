@@ -19,6 +19,7 @@ pub struct PianoFuture<F> {
     alloc_carry: AllocSnapshot,
     #[cfg(feature = "cpu-time")]
     cpu_accumulated_ns: u64,
+    tsc_accumulated: u64,
 }
 
 impl<F: Future> PianoFuture<F> {
@@ -33,6 +34,7 @@ impl<F: Future> PianoFuture<F> {
             alloc_carry: AllocSnapshot::new(),
             #[cfg(feature = "cpu-time")]
             cpu_accumulated_ns: 0,
+            tsc_accumulated: 0,
         }
     }
 }
@@ -71,6 +73,11 @@ impl<F: Future> Future for PianoFuture<F> {
                 }
             }
 
+            if let Some(first) = this.saved_entries.first_mut() {
+                first.start_tsc = crate::tsc::read().wrapping_sub(this.tsc_accumulated);
+                this.tsc_accumulated = 0;
+            }
+
             s.extend_from_slice(&this.saved_entries);
             this.saved_entries.clear();
             base
@@ -103,6 +110,10 @@ impl<F: Future> Future for PianoFuture<F> {
                 }
             }
 
+            if let Some(entry) = s.get(base) {
+                this.tsc_accumulated = crate::tsc::read().wrapping_sub(entry.start_tsc);
+            }
+
             this.saved_entries.clear();
             this.saved_entries.extend_from_slice(&s[base..]);
             s.truncate(base);
@@ -120,6 +131,10 @@ impl<F: Future> Future for PianoFuture<F> {
 impl<F> Drop for PianoFuture<F> {
     fn drop(&mut self) {
         if !self.saved_entries.is_empty() {
+            if let Some(first) = self.saved_entries.first_mut() {
+                first.start_tsc = crate::tsc::read().wrapping_sub(self.tsc_accumulated);
+                self.tsc_accumulated = 0;
+            }
             with_stack_mut(|s| {
                 s.extend_from_slice(&self.saved_entries);
                 self.saved_entries.clear();
@@ -442,6 +457,53 @@ mod tests {
             "cpu_self_ms ({:.3}) should not grossly exceed total_ms ({:.3}) -- arithmetic bug?",
             rec.cpu_self_ms,
             rec.total_ms,
+        );
+    }
+
+    /// Verifies that tsc_accumulated is correctly subtracted from tsc::read()
+    /// during the install phase. If the subtraction is missing or wrong, the
+    /// virtual start_tsc would not encode prior poll time, causing self_ms
+    /// for async functions to include suspension gaps.
+    #[test]
+    fn piano_future_wall_time_across_yields() {
+        collector::reset();
+        run(async {
+            PianoFuture::new(async {
+                let _guard = collector::enter("wall_yield");
+                collector::register("wall_yield");
+
+                // Do some CPU work before yield
+                collector::burn_cpu(10_000);
+                // Sleep introduces a suspension gap that should NOT appear in self_ms
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // More CPU work after yield
+                collector::burn_cpu(10_000);
+            })
+            .await;
+        });
+
+        let records = collector::collect_all();
+        let rec = records.iter().find(|r| r.name == "wall_yield").unwrap();
+
+        // total_ms should include the 50ms sleep (latency).
+        assert!(
+            rec.total_ms > 40.0,
+            "total_ms should include sleep: got {:.1}ms",
+            rec.total_ms,
+        );
+
+        // self_ms should NOT include the 50ms sleep (active time only).
+        // The gap between total_ms and self_ms should be at least 30ms
+        // (most of the 50ms sleep). Using a ratio avoids absolute thresholds
+        // that break on slow CI runners where burn_cpu takes longer.
+        let gap = rec.total_ms - rec.self_ms;
+        assert!(
+            gap > 30.0,
+            "suspension gap should be excluded from self_ms: gap={:.1}ms \
+             (total={:.1}ms, self={:.1}ms)",
+            gap,
+            rec.total_ms,
+            rec.self_ms,
         );
     }
 
