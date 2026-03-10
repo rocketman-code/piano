@@ -720,30 +720,29 @@ fn frame_pipeline_build_run_report() {
     let content = fs::read_to_string(&run_file).unwrap();
     let lines: Vec<&str> = content.lines().collect();
 
-    // Header should have format_version 4 and NO functions (v4 = trailer).
+    // Header should have format_version 4 with pre-interned function names.
     assert!(
         lines[0].contains("\"format_version\":4"),
         "header should have format_version 4"
     );
-    // v4: functions are in the trailer (last line), not the header.
-    let last_line = lines.last().unwrap();
+    // Function names are pre-interned in the header (no trailer needed).
     assert!(
-        last_line.contains("\"functions\""),
-        "trailer should have functions array"
+        lines[0].contains("\"functions\""),
+        "header should have functions array"
     );
     assert!(
-        last_line.contains("update"),
+        lines[0].contains("update"),
         "functions should include 'update'"
     );
     assert!(
-        last_line.contains("physics"),
+        lines[0].contains("physics"),
         "functions should include 'physics'"
     );
 
-    // Should have frame lines (header + at least 5 frames + trailer).
+    // Should have frame lines (header + at least 5 frames, no trailer).
     assert!(
-        lines.len() >= 7,
-        "expected header + 5 frames + trailer, got {} lines",
+        lines.len() >= 6,
+        "expected header + 5 frames, got {} lines",
         lines.len()
     );
 

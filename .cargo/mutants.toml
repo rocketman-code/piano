@@ -62,6 +62,10 @@ exclude_re = [
     # unit tests -- requires NDJSON integration tests.
     "replace - with .+ in drop_cold",
     "replace \\* with .+ in drop_cold",
+    # open_stream_file name_count > 0: NAME_TABLE_LEN is append-only (never
+    # resets), so it is always > 0 after any intern_name call. Since all tests
+    # intern names, > 0 vs >= 0 (always true for usize) is indistinguishable.
+    "replace > with >= in open_stream_file$",
     # drop_cold line 834 / aggregate line 994: `> 0.0` vs `>= 0.0` -- when
     # corrected == 0.0, both paths produce 0 (0.0 as u64 == 0, 0.0/1M == 0.0).
     # False positive. The > vs == and > vs < on line 834 are also streaming-
