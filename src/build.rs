@@ -378,30 +378,247 @@ pub fn find_project_root(start_dir: &Path) -> Result<PathBuf, Error> {
     }
 }
 
-/// Build the instrumented binary using `cargo build --release --message-format=json`.
-/// Returns the path to the compiled executable.
+/// Result of pre-building the piano-runtime library.
+pub struct PrebuiltRuntime {
+    /// Path to the compiled libpiano_runtime.rlib
+    pub rlib_path: PathBuf,
+    /// Directory containing the rlib and any transitive deps (for -L dependency=)
+    pub deps_dir: PathBuf,
+}
+
+/// Pre-build piano-runtime as an rlib using the user's toolchain.
 ///
-/// When `package` is `Some`, passes `-p <name>` to cargo to build a specific
-/// workspace member (used when staging an entire workspace).
-/// When `bin` is `Some`, passes `--bin <name>` to cargo to build a specific
-/// binary target.
+/// Writes the embedded source to `target_dir/runtime-src/`, runs
+/// `cargo build --release`, and locates the output rlib. Cargo's
+/// fingerprinting caches the result across runs.
+pub fn prebuild_runtime(
+    project_dir: &Path,
+    target_dir: &Path,
+    features: &[&str],
+) -> Result<PrebuiltRuntime, Error> {
+    let src_dir = target_dir.join("runtime-src");
+    crate::runtime_embed::write_to_disk(&src_dir)
+        .map_err(io_context("write runtime source to", &src_dir))?;
+
+    build_runtime_rlib(&src_dir, project_dir, target_dir, features)
+}
+
+/// Pre-build piano-runtime from a local source path (for --runtime-path).
+///
+/// Copies the runtime source to a standalone directory (with `[workspace]`
+/// injected) so that Cargo doesn't resolve the parent workspace. This prevents
+/// failures when the user's project pins an older toolchain that can't parse
+/// the piano workspace's edition.
+pub fn prebuild_runtime_from_path(
+    runtime_path: &Path,
+    project_dir: &Path,
+    target_dir: &Path,
+    features: &[&str],
+) -> Result<PrebuiltRuntime, Error> {
+    let dest = target_dir.join("runtime-src");
+    copy_runtime_standalone(runtime_path, &dest)?;
+    build_runtime_rlib(&dest, project_dir, target_dir, features)
+}
+
+/// Copy runtime source to a standalone directory with `[workspace]` injected.
+fn copy_runtime_standalone(src: &Path, dest: &Path) -> Result<(), Error> {
+    let src_dir = src.join("src");
+    let dest_src = dest.join("src");
+    std::fs::create_dir_all(&dest_src).map_err(io_context("create directory", &dest_src))?;
+
+    // Copy and patch Cargo.toml
+    let cargo_toml = std::fs::read_to_string(src.join("Cargo.toml"))
+        .map_err(io_context("read Cargo.toml", &src.join("Cargo.toml")))?;
+    let mut doc: toml_edit::DocumentMut = cargo_toml
+        .parse()
+        .map_err(|e| Error::BuildFailed(format!("failed to parse runtime Cargo.toml: {e}")))?;
+    doc.remove("bench");
+    doc.remove("dev-dependencies");
+    doc.remove("test");
+    let mut content = doc.to_string();
+    if !content.contains("[workspace]") {
+        content.push_str("\n[workspace]\n");
+    }
+    std::fs::write(dest.join("Cargo.toml"), content)
+        .map_err(io_context("write Cargo.toml", &dest.join("Cargo.toml")))?;
+
+    // Copy source files recursively
+    copy_rs_files_recursive(&src_dir, &dest_src)?;
+
+    Ok(())
+}
+
+fn copy_rs_files_recursive(src: &Path, dest: &Path) -> Result<(), Error> {
+    std::fs::create_dir_all(dest).map_err(io_context("create directory", dest))?;
+    for entry in std::fs::read_dir(src).map_err(io_context("read directory", src))? {
+        let entry = entry.map_err(io_context("read directory entry", src))?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        if path.is_dir() {
+            copy_rs_files_recursive(&path, &dest.join(file_name))?;
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            std::fs::copy(&path, dest.join(file_name)).map_err(io_context("copy file", &path))?;
+        }
+    }
+    Ok(())
+}
+
+fn build_runtime_rlib(
+    src_dir: &Path,
+    project_dir: &Path,
+    target_dir: &Path,
+    features: &[&str],
+) -> Result<PrebuiltRuntime, Error> {
+    let build_dir = target_dir.join("runtime-build");
+
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build")
+        .arg("--release")
+        .arg("--message-format=json")
+        .arg("--manifest-path")
+        .arg(src_dir.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", &build_dir)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .current_dir(project_dir);
+
+    if !features.is_empty() {
+        cmd.arg("--features").arg(features.join(","));
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| Error::BuildFailed(format!("failed to build piano-runtime: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::BuildFailed(format!(
+            "piano-runtime build failed: {stderr}"
+        )));
+    }
+
+    // Parse JSON to find the rlib artifact
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut rlib_path = None;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        let Some(target) = msg.get("target") else {
+            continue;
+        };
+        if target.get("name").and_then(|n| n.as_str()) != Some("piano_runtime") {
+            continue;
+        }
+        if let Some(filenames) = msg.get("filenames").and_then(|f| f.as_array()) {
+            for f in filenames {
+                if let Some(s) = f.as_str() {
+                    if s.ends_with(".rlib") {
+                        rlib_path = Some(PathBuf::from(s));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: if JSON parsing didn't find it (e.g., older Cargo versions
+    // with different JSON schema or "Fresh" artifacts), search the build dir.
+    let rlib_path = match rlib_path {
+        Some(p) => p,
+        None => find_rlib_in_dir(&build_dir.join("release"))?,
+    };
+    // The rlib may be at release/libpiano_runtime.rlib; deps dir is release/deps/
+    // which contains transitive dependency rlibs (needed for -L dependency=).
+    let release_dir = rlib_path.parent().unwrap_or(&build_dir);
+    let deps_dir = release_dir.join("deps");
+
+    Ok(PrebuiltRuntime {
+        rlib_path,
+        deps_dir,
+    })
+}
+
+/// Search a directory for a `libpiano_runtime*.rlib` file.
+fn find_rlib_in_dir(dir: &Path) -> Result<PathBuf, Error> {
+    if !dir.is_dir() {
+        return Err(Error::BuildFailed(format!(
+            "no rlib found: {} does not exist",
+            dir.display()
+        )));
+    }
+    for entry in std::fs::read_dir(dir).map_err(io_context("read directory", dir))? {
+        let entry = entry.map_err(io_context("read directory entry", dir))?;
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("libpiano_runtime") && name.ends_with(".rlib") {
+                return Ok(path);
+            }
+        }
+    }
+    Err(Error::BuildFailed(
+        "no rlib found in piano-runtime build output".into(),
+    ))
+}
+
+/// Clean up stale .piano.rs temp files left by crashed wrapper invocations.
+pub fn clean_stale_piano_files(src_dir: &Path) -> Result<(), Error> {
+    clean_piano_files_recursive(src_dir)
+}
+
+fn clean_piano_files_recursive(dir: &Path) -> Result<(), Error> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io_context("read directory entry", dir))?;
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip target/ directories
+            if path.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            clean_piano_files_recursive(&path)?;
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with('.') && name.ends_with(".piano.rs") {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build the instrumented binary using the wrapper pipeline.
+///
+/// Sets `RUSTC_WORKSPACE_WRAPPER` to the current piano binary and
+/// `PIANO_WRAPPER_CONFIG` to the config file path, then runs
+/// `cargo build --release --message-format=json`.
 pub fn build_instrumented(
-    staging_dir: &Path,
+    project_dir: &Path,
     target_dir: &Path,
     package: Option<&str>,
     bin: Option<&str>,
-    source_maps: &HashMap<PathBuf, SourceMap>,
+    config_path: &Path,
 ) -> Result<PathBuf, Error> {
-    // Remove RUSTUP_TOOLCHAIN so the target project's rust-toolchain.toml
-    // is respected. Without this, nested cargo invocations inherit the
-    // parent's toolchain, ignoring the project's pinned version.
+    let piano_exe = std::env::current_exe()
+        .map_err(|e| Error::BuildFailed(format!("failed to locate piano binary: {e}")))?;
+
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
         .arg("--release")
         .arg("--message-format=json")
         .env("CARGO_TARGET_DIR", target_dir)
+        .env("RUSTC_WORKSPACE_WRAPPER", &piano_exe)
+        .env(crate::wrapper::CONFIG_ENV, config_path)
+        // Disable LTO: the pre-built piano-runtime rlib is injected via --extern
+        // and won't have LLVM bitcode matching the user's LTO settings. Since
+        // piano already modifies the binary with instrumentation, LTO optimization
+        // differences are irrelevant for profiling.
+        .env("CARGO_PROFILE_RELEASE_LTO", "false")
         .env_remove("RUSTUP_TOOLCHAIN")
-        .current_dir(staging_dir);
+        .current_dir(project_dir);
     if let Some(pkg) = package {
         cmd.arg("-p").arg(pkg);
     }
@@ -417,11 +634,11 @@ pub fn build_instrumented(
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::BuildFailed(stderr.into_owned()));
         }
-        let mut error_text = rendered.join("");
-        if !source_maps.is_empty() {
-            error_text = remap_rendered_error(&error_text, source_maps);
-            error_text = filter_piano_internals(&error_text);
-        }
+        let error_text = rendered.join("");
+        // Remap line numbers using source maps written by the wrapper
+        let file_maps = crate::wrapper::read_source_maps(config_path);
+        let error_text = remap_rendered_error(&error_text, &file_maps);
+        let error_text = filter_piano_internals(&error_text);
         return Err(Error::BuildFailed(error_text));
     }
 
@@ -825,5 +1042,49 @@ edition = "2021"
             result.contains("expected `i32`"),
             "should keep user error: {result}"
         );
+    }
+
+    #[test]
+    fn prebuild_runtime_produces_rlib() {
+        let tmp = TempDir::new().unwrap();
+        let target_dir = tmp.path().join("target/piano");
+        std::fs::create_dir_all(&target_dir).unwrap();
+
+        let result = prebuild_runtime(tmp.path(), &target_dir, &[]).unwrap();
+
+        assert!(
+            result.rlib_path.exists(),
+            "rlib should exist at {}",
+            result.rlib_path.display()
+        );
+        assert!(
+            result.rlib_path.to_string_lossy().contains("piano_runtime"),
+            "rlib should be piano_runtime: {}",
+            result.rlib_path.display()
+        );
+        assert!(
+            result.deps_dir.is_dir(),
+            "deps dir should exist: {}",
+            result.deps_dir.display()
+        );
+    }
+
+    #[test]
+    fn clean_stale_piano_files_removes_temp_files() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        // Create stale temp files
+        std::fs::write(src.join(".main.piano.rs"), "stale").unwrap();
+        std::fs::write(src.join(".lib.piano.rs"), "stale").unwrap();
+        // Create a normal file that should be preserved
+        std::fs::write(src.join("main.rs"), "fn main() {}").unwrap();
+
+        clean_stale_piano_files(&src).unwrap();
+
+        assert!(!src.join(".main.piano.rs").exists());
+        assert!(!src.join(".lib.piano.rs").exists());
+        assert!(src.join("main.rs").exists());
     }
 }
