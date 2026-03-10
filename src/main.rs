@@ -553,6 +553,9 @@ fn build_project(
     std::fs::write(&config_path, config_json)
         .map_err(io_context("write wrapper config", &config_path))?;
 
+    // Clean stale concurrency data from previous builds.
+    let _ = std::fs::remove_file(piano::wrapper::concurrency_path(&config_path));
+
     // Build with wrapper
     let pkg_arg = if member_subdir.is_some() {
         Some(package_name.as_str())
@@ -566,6 +569,16 @@ fn build_project(
         bin.as_deref(),
         &config_path,
     )?;
+
+    // Warn about concurrent functions when --cpu-time is not enabled.
+    if !cpu_time {
+        let concurrency = piano::wrapper::read_concurrency(&config_path);
+        for (func, _pattern) in &concurrency {
+            eprintln!(
+                "warning: {func} spawns parallel work -- add --cpu-time to see computation time"
+            );
+        }
+    }
 
     Ok(Some((binary, runs_dir, total_fns)))
 }
