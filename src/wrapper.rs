@@ -160,15 +160,6 @@ impl ParsedRustcArgs {
     }
 }
 
-/// Guard that deletes a temp file on drop.
-struct TempFileGuard(PathBuf);
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// Wrapper entry point. Called when PIANO_WRAPPER_CONFIG is set.
 ///
 /// argv layout: piano, real_rustc, rustc_args...
@@ -228,6 +219,7 @@ pub fn run_wrapper() -> i32 {
 
     // Rewrite the source file
     let config_p = Path::new(&config_path);
+    let crate_name = parsed.crate_name.as_deref().unwrap_or("unknown");
     match rewrite_and_compile(
         real_rustc,
         &rustc_args,
@@ -235,6 +227,7 @@ pub fn run_wrapper() -> i32 {
         &source_key,
         &config,
         config_p,
+        crate_name,
     ) {
         Ok(code) => code,
         Err(e) => {
@@ -253,19 +246,22 @@ fn load_config(path: &str) -> Result<WrapperConfig, Error> {
         .map_err(|e| Error::BuildFailed(format!("failed to parse wrapper config: {e}")))
 }
 
-/// Write the source map for a file to the shared source maps JSON file.
-/// The wrapper writes these during instrumentation; the orchestrator reads
-/// them after a build failure to remap line numbers in error messages.
-fn write_source_map(source_file: &str, map: &SourceMap, config_path: &Path) {
+/// Write source maps in a single read-modify-write to minimize the race
+/// window when concurrent wrapper processes access source_maps.json.
+fn write_source_maps_batch(entries: &[(String, SourceMap)], config_path: &Path) {
+    if entries.is_empty() {
+        return;
+    }
     let maps_path = source_maps_path(config_path);
 
-    // Read existing maps (other wrapper invocations may have written theirs)
     let mut maps: HashMap<PathBuf, SourceMap> = std::fs::read_to_string(&maps_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    maps.insert(PathBuf::from(source_file), map.clone());
+    for (source_file, map) in entries {
+        maps.insert(PathBuf::from(source_file), map.clone());
+    }
 
     if let Ok(json) = serde_json::to_string(&maps) {
         let _ = std::fs::write(&maps_path, json);
@@ -309,30 +305,23 @@ fn rewrite_and_compile(
     source_key: &Path,
     config: &WrapperConfig,
     config_path: &Path,
+    crate_name: &str,
 ) -> Result<i32, Error> {
-    let source_p = Path::new(source_path);
-    let source_dir = source_p.parent();
     let is_entry_point = config.entry_point.source_path == source_key;
+    let source_parent = source_key.parent().unwrap_or(Path::new(""));
 
-    // Collect all module files that need instrumentation in this crate.
-    // These are config target files that share the same directory prefix.
-    let mut module_temps: Vec<TempFileGuard> = Vec::new();
+    // Phase 1: Instrument all target files, collecting (relative_path, content)
+    let mut instrumented_files: Vec<(PathBuf, String)> = Vec::new();
     let mut all_macro_fn_names: Vec<String> = Vec::new();
     let mut all_concurrency: Vec<(String, String)> = Vec::new();
-    // Map from module stem to temp file name, for #[path] redirects.
-    let mut path_redirects: HashMap<String, String> = HashMap::new();
+    let mut all_source_maps: Vec<(String, SourceMap)> = Vec::new();
 
-    // Instrument non-root module files first
     for (target_path, target_map) in &config.targets {
         if target_path == source_key {
             continue; // Handle root file below
         }
-        // Only rewrite files whose config path shares the source_key's parent directory prefix
         let target_parent = target_path.parent();
-        let source_parent = source_key.parent();
-        if target_parent != source_parent
-            && !target_path.starts_with(source_parent.unwrap_or(Path::new("")))
-        {
+        if target_parent != Some(source_parent) && !target_path.starts_with(source_parent) {
             continue;
         }
 
@@ -342,19 +331,9 @@ fn rewrite_and_compile(
             .map(|s| s.as_str())
             .unwrap_or("");
 
-        // Resolve actual filesystem path from source_path's parent + relative path
-        let actual_path = if let Some(dir) = source_dir {
-            let rel_from_root = target_path
-                .strip_prefix(source_key.parent().unwrap_or(Path::new("")))
-                .unwrap_or(target_path);
-            dir.join(rel_from_root)
-        } else {
-            PathBuf::from(target_path)
-        };
-
-        let module_source = match std::fs::read_to_string(&actual_path) {
+        let module_source = match std::fs::read_to_string(target_path.as_ref() as &Path) {
             Ok(s) => s,
-            Err(_) => continue, // File not found, skip
+            Err(_) => continue,
         };
 
         let result = instrument_source(
@@ -369,24 +348,16 @@ fn rewrite_and_compile(
         all_macro_fn_names.extend(result.macro_fn_names);
         all_concurrency.extend(result.concurrency);
 
-        // Write temp file
-        let stem = actual_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy();
-        let temp_name = format!(".{stem}.piano.rs");
-        let temp_path = actual_path.with_file_name(&temp_name);
-        std::fs::write(&temp_path, &result.source)
-            .map_err(io_context("write temp file", &temp_path))?;
-        module_temps.push(TempFileGuard(temp_path));
-
-        // Record #[path] redirect: stem -> temp_name
-        path_redirects.insert(stem.to_string(), temp_name);
+        all_source_maps.push((
+            target_path.to_string_lossy().into_owned(),
+            result.source_map,
+        ));
+        instrumented_files.push((target_path.clone(), result.source));
     }
 
     // Instrument the crate root file
-    let source =
-        std::fs::read_to_string(source_path).map_err(io_context("read source", source_p))?;
+    let source = std::fs::read_to_string(source_path)
+        .map_err(io_context("read source", Path::new(source_path)))?;
     let root_target_map = config.targets.get(source_key);
     let module_prefix = config
         .module_prefixes
@@ -401,12 +372,7 @@ fn rewrite_and_compile(
     all_concurrency.extend(result.concurrency);
 
     let mut rewritten = result.source;
-    let mut source_map = result.source_map;
-
-    // Insert #[path] attributes for modules that have temp files
-    if !path_redirects.is_empty() {
-        rewritten = insert_mod_path_redirects(&rewritten, &path_redirects);
-    }
+    let source_map = result.source_map;
 
     // Entry point: inject registrations, allocator, shutdown
     if is_entry_point {
@@ -415,37 +381,48 @@ fn rewrite_and_compile(
 
         let (r, reg_map) = inject_registrations(&rewritten, &fn_names)
             .map_err(|e| Error::BuildFailed(format!("registration injection failed: {e}")))?;
-        source_map.merge(reg_map);
+        let mut merged_map = source_map;
+        merged_map.merge(reg_map);
         rewritten = r;
 
         let alloc_kind = detect_allocator_kind(&rewritten)
             .map_err(|e| Error::BuildFailed(format!("allocator detection failed: {e}")))?;
         let (r, alloc_map) = inject_global_allocator(&rewritten, alloc_kind)
             .map_err(|e| Error::BuildFailed(format!("allocator injection failed: {e}")))?;
-        source_map.merge(alloc_map);
+        merged_map.merge(alloc_map);
         rewritten = r;
 
         let runs_dir_str = config.entry_point.runs_dir.to_string_lossy().to_string();
         let (r, shutdown_map) = inject_shutdown(&rewritten, Some(&runs_dir_str))
             .map_err(|e| Error::BuildFailed(format!("shutdown injection failed: {e}")))?;
-        source_map.merge(shutdown_map);
+        merged_map.merge(shutdown_map);
         rewritten = r;
+
+        all_source_maps.push((source_path.to_string(), merged_map));
+    } else {
+        all_source_maps.push((source_path.to_string(), source_map));
     }
 
-    // Write temp file for the crate root
-    let stem = source_p.file_stem().unwrap_or_default().to_string_lossy();
-    let temp_name = format!(".{stem}.piano.rs");
-    let temp_path = source_p.with_file_name(&temp_name);
+    instrumented_files.push((source_key.to_path_buf(), rewritten));
 
-    std::fs::write(&temp_path, &rewritten).map_err(io_context("write temp file", &temp_path))?;
-    let _root_guard = TempFileGuard(temp_path.clone());
+    // Phase 2: Create staging overlay
+    let ws_root =
+        std::env::current_dir().map_err(io_context("get working directory", Path::new(".")))?;
+    let staging_root = config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("staging-{crate_name}"));
 
-    // Build modified rustc args
+    crate::staging::create_staging_overlay(&ws_root, &staging_root, &instrumented_files)?;
+    let _staging_guard = crate::staging::StagingGuard(staging_root.clone());
+
+    // Phase 3: Build modified rustc args
+    let staging_source = staging_root.join(source_path);
     let mut new_args = rustc_args.to_vec();
 
     for arg in &mut new_args {
         if arg == source_path {
-            *arg = temp_path.to_string_lossy().to_string();
+            *arg = staging_source.to_string_lossy().to_string();
         }
     }
 
@@ -454,45 +431,20 @@ fn rewrite_and_compile(
     new_args.push("-L".into());
     new_args.push(format!("dependency={}", config.runtime_deps_dir.display()));
 
+    // Remap staging paths back to original workspace paths for debug symbols.
+    // Trailing separator ensures the prefix match doesn't produce a leading '/'.
+    let staging_prefix = format!("{}/", staging_root.display());
     new_args.push("--remap-path-prefix".into());
-    new_args.push(format!("{}={}", temp_path.display(), source_path));
+    new_args.push(format!("{staging_prefix}="));
 
-    // Write source map to disk for the orchestrator to use in error remapping.
-    // The orchestrator extracts rendered errors from Cargo's JSON output and
-    // applies the source map there (the wrapper can't remap because Cargo uses
-    // --message-format=json which wraps rustc errors in JSON).
-    write_source_map(source_path, &source_map, config_path);
+    write_source_maps_batch(&all_source_maps, config_path);
     write_concurrency(&all_concurrency, config_path);
 
     let exit_code = exec_rustc(real_rustc, &new_args);
 
-    // module_temps and _root_guard drop here, cleaning up all temp files
-    drop(module_temps);
+    // _staging_guard drops here, removing the staging directory
 
     Ok(exit_code)
-}
-
-/// Insert `#[path = "..."]` attributes before `mod` declarations that have
-/// corresponding temp files. This redirects rustc to compile the instrumented
-/// module file instead of the original.
-///
-/// Uses regex matching instead of line-based matching because instrument_source
-/// emits single-line output via to_token_stream().to_string().
-fn insert_mod_path_redirects(source: &str, redirects: &HashMap<String, String>) -> String {
-    let mut result = source.to_string();
-    for (mod_name, temp_name) in redirects {
-        // Match: (pub|pub(crate)|pub(super)|pub(in path))? mod <name> ;
-        // Handles original formatting and token-stream output (which adds
-        // spaces around punctuation, e.g., `pub (crate) mod foo ;`).
-        let pattern = format!(
-            r"((?:pub(?:\s*\([^)]*\))?\s+)?mod\s+{}\s*;)",
-            regex::escape(mod_name)
-        );
-        let re = regex::Regex::new(&pattern).unwrap();
-        let attr = format!("#[path = \"{temp_name}\"] ");
-        result = re.replace(&result, format!("{attr}$1")).to_string();
-    }
-    result
 }
 
 fn exec_rustc(rustc: &str, args: &[String]) -> i32 {
