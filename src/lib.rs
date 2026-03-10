@@ -4,4 +4,5 @@ pub mod naming;
 pub mod report;
 pub mod resolve;
 pub mod rewrite;
+pub mod runtime_embed;
 pub mod source_map;

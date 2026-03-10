@@ -613,6 +613,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml_edit",
+ "walkdir",
 ]
 
 [[package]]

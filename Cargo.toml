@@ -44,3 +44,4 @@ tempfile = "3"
 
 [build-dependencies]
 toml_edit = "0.22"
+walkdir = "2"
