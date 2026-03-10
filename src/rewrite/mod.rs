@@ -78,7 +78,7 @@ pub fn instrument_source(
 
     // Macro instrumentation uses token-stream mutation (separate from the
     // string-injection path). Apply it on the rewritten source if needed.
-    // prettyplease reformats the entire file, invalidating our source_map,
+    // ToTokens reformats the entire file, invalidating our source_map,
     // so we reset it to empty when this path is taken.
     let (final_source, final_map, macro_fn_names) = if instrument_macros {
         let mut rewritten_file: syn::File = syn::parse_str(&rewritten)?;
@@ -87,8 +87,13 @@ pub fn instrument_source(
             collected_names: Vec::new(),
         };
         macro_visitor.visit_file_mut(&mut rewritten_file);
+        // Use ToTokens instead of prettyplease to preserve #[cfg] attributes.
+        // prettyplease::unparse destroys cfg attrs on block exprs in match arms
+        // (#560, #561). The output here is compiled and discarded, so formatting
+        // quality doesn't matter.
+        let token_source = quote!(#rewritten_file).to_string();
         (
-            prettyplease::unparse(&rewritten_file),
+            token_source,
             SourceMap::default(),
             macro_visitor.collected_names,
         )
@@ -2590,6 +2595,68 @@ mod inner {
         assert!(
             result.contains(r#"piano_runtime::enter("inner::foo")"#),
             "inline mod should qualify guard name. Got:\n{result}",
+        );
+    }
+
+    #[test]
+    fn cfg_attr_on_match_arm_block_preserved() {
+        // Regression for #560: prettyplease stripped braces from match arms,
+        // exposing #[cfg] attributes on bare expressions (E0658).
+        let source = r#"
+fn dispatch(step: u8) {
+    match step {
+        1 => {
+            #[cfg(unix)]
+            do_unix_thing();
+        }
+        _ => {}
+    }
+}
+"#;
+        let targets = test_targets(&["dispatch"]);
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
+        // The #[cfg(unix)] must remain INSIDE a block, not on a bare expression.
+        assert!(
+            result.contains("# [cfg (unix)]"),
+            "cfg attribute must be preserved. Got:\n{result}",
+        );
+        // Must NOT have `=> #[cfg(unix)]` (attribute on bare match arm expression).
+        assert!(
+            !result.contains("=> # [cfg (unix)]"),
+            "cfg must not be on bare match arm expr (E0658). Got:\n{result}",
+        );
+    }
+
+    #[test]
+    fn cfg_feature_block_in_match_arm_preserved() {
+        // Regression for #561: prettyplease erased #[cfg(feature)] blocks
+        // entirely, making conditional code unconditional (E0433).
+        let source = r#"
+fn dispatch(step: u8) {
+    match step {
+        1 => {
+            #[cfg(feature = "optional")]
+            {
+                optional_mod::do_thing();
+            }
+        }
+        _ => {}
+    }
+}
+"#;
+        let targets = test_targets(&["dispatch"]);
+        let result = instrument_source(source, &targets, true, "")
+            .unwrap()
+            .source;
+        assert!(
+            result.contains("# [cfg (feature = \"optional\")]"),
+            "cfg(feature) gate must be preserved. Got:\n{result}",
+        );
+        assert!(
+            result.contains("optional_mod :: do_thing"),
+            "gated code must still be present. Got:\n{result}",
         );
     }
 }
