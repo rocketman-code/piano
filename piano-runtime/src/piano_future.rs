@@ -155,6 +155,7 @@ mod tests {
     use super::*;
     use crate::collector;
     use crate::collector::{lookup_name, unpack_name_id};
+    use serial_test::serial;
 
     fn run<F: Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_multi_thread()
@@ -166,6 +167,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn piano_future_basic_enter_drop() {
         collector::reset();
         run(async {
@@ -180,6 +182,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn piano_future_stack_restored_after_yield() {
         collector::reset();
         run(async {
@@ -198,6 +201,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn piano_future_nested_parent_child() {
         collector::reset();
         run(async {
@@ -232,6 +236,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn piano_future_stack_isolation_between_tasks() {
         collector::reset();
         run(async {
@@ -265,6 +270,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn piano_future_cancelled_by_select() {
         // When select! cancels a branch, the PianoFuture is dropped without
         // completing. The Drop impl must push saved entries back onto the
@@ -299,6 +305,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn piano_future_alloc_tracking() {
         collector::reset();
         run(async {
@@ -329,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial]
     fn piano_future_with_fork_adopt() {
         collector::reset();
         run(async {
@@ -366,6 +373,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn piano_future_split_index_correctness() {
         // Verifies that the stack split in poll() correctly separates
         // this future's entries from entries below it on the stack.
@@ -413,6 +421,7 @@ mod tests {
     /// under-counted across yields.
     #[cfg(feature = "cpu-time")]
     #[test]
+    #[serial]
     fn piano_future_cpu_time_across_yields() {
         collector::reset();
         run(async {
@@ -465,6 +474,7 @@ mod tests {
     /// virtual start_tsc would not encode prior poll time, causing self_ms
     /// for async functions to include suspension gaps.
     #[test]
+    #[serial]
     fn piano_future_wall_time_across_yields() {
         collector::reset();
         run(async {
@@ -508,6 +518,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn piano_future_drop_restores_stack_for_cancelled_guards() {
         // Verifies that PianoFuture::drop pushes saved_entries back onto
         // the STACK so Guards inside the cancelled future can pop cleanly.
