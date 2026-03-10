@@ -6,3 +6,4 @@ pub mod resolve;
 pub mod rewrite;
 pub mod runtime_embed;
 pub mod source_map;
+pub mod wrapper;
