@@ -27,13 +27,23 @@ fn main() {
     println!("cargo::rustc-env=PIANO_RUNTIME_VERSION={version}");
 
     // --- New: embed runtime source ---
-    let runtime_dir = if Path::new("piano-runtime/src/lib.rs").exists() {
-        PathBuf::from("piano-runtime")
+    // In workspace builds, piano-runtime/ is the workspace sibling.
+    // In crates.io packages, runtime-src/ holds a copy (Cargo.toml renamed
+    // to Cargo.toml.embed so cargo doesn't auto-detect it as a package).
+    let (runtime_dir, cargo_toml_name) = if Path::new("piano-runtime/src/lib.rs").exists() {
+        (PathBuf::from("piano-runtime"), "Cargo.toml")
     } else if Path::new("runtime-src/src/lib.rs").exists() {
-        PathBuf::from("runtime-src")
+        (PathBuf::from("runtime-src"), "Cargo.toml.embed")
     } else {
-        // When neither exists (shouldn't happen in normal builds),
-        // skip embedding. The wrapper will error at runtime if needed.
+        // When neither exists (crates.io package without workspace sibling),
+        // generate a stub so src/runtime_embed.rs compiles. The wrapper will
+        // error at runtime if write_to_disk is called with no files.
+        let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+        std::fs::write(
+            out_dir.join("runtime_embed.rs"),
+            "pub fn files() -> &'static [(&'static str, &'static str)] { &[] }\n",
+        )
+        .unwrap();
         return;
     };
 
@@ -44,7 +54,7 @@ fn main() {
     let mut files: Vec<(String, PathBuf)> = Vec::new();
 
     // Cargo.toml (with [workspace] injected)
-    let cargo_toml_src = runtime_dir.join("Cargo.toml");
+    let cargo_toml_src = runtime_dir.join(cargo_toml_name);
     std::fs::create_dir_all(embed_dir.join("src")).unwrap();
     let mut cargo_content = std::fs::read_to_string(&cargo_toml_src).unwrap();
     // Strip [[bench]], [dev-dependencies], and [[test]] sections -- these reference
