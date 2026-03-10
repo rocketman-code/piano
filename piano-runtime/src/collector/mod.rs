@@ -786,7 +786,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                 }
             }
 
-            RECORDS_BUF.with(|buf| {
+            let _ = RECORDS_BUF.try_with(|buf| {
                 merge_into_fnagg_vec(
                     &mut buf.borrow_mut(),
                     name,
@@ -805,7 +805,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
             {
                 let start_ns =
                     crate::tsc::ticks_to_epoch_ns(guard.start_tsc, crate::tsc::epoch_tsc());
-                INVOCATIONS.with(|inv| {
+                let _ = INVOCATIONS.try_with(|inv| {
                     inv.borrow_mut().push(InvocationRecord {
                         name,
                         start_ns,
@@ -822,7 +822,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                 });
             }
 
-            FRAME_BUFFER.with(|buf| {
+            let _ = FRAME_BUFFER.try_with(|buf| {
                 merge_into_frame_buf(
                     &mut buf.borrow_mut(),
                     name,
@@ -843,7 +843,7 @@ fn drop_cold(guard: &Guard, end_tsc: u64, #[cfg(feature = "cpu-time")] cpu_end_n
                 flush_records_buf();
             }
             if unpack_depth(entry.packed) == 0 {
-                FRAME_BUFFER.with(|buf| {
+                let _ = FRAME_BUFFER.try_with(|buf| {
                     let mut b = buf.borrow_mut();
                     // Apply amortized CPU bias correction before streaming.
                     #[cfg(feature = "cpu-time")]
