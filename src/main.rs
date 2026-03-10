@@ -486,6 +486,7 @@ fn build_project(
 
     // Clean stale temp files from previous crashed runs.
     clean_stale_piano_files(&src_dir)?;
+    piano::staging::clean_stale_staging(&target_dir);
 
     let runs_dir = target_dir.join("runs");
     std::fs::create_dir_all(&runs_dir).map_err(io_context("create directory", &runs_dir))?;
