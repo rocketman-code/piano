@@ -13,6 +13,24 @@ repository = "https://github.com/rocketman-code/piano"
 keywords = ["profiling", "profiler", "instrumentation", "performance", "timing"]
 categories = ["development-tools::profiling"]
 
+include = [
+    "src/**",
+    "tests/**",
+    "build.rs",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    ".cargo/**",
+    ".github/**",
+    ".gitignore",
+    "codecov.yml",
+    "docs/**",
+    "rust-toolchain.toml",
+    "runtime-src/Cargo.toml.embed",
+    "runtime-src/src/**",
+]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 syn = { version = "2", features = ["full", "visit", "visit-mut"] }
