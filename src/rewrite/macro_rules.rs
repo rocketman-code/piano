@@ -858,11 +858,11 @@ fn main() {}
             .source;
 
         assert!(
-            result.contains("stringify!"),
+            result.contains("stringify"),
             "macro fn with metavar name should use stringify!. Got:\n{result}"
         );
         assert!(
-            result.contains("piano_runtime::enter"),
+            result.contains("piano_runtime :: enter"),
             "macro fn should get a guard. Got:\n{result}"
         );
     }
@@ -885,7 +885,7 @@ fn main() {}
             .source;
 
         assert!(
-            result.contains(r#"piano_runtime::enter("initialize")"#),
+            result.contains(r#"piano_runtime :: enter ("initialize")"#),
             "macro fn with literal name should use string literal. Got:\n{result}"
         );
     }
@@ -908,7 +908,7 @@ fn main() {}
             .source;
 
         assert!(
-            result.contains("piano_runtime::enter"),
+            result.contains("piano_runtime :: enter"),
             "pub async fn in macro should be instrumented. Got:\n{result}"
         );
     }
@@ -935,10 +935,10 @@ fn main() {}
             .source;
 
         assert!(
-            result.contains(r#"piano_runtime::enter("normal")"#),
+            result.contains(r#"piano_runtime :: enter ("normal")"#),
             "normal fn should be instrumented. Got:\n{result}"
         );
-        let enter_count = result.matches("piano_runtime::enter").count();
+        let enter_count = result.matches("piano_runtime :: enter").count();
         assert_eq!(
             enter_count, 1,
             "only normal fn should be instrumented, not const/unsafe/extern. Got:\n{result}"
@@ -963,15 +963,15 @@ fn main() {}
             .source;
 
         assert!(
-            result.contains(r#"piano_runtime::enter("rust_abi")"#),
+            result.contains(r#"piano_runtime :: enter ("rust_abi")"#),
             "extern \"Rust\" fn should be instrumented. Got:\n{result}"
         );
         assert!(
-            result.contains(r#"piano_runtime::enter("pub_rust_abi")"#),
+            result.contains(r#"piano_runtime :: enter ("pub_rust_abi")"#),
             "pub extern \"Rust\" fn should be instrumented. Got:\n{result}"
         );
         assert!(
-            !result.contains(r#"piano_runtime::enter("c_abi")"#),
+            !result.contains(r#"piano_runtime :: enter ("c_abi")"#),
             "extern \"C\" fn should NOT be instrumented. Got:\n{result}"
         );
     }
@@ -993,7 +993,7 @@ fn main() {}
             .source;
 
         assert!(
-            result.contains(r#"piano_runtime::enter("process")"#),
+            result.contains(r#"piano_runtime :: enter ("process")"#),
             "fn after const variable should still be instrumented. Got:\n{result}"
         );
     }
@@ -1014,7 +1014,7 @@ fn main() {}
             .unwrap()
             .source;
 
-        let enter_count = result.matches("piano_runtime::enter").count();
+        let enter_count = result.matches("piano_runtime :: enter").count();
         assert_eq!(
             enter_count, 2,
             "both fns in macro should be instrumented. Got:\n{result}"
@@ -1039,7 +1039,7 @@ fn main() {}
             .unwrap()
             .source;
 
-        let enter_count = result.matches("piano_runtime::enter").count();
+        let enter_count = result.matches("piano_runtime :: enter").count();
         assert_eq!(
             enter_count, 2,
             "fn in each rule arm should be instrumented. Got:\n{result}"
@@ -1062,7 +1062,7 @@ fn main() {}
             .source;
 
         assert!(
-            !result.contains("piano_runtime::enter"),
+            !result.contains("piano_runtime :: enter"),
             "macro without fn should not be modified. Got:\n{result}"
         );
     }
@@ -1083,7 +1083,7 @@ fn main() {}
             .source;
 
         assert!(
-            result.contains("piano_runtime::enter"),
+            result.contains("piano_runtime :: enter"),
             "fn in paren-delimited template should be instrumented. Got:\n{result}"
         );
     }
@@ -1104,7 +1104,7 @@ fn main() {}
             .source;
 
         assert!(
-            !result.contains("piano_runtime::enter"),
+            !result.contains("piano_runtime :: enter"),
             "instrument_macros=false should skip macro instrumentation. Got:\n{result}"
         );
     }
@@ -1127,7 +1127,7 @@ fn main() {}
             .source;
 
         assert!(
-            result.contains("piano_runtime::enter"),
+            result.contains("piano_runtime :: enter"),
             "generic fn in macro should be instrumented. Got:\n{result}"
         );
     }
@@ -1150,7 +1150,7 @@ fn main() {}
             .source;
 
         assert!(
-            result.contains(r#"piano_runtime::enter("process")"#),
+            result.contains(r#"piano_runtime :: enter ("process")"#),
             "generic fn with Fn() -> T bound in macro should be instrumented. Got:\n{result}"
         );
     }
@@ -1173,7 +1173,7 @@ fn main() {}
             .source;
 
         assert!(
-            result.contains(r#"piano_runtime::enter("apply")"#),
+            result.contains(r#"piano_runtime :: enter ("apply")"#),
             "generic fn with Fn() -> Option<bool> bound in macro should be instrumented. Got:\n{result}"
         );
     }
@@ -1222,7 +1222,7 @@ fn main() {}
             .unwrap()
             .source;
         assert!(
-            result.contains(r#"piano_runtime::enter("Cruncher::process")"#),
+            result.contains(r#"piano_runtime :: enter ("Cruncher::process")"#),
             "method in impl with literal type should be qualified. Got:\n{result}"
         );
     }
@@ -1246,7 +1246,7 @@ fn main() {}
             .unwrap()
             .source;
         assert!(
-            result.contains(r#"piano_runtime::enter("Container::process")"#),
+            result.contains(r#"piano_runtime :: enter ("Container::process")"#),
             "generic impl should still qualify method name. Got:\n{result}"
         );
     }
@@ -1271,7 +1271,7 @@ fn main() {}
             .source;
         for method in &["new", "crunch_small", "crunch_large"] {
             assert!(
-                result.contains(&format!(r#"piano_runtime::enter("Cruncher::{method}")"#)),
+                result.contains(&format!(r#"piano_runtime :: enter ("Cruncher::{method}")"#)),
                 "method '{method}' should be qualified as Cruncher::{method}. Got:\n{result}"
             );
         }
@@ -1296,7 +1296,7 @@ fn main() {}
             .unwrap()
             .source;
         assert!(
-            result.contains(r#"piano_runtime::enter("Cruncher::fmt")"#),
+            result.contains(r#"piano_runtime :: enter ("Cruncher::fmt")"#),
             "impl Trait for Type should qualify with Type, not Trait. Got:\n{result}"
         );
     }
@@ -1319,14 +1319,14 @@ fn main() {}
         let result = instrument_source(source, &targets, true, "")
             .unwrap()
             .source;
-        // concat!(stringify!($ty), "::", "process") — prettyplease may reformat spacing.
+        // concat!(stringify!($ty), "::", "process") — ToTokens may reformat spacing.
         assert!(
             result.contains("concat") && result.contains("stringify") && result.contains("process"),
             "method in impl $ty should use concat+stringify. Got:\n{result}"
         );
         // Must NOT contain the bare unqualified name.
         assert!(
-            !result.contains(r#"piano_runtime::enter("process")"#),
+            !result.contains(r#"piano_runtime :: enter ("process")"#),
             "should not have bare unqualified name. Got:\n{result}"
         );
     }
@@ -1373,7 +1373,7 @@ fn main() {}
             .unwrap()
             .source;
         assert!(
-            result.contains(r#"piano_runtime::enter("api::Handler::validate")"#),
+            result.contains(r#"piano_runtime :: enter ("api::Handler::validate")"#),
             "macro fn should use module prefix. Got:\n{result}"
         );
     }
@@ -1393,7 +1393,7 @@ fn main() {}
             .unwrap()
             .source;
         assert!(
-            result.contains(r#"piano_runtime::enter("worker::process")"#),
+            result.contains(r#"piano_runtime :: enter ("worker::process")"#),
             "top-level macro fn should use module prefix. Got:\n{result}"
         );
     }

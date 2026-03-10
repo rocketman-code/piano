@@ -603,7 +603,6 @@ dependencies = [
  "clap",
  "ignore",
  "libc",
- "prettyplease",
  "proc-macro2",
  "proptest",
  "quote",

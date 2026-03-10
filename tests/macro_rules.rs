@@ -183,7 +183,7 @@ fn main() {
 
     // Verify the guards were actually injected.
     assert!(
-        result.source.contains("piano_runtime::enter"),
+        result.source.contains("piano_runtime :: enter"),
         "instrumented source should contain piano_runtime::enter guards.\nSource:\n{}",
         result.source
     );
