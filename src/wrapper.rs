@@ -64,6 +64,37 @@ pub fn read_source_maps(config_path: &Path) -> HashMap<PathBuf, SourceMap> {
     serde_json::from_str(&content).unwrap_or_default()
 }
 
+/// Derive the concurrency output file path from the config file path.
+pub fn concurrency_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("concurrency.ndjson")
+}
+
+/// Read concurrency entries written by wrapper processes during instrumentation.
+/// Each line is a JSON object: {"func": "name", "pattern": "par_iter"}
+pub fn read_concurrency(config_path: &Path) -> Vec<(String, String)> {
+    let path = concurrency_path(config_path);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let entry: ConcurrencyEntry = serde_json::from_str(line).ok()?;
+            Some((entry.func, entry.pattern))
+        })
+        .collect()
+}
+
+/// A single concurrency detection entry in the NDJSON file.
+#[derive(Debug, Serialize, Deserialize)]
+struct ConcurrencyEntry {
+    func: String,
+    pattern: String,
+}
+
 /// Parsed fields from rustc's command-line arguments.
 #[derive(Debug)]
 pub struct ParsedRustcArgs {
@@ -241,6 +272,36 @@ fn write_source_map(source_file: &str, map: &SourceMap, config_path: &Path) {
     }
 }
 
+/// Write concurrency entries to the shared NDJSON file using O_APPEND.
+/// Each wrapper invocation accumulates entries in memory, then writes them
+/// all in a single atomic append. Safe for concurrent wrapper processes.
+fn write_concurrency(entries: &[(String, String)], config_path: &Path) {
+    if entries.is_empty() {
+        return;
+    }
+    let path = concurrency_path(config_path);
+    let mut buf = String::new();
+    for (func, pattern) in entries {
+        let entry = ConcurrencyEntry {
+            func: func.clone(),
+            pattern: pattern.clone(),
+        };
+        // serde_json::to_string won't fail for simple string fields.
+        if let Ok(json) = serde_json::to_string(&entry) {
+            buf.push_str(&json);
+            buf.push('\n');
+        }
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let _ = std::io::Write::write_all(&mut f, buf.as_bytes());
+}
+
 fn rewrite_and_compile(
     real_rustc: &str,
     rustc_args: &[String],
@@ -257,6 +318,7 @@ fn rewrite_and_compile(
     // These are config target files that share the same directory prefix.
     let mut module_temps: Vec<TempFileGuard> = Vec::new();
     let mut all_macro_fn_names: Vec<String> = Vec::new();
+    let mut all_concurrency: Vec<(String, String)> = Vec::new();
     // Map from module stem to temp file name, for #[path] redirects.
     let mut path_redirects: HashMap<String, String> = HashMap::new();
 
@@ -305,6 +367,7 @@ fn rewrite_and_compile(
             Error::BuildFailed(format!("rewrite failed for {}: {e}", target_path.display()))
         })?;
         all_macro_fn_names.extend(result.macro_fn_names);
+        all_concurrency.extend(result.concurrency);
 
         // Write temp file
         let stem = actual_path
@@ -335,6 +398,7 @@ fn rewrite_and_compile(
     let result = instrument_source(&source, targets, config.instrument_macros, module_prefix)
         .map_err(|e| Error::BuildFailed(format!("rewrite failed: {e}")))?;
     all_macro_fn_names.extend(result.macro_fn_names);
+    all_concurrency.extend(result.concurrency);
 
     let mut rewritten = result.source;
     let mut source_map = result.source_map;
@@ -398,6 +462,7 @@ fn rewrite_and_compile(
     // applies the source map there (the wrapper can't remap because Cargo uses
     // --message-format=json which wraps rustc errors in JSON).
     write_source_map(source_path, &source_map, config_path);
+    write_concurrency(&all_concurrency, config_path);
 
     let exit_code = exec_rustc(real_rustc, &new_args);
 
@@ -527,6 +592,87 @@ mod tests {
         let args = vec!["-vV".into()];
         let parsed = ParsedRustcArgs::parse(&args);
         assert!(parsed.is_info_query);
+    }
+
+    #[test]
+    fn concurrency_path_derives_from_config() {
+        let config = Path::new("/target/piano/config.json");
+        assert_eq!(
+            super::concurrency_path(config),
+            PathBuf::from("/target/piano/concurrency.ndjson"),
+        );
+    }
+
+    #[test]
+    fn read_concurrency_empty_when_missing() {
+        let config = Path::new("/tmp/nonexistent/config.json");
+        assert!(super::read_concurrency(config).is_empty());
+    }
+
+    #[test]
+    fn read_concurrency_parses_ndjson() {
+        let dir = std::env::temp_dir().join("piano-test-concurrency");
+        let _ = std::fs::create_dir_all(&dir);
+        let config = dir.join("config.json");
+        let ndjson_path = dir.join("concurrency.ndjson");
+        std::fs::write(
+            &ndjson_path,
+            "{\"func\":\"a\",\"pattern\":\"par_iter\"}\n{\"func\":\"b\",\"pattern\":\"rayon::scope\"}\n",
+        )
+        .unwrap();
+
+        let result = super::read_concurrency(&config);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ("a".to_string(), "par_iter".to_string()));
+        assert_eq!(result[1], ("b".to_string(), "rayon::scope".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_concurrency_appends_ndjson() {
+        let dir = std::env::temp_dir().join("piano-test-write-concurrency");
+        let _ = std::fs::create_dir_all(&dir);
+        let config = dir.join("config.json");
+        let ndjson_path = super::concurrency_path(&config);
+        let _ = std::fs::remove_file(&ndjson_path);
+
+        // First write (simulates wrapper process 1)
+        let entries1 = vec![("func_a".to_string(), "par_iter".to_string())];
+        super::write_concurrency(&entries1, &config);
+
+        // Second write (simulates wrapper process 2)
+        let entries2 = vec![
+            ("func_b".to_string(), "rayon::scope".to_string()),
+            ("func_c".to_string(), "par_iter".to_string()),
+        ];
+        super::write_concurrency(&entries2, &config);
+
+        // Both writes should be present
+        let result = super::read_concurrency(&config);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, "func_a");
+        assert_eq!(result[1].0, "func_b");
+        assert_eq!(result[2].0, "func_c");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_concurrency_skips_empty() {
+        let dir = std::env::temp_dir().join("piano-test-write-empty");
+        let _ = std::fs::create_dir_all(&dir);
+        let config = dir.join("config.json");
+        let ndjson_path = super::concurrency_path(&config);
+        let _ = std::fs::remove_file(&ndjson_path);
+
+        super::write_concurrency(&[], &config);
+        assert!(
+            !ndjson_path.exists(),
+            "should not create file for empty entries"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
