@@ -25,10 +25,8 @@ include = [
     ".github/**",
     ".gitignore",
     "codecov.yml",
-    "docs/**",
+    "docs/standards/**",
     "rust-toolchain.toml",
-    "runtime-src/Cargo.toml.embed",
-    "runtime-src/src/**",
 ]
 
 [dependencies]
@@ -62,4 +60,3 @@ tempfile = "3"
 
 [build-dependencies]
 toml_edit = "0.22"
-walkdir = "2"
