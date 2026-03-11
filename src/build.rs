@@ -388,19 +388,50 @@ pub struct PrebuiltRuntime {
 
 /// Pre-build piano-runtime as an rlib using the user's toolchain.
 ///
-/// Writes the embedded source to `target_dir/runtime-src/`, runs
-/// `cargo build --release`, and locates the output rlib. Cargo's
-/// fingerprinting caches the result across runs.
+/// Creates a minimal crate that depends on `piano-runtime` from crates.io,
+/// builds it with `cargo build --release`, and locates the output rlib.
+/// Cargo's fingerprinting and registry cache avoid redundant downloads.
 pub fn prebuild_runtime(
     project_dir: &Path,
     target_dir: &Path,
     features: &[&str],
 ) -> Result<PrebuiltRuntime, Error> {
     let src_dir = target_dir.join("runtime-src");
-    crate::runtime_embed::write_to_disk(&src_dir)
-        .map_err(io_context("write runtime source to", &src_dir))?;
+    std::fs::create_dir_all(src_dir.join("src"))
+        .map_err(io_context("create directory", &src_dir))?;
 
-    build_runtime_rlib(&src_dir, project_dir, target_dir, features)
+    let version = env!("PIANO_RUNTIME_VERSION");
+
+    let dep_spec = if features.is_empty() {
+        format!("\"{version}\"")
+    } else {
+        let feat_list = features
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{ version = \"{version}\", features = [{feat_list}] }}")
+    };
+
+    let cargo_toml = format!(
+        "[package]\n\
+         name = \"piano-runtime-fetcher\"\n\
+         version = \"0.0.0\"\n\
+         edition = \"2021\"\n\
+         \n\
+         [dependencies]\n\
+         piano-runtime = {dep_spec}\n\
+         \n\
+         [workspace]\n"
+    );
+
+    std::fs::write(src_dir.join("Cargo.toml"), cargo_toml)
+        .map_err(io_context("write Cargo.toml", &src_dir))?;
+    std::fs::write(src_dir.join("src/lib.rs"), "")
+        .map_err(io_context("write src/lib.rs", &src_dir))?;
+
+    // Features are specified in the Cargo.toml dep, so pass empty to the builder.
+    build_runtime_rlib(&src_dir, project_dir, target_dir, &[])
 }
 
 /// Pre-build piano-runtime from a local source path (for --runtime-path).
@@ -527,12 +558,16 @@ fn build_runtime_rlib(
     // with different JSON schema or "Fresh" artifacts), search the build dir.
     let rlib_path = match rlib_path {
         Some(p) => p,
-        None => find_rlib_in_dir(&build_dir.join("release"))?,
+        None => {
+            let release_dir = build_dir.join("release");
+            find_rlib_in_dir(&release_dir)
+                .or_else(|_| find_rlib_in_dir(&release_dir.join("deps")))?
+        }
     };
-    // The rlib may be at release/libpiano_runtime.rlib; deps dir is release/deps/
-    // which contains transitive dependency rlibs (needed for -L dependency=).
-    let release_dir = rlib_path.parent().unwrap_or(&build_dir);
-    let deps_dir = release_dir.join("deps");
+    // The deps dir is release/deps/ which contains transitive dependency rlibs
+    // (needed for -L dependency=). The rlib itself may be in release/ or release/deps/
+    // depending on whether piano-runtime is the root crate or a dependency.
+    let deps_dir = build_dir.join("release").join("deps");
 
     Ok(PrebuiltRuntime {
         rlib_path,
