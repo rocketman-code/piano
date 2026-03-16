@@ -60,12 +60,16 @@ static BIAS_TICKS: AtomicU64 = AtomicU64::new(0);
 #[inline(always)]
 pub fn read() -> u64 {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: _rdtsc reads the timestamp counter. No memory safety
+    // implications — returns a u64 counter value.
     unsafe {
         core::arch::x86_64::_rdtsc()
     }
     #[cfg(target_arch = "aarch64")]
     {
         let val: u64;
+        // SAFETY: mrs cntvct_el0 reads the generic timer counter register.
+        // Architecturally guaranteed available at EL0 on all aarch64.
         unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) val) };
         val
     }

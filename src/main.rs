@@ -524,13 +524,18 @@ fn build_project(
             })
             .collect();
         all_fn_names.extend(macro_fn_names);
+        let all_fn_ids: Vec<(u32, &str)> = all_fn_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (i as u32, name.as_str()))
+            .collect();
         let main_source =
             std::fs::read_to_string(&main_file).map_err(|source| Error::RunReadError {
                 path: bin_entry.clone(),
                 source,
             })?;
         let (rewritten, reg_map) =
-            inject_registrations(&main_source, &all_fn_names).map_err(|source| {
+            inject_registrations(&main_source, &all_fn_ids).map_err(|source| {
                 Error::ParseError {
                     path: bin_entry.clone(),
                     source,
@@ -552,7 +557,7 @@ fn build_project(
 
         let runs_dir_str = runs_dir.to_string_lossy().to_string();
         let (rewritten, shutdown_map) =
-            inject_shutdown(&rewritten, Some(&runs_dir_str)).map_err(|source| {
+            inject_shutdown(&rewritten, &runs_dir_str, false).map_err(|source| {
                 Error::ParseError {
                     path: bin_entry.clone(),
                     source,

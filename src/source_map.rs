@@ -504,13 +504,13 @@ mod tests {
         let mut map = result.source_map;
         let mut current = result.source;
 
-        let (s, m) = inject_registrations(&current, &["work".to_string()]).unwrap();
+        let (s, m) = inject_registrations(&current, &[(0, "work")]).unwrap();
         map.merge(m);
         current = s;
         let (s, m) = inject_global_allocator(&current, AllocatorKind::Absent).unwrap();
         map.merge(m);
         current = s;
-        let (s, m) = inject_shutdown(&current, None).unwrap();
+        let (s, m) = inject_shutdown(&current, "/tmp/piano/runs", false).unwrap();
         map.merge(m);
 
         // fn main() should remap to original line 1
@@ -549,7 +549,7 @@ mod tests {
         let mut map = result.source_map;
         let mut current = result.source;
 
-        let (s, m) = inject_registrations(&current, &["work".to_string()]).unwrap();
+        let (s, m) = inject_registrations(&current, &[(0, "work")]).unwrap();
         map.merge(m);
         current = s;
 
@@ -557,7 +557,7 @@ mod tests {
         map.merge(m);
         current = s;
 
-        let (s, m) = inject_shutdown(&current, None).unwrap();
+        let (s, m) = inject_shutdown(&current, "/tmp/piano/runs", false).unwrap();
         map.merge(m);
 
         // "let bad: i32" is on original line 8.

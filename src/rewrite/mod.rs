@@ -805,24 +805,23 @@ impl<'s> Visit<'s> for InjectionCollector<'s> {
 /// was never called during the run.
 pub fn inject_registrations(
     source: &str,
-    names: &[String],
+    names: &[(u32, &str)],
 ) -> Result<(String, SourceMap), syn::Error> {
     let file: syn::File = syn::parse_str(source)?;
     let mut injector = StringInjector::new();
-    for item in &file.items {
-        if let syn::Item::Fn(func) = item {
-            if func.sig.ident == "main" {
-                let open = func.block.brace_token.span.open().start();
-                let byte_offset = skip_inner_attrs(source, line_col_to_byte(source, open) + 1);
-                let mut text = String::new();
-                for name in names {
-                    text.push_str(&format!("\n    piano_runtime::register(\"{name}\");"));
-                }
-                injector.insert(byte_offset, text);
-                break;
-            }
-        }
+
+    let insert_pos = match file.attrs.last() {
+        Some(attr) => line_col_to_byte(source, attr.span().end()),
+        None => 0,
+    };
+
+    let mut text = String::from("\nconst PIANO_NAMES: &[(u32, &str)] = &[");
+    for (id, name) in names {
+        text.push_str(&format!("({id}, {name:?}), "));
     }
+    text.push_str("];\n");
+
+    injector.insert(insert_pos, text);
     Ok(injector.apply(source))
 }
 
@@ -928,21 +927,29 @@ fn c() {}
     }
 
     #[test]
-    fn injects_register_calls_in_main() {
+    fn injects_name_table_at_file_level() {
         let source = r#"
 fn main() {
     do_stuff();
 }
 "#;
-        let names = vec!["walk".to_string(), "parse".to_string()];
+        let names = vec![(0, "walk"), (1, "parse")];
         let (result, _map) = inject_registrations(source, &names).unwrap();
         assert!(
-            result.contains("piano_runtime::register(\"walk\")"),
-            "Got:\n{result}"
+            result.contains("const PIANO_NAMES: &[(u32, &str)]"),
+            "should have name table const. Got:\n{result}"
         );
         assert!(
-            result.contains("piano_runtime::register(\"parse\")"),
-            "Got:\n{result}"
+            result.contains("(0, \"walk\")"),
+            "should contain walk entry. Got:\n{result}"
+        );
+        assert!(
+            result.contains("(1, \"parse\")"),
+            "should contain parse entry. Got:\n{result}"
+        );
+        assert!(
+            !result.contains("piano_runtime::register"),
+            "should NOT have register calls. Got:\n{result}"
         );
     }
 
@@ -2273,23 +2280,23 @@ fn work() {
     }
 
     #[test]
-    fn registrations_preserve_inner_attrs_in_main() {
-        let source = r#"
+    fn registrations_insert_after_file_level_inner_attrs() {
+        let source = r#"#![allow(unused)]
+
 fn main() {
-    #![allow(unused)]
     do_stuff();
 }
 "#;
-        let (result, _map) = inject_registrations(source, &["work".to_string()]).unwrap();
+        let (result, _map) = inject_registrations(source, &[(0, "work")]).unwrap();
 
         syn::parse_str::<syn::File>(&result)
             .unwrap_or_else(|e| panic!("rewritten source should parse: {e}\n\n{result}"));
 
         let attr_pos = result.find("#![allow(unused)]").unwrap();
-        let reg_pos = result.find("piano_runtime::register").unwrap();
+        let names_pos = result.find("PIANO_NAMES").unwrap();
         assert!(
-            attr_pos < reg_pos,
-            "inner attr must precede registration. Got:\n{result}"
+            names_pos > attr_pos,
+            "name table must come after file-level inner attrs. Got:\n{result}"
         );
     }
 
@@ -2311,7 +2318,7 @@ fn work() -> u64 {
         let mut map = result.source_map;
         let mut current = result.source;
 
-        let (s, m) = inject_registrations(&current, &["work".to_string()]).unwrap();
+        let (s, m) = inject_registrations(&current, &[(0, "work")]).unwrap();
         map.merge(m);
         current = s;
 
@@ -2319,7 +2326,7 @@ fn work() -> u64 {
         map.merge(m);
         current = s;
 
-        let (s, m) = inject_shutdown(&current, None).unwrap();
+        let (s, m) = inject_shutdown(&current, "/tmp/piano/runs", false).unwrap();
         map.merge(m);
 
         // The final source must parse.

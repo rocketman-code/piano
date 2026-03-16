@@ -212,11 +212,17 @@ fn main() {}
         result.macro_fn_names,
     );
 
+    let names: Vec<(u32, &str)> = result
+        .macro_fn_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (i as u32, n.as_str()))
+        .collect();
     let (registered_source, _map) =
-        piano::rewrite::inject_registrations(&result.source, &result.macro_fn_names)
+        piano::rewrite::inject_registrations(&result.source, &names)
             .expect("inject_registrations should succeed");
     assert!(
-        registered_source.contains(r#"piano_runtime::register("initialize")"#),
-        "literal macro fn should get register() call. Got:\n{registered_source}"
+        registered_source.contains(r#"(0, "initialize")"#),
+        "literal macro fn should appear in name table. Got:\n{registered_source}"
     );
 }

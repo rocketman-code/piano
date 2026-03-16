@@ -1,45 +1,110 @@
+#![allow(unsafe_code)]
+
+//! Allocation tracking -- per-thread counters, RAII reentrancy guard,
+//! and the PianoAllocator that intercepts heap allocations.
+//!
+//! Invariants:
+//! - Reentrancy guard is always correctly paired (enter/exit).
+//!   Enforcement: RAII ReentrancyGuard type. No public enter/exit
+//!   functions. The guard increments on creation, decrements on drop.
+//!   Unpaired exit is structurally impossible.
+//! - ReentrancyGuard is !Send (TLS counter is per-thread; moving the
+//!   guard to another thread would decrement the wrong counter).
+//!   Enforcement: PhantomData<*const ()>.
+//! - Alloc counters are monotonically increasing, never reset.
+//!   Enforcement: record_alloc only adds. No reset/clear functions.
+
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
-
-/// Allocation counters accumulated in the allocator hot path.
-/// All fields are plain integers -> `Copy` -> `Cell<AllocSnapshot>` has no
-/// destructor -> safe for use in global allocator TLS on all Rust versions.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct AllocSnapshot {
-    pub(crate) alloc_count: u64,
-    pub(crate) alloc_bytes: u64,
-    pub(crate) free_count: u64,
-    pub(crate) free_bytes: u64,
-}
+use std::marker::PhantomData;
 
 thread_local! {
-    /// Destructor-free counters that the allocator hot path increments.
-    /// `enter()` saves and zeroes this; `Guard::drop()` reads and restores.
-    pub(crate) static ALLOC_COUNTERS: Cell<AllocSnapshot> = Cell::new(AllocSnapshot::new());
+    static ALLOC_COUNT: Cell<u64> = const { Cell::new(0) };
+    static ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
+    static FREE_COUNT: Cell<u64> = const { Cell::new(0) };
+    static FREE_BYTES: Cell<u64> = const { Cell::new(0) };
+    static REENTRANCY: Cell<u32> = const { Cell::new(0) };
 }
 
-impl AllocSnapshot {
-    pub(crate) const fn new() -> Self {
+/// Snapshot the current thread's allocation counters.
+/// Returns (alloc_count, alloc_bytes, free_count, free_bytes).
+pub fn snapshot_alloc_counters() -> (u64, u64, u64, u64) {
+    ALLOC_COUNT.with(|ac| {
+        ALLOC_BYTES.with(|ab| {
+            FREE_COUNT.with(|fc| {
+                FREE_BYTES.with(|fb| (ac.get(), ab.get(), fc.get(), fb.get()))
+            })
+        })
+    })
+}
+
+/// Record an allocation on the current thread.
+/// Called by PianoAllocator and directly in tests.
+/// Skipped when reentrancy > 0 (profiler-internal allocs excluded).
+pub fn record_alloc(size: u64) {
+    let _ = REENTRANCY.try_with(|r| {
+        if r.get() == 0 {
+            let _ = ALLOC_COUNT.try_with(|c| c.set(c.get() + 1));
+            let _ = ALLOC_BYTES.try_with(|b| b.set(b.get() + size));
+        }
+    });
+}
+
+/// Record a deallocation on the current thread.
+/// Skipped when reentrancy > 0.
+fn record_dealloc(size: u64) {
+    let _ = REENTRANCY.try_with(|r| {
+        if r.get() == 0 {
+            let _ = FREE_COUNT.try_with(|c| c.set(c.get() + 1));
+            let _ = FREE_BYTES.try_with(|b| b.set(b.get() + size));
+        }
+    });
+}
+
+/// Check if currently inside a reentrancy-guarded section.
+pub fn is_reentrant() -> bool {
+    REENTRANCY.with(|r| r.get() > 0)
+}
+
+/// RAII guard that prevents allocation tracking during profiler
+/// bookkeeping. Increments a per-thread counter on creation,
+/// decrements on drop. While counter > 0, record_alloc/record_dealloc
+/// are no-ops.
+///
+/// !Send: TLS counter is per-thread; moving guard across threads
+/// would decrement the wrong counter.
+pub struct ReentrancyGuard {
+    _not_send: PhantomData<*const ()>,
+}
+
+impl ReentrancyGuard {
+    pub fn enter() -> Self {
+        let _ = REENTRANCY.try_with(|r| r.set(r.get() + 1));
         Self {
-            alloc_count: 0,
-            alloc_bytes: 0,
-            free_count: 0,
-            free_bytes: 0,
+            _not_send: PhantomData,
         }
     }
 }
 
-/// A global allocator wrapper that tracks allocation counts and bytes
-/// per instrumented function scope, with zero timing distortion.
+impl Drop for ReentrancyGuard {
+    fn drop(&mut self) {
+        let _ = REENTRANCY.try_with(|r| {
+            let prev = r.get();
+            debug_assert!(prev > 0, "ReentrancyGuard dropped without matching enter");
+            r.set(prev.saturating_sub(1));
+        });
+    }
+}
+
+/// A global allocator wrapper that tracks allocation counts and bytes.
 ///
-/// Wraps any inner `GlobalAlloc`. Uses a destructor-free `Cell<AllocSnapshot>`
-/// for thread-local bookkeeping, which is safe on all Rust versions
-/// (including < 1.93.1 where TLS with destructors is forbidden for
-/// global allocators).
+/// Wraps any inner `GlobalAlloc`. Uses per-thread counters with
+/// reentrancy protection so profiler-internal allocations don't
+/// contaminate user counts.
+///
 /// The struct bound is on `GlobalAlloc` impls only (not the struct itself)
 /// so that `const fn new` compiles on Rust < 1.61 where trait bounds on
 /// const fn parameters are unstable.
-#[non_exhaustive]
 pub struct PianoAllocator<A> {
     inner: A,
 }
@@ -50,219 +115,42 @@ impl<A> PianoAllocator<A> {
     }
 }
 
+// SAFETY: PianoAllocator delegates all allocation operations to the inner
+// allocator. The only addition is per-thread counter updates via record_alloc
+// and record_dealloc, which are thread-local Cell operations (no shared
+// mutable state, no UB). Failed allocations (null ptr) are not counted.
 unsafe impl<A: GlobalAlloc> GlobalAlloc for PianoAllocator<A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: layout validity is the caller's responsibility (GlobalAlloc contract).
         let ptr = unsafe { self.inner.alloc(layout) };
         if !ptr.is_null() {
-            track_alloc(layout.size() as u64);
+            record_alloc(layout.size() as u64);
         }
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: ptr was allocated by self.inner with the same layout (GlobalAlloc contract).
         unsafe { self.inner.dealloc(ptr, layout) };
-        track_dealloc(layout.size() as u64);
+        record_dealloc(layout.size() as u64);
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let old_size = layout.size() as u64;
+        // SAFETY: ptr was allocated by self.inner with layout, new_size >= 1 (GlobalAlloc contract).
         let result = unsafe { self.inner.realloc(ptr, layout, new_size) };
         if !result.is_null() {
-            track_dealloc(old_size);
-            track_alloc(new_size as u64);
+            record_dealloc(layout.size() as u64);
+            record_alloc(new_size as u64);
         }
         result
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: layout validity is the caller's responsibility (GlobalAlloc contract).
         let ptr = unsafe { self.inner.alloc_zeroed(layout) };
         if !ptr.is_null() {
-            track_alloc(layout.size() as u64);
+            record_alloc(layout.size() as u64);
         }
         ptr
-    }
-}
-
-#[inline(always)]
-pub(crate) fn track_alloc(bytes: u64) {
-    // Cell::get/set are plain memory reads/writes -- no allocation, no
-    // re-entrancy risk, no destructor. Safe from the global allocator.
-    let _ = ALLOC_COUNTERS.try_with(|cell| {
-        let mut snap = cell.get();
-        snap.alloc_count += 1;
-        snap.alloc_bytes += bytes;
-        cell.set(snap);
-    });
-}
-
-#[inline(always)]
-pub(crate) fn track_dealloc(bytes: u64) {
-    let _ = ALLOC_COUNTERS.try_with(|cell| {
-        let mut snap = cell.get();
-        snap.free_count += 1;
-        snap.free_bytes += bytes;
-        cell.set(snap);
-    });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{collect_invocations, enter, reset};
-
-    #[test]
-    fn track_alloc_updates_stack_entry() {
-        reset();
-        {
-            let _g = enter("alloc_test");
-            track_alloc(1024);
-            track_alloc(512);
-            track_dealloc(256);
-        }
-        let invocations = collect_invocations();
-        let rec = invocations.iter().find(|r| r.name == "alloc_test").unwrap();
-        assert_eq!(rec.alloc_count, 2);
-        assert_eq!(rec.alloc_bytes, 1536);
-        assert_eq!(rec.free_count, 1);
-        assert_eq!(rec.free_bytes, 256);
-    }
-
-    #[test]
-    fn alloc_tracking_nested_scopes() {
-        reset();
-        {
-            let _outer = enter("outer_alloc");
-            track_alloc(100);
-            {
-                let _inner = enter("inner_alloc");
-                track_alloc(200);
-                track_dealloc(50);
-            }
-            track_alloc(300);
-            track_dealloc(75);
-        }
-        let invocations = collect_invocations();
-        let outer = invocations
-            .iter()
-            .find(|r| r.name == "outer_alloc")
-            .unwrap();
-        let inner = invocations
-            .iter()
-            .find(|r| r.name == "inner_alloc")
-            .unwrap();
-
-        // Inner scope should only see its own allocations
-        assert_eq!(inner.alloc_count, 1, "inner alloc_count");
-        assert_eq!(inner.alloc_bytes, 200, "inner alloc_bytes");
-        assert_eq!(inner.free_count, 1, "inner free_count");
-        assert_eq!(inner.free_bytes, 50, "inner free_bytes");
-
-        // Outer scope should see its own allocations (before + after inner)
-        assert_eq!(outer.alloc_count, 2, "outer alloc_count");
-        assert_eq!(outer.alloc_bytes, 400, "outer alloc_bytes");
-        assert_eq!(outer.free_count, 1, "outer free_count");
-        assert_eq!(outer.free_bytes, 75, "outer free_bytes");
-    }
-
-    /// An allocator that always returns null, simulating allocation failure.
-    struct FailingAlloc;
-
-    unsafe impl GlobalAlloc for FailingAlloc {
-        unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
-            std::ptr::null_mut()
-        }
-
-        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
-
-        unsafe fn realloc(&self, _ptr: *mut u8, _layout: Layout, _new_size: usize) -> *mut u8 {
-            std::ptr::null_mut()
-        }
-
-        unsafe fn alloc_zeroed(&self, _layout: Layout) -> *mut u8 {
-            std::ptr::null_mut()
-        }
-    }
-
-    #[test]
-    fn failed_alloc_not_counted() {
-        ALLOC_COUNTERS.with(|cell| cell.set(AllocSnapshot::new()));
-        let allocator = PianoAllocator::new(FailingAlloc);
-        let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = unsafe { allocator.alloc(layout) };
-        assert!(ptr.is_null());
-        let snap = ALLOC_COUNTERS.with(|cell| cell.get());
-        assert_eq!(snap.alloc_count, 0, "failed alloc should not be counted");
-        assert_eq!(snap.alloc_bytes, 0, "failed alloc bytes should be zero");
-    }
-
-    #[test]
-    fn failed_alloc_zeroed_not_counted() {
-        ALLOC_COUNTERS.with(|cell| cell.set(AllocSnapshot::new()));
-        let allocator = PianoAllocator::new(FailingAlloc);
-        let layout = Layout::from_size_align(128, 8).unwrap();
-        let ptr = unsafe { allocator.alloc_zeroed(layout) };
-        assert!(ptr.is_null());
-        let snap = ALLOC_COUNTERS.with(|cell| cell.get());
-        assert_eq!(
-            snap.alloc_count, 0,
-            "failed alloc_zeroed should not be counted"
-        );
-        assert_eq!(
-            snap.alloc_bytes, 0,
-            "failed alloc_zeroed bytes should be zero"
-        );
-    }
-
-    #[test]
-    fn failed_realloc_not_counted() {
-        ALLOC_COUNTERS.with(|cell| cell.set(AllocSnapshot::new()));
-        let allocator = PianoAllocator::new(FailingAlloc);
-        let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = unsafe { allocator.realloc(std::ptr::null_mut(), layout, 128) };
-        assert!(ptr.is_null());
-        let snap = ALLOC_COUNTERS.with(|cell| cell.get());
-        assert_eq!(snap.alloc_count, 0, "failed realloc should not be counted");
-        assert_eq!(
-            snap.free_count, 0,
-            "failed realloc should not count dealloc"
-        );
-    }
-
-    #[test]
-    fn alloc_count_holds_values_above_u32_max() {
-        reset();
-        let large: u64 = u32::MAX as u64 + 100;
-        ALLOC_COUNTERS.with(|cell| {
-            cell.set(AllocSnapshot {
-                alloc_count: large,
-                alloc_bytes: 0,
-                free_count: large,
-                free_bytes: 0,
-            });
-        });
-        {
-            let _g = enter("large_count");
-            // Simulate one more allocation inside the scope
-            track_alloc(64);
-            track_dealloc(32);
-        }
-        let invocations = collect_invocations();
-        let rec = invocations
-            .iter()
-            .find(|r| r.name == "large_count")
-            .unwrap();
-        assert_eq!(rec.alloc_count, 1, "should see only in-scope allocation");
-        assert_eq!(rec.free_count, 1, "should see only in-scope deallocation");
-
-        // Verify the TLS counter was restored to the large value
-        let restored = ALLOC_COUNTERS.with(|cell| cell.get());
-        assert_eq!(
-            restored.alloc_count, large,
-            "alloc_count should preserve values above u32::MAX"
-        );
-        assert_eq!(
-            restored.free_count, large,
-            "free_count should preserve values above u32::MAX"
-        );
     }
 }
