@@ -72,6 +72,22 @@ pub fn bias_f64() -> f64 {
     f64::from_bits(CPU_BIAS_F64.load(Ordering::Relaxed))
 }
 
+/// Return the raw bits of the calibrated CPU-time bias.
+/// Used by CalibrationData to snapshot the value.
+#[cfg(unix)]
+#[inline(always)]
+pub(crate) fn bias_f64_bits() -> u64 {
+    CPU_BIAS_F64.load(Ordering::Relaxed)
+}
+
+/// Return the raw bits of the guard overhead.
+/// Used by CalibrationData to snapshot the value.
+#[cfg(unix)]
+#[inline(always)]
+pub(crate) fn guard_overhead_f64_bits() -> u64 {
+    GUARD_OVERHEAD_F64.load(Ordering::Relaxed)
+}
+
 /// Return the calibrated CPU-time bias as integer nanoseconds.
 #[cfg(all(any(test, feature = "_test_internals"), unix))]
 #[inline(always)]
@@ -147,4 +163,20 @@ pub fn cpu_now_ns() -> u64 {
 #[cfg(not(unix))]
 pub(crate) fn cpu_now_ns() -> u64 {
     unreachable!("cpu_now_ns called on non-Unix; gated by cpu_time_enabled bool")
+}
+
+/// No CPU-time calibration on non-Unix platforms.
+#[cfg(not(unix))]
+pub fn calibrate_bias() {}
+
+/// No CPU bias on non-Unix platforms.
+#[cfg(not(unix))]
+pub(crate) fn bias_f64_bits() -> u64 {
+    0
+}
+
+/// No guard overhead on non-Unix platforms.
+#[cfg(not(unix))]
+pub(crate) fn guard_overhead_f64_bits() -> u64 {
+    0
 }

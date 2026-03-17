@@ -27,6 +27,99 @@ static MULTIPLIER: AtomicU64 = AtomicU64::new(0);
 static BIAS_TICKS: AtomicU64 = AtomicU64::new(0);
 static EPOCH_TSC: AtomicU64 = AtomicU64::new(0);
 
+/// Immutable calibration snapshot. Copy-able, no atomics on access.
+///
+/// Created once per process by `CalibrationData::calibrate()`, then
+/// threaded through Ctx -> Guard / PianoFuture by value. Replaces
+/// the global AtomicU64 loads on every timing conversion with plain
+/// field reads.
+#[derive(Clone, Copy)]
+pub struct CalibrationData {
+    quotient: u64,
+    multiplier: u64,
+    bias_ticks: u64,
+    epoch_tsc: u64,
+    cpu_bias_f64_bits: u64,
+    guard_overhead_f64_bits: u64,
+}
+
+impl CalibrationData {
+    /// Run time + CPU bias calibration (once per process).
+    ///
+    /// Uses a Once + static inside the function so repeated calls
+    /// return the cached Copy value after the first.
+    pub fn calibrate() -> Self {
+        static ONCE: Once = Once::new();
+        static mut CACHED: CalibrationData = CalibrationData {
+            quotient: 0,
+            multiplier: 0,
+            bias_ticks: 0,
+            epoch_tsc: 0,
+            cpu_bias_f64_bits: 0,
+            guard_overhead_f64_bits: 0,
+        };
+
+        // SAFETY: ONCE.call_once guarantees single initialization. After init,
+        // CACHED is only read (never written). The static mut is required
+        // because OnceLock is unavailable on MSRV 1.59.
+        unsafe {
+            ONCE.call_once(|| {
+                // Run existing calibration routines (writes to globals)
+                calibrate();
+                calibrate_bias();
+                crate::cpu_clock::calibrate_bias();
+
+                // Snapshot the globals into the struct
+                CACHED = CalibrationData {
+                    quotient: QUOTIENT.load(Ordering::Relaxed),
+                    multiplier: MULTIPLIER.load(Ordering::Relaxed),
+                    bias_ticks: BIAS_TICKS.load(Ordering::Relaxed),
+                    epoch_tsc: EPOCH_TSC.load(Ordering::Relaxed),
+                    cpu_bias_f64_bits: crate::cpu_clock::bias_f64_bits(),
+                    guard_overhead_f64_bits: crate::cpu_clock::guard_overhead_f64_bits(),
+                };
+            });
+            CACHED
+        }
+    }
+
+    /// Convert raw ticks to nanoseconds using calibrated fixed-point ratio.
+    #[inline(always)]
+    pub fn ticks_to_ns(&self, ticks: u64) -> u64 {
+        if self.quotient == 0 && self.multiplier == 0 {
+            return 0;
+        }
+        let hi = ((ticks as u128 * self.multiplier as u128) >> 64) as u64;
+        ticks.wrapping_mul(self.quotient).wrapping_add(hi)
+    }
+
+    /// Convert a raw tick value to epoch-relative nanoseconds.
+    #[inline(always)]
+    pub fn now_ns(&self, raw_ticks: u64) -> u64 {
+        self.ticks_to_ns(raw_ticks.wrapping_sub(self.epoch_tsc))
+    }
+
+    /// Return the calibrated measurement bias in nanoseconds.
+    #[inline(always)]
+    pub fn bias_ns(&self) -> u64 {
+        self.ticks_to_ns(self.bias_ticks)
+    }
+
+    /// Return the calibrated CPU-time bias as f64 nanoseconds.
+    #[cfg(unix)]
+    #[inline(always)]
+    pub fn cpu_bias_f64(&self) -> f64 {
+        f64::from_bits(self.cpu_bias_f64_bits)
+    }
+
+    /// Return the guard instrumentation overhead as f64 nanoseconds.
+    #[cfg(unix)]
+    #[inline(always)]
+    pub fn guard_overhead_f64(&self) -> f64 {
+        f64::from_bits(self.guard_overhead_f64_bits)
+    }
+}
+
 /// Initialize the timing subsystem. Must be called before read().
 /// Safe to call multiple times (Once guard).
 pub(crate) fn init() {
