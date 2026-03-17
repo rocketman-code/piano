@@ -43,8 +43,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
     // The program allocates in an async function with .await points.
     // Vec::with_capacity forces a real heap allocation.
     // Uses a sync wrapper that calls the async function via block_on,
-    // ensuring the depth-0 guard boundary flushes FRAME_BUFFER to FRAMES
-    // so NDJSON output is produced.
+    // ensuring the depth-0 guard boundary flushes the per-thread buffer
+    // to the file sink so NDJSON output is produced.
     fs::write(
         dir.join("src").join("main.rs"),
         r#"
