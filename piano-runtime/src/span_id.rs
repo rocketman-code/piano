@@ -12,8 +12,6 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
-
-pub fn next_span_id() -> u64 {
-    NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed)
+pub fn next_span_id(alloc: &AtomicU64) -> u64 {
+    alloc.fetch_add(1, Ordering::Relaxed)
 }

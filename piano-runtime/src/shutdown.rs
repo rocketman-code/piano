@@ -20,15 +20,16 @@
 //!   itself -- only in the registered atexit callback (safe context).
 
 use crate::alloc::ReentrancyGuard;
-use crate::buffer::drain_all_buffers;
+use crate::buffer::{drain_all_buffers, Registry};
 use crate::file_sink::FileSink;
 use crate::output::{write_measurements, write_trailer};
-use crate::time;
+use crate::time::CalibrationData;
 use std::sync::{Arc, Mutex, Once};
 
 struct ShutdownState {
     file_sink: Arc<FileSink>,
     names: &'static [(u32, &'static str)],
+    registry: Arc<Registry>,
 }
 
 fn shutdown_state() -> &'static Mutex<Option<ShutdownState>> {
@@ -52,11 +53,12 @@ fn shutdown_state() -> &'static Mutex<Option<ShutdownState>> {
 pub(crate) fn register(
     file_sink: Arc<FileSink>,
     names: &'static [(u32, &'static str)],
+    registry: Arc<Registry>,
 ) {
     let mut state = shutdown_state()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    *state = Some(ShutdownState { file_sink, names });
+    *state = Some(ShutdownState { file_sink, names, registry });
 
     // Register atexit handler. Multiple registrations are safe --
     // each invocation drains (first finds data, subsequent find empty).
@@ -76,17 +78,20 @@ pub(crate) fn register(
 extern "C" fn atexit_handler() {
     // Clone the Arc and names pointer, then release the shutdown state
     // lock before doing any I/O. Minimizes lock hold time.
-    let (file_sink, names) = {
+    let (file_sink, names, registry) = {
         let state = shutdown_state()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         match state.as_ref() {
-            Some(s) => (Arc::clone(&s.file_sink), s.names),
+            Some(s) => (Arc::clone(&s.file_sink), s.names, Arc::clone(&s.registry)),
             None => return,
         }
     }; // shutdown state mutex released here
 
-    let remaining = drain_all_buffers();
+    let remaining = drain_all_buffers(&registry);
+
+    // Use CalibrationData for bias_ns
+    let calibration = CalibrationData::calibrate();
 
     let _reentry = ReentrancyGuard::enter();
     {
@@ -94,7 +99,7 @@ extern "C" fn atexit_handler() {
         if write_measurements(&mut *file, &remaining).is_err() {
             file_sink.record_io_error();
         }
-        if write_trailer(&mut *file, names, time::bias_ns()).is_err() {
+        if write_trailer(&mut *file, names, calibration.bias_ns()).is_err() {
             file_sink.record_io_error();
         }
     }

@@ -23,10 +23,13 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::{Context, Poll};
 
 use crate::alloc::{snapshot_alloc_counters, ReentrancyGuard};
-use crate::buffer::push_measurement;
+use crate::buffer::{push_measurement, Registry};
 use crate::measurement::Measurement;
 use crate::thread_id::current_thread_id;
-use crate::time::{now_ns, read};
+use crate::time::{read, CalibrationData};
+use crate::buffer::ThreadBuffer;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicU64;
 
 /// State passed from Ctx::enter_async() to PianoFuture::new().
 /// Contains the span identity and configuration for the async function.
@@ -35,6 +38,9 @@ pub struct PianoFutureState {
     pub parent_span_id: u64,
     pub name_id: u32,
     pub cpu_time_enabled: bool,
+    pub calibration: CalibrationData,
+    pub thread_id_alloc: Arc<AtomicU64>,
+    pub registry: Arc<Registry>,
 }
 
 /// Future wrapper for async function instrumentation.
@@ -55,6 +61,9 @@ pub struct PianoFuture<F> {
     free_bytes_acc: u64,
     cpu_acc_ns: u64,
     emitted: bool,
+    calibration: CalibrationData,
+    thread_id_alloc: Arc<AtomicU64>,
+    registry: Arc<Mutex<Vec<Arc<Mutex<ThreadBuffer>>>>>,
 }
 
 impl<F: Future> PianoFuture<F> {
@@ -73,6 +82,9 @@ impl<F: Future> PianoFuture<F> {
             free_bytes_acc: 0,
             cpu_acc_ns: 0,
             emitted: false,
+            calibration: state.calibration,
+            thread_id_alloc: state.thread_id_alloc,
+            registry: state.registry,
         }
     }
 }
@@ -94,7 +106,7 @@ impl<F: Future> Future for PianoFuture<F> {
 
             if this.start_ticks == 0 {
                 this.start_ticks = read();
-                this.thread_id = current_thread_id();
+                this.thread_id = current_thread_id(&this.thread_id_alloc);
             }
         }
         // _reentrancy dropped here -- user allocs during poll ARE tracked
@@ -154,8 +166,8 @@ impl<F> PianoFuture<F> {
             span_id: self.span_id,
             parent_span_id: self.parent_span_id,
             name_id: self.name_id,
-            start_ns: now_ns(self.start_ticks),
-            end_ns: now_ns(read()),
+            start_ns: self.calibration.now_ns(self.start_ticks),
+            end_ns: self.calibration.now_ns(read()),
             thread_id: self.thread_id,
             cpu_start_ns: 0,
             cpu_end_ns: self.cpu_acc_ns,
@@ -165,7 +177,7 @@ impl<F> PianoFuture<F> {
             free_bytes: self.free_bytes_acc,
         };
 
-        push_measurement(m);
+        push_measurement(m, &self.registry);
     }
 }
 
@@ -176,8 +188,8 @@ impl<F> Drop for PianoFuture<F> {
 }
 
 // PianoFuture is Send if the inner future is Send.
-// SAFETY: All our fields are Send-safe (primitives + the inner future).
-// The inner future determines sendability.
+// SAFETY: All our fields are Send-safe (primitives, Arc, CalibrationData (Copy))
+// + the inner future. The inner future determines sendability.
 // This static assertion proves it:
 const _: () = {
     fn _assert_send<T: Send>() {}

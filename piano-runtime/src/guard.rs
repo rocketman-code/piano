@@ -12,15 +12,18 @@
 //! - Guard never panics. All arithmetic uses saturating_sub.
 //!   Profiler never crashes the host.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
 use crate::alloc::{snapshot_alloc_counters, ReentrancyGuard};
-use crate::buffer::push_measurement;
+use crate::buffer::{push_measurement, Registry};
 use crate::cpu_clock::cpu_now_ns;
 use crate::measurement::Measurement;
 use crate::thread_id::current_thread_id;
-use crate::time::{read, now_ns};
+use crate::time::{read, CalibrationData};
 use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
+
+use crate::buffer::ThreadBuffer;
 
 /// RAII sentinel for sync function instrumentation.
 ///
@@ -42,6 +45,8 @@ pub struct Guard {
     free_count_start: u64,
     free_bytes_start: u64,
     thread_id: u64,
+    calibration: CalibrationData,
+    registry: Arc<Mutex<Vec<Arc<Mutex<ThreadBuffer>>>>>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -52,11 +57,19 @@ impl Guard {
     ///
     /// All bookkeeping allocations (Vec growth in snapshot, etc.) are
     /// excluded from user counts by the ReentrancyGuard.
-    pub fn new_uninstrumented(span_id: u64, parent_span_id: u64, name_id: u32, cpu_time_enabled: bool) -> Self {
+    pub fn new_uninstrumented(
+        span_id: u64,
+        parent_span_id: u64,
+        name_id: u32,
+        cpu_time_enabled: bool,
+        calibration: CalibrationData,
+        thread_id_alloc: &AtomicU64,
+        registry: Arc<Registry>,
+    ) -> Self {
         let _reentrancy = ReentrancyGuard::enter();
         let snap = snapshot_alloc_counters();
         let cpu_start_ns = if cpu_time_enabled { cpu_now_ns() } else { 0 };
-        let thread_id = current_thread_id();
+        let thread_id = current_thread_id(thread_id_alloc);
         // _reentrancy drops here -- reentrancy guard covers only alloc
         // snapshot and cpu_now_ns, not the rdtsc that stamp() will do.
         drop(_reentrancy);
@@ -73,6 +86,8 @@ impl Guard {
             free_count_start: snap.free_count,
             free_bytes_start: snap.free_bytes,
             thread_id,
+            calibration,
+            registry,
             _not_send: PhantomData,
         }
     }
@@ -102,8 +117,8 @@ impl Drop for Guard {
             span_id: self.span_id,
             parent_span_id: self.parent_span_id,
             name_id: self.name_id,
-            start_ns: now_ns(self.start_ns),
-            end_ns: now_ns(end_ticks),
+            start_ns: self.calibration.now_ns(self.start_ns),
+            end_ns: self.calibration.now_ns(end_ticks),
             thread_id: self.thread_id,
             cpu_start_ns: self.cpu_start_ns,
             cpu_end_ns,
@@ -113,7 +128,7 @@ impl Drop for Guard {
             free_bytes: snap_end.free_bytes.saturating_sub(self.free_bytes_start),
         };
 
-        push_measurement(m);
+        push_measurement(m, &self.registry);
         // _reentrancy drops here
     }
 }

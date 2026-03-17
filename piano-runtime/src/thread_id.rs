@@ -16,18 +16,16 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::cell::Cell;
 
-static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
-
 thread_local! {
     static THREAD_ID: Cell<u64> = const { Cell::new(0) };
 }
 
-pub(crate) fn current_thread_id() -> u64 {
+pub(crate) fn current_thread_id(alloc: &AtomicU64) -> u64 {
     THREAD_ID
         .try_with(|id| {
             let val = id.get();
             if val == 0 {
-                let new_id = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+                let new_id = alloc.fetch_add(1, Ordering::Relaxed);
                 id.set(new_id);
                 new_id
             } else {

@@ -2,7 +2,7 @@
 
 //! Per-thread measurement storage.
 //!
-//! Each thread gets its own buffer (via TLS + Arc in global registry).
+//! Each thread gets its own buffer (via TLS + Arc in registry).
 //! push_measurement() appends and flushes to the file sink when the
 //! buffer reaches FLUSH_THRESHOLD (1024). drain functions collect
 //! remaining measurements at shutdown.
@@ -12,7 +12,7 @@
 //!   double-drain returns empty. Enforced by Vec::drain iterator.
 //! - Measurements are never lost within a buffer: push appends,
 //!   drain collects all. No silent drops.
-//! - Thread buffers survive thread exit: Arc in global registry
+//! - Thread buffers survive thread exit: Arc in registry
 //!   keeps the buffer alive after TLS destruction.
 //! - All mutex locks heal poisoning (unwrap_or_else into_inner).
 //!   Profiler never crashes the host.
@@ -21,13 +21,16 @@ use crate::alloc::ReentrancyGuard;
 use crate::file_sink::FileSink;
 use crate::measurement::Measurement;
 use crate::output::write_measurements;
-use std::cell::{Cell, RefCell};
-use std::sync::{Arc, Mutex, Once};
+use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 
 /// Flush threshold -- buffer drains to file when this many measurements
 /// accumulate. 1024 entries = ~80KB per thread. Tuning parameter, not
 /// a derived constant.
 pub const FLUSH_THRESHOLD: usize = 1024;
+
+/// Registry type alias for readability.
+pub type Registry = Mutex<Vec<Arc<Mutex<ThreadBuffer>>>>;
 
 /// Per-thread measurement storage. Accumulates completed Measurements
 /// and drains them on request.
@@ -76,46 +79,17 @@ impl ThreadBuffer {
 }
 
 // ---------------------------------------------------------------------------
-// TLS storage + global registry
+// TLS storage
 // ---------------------------------------------------------------------------
-
-// Registry of all thread buffers for shutdown access.
-// Uses Once + unsafe because Mutex::new() is not const on MSRV 1.59.
-fn registry() -> &'static Mutex<Vec<Arc<Mutex<ThreadBuffer>>>> {
-    static ONCE: Once = Once::new();
-    static mut REGISTRY: *const Mutex<Vec<Arc<Mutex<ThreadBuffer>>>> = std::ptr::null();
-
-    // SAFETY: ONCE.call_once guarantees single initialization. After init,
-    // REGISTRY points to a heap-allocated Mutex that is never moved or freed
-    // (intentional leak for 'static lifetime). The static mut is required
-    // because OnceLock is unavailable on MSRV 1.59.
-    unsafe {
-        ONCE.call_once(|| {
-            REGISTRY = Box::into_raw(Box::new(Mutex::new(Vec::new())));
-        });
-        &*REGISTRY
-    }
-}
 
 thread_local! {
     static THREAD_BUFFER: RefCell<Option<Arc<Mutex<ThreadBuffer>>>> =
         const { RefCell::new(None) };
-
-    /// Fast-path flag: once the file_sink is set on this thread's buffer,
-    /// subsequent ensure_thread_file_sink calls skip the mutex lock entirely.
-    static FILE_SINK_SET: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Ensure the current thread's buffer has a reference to the file sink.
 /// Called by Ctx::enter() to propagate the file handle to each thread.
-/// Uses a Cell<bool> fast path -- after the first successful set,
-/// subsequent calls are just a Cell::get (~0.3ns).
-pub(crate) fn ensure_thread_file_sink(file_sink: &Arc<FileSink>) {
-    // Fast path: already set on this thread
-    if FILE_SINK_SET.try_with(|c| c.get()).unwrap_or(true) {
-        return;
-    }
-
+pub(crate) fn ensure_thread_file_sink(file_sink: &Arc<FileSink>, registry: &Registry) {
     let _ = THREAD_BUFFER.try_with(|cell| {
         let mut borrow = match cell.try_borrow_mut() {
             Ok(b) => b,
@@ -124,7 +98,7 @@ pub(crate) fn ensure_thread_file_sink(file_sink: &Arc<FileSink>) {
 
         let arc = borrow.get_or_insert_with(|| {
             let arc = Arc::new(Mutex::new(ThreadBuffer::new()));
-            registry()
+            registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(Arc::clone(&arc));
@@ -136,17 +110,15 @@ pub(crate) fn ensure_thread_file_sink(file_sink: &Arc<FileSink>) {
             buf.file_sink = Some(Arc::clone(file_sink));
         }
     });
-
-    let _ = FILE_SINK_SET.try_with(|c| c.set(true));
 }
 
 /// Push a measurement to the current thread's buffer.
 ///
 /// On first call per thread, initializes the buffer and registers it
-/// in the global registry for shutdown access.
+/// in the registry for shutdown access.
 /// Silent no-op if TLS is destroyed (thread teardown -- measurement
 /// is dropped, but the thread is dying anyway).
-pub fn push_measurement(m: Measurement) {
+pub fn push_measurement(m: Measurement, registry: &Registry) {
     let _ = THREAD_BUFFER.try_with(|cell| {
         // try_borrow_mut: silent no-op on reentrant borrow.
         // Same degradation principle as TLS teardown — data loss
@@ -159,7 +131,7 @@ pub fn push_measurement(m: Measurement) {
         // Lazy init: create buffer and register on first push
         let arc = borrow.get_or_insert_with(|| {
             let arc = Arc::new(Mutex::new(ThreadBuffer::new()));
-            registry()
+            registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) // heal poisoned mutex
                 .push(Arc::clone(&arc));
@@ -217,8 +189,8 @@ pub fn drain_thread_buffer() -> Vec<Measurement> {
 ///
 /// Safe to call concurrently -- Mutex serializes drains.
 /// Double-drain returns empty (no duplicates).
-pub fn drain_buffers_for_file_sink(file_sink: &Arc<FileSink>) -> Vec<Measurement> {
-    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+pub fn drain_buffers_for_file_sink(file_sink: &Arc<FileSink>, registry: &Registry) -> Vec<Measurement> {
+    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
     let mut all = Vec::new();
     for buf_arc in reg.iter() {
         let mut buf = buf_arc.lock().unwrap_or_else(|e| e.into_inner());
@@ -234,8 +206,8 @@ pub fn drain_buffers_for_file_sink(file_sink: &Arc<FileSink>) -> Vec<Measurement
 ///
 /// Safe to call concurrently -- Mutex serializes drains.
 /// Double-drain returns empty (no duplicates).
-pub fn drain_all_buffers() -> Vec<Measurement> {
-    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+pub fn drain_all_buffers(registry: &Registry) -> Vec<Measurement> {
+    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
     let mut all = Vec::new();
     for buf_arc in reg.iter() {
         let mut buf = buf_arc.lock().unwrap_or_else(|e| e.into_inner());
