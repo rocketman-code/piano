@@ -3,7 +3,7 @@ members = ["piano-runtime"]
 
 [package]
 name = "piano"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Automatic instrumentation-based profiler for Rust. Measures self-time, call counts, and heap allocations per function."
@@ -16,7 +16,6 @@ categories = ["development-tools::profiling"]
 clap = { version = "4", features = ["derive"] }
 syn = { version = "2", features = ["full", "visit", "visit-mut"] }
 quote = "1"
-prettyplease = "0.2"
 toml_edit = "0.22"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
@@ -26,6 +25,7 @@ proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 anstyle = "1"
 anstream = "0.6"
 regex = "1"
+ra_ap_syntax = "=0.0.270"
 
 [[bin]]
 name = "piano"
