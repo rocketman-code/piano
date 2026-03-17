@@ -621,15 +621,13 @@ fn build_project(
 
     // Pre-build piano-runtime with the user's toolchain.
     let target_dir = project.join("target").join("piano");
-    let features: Vec<&str> = if cpu_time { vec!["cpu-time"] } else { vec![] };
-
     eprintln!("pre-building piano-runtime...");
     let runtime = match runtime_path {
         Some(ref path) => {
             let abs_path = std::fs::canonicalize(path).map_err(io_context("canonicalize", path))?;
-            prebuild_runtime_from_path(&abs_path, &project, &target_dir, &features)?
+            prebuild_runtime_from_path(&abs_path, &project, &target_dir, &[])?
         }
-        None => prebuild_runtime(&project, &target_dir, &features)?,
+        None => prebuild_runtime(&project, &target_dir, &[])?,
     };
 
     // Clean stale temp files from previous crashed runs.
