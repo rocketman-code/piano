@@ -8,8 +8,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use piano::build::{
-    build_instrumented, cargo_metadata, find_bin_target, find_current_package, find_project_root,
-    inject_runtime_dependency, inject_runtime_path_dependency, prepare_staging,
+    build_instrumented, cargo_metadata, clean_stale_piano_files, find_bin_target,
+    find_current_package, find_project_root, prebuild_runtime, prebuild_runtime_from_path,
 };
 use piano::error::{Error, io_context};
 use piano::report::{
@@ -21,13 +21,10 @@ use piano::report::{
     load_two_latest_runs, relative_time, resolve_tag, reverse_resolve_tag, save_tag,
 };
 use piano::resolve::{
-    ResolveResult, SkippedFunction, TargetSpec, module_prefix, qualify, resolve_targets,
+    ResolveResult, ResolvedTarget, SkippedFunction, TargetSpec, module_prefix, qualify,
+    resolve_targets,
 };
-use piano::rewrite::{
-    detect_allocator_kind, inject_global_allocator, inject_registrations, inject_shutdown,
-    instrument_source,
-};
-use piano::source_map::SourceMap;
+use piano::rewrite::discover_macro_fn_names;
 
 #[derive(Parser)]
 #[command(
@@ -60,6 +57,16 @@ struct BuildOpts {
     #[arg(long = "mod", value_name = "NAME")]
     mod_patterns: Vec<String>,
 
+    /// Exclude functions by name from the measurement set (repeatable).
+    /// Two-phase precedence: selectors pick the inclusion set, --skip removes from it.
+    #[arg(long = "skip", value_name = "FUNC")]
+    skip_patterns: Vec<String>,
+
+    /// Limit instrumentation to functions at call-graph depth N or less.
+    /// Depth 0 = entry points only.
+    #[arg(long, value_name = "N")]
+    depth: Option<usize>,
+
     /// Project root (auto-detected from Cargo.toml).
     #[arg(long)]
     project: Option<PathBuf>,
@@ -76,6 +83,11 @@ struct BuildOpts {
     /// Capture per-thread CPU time alongside wall time (Unix only).
     #[arg(long)]
     cpu_time: bool,
+
+    /// Directory for profiling output files.
+    /// Overrides PIANO_RUNS_DIR env var and the default (target/piano/runs/).
+    #[arg(long, value_name = "DIR")]
+    output_dir: Option<PathBuf>,
 
     /// Show functions excluded from instrumentation and exit.
     #[arg(long)]
@@ -97,6 +109,11 @@ enum Commands {
         #[arg(long, value_name = "SECONDS", value_parser = parse_duration_secs)]
         duration: Option<f64>,
 
+        /// Directory for profiling output files.
+        /// Overrides PIANO_RUNS_DIR env var and the default (target/piano/runs/).
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
+
         /// Arguments to pass to the instrumented binary (after --).
         #[arg(last = true)]
         args: Vec<String>,
@@ -107,9 +124,13 @@ enum Commands {
         #[command(flatten)]
         opts: BuildOpts,
 
-        /// Show all functions, including those with zero calls.
-        #[arg(long)]
+        /// Show all functions, including those with zero calls (disables --top limit).
+        #[arg(long, conflicts_with = "top")]
         all: bool,
+
+        /// Show top N functions by self-time (default: 10).
+        #[arg(long, value_name = "N", conflicts_with = "all")]
+        top: Option<usize>,
 
         /// Show per-frame breakdown.
         #[arg(long)]
@@ -140,9 +161,13 @@ enum Commands {
         /// Path to a specific run file. If omitted, shows the latest.
         run: Option<PathBuf>,
 
-        /// Show all functions, including those with zero calls.
-        #[arg(long)]
+        /// Show all functions, including those with zero calls (disables --top limit).
+        #[arg(long, conflicts_with = "top")]
         all: bool,
+
+        /// Show top N functions by self-time (default: 10).
+        #[arg(long, value_name = "N", conflicts_with = "all")]
+        top: Option<usize>,
 
         /// Show per-frame breakdown.
         #[arg(long)]
@@ -155,6 +180,11 @@ enum Commands {
         /// Show per-thread breakdown instead of aggregated view.
         #[arg(long)]
         threads: bool,
+
+        /// Directory for profiling output files.
+        /// Overrides PIANO_RUNS_DIR env var and the default (target/piano/runs/).
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
     },
     /// Compare two profiling runs.
     Diff {
@@ -163,14 +193,32 @@ enum Commands {
         /// Second run (path or tag).
         b: Option<PathBuf>,
 
+        /// Show all functions, including those with zero calls (disables --top limit).
+        #[arg(long, conflicts_with = "top")]
+        all: bool,
+
+        /// Show top N functions by self-time (default: 10).
+        #[arg(long, value_name = "N", conflicts_with = "all")]
+        top: Option<usize>,
+
         /// Output structured JSON instead of a table.
         #[arg(long)]
         json: bool,
+
+        /// Directory for profiling output files.
+        /// Overrides PIANO_RUNS_DIR env var and the default (target/piano/runs/).
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
     },
     /// Tag the latest run, or list existing tags (no args).
     Tag {
         /// Tag name. If omitted, lists all saved tags.
         name: Option<String>,
+
+        /// Directory for profiling output files.
+        /// Overrides PIANO_RUNS_DIR env var and the default (target/piano/runs/).
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
     },
 }
 
@@ -193,7 +241,29 @@ fn parse_duration_secs(s: &str) -> Result<f64, String> {
     Ok(secs)
 }
 
+/// Default number of functions shown in report output.
+const DEFAULT_TOP_N: usize = 10;
+
+/// Resolve `--all` and `--top N` flags into `(show_all, limit)`.
+///
+/// - `--all`: show everything, no limit.
+/// - `--top N`: show top N, hide zero-call entries.
+/// - Neither: show top DEFAULT_TOP_N, hide zero-call entries.
+fn resolve_display_limit(all: bool, top: Option<usize>) -> (bool, Option<usize>) {
+    if all {
+        (true, None)
+    } else {
+        (false, Some(top.unwrap_or(DEFAULT_TOP_N)))
+    }
+}
+
 fn main() {
+    // Wrapper mode: when invoked as RUSTC_WORKSPACE_WRAPPER, Cargo passes
+    // the real rustc path as argv[1]. Detect via PIANO_WRAPPER_CONFIG env var.
+    if std::env::var_os(piano::wrapper::CONFIG_ENV).is_some() {
+        std::process::exit(piano::wrapper::run_wrapper());
+    }
+
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
         eprintln!("error: {e}");
@@ -205,36 +275,60 @@ fn run(cli: Cli) -> Result<(), Error> {
     let project_root = find_project_root(&std::env::current_dir()?).ok();
     match cli.command {
         Commands::Build { opts } => cmd_build(opts, &project_root),
-        Commands::Run { duration, args } => cmd_run(duration, args, &project_root),
+        Commands::Run {
+            duration,
+            output_dir,
+            args,
+        } => cmd_run(duration, output_dir, args, &project_root),
         Commands::Profile {
             opts,
             all,
+            top,
             frames,
             json,
             threads,
             ignore_exit_code,
             duration,
             args,
-        } => cmd_profile(
-            opts,
-            &project_root,
-            all,
-            frames,
-            json,
-            threads,
-            ignore_exit_code,
-            duration,
-            args,
-        ),
+        } => {
+            let (show_all, limit) = resolve_display_limit(all, top);
+            cmd_profile(
+                opts,
+                &project_root,
+                show_all,
+                limit,
+                frames,
+                json,
+                threads,
+                ignore_exit_code,
+                duration,
+                args,
+            )
+        }
         Commands::Report {
             run,
             all,
+            top,
             frames,
             json,
             threads,
-        } => cmd_report(run, all, frames, json, threads, &project_root),
-        Commands::Diff { a, b, json } => cmd_diff(a, b, json, &project_root),
-        Commands::Tag { name } => cmd_tag(name, &project_root),
+            output_dir,
+        } => {
+            let (show_all, limit) = resolve_display_limit(all, top);
+            cmd_report(run, show_all, limit, frames, json, threads, &project_root, output_dir)
+        }
+        Commands::Diff {
+            a,
+            b,
+            all,
+            top,
+            json,
+            output_dir,
+        } => {
+            let (show_all, limit) = resolve_display_limit(all, top);
+            cmd_diff(a, b, show_all, limit, json, &project_root, output_dir)
+        }
+        Commands::Tag { name, output_dir } => cmd_tag(name, &project_root, output_dir),
     }
 }
 
@@ -261,12 +355,21 @@ fn build_project(
         exact,
         file_patterns,
         mod_patterns,
+        skip_patterns,
+        depth,
         project,
         runtime_path,
         bin,
         cpu_time,
+        output_dir,
         list_skipped,
     } = opts;
+
+    if depth.is_some() {
+        return Err(Error::BuildFailed(
+            "--depth requires call-graph analysis which is not yet implemented".into(),
+        ));
+    }
 
     let project = match project {
         Some(p) => p,
@@ -357,7 +460,28 @@ fn build_project(
         bin_rel.parent().unwrap_or(&pkg_root).to_path_buf()
     };
 
-    let ResolveResult { targets, skipped } = resolve_targets(&src_dir, &specs, exact)?;
+    let ResolveResult { targets, skipped, all_functions } = resolve_targets(&src_dir, &specs, exact)?;
+
+    // Apply --skip: remove functions matching skip patterns from the measured set.
+    // Two-phase precedence: selectors pick the inclusion set, --skip removes from it.
+    let targets: Vec<ResolvedTarget> = if skip_patterns.is_empty() {
+        targets
+    } else {
+        targets
+            .into_iter()
+            .filter_map(|mut t| {
+                t.functions.retain(|qf| {
+                    let bare = qf.minimal.rsplit("::").next().unwrap_or(&qf.minimal);
+                    !skip_patterns.iter().any(|skip| bare == skip.as_str() || qf.minimal == *skip)
+                });
+                if t.functions.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            })
+            .collect()
+    };
 
     if list_skipped {
         if skipped.is_empty() {
@@ -394,14 +518,11 @@ fn build_project(
     for target in &targets {
         let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
         eprintln!("  {}:", relative.display());
-        for f in &target.functions {
-            eprintln!("    {f}");
+        for qf in &target.functions {
+            eprintln!("    {}", qf.minimal);
         }
     }
 
-    // Stage from the workspace root so inherited fields and cross-member
-    // path dependencies resolve correctly.
-    let staging_root = workspace_root.clone();
     let member_subdir = if pkg_root != workspace_root {
         Some(
             pkg_root
@@ -413,84 +534,148 @@ fn build_project(
         None
     };
 
-    // Prepare staging directory.
-    // Use a stable path so cargo can cache incremental builds across runs.
-    // Dependencies compile once; only instrumented source files recompile.
-    let staging = staging_root.join("target/piano/staging");
-    std::fs::create_dir_all(&staging).map_err(io_context("create directory", &staging))?;
-    prepare_staging(&staging_root, &staging)?;
+    let instrument_macros = specs.is_empty();
+    let src_rel = src_dir.strip_prefix(&pkg_root).unwrap_or(Path::new("src"));
 
-    // Determine the member directory within staging (workspace root for standalone).
-    let member_staging = match &member_subdir {
-        Some(sub) => staging.join(sub),
-        None => staging.clone(),
-    };
+    // Collect all QualifiedFunction entries with module prefixes applied,
+    // then run progressive disambiguation to compute display names.
+    let mut all_qualified: Vec<piano::naming::QualifiedFunction> = Vec::new();
+    for target in &targets {
+        let prefix = module_prefix(target.file.strip_prefix(&src_dir).unwrap_or(&target.file));
+        for qf in &target.functions {
+            all_qualified.push(piano::naming::QualifiedFunction::new(
+                &qualify(&prefix, &qf.minimal),
+                &qualify(&prefix, &qf.medium),
+                &qualify(&prefix, &qf.full),
+            ));
+        }
+    }
+    let display_names = piano::naming::disambiguate(&all_qualified);
 
-    // Inject piano-runtime dependency.
+    // Pre-assign name_ids globally so instrument_source receives the correct u32 ids
+    // that match what inject_registrations will later write.
+    // Keys are the fully-qualified minimal names (used as lookup keys by InjectionCollector).
+    // Display names (post-disambiguation) are used only in the name table.
+    let mut next_id: u32 = 0;
+    let mut global_name_ids: HashMap<String, u32> = HashMap::new();
+    let mut global_display_names: HashMap<String, String> = HashMap::new();
+    for (qf, display) in all_qualified.iter().zip(display_names.iter()) {
+        // main() is the lifecycle boundary -- it creates the root context, not a profiled
+        // function, so exclude it from the name table.
+        if qf.minimal == "main" {
+            continue;
+        }
+        let id = *global_name_ids.entry(qf.minimal.clone()).or_insert_with(|| {
+            let id = next_id;
+            next_id += 1;
+            id
+        });
+        global_display_names.entry(qf.minimal.clone()).or_insert_with(|| display.clone());
+        let _ = id;
+    }
+
+    // Discover macro function names via pre-scan before instrument_source runs.
+    // IDs are assigned sequentially after regular function IDs.
+    // Read from original source files (wrapper rewrites from originals too).
+    if instrument_macros {
+        for target in &targets {
+            let prefix =
+                module_prefix(target.file.strip_prefix(&src_dir).unwrap_or(&target.file));
+            let source = std::fs::read_to_string(&target.file).unwrap_or_default();
+            if let Ok(names) = discover_macro_fn_names(&source, &prefix) {
+                for name in names {
+                    global_name_ids.entry(name.clone()).or_insert_with(|| {
+                        let id = next_id;
+                        next_id += 1;
+                        id
+                    });
+                    // Macro-discovered names use themselves as display names
+                    // (no disambiguation needed -- they come from macro bodies).
+                    global_display_names.entry(name.clone()).or_insert_with(|| name.clone());
+                }
+            }
+        }
+    }
+
+    // Build set of all instrumentable function names across the entire workspace.
+    // Uses all_functions (not just measured targets) so that non-measured functions
+    // become pass-through: they receive ctx parameter for context propagation
+    // but no guard (zero profiling overhead for pass-through functions).
+    let mut all_instrumentable: HashSet<String> = all_functions
+        .iter()
+        .flat_map(|t| t.functions.iter().map(|qf| qf.minimal.clone()))
+        .collect();
+    // Include macro-discovered names so call-site injection handles them.
+    for name in global_name_ids.keys() {
+        all_instrumentable.insert(name.clone());
+    }
+
+    // Build a set of measured function names (from targets) for quick lookup.
+    let measured_names: HashSet<String> = targets
+        .iter()
+        .flat_map(|t| {
+            let prefix = module_prefix(t.file.strip_prefix(&src_dir).unwrap_or(&t.file));
+            t.functions.iter().map(move |qf| qualify(&prefix, &qf.minimal))
+        })
+        .collect();
+
+    // Pre-build piano-runtime with the user's toolchain.
+    let target_dir = project.join("target").join("piano");
     let features: Vec<&str> = if cpu_time { vec!["cpu-time"] } else { vec![] };
-    match runtime_path {
+
+    eprintln!("pre-building piano-runtime...");
+    let runtime = match runtime_path {
         Some(ref path) => {
             let abs_path = std::fs::canonicalize(path).map_err(io_context("canonicalize", path))?;
-            inject_runtime_path_dependency(&member_staging, &abs_path, &features)?;
+            prebuild_runtime_from_path(&abs_path, &project, &target_dir, &features)?
         }
-        None => {
-            inject_runtime_dependency(&member_staging, env!("PIANO_RUNTIME_VERSION"), &features)?;
-        }
-    }
-
-    // Rewrite each target file in staging.
-    // Rebase source paths from the original project into the staging directory.
-    let instrument_macros = specs.is_empty();
-    let mut all_concurrency: Vec<(String, String)> = Vec::new();
-    let mut source_maps: HashMap<PathBuf, SourceMap> = HashMap::new();
-    let mut macro_fn_names: Vec<String> = Vec::new();
-
-    // The staging src dir corresponds to the original src_dir but within staging.
-    // Derive from src_dir relative to pkg_root (src_dir may not be "src/" when
-    // the fallback in the src_dir computation above triggers).
-    let src_rel = src_dir.strip_prefix(&pkg_root).unwrap_or(Path::new("src"));
-    let staging_src_dir = if let Some(ref sub) = member_subdir {
-        staging.join(sub).join(src_rel)
-    } else {
-        staging.join(src_rel)
+        None => prebuild_runtime(&project, &target_dir, &features)?,
     };
 
-    for target in &targets {
-        let target_set: HashSet<String> = target.functions.iter().cloned().collect();
-        let relative = target.file.strip_prefix(&src_dir).unwrap_or(&target.file);
-        let staged_file = staging_src_dir.join(relative);
-        let display_path = PathBuf::from("src").join(relative);
-        let source =
-            std::fs::read_to_string(&staged_file).map_err(|source| Error::RunReadError {
-                path: display_path.clone(),
-                source,
-            })?;
+    // Clean stale temp files from previous crashed runs.
+    clean_stale_piano_files(&src_dir)?;
+    piano::staging::clean_stale_staging(&target_dir);
 
+    let runs_dir = match &output_dir {
+        Some(dir) => dir.clone(),
+        None => target_dir.join("runs"),
+    };
+    std::fs::create_dir_all(&runs_dir).map_err(io_context("create directory", &runs_dir))?;
+
+    // Compute source paths relative to workspace root (matches what wrapper receives).
+    let mut targets_relative: HashMap<PathBuf, HashMap<String, u32>> = HashMap::new();
+    let mut module_prefixes_relative: HashMap<PathBuf, String> = HashMap::new();
+
+    for af in &all_functions {
+        let relative = af.file.strip_prefix(&src_dir).unwrap_or(&af.file);
         let prefix = module_prefix(relative);
-        let result = instrument_source(&source, &target_set, instrument_macros, &prefix).map_err(
-            |source| Error::ParseError {
-                path: display_path.clone(),
-                source,
-            },
-        )?;
+        // Build per-file measured map: only functions that are in the measured
+        // set (selected by selectors, minus --skip) get name_ids and guards.
+        let measured: HashMap<String, u32> = af
+            .functions
+            .iter()
+            .filter_map(|qf| {
+                let qualified = qualify(&prefix, &qf.minimal);
+                if measured_names.contains(&qualified) {
+                    global_name_ids.get(&qualified).map(|&id| (qf.minimal.clone(), id))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        all_concurrency.extend(result.concurrency);
-        macro_fn_names.extend(result.macro_fn_names);
-        source_maps.insert(display_path, result.source_map);
-        std::fs::write(&staged_file, result.source).map_err(io_context("write", &staged_file))?;
+        // Path relative to workspace root for the config
+        let ws_relative = if let Some(ref sub) = member_subdir {
+            PathBuf::from(sub).join(src_rel).join(relative)
+        } else {
+            PathBuf::from(src_rel).join(relative)
+        };
+
+        targets_relative.insert(ws_relative.clone(), measured);
+        module_prefixes_relative.insert(ws_relative, prefix);
     }
 
-    // Warn if parallel code was detected without --cpu-time.
-    if !cpu_time && !all_concurrency.is_empty() {
-        for (func, _pattern) in &all_concurrency {
-            eprintln!(
-                "warning: {func} spawns parallel work -- add --cpu-time to see computation time"
-            );
-        }
-    }
-
-    // Inject register calls into the binary entry point for all instrumented functions.
-    // Rebase the bin_src_path into the staging directory.
+    // Entry point path relative to workspace root
     let bin_src_canonical = bin_src_path.canonicalize().map_err(|e| {
         Error::BuildFailed(format!(
             "failed to canonicalize binary source path {}: {e}",
@@ -505,86 +690,72 @@ fn build_project(
                 bin_src_canonical.display(),
                 workspace_root.display()
             ))
-        })?;
-    let main_file = staging.join(bin_entry_relative);
-    // Display path is relative to the package root for error messages.
-    let bin_entry = bin_src_canonical
-        .strip_prefix(&pkg_root)
-        .unwrap_or(&bin_src_canonical)
+        })?
         .to_path_buf();
-    let target_dir = project.join("target").join("piano");
-    let runs_dir = target_dir.join("runs");
-    std::fs::create_dir_all(&runs_dir).map_err(io_context("create directory", &runs_dir))?;
-    {
-        let mut all_fn_names: Vec<String> = targets
-            .iter()
-            .flat_map(|t| {
-                let prefix = module_prefix(t.file.strip_prefix(&src_dir).unwrap_or(&t.file));
-                t.functions.iter().map(move |f| qualify(&prefix, f))
-            })
-            .collect();
-        all_fn_names.extend(macro_fn_names);
-        let all_fn_ids: Vec<(u32, &str)> = all_fn_names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (i as u32, name.as_str()))
-            .collect();
-        let main_source =
-            std::fs::read_to_string(&main_file).map_err(|source| Error::RunReadError {
-                path: bin_entry.clone(),
-                source,
-            })?;
-        let (rewritten, reg_map) =
-            inject_registrations(&main_source, &all_fn_ids).map_err(|source| {
-                Error::ParseError {
-                    path: bin_entry.clone(),
-                    source,
-                }
-            })?;
 
-        // Inject global allocator for allocation tracking.
-        let alloc_kind = detect_allocator_kind(&rewritten).map_err(|source| Error::ParseError {
-            path: bin_entry.clone(),
-            source,
-        })?;
-        let (rewritten, alloc_map) =
-            inject_global_allocator(&rewritten, alloc_kind).map_err(|source| {
-                Error::ParseError {
-                    path: bin_entry.clone(),
-                    source,
-                }
-            })?;
+    // Build the (id, display_name) name table sorted by id.
+    let mut name_table: Vec<(u32, String)> = global_name_ids
+        .iter()
+        .map(|(qualified, &id)| {
+            let display = global_display_names
+                .get(qualified)
+                .cloned()
+                .unwrap_or_else(|| qualified.clone());
+            (id, display)
+        })
+        .collect();
+    name_table.sort_by_key(|(id, _)| *id);
 
-        let runs_dir_str = runs_dir.to_string_lossy().to_string();
-        let (rewritten, shutdown_map) =
-            inject_shutdown(&rewritten, &runs_dir_str, false).map_err(|source| {
-                Error::ParseError {
-                    path: bin_entry.clone(),
-                    source,
-                }
-            })?;
-        std::fs::write(&main_file, rewritten).map_err(io_context("write", &main_file))?;
+    // Write wrapper config
+    let config = piano::wrapper::WrapperConfig {
+        runtime_rlib: runtime.rlib_path,
+        runtime_deps_dir: runtime.deps_dir,
+        instrument_macros,
+        entry_point: piano::wrapper::EntryPointConfig {
+            source_path: bin_entry_relative,
+            name_table,
+            runs_dir: runs_dir.clone(),
+            cpu_time,
+            cli_override: output_dir.is_some(),
+        },
+        targets: targets_relative,
+        all_instrumentable,
+        module_prefixes: module_prefixes_relative,
+        macro_name_ids: global_name_ids,
+    };
 
-        // Merge registration/allocator/shutdown source maps into the bin
-        // entry's map. Each step's map was computed relative to its input
-        // (which already contains prior injections), so the line numbers
-        // are in shifted coordinates. Merging gives approximate remapping
-        // -- exact for guard injections, close enough for the few lines
-        // added by registration/allocator/shutdown boilerplate.
-        let entry_map = source_maps.entry(bin_entry.clone()).or_default();
-        entry_map.merge(reg_map);
-        entry_map.merge(alloc_map);
-        entry_map.merge(shutdown_map);
-    }
+    let config_path = target_dir.join("config.json");
+    let config_json = serde_json::to_string(&config)
+        .map_err(|e| Error::BuildFailed(format!("failed to serialize wrapper config: {e}")))?;
+    std::fs::write(&config_path, config_json)
+        .map_err(io_context("write wrapper config", &config_path))?;
 
-    // Build the instrumented binary.
-    // Pass the package name when in a workspace (member != root).
+    // Clean stale concurrency data from previous builds.
+    let _ = std::fs::remove_file(piano::wrapper::concurrency_path(&config_path));
+
+    // Build with wrapper
     let pkg_arg = if member_subdir.is_some() {
         Some(package_name.as_str())
     } else {
         None
     };
-    let binary = build_instrumented(&staging, &target_dir, pkg_arg, bin.as_deref(), &source_maps)?;
+    let binary = build_instrumented(
+        &workspace_root,
+        &target_dir,
+        pkg_arg,
+        bin.as_deref(),
+        &config_path,
+    )?;
+
+    // Warn about concurrent functions when --cpu-time is not enabled.
+    if !cpu_time {
+        let concurrency = piano::wrapper::read_concurrency(&config_path);
+        for (func, _pattern) in &concurrency {
+            eprintln!(
+                "warning: {func} spawns parallel work -- add --cpu-time to see computation time"
+            );
+        }
+    }
 
     Ok(Some((binary, runs_dir, total_fns)))
 }
@@ -789,6 +960,7 @@ fn run_child(
 
 fn cmd_run(
     duration: Option<f64>,
+    output_dir: Option<PathBuf>,
     args: Vec<String>,
     project_root: &Option<PathBuf>,
 ) -> Result<(), Error> {
@@ -796,8 +968,16 @@ fn cmd_run(
     eprintln!("running: {}", binary.display());
     eprintln!("--- program output ---");
 
+    // When --output-dir is provided, override the runs directory via env var
+    // so the instrumented binary writes output there.
+    let output_dir_str = output_dir.as_ref().map(|d| d.to_string_lossy().into_owned());
+    let env: Vec<(&str, &str)> = match &output_dir_str {
+        Some(dir) => vec![("PIANO_RUNS_DIR", dir.as_str())],
+        None => vec![],
+    };
+
     let timeout = duration.map(Duration::from_secs_f64);
-    let outcome = run_child(&binary, &args, timeout, false, &[])?;
+    let outcome = run_child(&binary, &args, timeout, false, &env)?;
 
     match outcome.stop_reason {
         StopReason::Duration => std::process::exit(0),
@@ -811,6 +991,7 @@ fn cmd_profile(
     opts: BuildOpts,
     project_root: &Option<PathBuf>,
     show_all: bool,
+    limit: Option<usize>,
     frames: bool,
     json: bool,
     threads: bool,
@@ -882,7 +1063,7 @@ fn cmd_profile(
     }
 
     eprintln!("--- profiling report ---");
-    let report_result = match cmd_report(None, show_all, frames, json, threads, project_root) {
+    let report_result = match cmd_report(None, show_all, limit, frames, json, threads, project_root, None) {
         Ok(()) => Ok(()),
         Err(Error::NoRuns)
             if !outcome.status.success() && !ignore_exit_code && !intentional_stop =>
@@ -919,14 +1100,22 @@ fn cmd_profile(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_report(
     run_path: Option<PathBuf>,
     show_all: bool,
+    limit: Option<usize>,
     frames: bool,
     json: bool,
     threads: bool,
     project_root: &Option<PathBuf>,
+    output_dir: Option<PathBuf>,
 ) -> Result<(), Error> {
+    // When --output-dir is provided, set the env var so default_runs_dir picks it up.
+    if let Some(ref dir) = output_dir {
+        // SAFETY: single-threaded CLI -- no concurrent env reads.
+        unsafe { std::env::set_var("PIANO_RUNS_DIR", dir) };
+    }
     // Resolve the run file path.
     let resolved_path = match &run_path {
         Some(p) if p.exists() => Some(p.clone()),
@@ -952,9 +1141,9 @@ fn cmd_report(
                         );
                     }
                     if json {
-                        println!("{}", format_json(&run, show_all));
+                        println!("{}", format_json(&run, show_all, limit));
                     } else {
-                        anstream::print!("{}", format_table(&run, show_all));
+                        anstream::print!("{}", format_table(&run, show_all, limit));
                     }
                     return Ok(());
                 }
@@ -971,7 +1160,7 @@ fn cmd_report(
     if let Some(path) = &resolved_path
         && path.extension().and_then(|e| e.to_str()) == Some("ndjson")
     {
-        let (_run, frame_data) = load_ndjson(path)?;
+        let (_run, frame_data, _completeness) = load_ndjson(path)?;
 
         let has_tid = frame_data
             .frames
@@ -987,21 +1176,21 @@ fn cmd_report(
 
         if threads && has_tid {
             if json {
-                println!("{}", format_per_thread_json(&frame_data, show_all));
+                println!("{}", format_per_thread_json(&frame_data, show_all, limit));
             } else {
                 anstream::print!(
                     "{}",
-                    format_per_thread_tables_from_frames(&frame_data, show_all)
+                    format_per_thread_tables_from_frames(&frame_data, show_all, limit)
                 );
             }
         } else if json && frames {
-            println!("{}", format_frames_json(&frame_data, show_all));
+            println!("{}", format_frames_json(&frame_data, show_all, limit));
         } else if json {
-            println!("{}", format_json_with_frames(&frame_data, show_all));
+            println!("{}", format_json_with_frames(&frame_data, show_all, limit));
         } else if frames {
             anstream::print!("{}", format_frames_table(&frame_data));
         } else {
-            anstream::print!("{}", format_table_with_frames(&frame_data, show_all));
+            anstream::print!("{}", format_table_with_frames(&frame_data, show_all, limit));
         }
         return Ok(());
     }
@@ -1010,7 +1199,7 @@ fn cmd_report(
     if threads {
         let dir = default_runs_dir(project_root)?;
         let thread_runs = load_latest_runs_per_thread(&dir)?;
-        anstream::print!("{}", format_per_thread_tables(&thread_runs, show_all));
+        anstream::print!("{}", format_per_thread_tables(&thread_runs, show_all, limit));
         return Ok(());
     }
 
@@ -1023,9 +1212,9 @@ fn cmd_report(
         }
     };
     if json {
-        println!("{}", format_json(&run, show_all));
+        println!("{}", format_json(&run, show_all, limit));
     } else {
-        anstream::print!("{}", format_table(&run, show_all));
+        anstream::print!("{}", format_table(&run, show_all, limit));
     }
     Ok(())
 }
@@ -1046,9 +1235,17 @@ fn diff_label(arg: &Path) -> String {
 fn cmd_diff(
     a: Option<PathBuf>,
     b: Option<PathBuf>,
+    show_all: bool,
+    limit: Option<usize>,
     json: bool,
     project_root: &Option<PathBuf>,
+    output_dir: Option<PathBuf>,
 ) -> Result<(), Error> {
+    // When --output-dir is provided, set the env var so default_runs_dir picks it up.
+    if let Some(ref dir) = output_dir {
+        // SAFETY: single-threaded CLI -- no concurrent env reads.
+        unsafe { std::env::set_var("PIANO_RUNS_DIR", dir) };
+    }
     match (a, b) {
         (Some(a), Some(b)) => {
             let label_a = diff_label(&a);
@@ -1056,9 +1253,9 @@ fn cmd_diff(
             let run_a = resolve_run_arg(&a, project_root)?;
             let run_b = resolve_run_arg(&b, project_root)?;
             if json {
-                println!("{}", diff_runs_json(&run_a, &run_b));
+                println!("{}", diff_runs_json(&run_a, &run_b, show_all, limit));
             } else {
-                anstream::print!("{}", diff_runs(&run_a, &run_b, &label_a, &label_b));
+                anstream::print!("{}", diff_runs(&run_a, &run_b, &label_a, &label_b, show_all, limit));
             }
         }
         (None, None) => {
@@ -1067,12 +1264,12 @@ fn cmd_diff(
             let (previous, latest) = load_two_latest_runs(&runs_dir)?;
 
             if json {
-                println!("{}", diff_runs_json(&previous, &latest));
+                println!("{}", diff_runs_json(&previous, &latest, show_all, limit));
             } else {
                 let label_a = resolve_diff_label(&tags_dir, &previous, &runs_dir, "previous");
                 let label_b = resolve_diff_label(&tags_dir, &latest, &runs_dir, "latest");
                 eprintln!("comparing: {label_a} vs {label_b}");
-                anstream::print!("{}", diff_runs(&previous, &latest, &label_a, &label_b));
+                anstream::print!("{}", diff_runs(&previous, &latest, &label_a, &label_b, show_all, limit));
             }
         }
         _ => {
@@ -1115,7 +1312,12 @@ fn resolve_diff_label(
     format!("{role} ({stem})")
 }
 
-fn cmd_tag(name: Option<String>, project_root: &Option<PathBuf>) -> Result<(), Error> {
+fn cmd_tag(name: Option<String>, project_root: &Option<PathBuf>, output_dir: Option<PathBuf>) -> Result<(), Error> {
+    // When --output-dir is provided, set the env var so default_runs_dir picks it up.
+    if let Some(ref dir) = output_dir {
+        // SAFETY: single-threaded CLI -- no concurrent env reads.
+        unsafe { std::env::set_var("PIANO_RUNS_DIR", dir) };
+    }
     let Some(name) = name else {
         let tags_dir = match default_tags_dir(project_root) {
             Ok(dir) => dir,
@@ -1277,5 +1479,52 @@ mod tests {
     #[test]
     fn parse_duration_invalid_string() {
         assert!(parse_duration_secs("abc").is_err());
+    }
+
+    /// main() is excluded from the name table -- it is the lifecycle boundary that
+    /// creates the root context, not a profiled function.
+    #[test]
+    fn name_table_excludes_main() {
+        let all_qualified = vec![
+            piano::naming::QualifiedFunction::new("main", "main", "main"),
+            piano::naming::QualifiedFunction::new("process", "process", "process"),
+            piano::naming::QualifiedFunction::new("db::query", "db::query", "db::query"),
+        ];
+        let display_names = piano::naming::disambiguate(&all_qualified);
+
+        let mut next_id: u32 = 0;
+        let mut global_name_ids: HashMap<String, u32> = HashMap::new();
+        let mut global_display_names: HashMap<String, String> = HashMap::new();
+        for (qf, display) in all_qualified.iter().zip(display_names.iter()) {
+            if qf.minimal == "main" {
+                continue;
+            }
+            let id = *global_name_ids.entry(qf.minimal.clone()).or_insert_with(|| {
+                let id = next_id;
+                next_id += 1;
+                id
+            });
+            global_display_names
+                .entry(qf.minimal.clone())
+                .or_insert_with(|| display.clone());
+            let _ = id;
+        }
+
+        assert!(
+            !global_name_ids.contains_key("main"),
+            "main must not appear in the name table"
+        );
+        assert!(
+            !global_display_names.contains_key("main"),
+            "main must not appear in the display names"
+        );
+        assert!(
+            global_name_ids.contains_key("process"),
+            "non-main functions must be in the name table"
+        );
+        assert!(
+            global_name_ids.contains_key("db::query"),
+            "module-qualified functions must be in the name table"
+        );
     }
 }

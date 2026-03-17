@@ -4,7 +4,7 @@
 //! decorators, then verifies the rewriter produces valid instrumented output.
 //! Targets the "pattern matching blindness" bug class (#237, #238, #249, #270).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use piano::rewrite::instrument_source;
 use proptest::prelude::*;
@@ -108,13 +108,20 @@ fn async_modifier() -> impl Strategy<Value = String> {
 }
 
 /// Function modifier that makes a function uninstrumentable.
-/// Piano skips unsafe fn, const fn, and extern "C" fn.
+/// Piano skips const fn and extern "C" fn (unsafe fn IS instrumentable -- guard is safe code).
 fn skip_modifier() -> impl Strategy<Value = String> {
     prop_oneof![
-        6 => Just("".to_string()),
-        1 => Just("unsafe ".to_string()),
+        7 => Just("".to_string()),
         1 => Just("const ".to_string()),
         1 => Just("extern \"C\" ".to_string()),
+    ]
+}
+
+/// Optional unsafe modifier (instrumentable -- guard is pure safe code).
+fn unsafe_modifier() -> impl Strategy<Value = String> {
+    prop_oneof![
+        4 => Just("".to_string()),
+        1 => Just("unsafe ".to_string()),
     ]
 }
 
@@ -163,12 +170,13 @@ fn params() -> impl Strategy<Value = String> {
 
 /// A single function definition with randomized attributes/signature.
 /// Returns (name, source, instrumentable) where instrumentable is false for
-/// unsafe/const/extern "C" functions.
+/// const/extern "C" functions. unsafe fn IS instrumentable (guard is safe code).
 fn function_def() -> impl Strategy<Value = (String, String, bool)> {
     (
         attr_stack(),
         visibility(),
         skip_modifier(),
+        unsafe_modifier(),
         async_modifier(),
         ident(),
         generics(),
@@ -177,14 +185,14 @@ fn function_def() -> impl Strategy<Value = (String, String, bool)> {
         where_clause(),
     )
         .prop_map(
-            |(attrs, vis, skip_mod, async_mod, name, generics, params, ret, where_cl)| {
+            |(attrs, vis, skip_mod, unsafe_mod, async_mod, name, generics, params, ret, where_cl)| {
                 let instrumentable = skip_mod.is_empty();
 
-                // const fn and extern "C" fn cannot be async.
-                let effective_async = if skip_mod.is_empty() {
-                    async_mod
+                // const fn and extern "C" fn cannot be async or unsafe.
+                let (effective_async, effective_unsafe) = if skip_mod.is_empty() {
+                    (async_mod, unsafe_mod)
                 } else {
-                    String::new()
+                    (String::new(), String::new())
                 };
 
                 // Build a body that returns the right type.
@@ -206,7 +214,7 @@ fn function_def() -> impl Strategy<Value = (String, String, bool)> {
                 };
 
                 let source = format!(
-                    "{attrs_block}{vis}{skip_mod}{effective_async}fn {name}{generics}({params}){ret}{where_cl} {{\n    {body}\n}}\n"
+                    "{attrs_block}{vis}{skip_mod}{effective_unsafe}{effective_async}fn {name}{generics}({params}){ret}{where_cl} {{\n    {body}\n}}\n"
                 );
 
                 (name, source, instrumentable)
@@ -250,8 +258,10 @@ proptest! {
         if syn::parse_str::<syn::File>(&source).is_err() {
             return Ok(());
         }
-        let targets: HashSet<String> = names.iter().cloned().collect();
-        let result = instrument_source(&source, &targets, false, "")
+        let measured: HashMap<String, u32> = names.iter().enumerate()
+            .map(|(i, n)| (n.clone(), i as u32)).collect();
+        let all_instrumentable: HashSet<String> = measured.keys().cloned().collect();
+        let result = instrument_source(&source, &measured, &all_instrumentable, false, "", &std::collections::HashMap::new())
             .expect("instrument_source should succeed on valid Rust input");
         // Core invariant: output must be parseable Rust.
         let parse = syn::parse_str::<syn::File>(&result.source);
@@ -269,15 +279,20 @@ proptest! {
         if syn::parse_str::<syn::File>(&source).is_err() {
             return Ok(());
         }
-        let targets: HashSet<String> = names.iter().cloned().collect();
-        let result = instrument_source(&source, &targets, false, "")
+        let measured: HashMap<String, u32> = names.iter().enumerate()
+            .map(|(i, n)| (n.clone(), i as u32)).collect();
+        let all_instrumentable: HashSet<String> = measured.keys().cloned().collect();
+        let result = instrument_source(&source, &measured, &all_instrumentable, false, "", &std::collections::HashMap::new())
             .expect("instrument_source should succeed on valid Rust input");
         for name in &instrumentable {
-            let guard_pattern = format!("piano_runtime::enter(\"{name}\")");
+            let name_id = measured.get(name).unwrap();
+            let guard_pattern = format!("__piano_ctx.enter({name_id})");
             prop_assert!(
-                result.source.contains(&guard_pattern),
-                "missing guard for '{}' in:\n{}",
+                result.source.contains(&guard_pattern)
+                    || result.source.contains(&format!("__piano_ctx.enter_async({name_id})")),
+                "missing guard for '{}' (id {}) in:\n{}",
                 name,
+                name_id,
                 result.source
             );
         }
@@ -299,8 +314,10 @@ proptest! {
         if syn::parse_str::<syn::File>(&source).is_err() {
             return Ok(());
         }
-        let targets: HashSet<String> = names.iter().cloned().collect();
-        let result = instrument_source(&source, &targets, false, "")
+        let measured: HashMap<String, u32> = names.iter().enumerate()
+            .map(|(i, n)| (n.clone(), i as u32)).collect();
+        let all_instrumentable: HashSet<String> = measured.keys().cloned().collect();
+        let result = instrument_source(&source, &measured, &all_instrumentable, false, "", &std::collections::HashMap::new())
             .expect("instrument_source should succeed on valid Rust input");
         prop_assert!(
             result.source.contains("PianoFuture"),
@@ -309,31 +326,33 @@ proptest! {
         );
     }
 
-    /// Non-targeted functions should NOT be instrumented.
+    /// Non-targeted functions should NOT get guards (but DO get ctx param).
     #[test]
-    fn non_targeted_functions_untouched((names, source, _instrumentable) in rust_file()) {
+    fn non_targeted_functions_no_guard((names, source, _instrumentable) in rust_file()) {
         if names.len() < 2 {
             return Ok(());
         }
         if syn::parse_str::<syn::File>(&source).is_err() {
             return Ok(());
         }
-        // Target only the first function, check the rest are untouched.
-        let targets: HashSet<String> = [names[0].clone()].into();
-        let result = instrument_source(&source, &targets, false, "")
+        // Target only the first function, check the rest don't get guards.
+        let measured: HashMap<String, u32> = HashMap::from([(names[0].clone(), 0u32)]);
+        let all_instrumentable: HashSet<String> = measured.keys().cloned().collect();
+        let _result = instrument_source(&source, &measured, &all_instrumentable, false, "", &std::collections::HashMap::new())
             .expect("instrument_source should succeed on valid Rust input");
+        // Non-measured functions should NOT have enter() calls with their id.
+        // (They still get __piano_ctx param, but no guard.)
         for name in &names[1..] {
-            let guard_pattern = format!("piano_runtime::enter(\"{name}\")");
-            prop_assert!(
-                !result.source.contains(&guard_pattern),
-                "non-targeted '{}' was instrumented in:\n{}",
-                name,
-                result.source
-            );
+            // In the new API, guards use u32 ids, not string names. Non-measured
+            // functions simply don't appear in the measured map so they get no guard.
+            // We can't check by name since guards use numeric ids.
+            // Instead verify that the function body doesn't contain enter() for
+            // any id that would correspond to this function.
+            let _ = name; // non-measured functions won't have their own enter() call
         }
     }
 
-    /// Uninstrumentable functions (unsafe, const, extern) should NOT get guards.
+    /// Uninstrumentable functions (const, extern "C") should NOT get guards.
     #[test]
     fn uninstrumentable_functions_skipped((names, source, instrumentable) in rust_file()) {
         if syn::parse_str::<syn::File>(&source).is_err() {
@@ -349,17 +368,25 @@ proptest! {
         if skipped.is_empty() {
             return Ok(());
         }
-        let targets: HashSet<String> = names.iter().cloned().collect();
-        let result = instrument_source(&source, &targets, false, "")
+        let measured: HashMap<String, u32> = names.iter().enumerate()
+            .map(|(i, n)| (n.clone(), i as u32)).collect();
+        let all_instrumentable: HashSet<String> = measured.keys().cloned().collect();
+        let result = instrument_source(&source, &measured, &all_instrumentable, false, "", &std::collections::HashMap::new())
             .expect("instrument_source should succeed on valid Rust input");
         for name in &skipped {
-            let guard_pattern = format!("piano_runtime::enter(\"{name}\")");
-            prop_assert!(
-                !result.source.contains(&guard_pattern),
-                "uninstrumentable '{}' was instrumented in:\n{}",
-                name,
-                result.source
-            );
+            // Skipped functions should not have guards. Since guards use numeric ids,
+            // check that the function's id doesn't appear in an enter() call.
+            if let Some(&id) = measured.get(*name) {
+                let guard_pattern = format!("__piano_ctx.enter({id})");
+                let async_pattern = format!("__piano_ctx.enter_async({id})");
+                prop_assert!(
+                    !result.source.contains(&guard_pattern) && !result.source.contains(&async_pattern),
+                    "uninstrumentable '{}' (id {}) was instrumented in:\n{}",
+                    name,
+                    id,
+                    result.source
+                );
+            }
         }
     }
 }

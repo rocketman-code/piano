@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use quote::quote;
 use syn::visit_mut::VisitMut;
 
@@ -6,6 +8,8 @@ struct FnMatch {
     /// The tokens that form the function name (either a single Ident for
     /// literal names, or [Punct('$'), Ident] for metavar names).
     name_tokens: Vec<proc_macro2::TokenTree>,
+    /// Index of the Parenthesis Group containing the parameter list.
+    params_index: usize,
     /// Index of the brace Group containing the function body.
     body_index: usize,
 }
@@ -15,12 +19,117 @@ fn is_macro_rules(item: &syn::ItemMacro) -> bool {
     item.mac.path.is_ident("macro_rules")
 }
 
+/// Pre-scan source for literal function names inside macro_rules! bodies.
+/// Returns qualified names (with module_prefix) for all literal-name functions
+/// found. Metavar names ($name) are excluded.
+///
+/// This is the read-only counterpart to instrument_macro_tokens -- same walk
+/// logic, but only collects names without modifying anything.
+pub fn discover_macro_fn_names(source: &str, module_prefix: &str) -> Result<Vec<String>, syn::Error> {
+    let file: syn::File = syn::parse_str(source)?;
+    let mut names = Vec::new();
+    for item in &file.items {
+        if let syn::Item::Macro(item_macro) = item {
+            if is_macro_rules(item_macro) {
+                collect_names_from_macro_tokens(&item_macro.mac.tokens, module_prefix, &mut names);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// Walk a macro_rules! token stream collecting literal fn names from rule
+/// arm templates. Same structure as instrument_macro_tokens but read-only.
+fn collect_names_from_macro_tokens(
+    tokens: &proc_macro2::TokenStream,
+    module_prefix: &str,
+    names: &mut Vec<String>,
+) {
+    let tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
+    let len = tts.len();
+    let mut i = 0;
+
+    while i < len {
+        if is_fat_arrow(&tts, i) {
+            let template_idx = i + 2;
+            if template_idx < len {
+                if let proc_macro2::TokenTree::Group(ref group) = tts[template_idx] {
+                    let inner: Vec<proc_macro2::TokenTree> =
+                        group.stream().into_iter().collect();
+                    collect_fn_names_in_tokens(&inner, None, module_prefix, names);
+                }
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Scan a flat token vector collecting literal fn names. Recurses into brace
+/// groups for impl blocks. Read-only counterpart to inject_fn_guards_in_tokens.
+fn collect_fn_names_in_tokens(
+    tokens: &[proc_macro2::TokenTree],
+    impl_type: Option<&MacroImplType>,
+    module_prefix: &str,
+    names: &mut Vec<String>,
+) {
+    let mut i = 0;
+    while i < tokens.len() {
+        if let Some(skip_to) = skip_non_instrumentable_fn(tokens, i) {
+            i = skip_to;
+            continue;
+        }
+
+        if let Some(fm) = match_fn_pattern(tokens, i) {
+            let body_idx = fm.body_index;
+            let is_metavar_name = fm.name_tokens.len() == 2
+                && matches!(&fm.name_tokens[0], proc_macro2::TokenTree::Punct(p) if p.as_char() == '$');
+
+            if !is_metavar_name {
+                let method_str = match &fm.name_tokens[0] {
+                    proc_macro2::TokenTree::Ident(ident) => ident.to_string(),
+                    _ => unreachable!(
+                        "match_fn_pattern guarantees name_tokens[0] is Ident for literal names"
+                    ),
+                };
+                let qualified = match impl_type {
+                    Some(MacroImplType::Literal(ty)) => {
+                        crate::resolve::qualify(module_prefix, &format!("{ty}::{method_str}"))
+                    }
+                    None => crate::resolve::qualify(module_prefix, &method_str),
+                    Some(MacroImplType::Metavar(_)) => {
+                        // Can't resolve at rewrite time -- use bare method name.
+                        crate::resolve::qualify(module_prefix, &method_str)
+                    }
+                };
+                if !qualified.is_empty() {
+                    names.push(qualified);
+                }
+            }
+            i = body_idx + 1;
+        } else {
+            if let proc_macro2::TokenTree::Group(ref group) = tokens[i] {
+                if group.delimiter() == proc_macro2::Delimiter::Brace {
+                    let detected = detect_impl_type(tokens, i);
+                    let recurse_impl = detected.as_ref().or(impl_type);
+                    let inner: Vec<proc_macro2::TokenTree> =
+                        group.stream().into_iter().collect();
+                    collect_fn_names_in_tokens(&inner, recurse_impl, module_prefix, names);
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
 /// Top-level entry: scan a macro_rules! token stream for rule arms and
 /// instrument any fn items found in each arm's template body.
 fn instrument_macro_tokens(
     tokens: &mut proc_macro2::TokenStream,
     module_prefix: &str,
     collected_names: &mut Vec<String>,
+    name_ids: &HashMap<String, u32>,
 ) {
     let mut tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
     let len = tts.len();
@@ -37,7 +146,13 @@ fn instrument_macro_tokens(
                     // Templates can use brace, paren, or bracket delimiters.
                     let mut inner: Vec<proc_macro2::TokenTree> =
                         group.stream().into_iter().collect();
-                    inject_fn_guards_in_tokens(&mut inner, None, module_prefix, collected_names);
+                    inject_fn_guards_in_tokens(
+                        &mut inner,
+                        None,
+                        module_prefix,
+                        collected_names,
+                        name_ids,
+                    );
                     let new_stream: proc_macro2::TokenStream = inner.into_iter().collect();
                     let mut new_group = proc_macro2::Group::new(group.delimiter(), new_stream);
                     new_group.set_span(group.span());
@@ -75,6 +190,7 @@ enum MacroImplType {
     /// A literal type name, e.g. `impl Cruncher { ... }`.
     Literal(String),
     /// A metavar type, e.g. `impl $ty { ... }`.
+    #[allow(dead_code)]
     Metavar(proc_macro2::TokenTree),
 }
 
@@ -219,18 +335,19 @@ fn detect_impl_type(tokens: &[proc_macro2::TokenTree], brace_idx: usize) -> Opti
     None
 }
 
-/// Scan a flat token vector for fn patterns and inject guards into each
-/// matched function body. Recurses into brace groups to handle fn items
-/// inside impl blocks within macro templates.
+/// Scan a flat token vector for fn patterns and inject guards + ctx
+/// parameters into each matched function. Recurses into brace groups to
+/// handle fn items inside impl blocks within macro templates.
 fn inject_fn_guards_in_tokens(
     tokens: &mut [proc_macro2::TokenTree],
     impl_type: Option<&MacroImplType>,
     module_prefix: &str,
     collected_names: &mut Vec<String>,
+    name_ids: &HashMap<String, u32>,
 ) {
     let mut i = 0;
     while i < tokens.len() {
-        // Skip non-instrumentable fn definitions (const fn, unsafe fn, extern fn)
+        // Skip non-instrumentable fn definitions (const fn, extern fn with non-Rust ABI)
         // so we don't accidentally match the inner `fn` keyword.
         if let Some(skip_to) = skip_non_instrumentable_fn(tokens, i) {
             i = skip_to;
@@ -238,6 +355,7 @@ fn inject_fn_guards_in_tokens(
         }
 
         if let Some(fm) = match_fn_pattern(tokens, i) {
+            let params_idx = fm.params_index;
             let body_idx = fm.body_index;
 
             // Collect literal (non-metavar) function names for registration.
@@ -256,29 +374,42 @@ fn inject_fn_guards_in_tokens(
                         crate::resolve::qualify(module_prefix, &format!("{ty}::{method_str}"))
                     }
                     None => crate::resolve::qualify(module_prefix, &method_str),
-                    Some(MacroImplType::Metavar(_)) => String::new(),
+                    Some(MacroImplType::Metavar(_)) => {
+                        // Can't resolve qualified name -- use bare method name.
+                        crate::resolve::qualify(module_prefix, &method_str)
+                    }
                 };
                 if !qualified.is_empty() {
-                    collected_names.push(qualified);
+                    collected_names.push(qualified.clone());
                 }
-            }
 
-            // Build the guard token stream for this function name.
-            let guard = make_guard_tokens(&fm.name_tokens, impl_type, module_prefix);
-            let guard_tts: Vec<proc_macro2::TokenTree> = guard.into_iter().collect();
+                // Build the profiling guard if we have a name_id for this function.
+                let guard_opt = make_guard_tokens(
+                    &fm.name_tokens,
+                    impl_type,
+                    module_prefix,
+                    name_ids,
+                );
 
-            // Inject guard tokens at the start of the body brace group.
-            if let proc_macro2::TokenTree::Group(ref group) = tokens[body_idx] {
-                let mut body_tts: Vec<proc_macro2::TokenTree> =
-                    group.stream().into_iter().collect();
-                for (j, tt) in guard_tts.into_iter().enumerate() {
-                    body_tts.insert(j, tt);
+                // Inject ctx parameter into the parenthesized param list.
+                inject_ctx_param(tokens, params_idx);
+
+                // Inject guard tokens at the start of the body brace group.
+                if let Some(guard) = guard_opt {
+                    let guard_tts: Vec<proc_macro2::TokenTree> = guard.into_iter().collect();
+                    if let proc_macro2::TokenTree::Group(ref group) = tokens[body_idx] {
+                        let mut body_tts: Vec<proc_macro2::TokenTree> =
+                            group.stream().into_iter().collect();
+                        for (j, tt) in guard_tts.into_iter().enumerate() {
+                            body_tts.insert(j, tt);
+                        }
+                        let new_stream: proc_macro2::TokenStream = body_tts.into_iter().collect();
+                        let mut new_group =
+                            proc_macro2::Group::new(proc_macro2::Delimiter::Brace, new_stream);
+                        new_group.set_span(group.span());
+                        tokens[body_idx] = proc_macro2::TokenTree::Group(new_group);
+                    }
                 }
-                let new_stream: proc_macro2::TokenStream = body_tts.into_iter().collect();
-                let mut new_group =
-                    proc_macro2::Group::new(proc_macro2::Delimiter::Brace, new_stream);
-                new_group.set_span(group.span());
-                tokens[body_idx] = proc_macro2::TokenTree::Group(new_group);
             }
             // Advance past the body group.
             i = body_idx + 1;
@@ -295,6 +426,7 @@ fn inject_fn_guards_in_tokens(
                         recurse_impl,
                         module_prefix,
                         collected_names,
+                        name_ids,
                     );
                     let new_stream: proc_macro2::TokenStream = inner.into_iter().collect();
                     let mut new_group =
@@ -308,13 +440,37 @@ fn inject_fn_guards_in_tokens(
     }
 }
 
+/// Inject `__piano_ctx: piano_runtime::ctx::Ctx` as the last parameter in
+/// the parenthesized parameter list at `params_idx`.
+fn inject_ctx_param(tokens: &mut [proc_macro2::TokenTree], params_idx: usize) {
+    if let proc_macro2::TokenTree::Group(ref group) = tokens[params_idx] {
+        let existing: proc_macro2::TokenStream = group.stream();
+        let ctx_param = quote! { __piano_ctx: piano_runtime::ctx::Ctx };
+        let new_stream = if existing.is_empty() {
+            ctx_param
+        } else {
+            let comma = proc_macro2::Punct::new(',', proc_macro2::Spacing::Alone);
+            let mut tts: Vec<proc_macro2::TokenTree> = existing.into_iter().collect();
+            tts.push(proc_macro2::TokenTree::Punct(comma));
+            tts.extend(ctx_param);
+            tts.into_iter().collect()
+        };
+        let mut new_group =
+            proc_macro2::Group::new(proc_macro2::Delimiter::Parenthesis, new_stream);
+        new_group.set_span(group.span());
+        tokens[params_idx] = proc_macro2::TokenTree::Group(new_group);
+    }
+}
+
 /// If the token at position `i` starts a non-instrumentable fn definition
-/// (const fn, unsafe fn, extern fn with non-Rust ABI), return the index just
-/// past the body brace group so the caller can skip the entire definition.
-/// Returns None if this is not a non-instrumentable fn.
+/// (const fn, extern fn with non-Rust ABI, unsafe extern non-Rust ABI fn),
+/// return the index just past the body brace group so the caller can skip
+/// the entire definition. Returns None if this is not a non-instrumentable fn.
+/// unsafe fn alone is instrumentable (guard is pure safe code) and handled
+/// by match_fn_pattern.
 ///
 /// Unlike match_fn_pattern, this requires `fn` to immediately follow the
-/// modifier(s). A `const SIZE: usize = 42;` is NOT a const fn — we must not
+/// modifier(s). A `const SIZE: usize = 42;` is NOT a const fn -- we must not
 /// greedily scan forward and swallow the next real fn.
 fn skip_non_instrumentable_fn(tokens: &[proc_macro2::TokenTree], i: usize) -> Option<usize> {
     let len = tokens.len();
@@ -332,18 +488,17 @@ fn skip_non_instrumentable_fn(tokens: &[proc_macro2::TokenTree], i: usize) -> Op
         }
     }
 
-    // Must see one of: const, unsafe, extern (non-Rust ABI) — then `fn` must follow immediately.
+    // Must see one of: const, unsafe extern (non-Rust ABI), extern (non-Rust ABI)
+    // — then `fn` must follow immediately.
+    // unsafe fn alone is instrumentable (guard is pure safe code) and handled by match_fn_pattern.
     if is_ident(tokens, pos, "const") {
         pos += 1;
-    } else if is_ident(tokens, pos, "unsafe") {
-        pos += 1;
-        // unsafe extern "ABI" fn
-        if is_ident(tokens, pos, "extern") {
-            pos += 1;
-            if pos < len {
-                if let proc_macro2::TokenTree::Literal(_) = &tokens[pos] {
-                    pos += 1; // skip ABI string like "C"
-                }
+    } else if is_ident(tokens, pos, "unsafe") && is_non_rust_extern(tokens, pos + 1) {
+        pos += 1; // skip `unsafe`
+        pos += 1; // skip `extern`
+        if pos < len {
+            if let proc_macro2::TokenTree::Literal(_) = &tokens[pos] {
+                pos += 1; // skip ABI string like "C"
             }
         }
     } else if is_non_rust_extern(tokens, pos) {
@@ -378,18 +533,18 @@ fn skip_non_instrumentable_fn(tokens: &[proc_macro2::TokenTree], i: usize) -> Op
 }
 
 /// Try to match a fn pattern starting at position `start`:
-///   [pub [( ... )]]? [extern "Rust"]? [async]? fn NAME ( ... ) [-> ...]? { ... }
+///   [pub [( ... )]]? [unsafe]? [extern "Rust"]? [async]? fn NAME ( ... ) [-> ...]? { ... }
 ///
-/// Rejects const fn, unsafe fn, and extern fn with non-Rust ABI (matching classify()).
+/// Rejects const fn and extern fn with non-Rust ABI (matching classify()).
+/// unsafe fn IS accepted -- the guard is pure safe code, so unsafe fn is instrumentable.
 /// NAME can be an Ident (literal name) or $metavar (Punct('$') + Ident).
 fn match_fn_pattern(tokens: &[proc_macro2::TokenTree], start: usize) -> Option<FnMatch> {
     let len = tokens.len();
     let mut pos = start;
 
-    // Check for non-instrumentable prefixes: const, unsafe, extern (non-Rust ABI).
+    // Check for non-instrumentable prefixes: const, extern (non-Rust ABI).
     // If we see any of these before `fn`, skip this position.
     if is_ident(tokens, pos, "const")
-        || is_ident(tokens, pos, "unsafe")
         || is_non_rust_extern(tokens, pos)
     {
         return None;
@@ -413,9 +568,16 @@ fn match_fn_pattern(tokens: &[proc_macro2::TokenTree], start: usize) -> Option<F
 
         // After pub, check for non-instrumentable prefixes.
         if is_ident(tokens, pos, "const")
-            || is_ident(tokens, pos, "unsafe")
             || is_non_rust_extern(tokens, pos)
         {
+            return None;
+        }
+    }
+
+    // Optional: `unsafe`.
+    if is_ident(tokens, pos, "unsafe") {
+        pos += 1;
+        if pos >= len {
             return None;
         }
     }
@@ -515,6 +677,7 @@ fn match_fn_pattern(tokens: &[proc_macro2::TokenTree], start: usize) -> Option<F
     }
 
     // Required: parameter list (parenthesized group).
+    let params_pos = pos;
     if let proc_macro2::TokenTree::Group(g) = &tokens[pos] {
         if g.delimiter() != proc_macro2::Delimiter::Parenthesis {
             return None;
@@ -543,6 +706,7 @@ fn match_fn_pattern(tokens: &[proc_macro2::TokenTree], start: usize) -> Option<F
         if g.delimiter() == proc_macro2::Delimiter::Brace {
             return Some(FnMatch {
                 name_tokens,
+                params_index: params_pos,
                 body_index: pos,
             });
         }
@@ -578,252 +742,45 @@ fn is_non_rust_extern(tokens: &[proc_macro2::TokenTree], i: usize) -> bool {
     true
 }
 
-/// Build a `stringify!($metavar)` token stream. `quote!` cannot emit `$`
-/// tokens, so we construct manually.
-fn build_stringify_call(metavar_ident: &proc_macro2::TokenTree) -> proc_macro2::TokenStream {
-    let span = proc_macro2::Span::call_site();
-    let dollar = proc_macro2::Punct::new('$', proc_macro2::Spacing::Alone);
-    let inner: proc_macro2::TokenStream =
-        vec![proc_macro2::TokenTree::Punct(dollar), metavar_ident.clone()]
-            .into_iter()
-            .collect();
-    vec![
-        proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("stringify", span)),
-        proc_macro2::TokenTree::Punct(proc_macro2::Punct::new('!', proc_macro2::Spacing::Alone)),
-        proc_macro2::TokenTree::Group(proc_macro2::Group::new(
-            proc_macro2::Delimiter::Parenthesis,
-            inner,
-        )),
-    ]
-    .into_iter()
-    .collect()
-}
-
-/// Build the full `let __piano_guard = piano_runtime::enter(ARG);` statement,
-/// where `enter_arg_stream` is the token stream to place inside the parens.
-fn build_enter_guard(enter_arg_stream: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
-    let span = proc_macro2::Span::call_site();
-    let enter_arg = proc_macro2::Group::new(proc_macro2::Delimiter::Parenthesis, enter_arg_stream);
-    vec![
-        proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("let", span)),
-        proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("__piano_guard", span)),
-        proc_macro2::TokenTree::Punct(proc_macro2::Punct::new('=', proc_macro2::Spacing::Alone)),
-        proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("piano_runtime", span)),
-        proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(':', proc_macro2::Spacing::Joint)),
-        proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(':', proc_macro2::Spacing::Alone)),
-        proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("enter", span)),
-        proc_macro2::TokenTree::Group(enter_arg),
-        proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(';', proc_macro2::Spacing::Alone)),
-    ]
-    .into_iter()
-    .collect()
-}
-
-/// Prepend `"prefix::", ` to a concat! argument list when module_prefix is non-empty.
-fn prepend_module_prefix_tokens(tts: &mut Vec<proc_macro2::TokenTree>, module_prefix: &str) {
-    if !module_prefix.is_empty() {
-        let prefix_with_sep = format!("{module_prefix}::");
-        tts.extend(quote! { #prefix_with_sep });
-        tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-            ',',
-            proc_macro2::Spacing::Alone,
-        )));
+/// Build the profiling guard: `let (__piano_guard, __piano_ctx) = __piano_ctx.enter(N);`
+fn build_profiling_guard(name_id: u32) -> proc_macro2::TokenStream {
+    quote! {
+        let (__piano_guard, __piano_ctx) = __piano_ctx.enter(#name_id);
     }
 }
 
-/// Build the guard statement tokens for a function name, optionally qualified
-/// with the enclosing impl type.
+/// Build the guard statement tokens for a literal-name function, looking up
+/// the name_id in the provided map. Returns None if the function name has no
+/// assigned ID (guard generation is skipped).
 ///
-/// For a literal name like `initialize` in `impl Cruncher`:
-///   `let __piano_guard = piano_runtime::enter("Cruncher::initialize");`
-///
-/// For a metavar name like `$name`:
-///   `let __piano_guard = piano_runtime::enter(stringify!($name));`
-///
-/// For a literal name in `impl $ty`:
-///   `let __piano_guard = piano_runtime::enter(concat!(stringify!($ty), "::", "method"));`
-///
-/// For a metavar name in `impl $ty`:
-///   `let __piano_guard = piano_runtime::enter(concat!(stringify!($ty), "::", stringify!($name)));`
+/// Metavar-name functions are never passed to this function -- they are
+/// skipped entirely by the caller (metavar names are unknown at rewrite time).
 fn make_guard_tokens(
     name_tokens: &[proc_macro2::TokenTree],
     impl_type: Option<&MacroImplType>,
     module_prefix: &str,
-) -> proc_macro2::TokenStream {
-    let is_name_metavar = name_tokens.len() == 2
-        && matches!(&name_tokens[0], proc_macro2::TokenTree::Punct(p) if p.as_char() == '$');
+    name_ids: &HashMap<String, u32>,
+) -> Option<proc_macro2::TokenStream> {
+    let method_str = match &name_tokens[0] {
+        proc_macro2::TokenTree::Ident(ident) => ident.to_string(),
+        _ => unreachable!(
+            "make_guard_tokens is only called for literal names"
+        ),
+    };
 
-    match (impl_type, is_name_metavar) {
-        // Literal type + literal name: "Type::method"
-        (Some(MacroImplType::Literal(type_name)), false) => {
-            let method_name = match &name_tokens[0] {
-                proc_macro2::TokenTree::Ident(ident) => ident.to_string(),
-                _ => unreachable!(
-                    "match_fn_pattern guarantees name_tokens[0] is Ident for literal names"
-                ),
-            };
-            let qualified =
-                crate::resolve::qualify(module_prefix, &format!("{type_name}::{method_name}"));
-            quote! {
-                let __piano_guard = piano_runtime::enter(#qualified);
-            }
+    // Determine the qualified name to look up in name_ids.
+    let qualified = match impl_type {
+        Some(MacroImplType::Literal(ty)) => {
+            crate::resolve::qualify(module_prefix, &format!("{ty}::{method_str}"))
         }
-        // Metavar type + literal name: concat!(stringify!($ty), "::", "method")
-        (Some(MacroImplType::Metavar(ty_ident)), false) => {
-            let method_name = match &name_tokens[0] {
-                proc_macro2::TokenTree::Ident(ident) => ident.to_string(),
-                _ => unreachable!(
-                    "match_fn_pattern guarantees name_tokens[0] is Ident for literal names"
-                ),
-            };
-            let stringify_call = build_stringify_call(ty_ident);
-            let separator: proc_macro2::TokenStream = quote! { "::" };
-            let method_lit: proc_macro2::TokenStream = quote! { #method_name };
-            // Build: concat!("prefix::", stringify!($ty), "::", "method")
-            let span = proc_macro2::Span::call_site();
-            let concat_inner: proc_macro2::TokenStream = {
-                let mut tts = Vec::new();
-                prepend_module_prefix_tokens(&mut tts, module_prefix);
-                tts.extend(stringify_call);
-                tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                    ',',
-                    proc_macro2::Spacing::Alone,
-                )));
-                tts.extend(separator);
-                tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                    ',',
-                    proc_macro2::Spacing::Alone,
-                )));
-                tts.extend(method_lit);
-                tts.into_iter().collect()
-            };
-            let concat_call: proc_macro2::TokenStream = vec![
-                proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("concat", span)),
-                proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                    '!',
-                    proc_macro2::Spacing::Alone,
-                )),
-                proc_macro2::TokenTree::Group(proc_macro2::Group::new(
-                    proc_macro2::Delimiter::Parenthesis,
-                    concat_inner,
-                )),
-            ]
-            .into_iter()
-            .collect();
-            build_enter_guard(concat_call)
+        Some(MacroImplType::Metavar(_)) => {
+            // Can't resolve qualified name at rewrite time -- try bare method name.
+            crate::resolve::qualify(module_prefix, &method_str)
         }
-        // Literal type + metavar name: concat!("Type::", stringify!($name))
-        (Some(MacroImplType::Literal(type_name)), true) => {
-            let qualified_type = crate::resolve::qualify(module_prefix, type_name);
-            let prefix = format!("{qualified_type}::");
-            let stringify_call = build_stringify_call(&name_tokens[1]);
-            let prefix_lit: proc_macro2::TokenStream = quote! { #prefix };
-            let span = proc_macro2::Span::call_site();
-            let concat_inner: proc_macro2::TokenStream = {
-                let mut tts = Vec::new();
-                tts.extend(prefix_lit);
-                tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                    ',',
-                    proc_macro2::Spacing::Alone,
-                )));
-                tts.extend(stringify_call);
-                tts.into_iter().collect()
-            };
-            let concat_call: proc_macro2::TokenStream = vec![
-                proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("concat", span)),
-                proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                    '!',
-                    proc_macro2::Spacing::Alone,
-                )),
-                proc_macro2::TokenTree::Group(proc_macro2::Group::new(
-                    proc_macro2::Delimiter::Parenthesis,
-                    concat_inner,
-                )),
-            ]
-            .into_iter()
-            .collect();
-            build_enter_guard(concat_call)
-        }
-        // Metavar type + metavar name: concat!(stringify!($ty), "::", stringify!($name))
-        (Some(MacroImplType::Metavar(ty_ident)), true) => {
-            let ty_stringify = build_stringify_call(ty_ident);
-            let name_stringify = build_stringify_call(&name_tokens[1]);
-            let separator: proc_macro2::TokenStream = quote! { "::" };
-            let span = proc_macro2::Span::call_site();
-            let concat_inner: proc_macro2::TokenStream = {
-                let mut tts = Vec::new();
-                prepend_module_prefix_tokens(&mut tts, module_prefix);
-                tts.extend(ty_stringify);
-                tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                    ',',
-                    proc_macro2::Spacing::Alone,
-                )));
-                tts.extend(separator);
-                tts.push(proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                    ',',
-                    proc_macro2::Spacing::Alone,
-                )));
-                tts.extend(name_stringify);
-                tts.into_iter().collect()
-            };
-            let concat_call: proc_macro2::TokenStream = vec![
-                proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("concat", span)),
-                proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                    '!',
-                    proc_macro2::Spacing::Alone,
-                )),
-                proc_macro2::TokenTree::Group(proc_macro2::Group::new(
-                    proc_macro2::Delimiter::Parenthesis,
-                    concat_inner,
-                )),
-            ]
-            .into_iter()
-            .collect();
-            build_enter_guard(concat_call)
-        }
-        // No impl type, metavar name: stringify!($name) or concat!("prefix::", stringify!($name))
-        (None, true) => {
-            let stringify_call = build_stringify_call(&name_tokens[1]);
-            if module_prefix.is_empty() {
-                build_enter_guard(stringify_call)
-            } else {
-                let span = proc_macro2::Span::call_site();
-                let concat_inner: proc_macro2::TokenStream = {
-                    let mut tts = Vec::new();
-                    prepend_module_prefix_tokens(&mut tts, module_prefix);
-                    tts.extend(stringify_call);
-                    tts.into_iter().collect()
-                };
-                let concat_call: proc_macro2::TokenStream = vec![
-                    proc_macro2::TokenTree::Ident(proc_macro2::Ident::new("concat", span)),
-                    proc_macro2::TokenTree::Punct(proc_macro2::Punct::new(
-                        '!',
-                        proc_macro2::Spacing::Alone,
-                    )),
-                    proc_macro2::TokenTree::Group(proc_macro2::Group::new(
-                        proc_macro2::Delimiter::Parenthesis,
-                        concat_inner,
-                    )),
-                ]
-                .into_iter()
-                .collect();
-                build_enter_guard(concat_call)
-            }
-        }
-        // No impl type, literal name: "name"
-        (None, false) => {
-            let name_str = match &name_tokens[0] {
-                proc_macro2::TokenTree::Ident(ident) => ident.to_string(),
-                _ => unreachable!(
-                    "match_fn_pattern guarantees name_tokens[0] is Ident for literal names"
-                ),
-            };
-            let qualified = crate::resolve::qualify(module_prefix, &name_str);
-            quote! {
-                let __piano_guard = piano_runtime::enter(#qualified);
-            }
-        }
-    }
+        None => crate::resolve::qualify(module_prefix, &method_str),
+    };
+
+    name_ids.get(&qualified).map(|&id| build_profiling_guard(id))
 }
 
 /// Separate VisitMut that only handles macro_rules! instrumentation.
@@ -831,6 +788,7 @@ fn make_guard_tokens(
 pub(super) struct MacroInstrumenter {
     pub(super) module_prefix: String,
     pub(super) collected_names: Vec<String>,
+    pub(super) name_ids: HashMap<String, u32>,
 }
 
 impl VisitMut for MacroInstrumenter {
@@ -840,6 +798,7 @@ impl VisitMut for MacroInstrumenter {
                 &mut node.mac.tokens,
                 &self.module_prefix,
                 &mut self.collected_names,
+                &self.name_ids,
             );
         }
         syn::visit_mut::visit_item_macro_mut(self, node);
@@ -848,12 +807,60 @@ impl VisitMut for MacroInstrumenter {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use crate::rewrite::instrument_source;
 
+    /// Test helper: calls instrument_source with all_instrumentable derived from
+    /// measured keys (sufficient for tests that don't exercise call-site injection).
+    /// Pre-scans for macro function names and assigns IDs starting after the
+    /// highest ID in `measured`.
+    fn instrument(
+        source: &str,
+        measured: &HashMap<String, u32>,
+        instrument_macros: bool,
+        module_prefix: &str,
+    ) -> Result<crate::rewrite::InstrumentResult, String> {
+        let all_instrumentable: HashSet<String> = measured.keys().cloned().collect();
+        // Build macro name_ids by pre-scanning, mirroring main.rs behavior.
+        let mut macro_name_ids: HashMap<String, u32> = measured.clone();
+        let mut next_id: u32 = measured.values().copied().max().map_or(0, |m| m + 1);
+        if instrument_macros {
+            if let Ok(names) = super::discover_macro_fn_names(source, module_prefix) {
+                for name in names {
+                    macro_name_ids.entry(name).or_insert_with(|| {
+                        let id = next_id;
+                        next_id += 1;
+                        id
+                    });
+                }
+            }
+        }
+        instrument_source(source, measured, &all_instrumentable, instrument_macros, module_prefix, &macro_name_ids)
+    }
+
+    /// Check if the output contains the ctx parameter, tolerating whitespace
+    /// differences from prettyplease.
+    fn contains_ctx_param(source: &str) -> bool {
+        let stripped: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        stripped.contains("__piano_ctx:piano_runtime::ctx::Ctx")
+    }
+
+    /// Count occurrences of profiling guards (`__piano_ctx.enter(`), tolerating
+    /// prettyplease line breaks and spaces.
+    fn count_profiling_guards(source: &str) -> usize {
+        let stripped: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        stripped.matches("__piano_ctx.enter(").count()
+    }
+
+    /// Count occurrences of the ctx parameter in function signatures.
+    fn count_ctx_params(source: &str) -> usize {
+        let stripped: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        stripped.matches("__piano_ctx:piano_runtime::ctx::Ctx").count()
+    }
+
     #[test]
-    fn instruments_fn_in_macro_rules_metavar_name() {
+    fn skips_fn_in_macro_rules_metavar_name() {
         let source = r#"
 macro_rules! make_handler {
     ($name:ident) => {
@@ -864,18 +871,15 @@ macro_rules! make_handler {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
+        // Metavar-name functions are skipped -- name is unknown at rewrite time.
         assert!(
-            result.contains("stringify!"),
-            "macro fn with metavar name should use stringify!. Got:\n{result}"
-        );
-        assert!(
-            result.contains("piano_runtime::enter"),
-            "macro fn should get a guard. Got:\n{result}"
+            !result.contains("__piano_ctx"),
+            "macro fn with metavar name should be skipped. Got:\n{result}"
         );
     }
 
@@ -891,19 +895,23 @@ macro_rules! setup {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
         assert!(
-            result.contains(r#"piano_runtime::enter("initialize")"#),
-            "macro fn with literal name should use string literal. Got:\n{result}"
+            count_profiling_guards(&result) > 0,
+            "macro fn with literal name should get profiling guard. Got:\n{result}"
+        );
+        assert!(
+            contains_ctx_param(&result),
+            "macro fn with literal name should get ctx parameter. Got:\n{result}"
         );
     }
 
     #[test]
-    fn instruments_pub_async_fn_in_macro_rules() {
+    fn skips_pub_async_fn_with_metavar_name_in_macro_rules() {
         let source = r#"
 macro_rules! make_async {
     ($name:ident) => {
@@ -914,19 +922,20 @@ macro_rules! make_async {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
+        // Metavar-name functions are skipped -- name is unknown at rewrite time.
         assert!(
-            result.contains("piano_runtime::enter"),
-            "pub async fn in macro should be instrumented. Got:\n{result}"
+            !result.contains("__piano_ctx"),
+            "pub async fn with metavar name should be skipped. Got:\n{result}"
         );
     }
 
     #[test]
-    fn skips_const_unsafe_extern_fn_in_macro_rules() {
+    fn skips_const_and_extern_fn_in_macro_rules() {
         let source = r#"
 macro_rules! special_fns {
     () => {
@@ -941,19 +950,16 @@ macro_rules! special_fns {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
-        assert!(
-            result.contains(r#"piano_runtime::enter("normal")"#),
-            "normal fn should be instrumented. Got:\n{result}"
-        );
-        let enter_count = result.matches("piano_runtime::enter").count();
+        // unsafe fn IS instrumentable (guard is safe code): normal + danger + pub_danger = 3
+        let enter_count = count_profiling_guards(&result);
         assert_eq!(
-            enter_count, 1,
-            "only normal fn should be instrumented, not const/unsafe/extern. Got:\n{result}"
+            enter_count, 3,
+            "normal + unsafe fns should be instrumented, not const/extern. Got:\n{result}"
         );
     }
 
@@ -969,22 +975,21 @@ macro_rules! abi_fns {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
-        assert!(
-            result.contains(r#"piano_runtime::enter("rust_abi")"#),
-            "extern \"Rust\" fn should be instrumented. Got:\n{result}"
+        // Both Rust-ABI fns should get ctx params and guards.
+        let enter_count = count_profiling_guards(&result);
+        assert_eq!(
+            enter_count, 2,
+            "extern \"Rust\" fns should be instrumented with profiling guards. Got:\n{result}"
         );
-        assert!(
-            result.contains(r#"piano_runtime::enter("pub_rust_abi")"#),
-            "pub extern \"Rust\" fn should be instrumented. Got:\n{result}"
-        );
-        assert!(
-            !result.contains(r#"piano_runtime::enter("c_abi")"#),
-            "extern \"C\" fn should NOT be instrumented. Got:\n{result}"
+        let ctx_count = count_ctx_params(&result);
+        assert_eq!(
+            ctx_count, 2,
+            "extern \"Rust\" fns should get ctx params. Got:\n{result}"
         );
     }
 
@@ -999,19 +1004,19 @@ macro_rules! with_const {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
         assert!(
-            result.contains(r#"piano_runtime::enter("process")"#),
+            count_profiling_guards(&result) > 0,
             "fn after const variable should still be instrumented. Got:\n{result}"
         );
     }
 
     #[test]
-    fn instruments_multiple_fns_in_one_macro_rule() {
+    fn skips_multiple_metavar_fns_in_one_macro_rule() {
         let source = r#"
 macro_rules! make_pair {
     ($a:ident, $b:ident) => {
@@ -1021,20 +1026,20 @@ macro_rules! make_pair {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
-        let enter_count = result.matches("piano_runtime::enter").count();
-        assert_eq!(
-            enter_count, 2,
-            "both fns in macro should be instrumented. Got:\n{result}"
+        // Metavar-name functions are skipped -- name is unknown at rewrite time.
+        assert!(
+            !result.contains("__piano_ctx"),
+            "metavar-name fns should be skipped. Got:\n{result}"
         );
     }
 
     #[test]
-    fn instruments_multiple_macro_rules_arms() {
+    fn skips_multiple_metavar_macro_rules_arms() {
         let source = r#"
 macro_rules! multi {
     (one $name:ident) => {
@@ -1046,15 +1051,15 @@ macro_rules! multi {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
-        let enter_count = result.matches("piano_runtime::enter").count();
-        assert_eq!(
-            enter_count, 2,
-            "fn in each rule arm should be instrumented. Got:\n{result}"
+        // Metavar-name fns in each arm are skipped.
+        assert!(
+            !result.contains("__piano_ctx"),
+            "metavar-name fns in each rule arm should be skipped. Got:\n{result}"
         );
     }
 
@@ -1068,19 +1073,19 @@ macro_rules! log {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
         assert!(
-            !result.contains("piano_runtime::enter"),
+            !result.contains("__piano_ctx"),
             "macro without fn should not be modified. Got:\n{result}"
         );
     }
 
     #[test]
-    fn instruments_fn_in_paren_delimited_macro_template() {
+    fn skips_fn_in_paren_delimited_macro_template_metavar() {
         let source = r#"
 macro_rules! make {
     ($name:ident) => (
@@ -1089,14 +1094,15 @@ macro_rules! make {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
+        // Metavar-name fn is skipped even in paren-delimited template.
         assert!(
-            result.contains("piano_runtime::enter"),
-            "fn in paren-delimited template should be instrumented. Got:\n{result}"
+            !result.contains("__piano_ctx"),
+            "metavar fn in paren-delimited template should be skipped. Got:\n{result}"
         );
     }
 
@@ -1110,19 +1116,19 @@ macro_rules! make {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, false, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, false, "")
             .unwrap()
             .source;
 
         assert!(
-            !result.contains("piano_runtime::enter"),
+            !result.contains("__piano_ctx"),
             "instrument_macros=false should skip macro instrumentation. Got:\n{result}"
         );
     }
 
     #[test]
-    fn instruments_generic_fn_in_macro_rules() {
+    fn skips_generic_fn_with_metavar_name_in_macro_rules() {
         let source = r#"
 macro_rules! make_generic {
     ($name:ident) => {
@@ -1133,14 +1139,15 @@ macro_rules! make_generic {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
+        // Metavar-name functions are skipped.
         assert!(
-            result.contains("piano_runtime::enter"),
-            "generic fn in macro should be instrumented. Got:\n{result}"
+            !result.contains("__piano_ctx"),
+            "generic fn with metavar name should be skipped. Got:\n{result}"
         );
     }
 
@@ -1156,14 +1163,18 @@ macro_rules! make {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
         assert!(
-            result.contains(r#"piano_runtime::enter("process")"#),
-            "generic fn with Fn() -> T bound in macro should be instrumented. Got:\n{result}"
+            count_profiling_guards(&result) > 0,
+            "generic fn with Fn() -> T bound in macro should get profiling guard. Got:\n{result}"
+        );
+        assert!(
+            contains_ctx_param(&result),
+            "generic fn with Fn() -> T bound in macro should get ctx param. Got:\n{result}"
         );
     }
 
@@ -1179,19 +1190,19 @@ macro_rules! make {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
         assert!(
-            result.contains(r#"piano_runtime::enter("apply")"#),
-            "generic fn with Fn() -> Option<bool> bound in macro should be instrumented. Got:\n{result}"
+            count_profiling_guards(&result) > 0,
+            "generic fn with Fn() -> Option<bool> bound should get profiling guard. Got:\n{result}"
         );
     }
 
     #[test]
-    fn instruments_fn_in_impl_block_in_macro_rules() {
+    fn instruments_fn_in_impl_metavar_type_in_macro_rules() {
         let source = r#"
 macro_rules! make_impl {
     ($ty:ident) => {
@@ -1204,14 +1215,19 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
 
+        // Literal method name in impl $ty -- gets profiling guard and ctx param.
         assert!(
-            result.contains("concat") && result.contains("stringify") && result.contains("process"),
-            "fn inside impl $ty block should be qualified via concat!(stringify!($ty), ...). Got:\n{result}"
+            count_profiling_guards(&result) > 0,
+            "fn inside impl $ty block should get profiling guard. Got:\n{result}"
+        );
+        assert!(
+            contains_ctx_param(&result),
+            "fn inside impl $ty block should get ctx param. Got:\n{result}"
         );
     }
 
@@ -1229,13 +1245,17 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
         assert!(
-            result.contains(r#"piano_runtime::enter("Cruncher::process")"#),
-            "method in impl with literal type should be qualified. Got:\n{result}"
+            count_profiling_guards(&result) > 0,
+            "method in impl with literal type should get profiling guard. Got:\n{result}"
+        );
+        assert!(
+            contains_ctx_param(&result),
+            "method in impl with literal type should get ctx param. Got:\n{result}"
         );
     }
 
@@ -1253,18 +1273,18 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
         assert!(
-            result.contains(r#"piano_runtime::enter("Container::process")"#),
-            "generic impl should still qualify method name. Got:\n{result}"
+            count_profiling_guards(&result) > 0,
+            "generic impl method should get profiling guard. Got:\n{result}"
         );
     }
 
     #[test]
-    fn macro_impl_multiple_methods_all_qualified() {
+    fn macro_impl_multiple_methods_all_instrumented() {
         let source = r#"
 macro_rules! make_impl {
     () => {
@@ -1277,16 +1297,20 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
-        for method in &["new", "crunch_small", "crunch_large"] {
-            assert!(
-                result.contains(&format!(r#"piano_runtime::enter("Cruncher::{method}")"#)),
-                "method '{method}' should be qualified as Cruncher::{method}. Got:\n{result}"
-            );
-        }
+        let enter_count = count_profiling_guards(&result);
+        assert_eq!(
+            enter_count, 3,
+            "all 3 methods should get profiling guards. Got:\n{result}"
+        );
+        let ctx_count = count_ctx_params(&result);
+        assert_eq!(
+            ctx_count, 3,
+            "all 3 methods should get ctx params. Got:\n{result}"
+        );
     }
 
     #[test]
@@ -1303,18 +1327,22 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
         assert!(
-            result.contains(r#"piano_runtime::enter("Cruncher::fmt")"#),
-            "impl Trait for Type should qualify with Type, not Trait. Got:\n{result}"
+            count_profiling_guards(&result) > 0,
+            "impl Trait for Type method should get profiling guard. Got:\n{result}"
+        );
+        assert!(
+            contains_ctx_param(&result),
+            "impl Trait for Type method should get ctx param. Got:\n{result}"
         );
     }
 
     #[test]
-    fn macro_impl_metavar_type_uses_concat_stringify() {
+    fn macro_impl_metavar_type_instruments_literal_method() {
         let source = r#"
 macro_rules! make_impl {
     ($ty:ident) => {
@@ -1327,24 +1355,23 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
-        // concat!(stringify!($ty), "::", "process") — prettyplease may reformat spacing.
+        // Literal method name gets profiling guard + ctx param even with metavar type.
         assert!(
-            result.contains("concat") && result.contains("stringify") && result.contains("process"),
-            "method in impl $ty should use concat+stringify. Got:\n{result}"
+            count_profiling_guards(&result) > 0,
+            "method in impl $ty should get profiling guard. Got:\n{result}"
         );
-        // Must NOT contain the bare unqualified name.
         assert!(
-            !result.contains(r#"piano_runtime::enter("process")"#),
-            "should not have bare unqualified name. Got:\n{result}"
+            contains_ctx_param(&result),
+            "method in impl $ty should get ctx param. Got:\n{result}"
         );
     }
 
     #[test]
-    fn macro_impl_metavar_type_and_metavar_name() {
+    fn macro_impl_metavar_type_and_metavar_name_skipped() {
         let source = r#"
 macro_rules! make_impl {
     ($ty:ident, $method:ident) => {
@@ -1357,14 +1384,14 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "")
             .unwrap()
             .source;
-        // Both type and method are metavars — should use concat!(stringify!($ty), "::", stringify!($method)).
+        // Metavar method name is skipped -- name is unknown at rewrite time.
         assert!(
-            result.contains("concat") && result.contains("stringify"),
-            "both metavar type+name should use concat+stringify. Got:\n{result}"
+            !result.contains("__piano_ctx"),
+            "metavar method name should be skipped. Got:\n{result}"
         );
     }
 
@@ -1380,13 +1407,17 @@ macro_rules! make_impl {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "api")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "api")
             .unwrap()
             .source;
         assert!(
-            result.contains(r#"piano_runtime::enter("api::Handler::validate")"#),
-            "macro fn should use module prefix. Got:\n{result}"
+            count_profiling_guards(&result) > 0,
+            "macro fn with module prefix should get profiling guard. Got:\n{result}"
+        );
+        assert!(
+            contains_ctx_param(&result),
+            "macro fn with module prefix should get ctx param. Got:\n{result}"
         );
     }
 
@@ -1400,13 +1431,13 @@ macro_rules! make_fn {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "worker")
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "worker")
             .unwrap()
             .source;
         assert!(
-            result.contains(r#"piano_runtime::enter("worker::process")"#),
-            "top-level macro fn should use module prefix. Got:\n{result}"
+            count_profiling_guards(&result) > 0,
+            "top-level macro fn with module prefix should get profiling guard. Got:\n{result}"
         );
     }
 
@@ -1428,8 +1459,8 @@ macro_rules! make_fn {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "api").unwrap();
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "api").unwrap();
         let mut names = result.macro_fn_names.clone();
         names.sort();
         assert_eq!(
@@ -1453,8 +1484,8 @@ macro_rules! make_fn {
 }
 fn main() {}
 "#;
-        let targets: HashSet<String> = HashSet::new();
-        let result = instrument_source(source, &targets, true, "").unwrap();
+        let targets: HashMap<String, u32> = HashMap::new();
+        let result = instrument(source, &targets, true, "").unwrap();
         assert!(
             result.macro_fn_names.is_empty(),
             "metavar names should not be collected. Got: {:?}",
@@ -1464,33 +1495,32 @@ fn main() {}
 
     #[test]
     fn macro_filter_agrees_with_classify() {
-        // Both paths must agree: classify() on a parsed signature and
+        // Both paths must agree: classify() on primitive properties and
         // match_fn_pattern() on the equivalent token stream must make
         // the same accept/reject decision.
         use crate::resolve::{Classification, classify};
 
-        let cases = [
-            ("fn foo() {}", true),
-            ("pub fn foo() {}", true),
-            ("async fn foo() {}", true),
-            ("pub async fn foo() {}", true),
-            ("extern \"Rust\" fn foo() {}", true),
-            ("pub extern \"Rust\" fn foo() {}", true),
-            ("const fn foo() {}", false),
-            ("unsafe fn foo() {}", false),
-            ("extern \"C\" fn foo() {}", false),
-            ("extern fn foo() {}", false),
-            ("pub const fn foo() {}", false),
-            ("pub unsafe fn foo() {}", false),
-            ("pub extern \"C\" fn foo() {}", false),
+        // (code, is_const, abi, expected_instrumentable)
+        let cases: &[(&str, bool, Option<&str>, bool)] = &[
+            ("fn foo() {}", false, None, true),
+            ("pub fn foo() {}", false, None, true),
+            ("async fn foo() {}", false, None, true),
+            ("pub async fn foo() {}", false, None, true),
+            ("extern \"Rust\" fn foo() {}", false, Some("Rust"), true),
+            ("pub extern \"Rust\" fn foo() {}", false, Some("Rust"), true),
+            ("unsafe fn foo() {}", false, None, true),
+            ("pub unsafe fn foo() {}", false, None, true),
+            ("const fn foo() {}", true, None, false),
+            ("extern \"C\" fn foo() {}", false, Some("C"), false),
+            ("extern fn foo() {}", false, Some(""), false),
+            ("pub const fn foo() {}", true, None, false),
+            ("pub extern \"C\" fn foo() {}", false, Some("C"), false),
         ];
 
-        for (code, expected_instrumentable) in cases {
-            // Path 1: classify() on parsed signature
-            let item: syn::ItemFn = syn::parse_str(code).unwrap_or_else(|e| {
-                panic!("failed to parse '{code}': {e}");
-            });
-            let classify_says = matches!(classify(&item.sig), Classification::Instrumentable);
+        for &(code, is_const, abi, expected_instrumentable) in cases {
+            // Path 1: classify() on primitive properties
+            let classify_says =
+                matches!(classify(is_const, abi), Classification::Instrumentable);
 
             // Path 2: match_fn_pattern() on token stream
             let tokens: proc_macro2::TokenStream = code.parse().unwrap();

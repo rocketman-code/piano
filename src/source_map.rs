@@ -4,7 +4,7 @@
 /// number of newlines in the injected text. Given a line number in the
 /// rewritten source, `remap_line` subtracts the injected newlines that
 /// precede it to recover the original line number.
-#[derive(Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SourceMap {
     /// Sorted by `original_line` ascending.
     /// Each entry: (original_line, offset, none_span).
@@ -174,131 +174,6 @@ impl StringInjector {
 
         (result, map)
     }
-}
-
-/// Skip past inner attributes (`#![...]`) starting from `offset` in `source`.
-///
-/// Returns the byte offset just after the last inner attribute (and any
-/// trailing whitespace between attributes), or `offset` unchanged if no
-/// inner attributes are found at that position.
-///
-/// This handles nested brackets within attributes (e.g. `#![cfg_attr(a, b)]`).
-///
-/// Limitation: bracket counting does not skip string literals or comments, so
-/// an inner attribute containing an unbalanced `]` inside a string (e.g.
-/// `#![doc = "text ]"]`) would cause early termination. This is acceptable
-/// because real-world inner attributes (`allow`, `deny`, `feature`, `cfg_attr`,
-/// `no_std`) never contain unbalanced brackets.
-pub fn skip_inner_attrs(source: &str, offset: usize) -> usize {
-    let bytes = source.as_bytes();
-    let mut pos = offset;
-
-    loop {
-        // Skip whitespace.
-        let mut probe = pos;
-        while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
-            probe += 1;
-        }
-
-        if probe >= bytes.len() {
-            break;
-        }
-
-        // `#![...]` — inner attribute.
-        if probe + 2 < bytes.len()
-            && bytes[probe] == b'#'
-            && bytes[probe + 1] == b'!'
-            && bytes[probe + 2] == b'['
-        {
-            probe += 3;
-            let mut bracket_depth = 1u32;
-            while probe < bytes.len() && bracket_depth > 0 {
-                match bytes[probe] {
-                    b'[' => bracket_depth += 1,
-                    b']' => bracket_depth -= 1,
-                    _ => {}
-                }
-                probe += 1;
-            }
-            pos = probe;
-            continue;
-        }
-
-        // `/*!...*/` — block inner doc comment (Rust block comments nest).
-        if probe + 2 < bytes.len()
-            && bytes[probe] == b'/'
-            && bytes[probe + 1] == b'*'
-            && bytes[probe + 2] == b'!'
-        {
-            probe += 3;
-            let mut depth = 1u32;
-            while probe + 1 < bytes.len() && depth > 0 {
-                if bytes[probe] == b'/' && bytes[probe + 1] == b'*' {
-                    depth += 1;
-                    probe += 2;
-                } else if bytes[probe] == b'*' && bytes[probe + 1] == b'/' {
-                    depth -= 1;
-                    probe += 2;
-                } else {
-                    probe += 1;
-                }
-            }
-            pos = probe;
-            continue;
-        }
-
-        // `//!...` — line inner doc comment.
-        if probe + 2 < bytes.len()
-            && bytes[probe] == b'/'
-            && bytes[probe + 1] == b'/'
-            && bytes[probe + 2] == b'!'
-        {
-            probe += 3;
-            while probe < bytes.len() && bytes[probe] != b'\n' {
-                probe += 1;
-            }
-            if probe < bytes.len() {
-                probe += 1; // skip the newline
-            }
-            pos = probe;
-            continue;
-        }
-
-        // `//...` or `/*...*/` — regular comments between inner attrs.
-        // Skip these so we can find inner attrs/docs that follow them.
-        if probe + 1 < bytes.len() && bytes[probe] == b'/' && bytes[probe + 1] == b'/' {
-            probe += 2;
-            while probe < bytes.len() && bytes[probe] != b'\n' {
-                probe += 1;
-            }
-            if probe < bytes.len() {
-                probe += 1;
-            }
-            pos = probe;
-            continue;
-        }
-        if probe + 1 < bytes.len() && bytes[probe] == b'/' && bytes[probe + 1] == b'*' {
-            probe += 2;
-            let mut depth = 1u32;
-            while probe + 1 < bytes.len() && depth > 0 {
-                if bytes[probe] == b'/' && bytes[probe + 1] == b'*' {
-                    depth += 1;
-                    probe += 2;
-                } else if bytes[probe] == b'*' && bytes[probe + 1] == b'/' {
-                    depth -= 1;
-                    probe += 2;
-                } else {
-                    probe += 1;
-                }
-            }
-            pos = probe;
-            continue;
-        }
-
-        break;
-    }
-
-    pos
 }
 
 #[cfg(test)]
@@ -498,9 +373,11 @@ mod tests {
             instrument_source,
         };
         let source = "fn main() {\n    let result = work();\n    println!(\"result: {result}\");\n}\n\nfn work() -> u64 {\n    let mut sum: u64 = 0;\n    let bad: i32 = \"hello\";\n    sum\n}\n";
-        let targets: std::collections::HashSet<String> = ["work".to_string()].into_iter().collect();
+        let targets: std::collections::HashMap<String, u32> = [("work".to_string(), 0u32)].into_iter().collect();
+        let all_instrumentable: std::collections::HashSet<String> = targets.keys().cloned().collect();
 
-        let result = instrument_source(source, &targets, false, "").unwrap();
+        let macro_name_ids: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let result = instrument_source(source, &targets, &all_instrumentable, false, "", &macro_name_ids).unwrap();
         let mut map = result.source_map;
         let mut current = result.source;
 
@@ -510,14 +387,14 @@ mod tests {
         let (s, m) = inject_global_allocator(&current, AllocatorKind::Absent).unwrap();
         map.merge(m);
         current = s;
-        let (s, m) = inject_shutdown(&current, "/tmp/piano/runs", false).unwrap();
+        let (s, m) = inject_shutdown(&current, "/tmp/piano/runs", false, false).unwrap();
         map.merge(m);
 
         // fn main() should remap to original line 1
         let main_line = s
             .lines()
             .enumerate()
-            .find(|(_, l)| l.contains("fn main()"))
+            .find(|(_, l)| l.contains("fn main("))
             .map(|(i, _)| (i + 1) as u32)
             .unwrap();
         assert_eq!(
@@ -543,9 +420,11 @@ mod tests {
             instrument_source,
         };
         let source = "fn main() {\n    let result = work();\n    println!(\"result: {result}\");\n}\n\nfn work() -> u64 {\n    let mut sum: u64 = 0;\n    let bad: i32 = \"hello\";\n    sum\n}\n";
-        let targets: std::collections::HashSet<String> = ["work".to_string()].into_iter().collect();
+        let targets: std::collections::HashMap<String, u32> = [("work".to_string(), 0u32)].into_iter().collect();
+        let all_instrumentable: std::collections::HashSet<String> = targets.keys().cloned().collect();
 
-        let result = instrument_source(source, &targets, false, "").unwrap();
+        let macro_name_ids: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let result = instrument_source(source, &targets, &all_instrumentable, false, "", &macro_name_ids).unwrap();
         let mut map = result.source_map;
         let mut current = result.source;
 
@@ -557,7 +436,7 @@ mod tests {
         map.merge(m);
         current = s;
 
-        let (s, m) = inject_shutdown(&current, "/tmp/piano/runs", false).unwrap();
+        let (s, m) = inject_shutdown(&current, "/tmp/piano/runs", false, false).unwrap();
         map.merge(m);
 
         // "let bad: i32" is on original line 8.
@@ -571,75 +450,4 @@ mod tests {
         assert_eq!(map.remap_line(bad_line), Some(8));
     }
 
-    #[test]
-    fn skip_inner_attrs_no_attrs() {
-        assert_eq!(skip_inner_attrs("fn main() {}", 0), 0);
-        assert_eq!(skip_inner_attrs("  fn main() {}", 0), 0);
-    }
-
-    #[test]
-    fn skip_inner_attrs_single() {
-        let src = "#![allow(unused)]\nfn main() {}";
-        let pos = skip_inner_attrs(src, 0);
-        assert!(
-            src[pos..].trim_start().starts_with("fn"),
-            "should skip past inner attr. Rest: {:?}",
-            &src[pos..]
-        );
-    }
-
-    #[test]
-    fn skip_inner_attrs_multiple() {
-        let src = "#![allow(unused)]\n#![cfg_attr(test, feature(test))]\nfn main() {}";
-        let pos = skip_inner_attrs(src, 0);
-        assert!(
-            src[pos..].trim_start().starts_with("fn"),
-            "should skip past both inner attrs. Rest: {:?}",
-            &src[pos..]
-        );
-    }
-
-    #[test]
-    fn skip_inner_attrs_nested_brackets() {
-        let src = "#![cfg_attr(all(target_os = \"linux\"), feature(test))]\nuse foo;";
-        let pos = skip_inner_attrs(src, 0);
-        assert!(
-            src[pos..].trim_start().starts_with("use"),
-            "should handle nested parens. Rest: {:?}",
-            &src[pos..]
-        );
-    }
-
-    #[test]
-    fn skip_inner_attrs_in_block() {
-        // After opening brace of a function body.
-        let src = "fn main() {\n    #![allow(unused)]\n    body();\n}";
-        let brace_pos = src.find('{').unwrap();
-        let pos = skip_inner_attrs(src, brace_pos + 1);
-        assert!(
-            src[pos..].trim_start().starts_with("body"),
-            "should skip inner attr in block body. Got: {:?}",
-            &src[pos..]
-        );
-    }
-
-    #[test]
-    fn skip_inner_attrs_ignores_outer_attrs() {
-        // #[derive(Debug)] is an outer attribute, not #![...]
-        let src = "#[derive(Debug)]\nstruct Foo;";
-        let pos = skip_inner_attrs(src, 0);
-        assert_eq!(pos, 0, "outer attrs should not be skipped");
-    }
-
-    #[test]
-    fn skip_inner_attrs_at_offset() {
-        let src = "prefix\n#![allow(dead_code)]\nfn foo() {}";
-        let offset = src.find("#![").unwrap();
-        let pos = skip_inner_attrs(src, offset);
-        assert!(
-            src[pos..].trim_start().starts_with("fn"),
-            "should skip attr at offset. Rest: {:?}",
-            &src[pos..]
-        );
-    }
 }

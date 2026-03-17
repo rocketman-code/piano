@@ -415,51 +415,20 @@ fn async_alloc_tracking_pipeline() {
     let run_file = common::largest_ndjson_file(&runs_dir);
     let content = fs::read_to_string(&run_file).unwrap();
 
-    // NDJSON v4 format:
-    //   Line 1 (header): {"format_version":4,"run_id":"...","timestamp_ms":...}
-    //   Lines 2..N (frames): {"frame":0,"fns":[{"id":0,"calls":1,"self_ns":...,"ac":N,"ab":N,...}]}
-    //   Last line (trailer): {"functions":["allocating_work","main"]}
-    // "ac" = alloc_count, "ab" = alloc_bytes. Functions referenced by index from trailer.
+    // NDJSON format:
+    //   Header: {"type":"header","names":{"0":"allocating_work",...}}
+    //   Measurement: {"span_id":N,"parent_span_id":N,"name_id":N,...,"alloc_count":N,"alloc_bytes":N}
+    //   Trailer: {"type":"trailer","names":{"0":"allocating_work",...}}
 
-    // v4: function names are in the trailer (last non-empty line), not the header.
-    let all_lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    let trailer_line = all_lines
-        .last()
-        .expect("should have at least header + trailer");
-    let trailer: serde_json::Value =
-        serde_json::from_str(trailer_line).expect("trailer should be valid JSON");
-    let fn_names = trailer
-        .get("functions")
-        .and_then(|f| f.as_array())
-        .expect("trailer should have functions array");
-    let alloc_work_id = fn_names
-        .iter()
-        .position(|n| n.as_str() == Some("allocating_work"))
-        .expect("allocating_work should be in functions list");
+    let stats = common::aggregate_ndjson(&content);
 
-    // Search frame lines (skip header and trailer) for an entry with that function id
-    // and non-zero "ac".
-    let frame_lines = &all_lines[1..all_lines.len() - 1];
-    let has_alloc_data = frame_lines.iter().any(|line| {
-        if let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) {
-            frame
-                .get("fns")
-                .and_then(|f| f.as_array())
-                .map(|fns| {
-                    fns.iter().any(|f| {
-                        f.get("id").and_then(|id| id.as_u64()) == Some(alloc_work_id as u64)
-                            && f.get("ac").and_then(|n| n.as_u64()).unwrap_or(0) > 0
-                    })
-                })
-                .unwrap_or(false)
-        } else {
-            false
-        }
-    });
+    let alloc_stats = stats
+        .get("allocating_work")
+        .expect("allocating_work should appear in output");
 
     assert!(
-        has_alloc_data,
-        "allocating_work should have non-zero alloc_count (ac) in NDJSON output.\nContent:\n{content}"
+        alloc_stats.alloc_count > 0,
+        "allocating_work should have non-zero alloc_count in NDJSON output.\nContent:\n{content}"
     );
 }
 

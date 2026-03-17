@@ -389,51 +389,20 @@ fn cfg_gated_allocator_reports_nonzero() {
     let run_file = common::largest_ndjson_file(&runs_dir);
     let content = fs::read_to_string(&run_file).unwrap();
 
-    // NDJSON v4 format:
-    //   Line 1 (header): {"format_version":4,"run_id":"...","timestamp_ms":...}
-    //   Lines 2..N (frames): {"frame":0,"fns":[{"id":0,"calls":1,"self_ns":...,"ac":N,"ab":N,...}]}
-    //   Last line (trailer): {"functions":["do_allocs","main"]}
-    // "ac" = alloc_count, "ab" = alloc_bytes. Functions referenced by index from trailer.
+    // NDJSON format:
+    //   Header: {"type":"header","bias_ns":N,"names":{"0":"do_allocs",...}}
+    //   Measurement: {"span_id":N,...,"alloc_count":N,"alloc_bytes":N}
+    //   Trailer: {"type":"trailer","bias_ns":N,"names":{"0":"do_allocs",...}}
 
-    // v4: function names are in the trailer (last non-empty line), not the header.
-    let all_lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    let trailer_line = all_lines
-        .last()
-        .expect("should have at least header + trailer");
-    let trailer: serde_json::Value =
-        serde_json::from_str(trailer_line).expect("trailer should be valid JSON");
-    let fn_names = trailer
-        .get("functions")
-        .and_then(|f| f.as_array())
-        .expect("trailer should have functions array");
-    let do_allocs_id = fn_names
-        .iter()
-        .position(|n| n.as_str() == Some("do_allocs"))
-        .expect("do_allocs should be in functions list");
+    let stats = common::aggregate_ndjson(&content);
 
-    // Search frame lines (skip header and trailer) for an entry with that function id
-    // and non-zero "ac".
-    let frame_lines = &all_lines[1..all_lines.len() - 1];
-    let has_alloc_data = frame_lines.iter().any(|line| {
-        if let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) {
-            frame
-                .get("fns")
-                .and_then(|f| f.as_array())
-                .map(|fns| {
-                    fns.iter().any(|f| {
-                        f.get("id").and_then(|id| id.as_u64()) == Some(do_allocs_id as u64)
-                            && f.get("ac").and_then(|n| n.as_u64()).unwrap_or(0) > 0
-                    })
-                })
-                .unwrap_or(false)
-        } else {
-            false
-        }
-    });
+    let alloc_stats = stats
+        .get("do_allocs")
+        .expect("do_allocs should appear in output");
 
     assert!(
-        has_alloc_data,
-        "do_allocs should have non-zero alloc_count (ac) in NDJSON output.\n\
+        alloc_stats.alloc_count > 0,
+        "do_allocs should have non-zero alloc_count in NDJSON output.\n\
          This means the cfg-gated allocator fallback was not injected correctly.\n\
          Content:\n{content}"
     );
@@ -502,15 +471,16 @@ fn cpu_time_flag_produces_cpu_data() {
     // Verify the run file contains CPU time data.
     let content = fs::read_to_string(&run_file).unwrap();
 
-    // NDJSON: header should have has_cpu_time, entries should have csn field.
+    // NDJSON measurements contain cpu_start_ns and cpu_end_ns fields.
+    // With --cpu-time, at least one measurement should have non-zero cpu_end_ns.
     assert!(
-        content.contains("\"has_cpu_time\":true"),
-        "NDJSON header should contain has_cpu_time flag. Got:\n{}",
+        content.contains("\"cpu_start_ns\":"),
+        "measurements should contain cpu_start_ns field. Got:\n{}",
         content.lines().next().unwrap_or("")
     );
     assert!(
-        content.contains("\"csn\":"),
-        "NDJSON entries should contain csn (cpu_self_ns) field"
+        content.contains("\"cpu_end_ns\":"),
+        "measurements should contain cpu_end_ns field"
     );
 
     // Verify `piano report` shows CPU column.
@@ -715,36 +685,43 @@ fn frame_pipeline_build_run_report() {
         "program should produce correct output, got: {program_stdout}"
     );
 
-    // Verify an NDJSON file was written (frame boundaries produce NDJSON output).
+    // Verify an NDJSON file was written.
     let run_file = common::largest_ndjson_file(&runs_dir);
     let content = fs::read_to_string(&run_file).unwrap();
-    let lines: Vec<&str> = content.lines().collect();
 
-    // Header should have format_version 4 and NO functions (v4 = trailer).
+    // NDJSON format: header has type + names, trailer has type + names.
     assert!(
-        lines[0].contains("\"format_version\":4"),
-        "header should have format_version 4"
-    );
-    // v4: functions are in the trailer (last line), not the header.
-    let last_line = lines.last().unwrap();
-    assert!(
-        last_line.contains("\"functions\""),
-        "trailer should have functions array"
+        content.contains("\"type\":\"header\""),
+        "output should contain NDJSON header"
     );
     assert!(
-        last_line.contains("update"),
-        "functions should include 'update'"
-    );
-    assert!(
-        last_line.contains("physics"),
-        "functions should include 'physics'"
+        content.contains("\"type\":\"trailer\""),
+        "output should contain NDJSON trailer"
     );
 
-    // Should have frame lines (header + at least 5 frames + trailer).
+    // Verify instrumented function names appear in the name table.
+    let stats = common::aggregate_ndjson(&content);
     assert!(
-        lines.len() >= 7,
-        "expected header + 5 frames + trailer, got {} lines",
-        lines.len()
+        stats.contains_key("update"),
+        "output should contain 'update'. Got keys: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        stats.contains_key("physics"),
+        "output should contain 'physics'. Got keys: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+
+    // Should have measurement spans: update is called 5 times, physics 5 times.
+    assert!(
+        stats["update"].calls == 5,
+        "update should be called 5 times, got {}",
+        stats["update"].calls
+    );
+    assert!(
+        stats["physics"].calls == 5,
+        "physics should be called 5 times, got {}",
+        stats["physics"].calls
     );
 
     // Verify `piano report` works with ndjson (default view).

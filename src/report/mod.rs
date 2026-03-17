@@ -16,6 +16,20 @@ pub enum RunFormat {
     Ndjson,
 }
 
+/// Whether an NDJSON run file was fully written or recovered from a crash.
+///
+/// Complete files have a trailer with the authoritative name table.
+/// Recovered files are missing the trailer (process was killed before shutdown)
+/// so the header name table is used instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunCompleteness {
+    /// File has header + measurements + trailer. Name table from trailer.
+    Complete,
+    /// File has header + measurements but no trailer (crashed/killed run).
+    /// Name table from header.
+    Recovered,
+}
+
 /// A single profiling run loaded from a JSON file written by piano-runtime.
 #[derive(Debug, serde::Deserialize)]
 pub struct Run {
@@ -75,51 +89,45 @@ pub struct FrameFnEntry {
     pub free_bytes: u64,
 }
 
-/// NDJSON header line.
+/// NDJSON header/trailer line.
+///
+/// Both header and trailer share the same structure: a "type" field
+/// ("header" or "trailer") and a "names" map of name_id -> function name.
+/// The header is written eagerly at startup; the trailer confirms clean shutdown.
 #[derive(serde::Deserialize)]
-pub(super) struct NdjsonHeader {
-    #[serde(rename = "format_version")]
-    pub(super) _format_version: u32,
-    pub(super) run_id: Option<String>,
-    pub(super) timestamp_ms: u128,
+pub(super) struct NdjsonNameTable {
+    /// "header" or "trailer".
+    #[serde(rename = "type")]
+    pub(super) kind: String,
+    /// Name table: string keys (name_id) mapped to function names.
     #[serde(default)]
-    pub(super) functions: Vec<String>,
+    pub(super) names: std::collections::HashMap<String, String>,
+    /// Calibration bias in nanoseconds (not used by the reader, but present in the format).
     #[serde(default)]
-    pub(super) has_cpu_time: bool,
+    #[allow(dead_code)]
+    pub(super) bias_ns: u64,
 }
 
-/// NDJSON frame line.
+/// NDJSON measurement line -- one per completed function invocation.
+///
+/// All timing values are inclusive (include children's contributions).
+/// Self-attribution is computed by the report reader from the span tree.
 #[derive(serde::Deserialize)]
-pub(super) struct NdjsonFrame {
-    #[serde(rename = "frame")]
-    pub(super) _frame: usize,
+pub(super) struct NdjsonMeasurement {
+    pub(super) span_id: u64,
+    pub(super) parent_span_id: u64,
+    pub(super) name_id: u32,
+    pub(super) start_ns: u64,
+    pub(super) end_ns: u64,
+    pub(super) thread_id: u64,
+    pub(super) cpu_start_ns: u64,
+    pub(super) cpu_end_ns: u64,
+    pub(super) alloc_count: u64,
+    pub(super) alloc_bytes: u64,
     #[serde(default)]
-    pub(super) tid: Option<usize>,
-    pub(super) fns: Vec<NdjsonFnEntry>,
-}
-
-/// Per-function entry within an NDJSON frame line.
-#[derive(serde::Deserialize)]
-pub(super) struct NdjsonFnEntry {
-    pub(super) id: usize,
-    pub(super) calls: u64,
-    pub(super) self_ns: u64,
+    pub(super) free_count: u64,
     #[serde(default)]
-    pub(super) csn: Option<u64>,
-    #[serde(default)]
-    pub(super) ac: u64,
-    #[serde(default)]
-    pub(super) ab: u64,
-    #[serde(default)]
-    pub(super) fc: u64,
-    #[serde(default)]
-    pub(super) fb: u64,
-}
-
-/// NDJSON v4 trailer line (written at shutdown with the function name table).
-#[derive(serde::Deserialize)]
-pub(super) struct NdjsonTrailer {
-    pub(super) functions: Vec<String>,
+    pub(super) free_bytes: u64,
 }
 
 pub(super) fn format_ns(ns: u64) -> String {

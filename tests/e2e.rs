@@ -114,12 +114,12 @@ fn full_pipeline_instrument_build_run_verify() {
         "output should contain instrumented function name 'work'"
     );
     assert!(
-        content.contains("\"timestamp_ms\""),
-        "output should contain timestamp_ms"
+        content.contains("\"type\":\"header\""),
+        "output should contain NDJSON header"
     );
     assert!(
-        content.contains("\"run_id\":\""),
-        "output should contain run_id"
+        content.contains("\"names\""),
+        "output should contain names table"
     );
 
     // Verify `piano report` with latest-run consolidation.
@@ -211,10 +211,11 @@ fn build_with_no_targets_instruments_all_functions() {
         "program should produce correct output, got: {program_stdout}"
     );
 
-    // Verify run file contains both functions.
+    // Verify run file contains instrumented functions.
+    // main() is the lifecycle boundary (creates root context) -- excluded from the name table.
     let run_file = common::largest_ndjson_file(&runs_dir);
     let content = fs::read_to_string(&run_file).unwrap();
-    assert!(content.contains("\"main\""), "output should contain 'main'");
+    assert!(!content.contains("\"main\""), "main should NOT appear in name table (lifecycle boundary)");
     assert!(content.contains("\"work\""), "output should contain 'work'");
 }
 
@@ -497,7 +498,7 @@ fn signal_recovery_flushes_profiling_data_on_sigterm() {
         "output should contain the instrumented function name 'work'"
     );
     assert!(
-        content.contains("\"timestamp_ms\""),
-        "output should contain timestamp_ms"
+        content.contains("\"type\":\"header\"") || content.contains("\"type\":\"trailer\""),
+        "output should contain NDJSON header or trailer"
     );
 }

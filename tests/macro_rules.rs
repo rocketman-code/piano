@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -26,11 +26,14 @@ path = "src/main.rs"
     )
     .unwrap();
 
+    // Uses literal-name functions in macros (not metavar names) so they
+    // get profiling guards. Metavar-name functions are skipped because
+    // the function name is unknown at rewrite time.
     fs::write(
         dir.join("src").join("main.rs"),
-        r#"macro_rules! make_handler {
-    ($name:ident) => {
-        fn $name() -> u64 {
+        r#"macro_rules! setup_compute {
+    () => {
+        fn compute() -> u64 {
             let mut sum = 0u64;
             for i in 0..100 {
                 sum += i;
@@ -40,15 +43,15 @@ path = "src/main.rs"
     };
 }
 
-macro_rules! make_pair {
-    ($a:ident, $b:ident) => {
-        fn $a() -> u64 { 42 }
-        fn $b() -> u64 { 99 }
+macro_rules! setup_pair {
+    () => {
+        fn alpha() -> u64 { 42 }
+        fn beta() -> u64 { 99 }
     };
 }
 
-make_handler!(compute);
-make_pair!(alpha, beta);
+setup_compute!();
+setup_pair!();
 
 fn main() {
     let a = compute();
@@ -89,13 +92,12 @@ fn macro_generated_fns_appear_in_output() {
         "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
     );
 
-    // Run the instrumented binary.
-    let runs_dir = tmp.path().join("runs");
-    fs::create_dir_all(&runs_dir).unwrap();
+    // Run the instrumented binary. The runs dir is hardcoded at build time
+    // inside the project's target/piano/runs.
+    let runs_dir = project_dir.join("target/piano/runs");
 
     let binary_path = stdout.trim();
     let run_output = Command::new(binary_path)
-        .env("PIANO_RUNS_DIR", &runs_dir)
         .output()
         .expect("failed to run instrumented binary");
 
@@ -130,17 +132,21 @@ fn macro_generated_fns_appear_in_output() {
         "output should contain macro-generated function 'beta'"
     );
 
-    // main should also be instrumented (no target filter = instrument all).
-    assert!(content.contains("\"main\""), "output should contain 'main'");
+    // main() is excluded from the name table -- lifecycle boundary, not a profiled function.
+    assert!(
+        !content.contains("\"main\""),
+        "output should NOT contain 'main' (lifecycle boundary, excluded from name table)"
+    );
 }
 
 #[test]
 fn instrumented_macro_output_is_valid_syntax() {
     // Use instrument_source directly and verify the output parses as valid Rust.
+    // Uses a literal-name function so profiling guards are injected.
     let source = r#"
-macro_rules! make_handler {
-    ($name:ident) => {
-        fn $name() -> u64 {
+macro_rules! setup {
+    () => {
+        fn initialize() -> u64 {
             let mut sum = 0u64;
             for i in 0..100 {
                 sum += i;
@@ -150,26 +156,23 @@ macro_rules! make_handler {
     };
 }
 
-macro_rules! make_pair {
-    ($a:ident, $b:ident) => {
-        fn $a() -> u64 { 42 }
-        fn $b() -> u64 { 99 }
-    };
-}
-
-make_handler!(compute);
-make_pair!(alpha, beta);
+setup!();
 
 fn main() {
-    let a = compute();
-    let b = alpha();
-    let c = beta();
-    println!("results: {a} {b} {c}");
+    let a = initialize();
+    println!("result: {a}");
 }
 "#;
 
-    let targets: HashSet<String> = HashSet::new();
-    let result = piano::rewrite::instrument_source(source, &targets, true, "")
+    let targets: HashMap<String, u32> = HashMap::new();
+    let all_instrumentable: HashSet<String> = HashSet::new();
+    // Pre-scan to discover macro function names and assign IDs.
+    let macro_names = piano::rewrite::discover_macro_fn_names(source, "").unwrap();
+    let mut macro_name_ids: HashMap<String, u32> = HashMap::new();
+    for (i, name) in macro_names.iter().enumerate() {
+        macro_name_ids.insert(name.clone(), i as u32);
+    }
+    let result = piano::rewrite::instrument_source(source, &targets, &all_instrumentable, true, "", &macro_name_ids)
         .expect("instrument_source should succeed");
 
     // The instrumented source must parse as valid Rust.
@@ -181,10 +184,17 @@ fn main() {
         result.source
     );
 
-    // Verify the guards were actually injected.
+    // Verify profiling guards were injected (strip whitespace to tolerate prettyplease reformatting).
+    let stripped: String = result.source.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        result.source.contains("piano_runtime::enter"),
-        "instrumented source should contain piano_runtime::enter guards.\nSource:\n{}",
+        stripped.contains("__piano_ctx.enter("),
+        "instrumented source should contain profiling guards.\nSource:\n{}",
+        result.source
+    );
+    // Verify ctx parameter was injected.
+    assert!(
+        stripped.contains("__piano_ctx:piano_runtime::ctx::Ctx"),
+        "instrumented source should contain ctx parameter.\nSource:\n{}",
         result.source
     );
 }
@@ -202,8 +212,15 @@ macro_rules! setup {
 setup!();
 fn main() {}
 "#;
-    let targets: HashSet<String> = HashSet::new();
-    let result = piano::rewrite::instrument_source(source, &targets, true, "")
+    let targets: HashMap<String, u32> = HashMap::new();
+    let all_instrumentable: HashSet<String> = HashSet::new();
+    // Pre-scan to discover macro function names.
+    let macro_names = piano::rewrite::discover_macro_fn_names(source, "").unwrap();
+    let mut macro_name_ids: HashMap<String, u32> = HashMap::new();
+    for (i, name) in macro_names.iter().enumerate() {
+        macro_name_ids.insert(name.clone(), i as u32);
+    }
+    let result = piano::rewrite::instrument_source(source, &targets, &all_instrumentable, true, "", &macro_name_ids)
         .expect("instrument_source should succeed");
 
     assert!(

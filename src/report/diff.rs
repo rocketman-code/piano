@@ -37,7 +37,9 @@ pub struct JsonDiffEntry {
 ///
 /// Each entry contains the function name, self time from each run,
 /// the absolute delta, and the percentage change (null when the base is zero).
-pub fn diff_runs_json(a: &Run, b: &Run) -> String {
+/// When `show_all` is false, entries where both runs have zero calls are hidden.
+/// When `limit` is `Some(n)`, only the top `n` entries (by absolute delta) are included.
+pub fn diff_runs_json(a: &Run, b: &Run, show_all: bool, limit: Option<usize>) -> String {
     let a_map: HashMap<&str, &FnEntry> = a.functions.iter().map(|f| (f.name.as_str(), f)).collect();
     let b_map: HashMap<&str, &FnEntry> = b.functions.iter().map(|f| (f.name.as_str(), f)).collect();
 
@@ -55,6 +57,18 @@ pub fn diff_runs_json(a: &Run, b: &Run) -> String {
             .partial_cmp(&delta_a)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    if !show_all {
+        names.retain(|name| {
+            let calls_a = a_map.get(name).map_or(0, |e| e.calls);
+            let calls_b = b_map.get(name).map_or(0, |e| e.calls);
+            calls_a > 0 || calls_b > 0
+        });
+    }
+
+    if let Some(n) = limit {
+        names.truncate(n);
+    }
 
     let json_entries: Vec<JsonDiffEntry> = names
         .iter()
@@ -94,7 +108,16 @@ pub fn diff_runs_json(a: &Run, b: &Run) -> String {
 ///
 /// `label_a` and `label_b` are used as column headers (e.g. tag names or file stems).
 /// Labels longer than 20 characters are truncated with '...'.
-pub fn diff_runs(a: &Run, b: &Run, label_a: &str, label_b: &str) -> String {
+/// When `show_all` is false, entries where both runs have zero calls are hidden.
+/// When `limit` is `Some(n)`, only the top `n` entries (by absolute delta) are shown.
+pub fn diff_runs(
+    a: &Run,
+    b: &Run,
+    label_a: &str,
+    label_b: &str,
+    show_all: bool,
+    limit: Option<usize>,
+) -> String {
     // Warn if comparing runs from different formats.
     if a.source_format != b.source_format {
         eprintln!("warning: comparing runs with different source formats (JSON vs NDJSON)");
@@ -119,6 +142,19 @@ pub fn diff_runs(a: &Run, b: &Run, label_a: &str, label_b: &str) -> String {
             .partial_cmp(&delta_a)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    let total_count = names.len();
+    if !show_all {
+        names.retain(|name| {
+            let calls_a = a_map.get(name).map_or(0, |e| e.calls);
+            let calls_b = b_map.get(name).map_or(0, |e| e.calls);
+            calls_a > 0 || calls_b > 0
+        });
+    }
+    let after_filter_count = names.len();
+    if let Some(n) = limit {
+        names.truncate(n);
+    }
 
     // Check if either run has alloc data or CPU data.
     let has_allocs = a.functions.iter().any(|f| f.alloc_count > 0)
@@ -191,6 +227,27 @@ pub fn diff_runs(a: &Run, b: &Run, label_a: &str, label_b: &str) -> String {
 
         out.push('\n');
     }
+
+    // Append footer for hidden/truncated entries.
+    let zero_call_hidden = total_count - after_filter_count;
+    let truncated = after_filter_count - names.len();
+    let total_hidden = zero_call_hidden + truncated;
+    if total_hidden > 0 {
+        let label = if total_hidden == 1 {
+            "function"
+        } else {
+            "functions"
+        };
+        let hint = if truncated > 0 {
+            "use --top N or --all to show"
+        } else {
+            "use --all to show"
+        };
+        out.push_str(&format!(
+            "{DIM}\n{total_hidden} {label} hidden; {hint}\n{DIM:#}"
+        ));
+    }
+
     out
 }
 
@@ -229,7 +286,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let diff = diff_runs(&a, &b, "Before", "After");
+        let diff = diff_runs(&a, &b, "Before", "After", true, None);
         assert!(diff.contains("walk"), "should mention walk");
         assert!(diff.contains("-2.00"), "should show negative delta: {diff}");
     }
@@ -264,7 +321,7 @@ mod tests {
                 alloc_bytes: 4096,
             }],
         };
-        let diff = diff_runs(&a, &b, "Before", "After");
+        let diff = diff_runs(&a, &b, "Before", "After", true, None);
         assert!(diff.contains("Allocs"), "should have Allocs column header");
         assert!(
             diff.contains("-50"),
@@ -303,7 +360,7 @@ mod tests {
                 alloc_bytes: 0,
             }],
         };
-        let diff = diff_runs(&a, &b, "Before", "After");
+        let diff = diff_runs(&a, &b, "Before", "After", true, None);
         // Extract the A.Delta column value from the alloc_heavy row.
         // With the old `as i64` cast, large_count wraps to negative i64 and
         // the delta becomes a large positive number (wrong direction).
@@ -345,7 +402,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let diff = diff_runs(&a, &b, "Before", "After");
+        let diff = diff_runs(&a, &b, "Before", "After", true, None);
         assert!(
             diff.contains("CPU.Before"),
             "should have CPU.Before column. Got:\n{diff}"
@@ -393,7 +450,7 @@ mod tests {
             }],
         };
         // Should still render CPU columns (because A has CPU data).
-        let diff = diff_runs(&a, &b, "Before", "After");
+        let diff = diff_runs(&a, &b, "Before", "After", true, None);
         assert!(
             diff.contains("CPU.Before"),
             "should show CPU columns when either run has CPU data. Got:\n{diff}"
@@ -437,7 +494,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let diff = diff_runs(&a, &b, "Before", "After");
+        let diff = diff_runs(&a, &b, "Before", "After", true, None);
         assert!(
             !diff.contains("CPU"),
             "should not show CPU columns when neither run has CPU data. Got:\n{diff}"
@@ -470,7 +527,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let diff = diff_runs(&a, &b, "baseline", "optimized");
+        let diff = diff_runs(&a, &b, "baseline", "optimized", true, None);
         assert!(
             diff.contains("baseline"),
             "should use label_a as column header. Got:\n{diff}"
@@ -517,7 +574,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let diff = diff_runs(&a, &b, "v1", "v2");
+        let diff = diff_runs(&a, &b, "v1", "v2", true, None);
         assert!(
             diff.contains("CPU.v1"),
             "should use CPU.label_a as CPU column header. Got:\n{diff}"
@@ -550,7 +607,7 @@ mod tests {
             functions: vec![entry()],
         };
         let long_label = "my-really-long-tag-name-that-goes-on";
-        let diff = diff_runs(&a, &b, long_label, "short");
+        let diff = diff_runs(&a, &b, long_label, "short", true, None);
         // Should be truncated to 20 chars with ellipsis.
         assert!(
             diff.contains("my-really-long-tag-n\u{2026}"),
@@ -584,7 +641,7 @@ mod tests {
             functions: vec![entry()],
         };
         // "after-refactor" is 14 chars, wider than default 10.
-        let diff = diff_runs(&a, &b, "before", "after-refactor");
+        let diff = diff_runs(&a, &b, "before", "after-refactor", true, None);
         // The "after-refactor" header should appear untruncated.
         assert!(
             diff.contains("after-refactor"),
@@ -594,27 +651,32 @@ mod tests {
 
     #[test]
     fn ndjson_diff_does_not_produce_misleading_total_ms() {
-        // When diffing two NDJSON runs, total_ms is 0.0 on both sides,
+        // When diffing two NDJSON runs, total_ms is None on both sides,
         // so it should not contaminate the diff output.
         let dir = TempDir::new().unwrap();
-        let ndjson_a = r#"{"format_version":2,"run_id":"diff_a","timestamp_ms":1000,"functions":["work"]}
-{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":5000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
-"#;
-        let ndjson_b = r#"{"format_version":2,"run_id":"diff_b","timestamp_ms":2000,"functions":["work"]}
-{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":8000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
-"#;
+        // NDJSON format: header with names, single root measurement, trailer
+        let ndjson_a = concat!(
+            r#"{"type":"header","run_id":"diff_a","timestamp_ms":1000,"bias_ns":0,"names":{"0":"work"}}"#, "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":5000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#, "\n",
+            r#"{"type":"trailer","bias_ns":0,"names":{"0":"work"}}"#, "\n",
+        );
+        let ndjson_b = concat!(
+            r#"{"type":"header","run_id":"diff_b","timestamp_ms":2000,"bias_ns":0,"names":{"0":"work"}}"#, "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":8000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#, "\n",
+            r#"{"type":"trailer","bias_ns":0,"names":{"0":"work"}}"#, "\n",
+        );
         fs::write(dir.path().join("1000.ndjson"), ndjson_a).unwrap();
         fs::write(dir.path().join("2000.ndjson"), ndjson_b).unwrap();
 
-        let (run_a, _) = load_ndjson(&dir.path().join("1000.ndjson")).unwrap();
-        let (run_b, _) = load_ndjson(&dir.path().join("2000.ndjson")).unwrap();
+        let (run_a, _, _) = load_ndjson(&dir.path().join("1000.ndjson")).unwrap();
+        let (run_b, _, _) = load_ndjson(&dir.path().join("2000.ndjson")).unwrap();
 
         // Both runs should have total_ms == None
         assert!(run_a.functions[0].total_ms.is_none());
         assert!(run_b.functions[0].total_ms.is_none());
 
         // Diff should show self_ms delta (8ms - 5ms = +3ms), not total_ms.
-        let diff = diff_runs(&run_a, &run_b, "before", "after");
+        let diff = diff_runs(&run_a, &run_b, "before", "after", true, None);
         assert!(diff.contains("work"), "diff should contain function name");
         assert!(
             diff.contains("+3.00ms"),
@@ -646,7 +708,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let json = diff_runs_json(&run_a, &run_b);
+        let json = diff_runs_json(&run_a, &run_b, true, None);
         let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "work");
@@ -677,7 +739,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let json = diff_runs_json(&run_a, &run_b);
+        let json = diff_runs_json(&run_a, &run_b, true, None);
         // Verify delta_pct is present as null (not omitted) via Value parse.
         let raw: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
         assert!(
@@ -715,7 +777,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let json = diff_runs_json(&run_a, &run_b);
+        let json = diff_runs_json(&run_a, &run_b, true, None);
         let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "idle");
@@ -734,16 +796,20 @@ mod tests {
         fs::create_dir_all(&runs_dir).unwrap();
         fs::create_dir_all(&tags_dir).unwrap();
 
-        // Run A: NDJSON only (no .json). "compute" has 2 frames, self_ns sums to 5ms.
-        let ndjson_a = r#"{"format_version":2,"run_id":"aaa_1000","timestamp_ms":1000,"functions":["compute"]}
-{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":2000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
-{"frame":1,"fns":[{"id":0,"calls":1,"self_ns":3000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
-"#;
-        // Run B: NDJSON only. "compute" has 2 frames, self_ns sums to 8ms.
-        let ndjson_b = r#"{"format_version":2,"run_id":"bbb_2000","timestamp_ms":2000,"functions":["compute"]}
-{"frame":0,"fns":[{"id":0,"calls":1,"self_ns":4000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
-{"frame":1,"fns":[{"id":0,"calls":1,"self_ns":4000000,"ac":0,"ab":0,"fc":0,"fb":0}]}
-"#;
+        // Run A: "compute" called twice, self_ns sums to 5ms.
+        let ndjson_a = concat!(
+            r#"{"type":"header","run_id":"aaa_1000","timestamp_ms":1000,"bias_ns":0,"names":{"0":"compute"}}"#, "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":2000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#, "\n",
+            r#"{"span_id":2,"parent_span_id":0,"name_id":0,"start_ns":3000000,"end_ns":6000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#, "\n",
+            r#"{"type":"trailer","bias_ns":0,"names":{"0":"compute"}}"#, "\n",
+        );
+        // Run B: "compute" called twice, self_ns sums to 8ms.
+        let ndjson_b = concat!(
+            r#"{"type":"header","run_id":"bbb_2000","timestamp_ms":2000,"bias_ns":0,"names":{"0":"compute"}}"#, "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":4000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#, "\n",
+            r#"{"span_id":2,"parent_span_id":0,"name_id":0,"start_ns":5000000,"end_ns":9000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#, "\n",
+            r#"{"type":"trailer","bias_ns":0,"names":{"0":"compute"}}"#, "\n",
+        );
         fs::write(runs_dir.join("1000.ndjson"), ndjson_a).unwrap();
         fs::write(runs_dir.join("2000.ndjson"), ndjson_b).unwrap();
 
@@ -763,7 +829,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             compute_a.calls, 2,
-            "run A should have 2 calls from 2 frames"
+            "run A should have 2 calls from 2 spans"
         );
         assert!(
             (compute_a.self_ms - 5.0).abs() < 0.01,
@@ -778,7 +844,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             compute_b.calls, 2,
-            "run B should have 2 calls from 2 frames"
+            "run B should have 2 calls from 2 spans"
         );
         assert!(
             (compute_b.self_ms - 8.0).abs() < 0.01,
@@ -787,7 +853,7 @@ mod tests {
         );
 
         // Diff output should show the NDJSON-derived values.
-        let diff = diff_runs(&run_a, &run_b, "before", "after");
+        let diff = diff_runs(&run_a, &run_b, "before", "after", true, None);
         assert!(
             diff.contains("compute"),
             "diff should contain function name: {diff}"
@@ -829,7 +895,7 @@ mod tests {
             }],
         };
 
-        let json = diff_runs_json(&run_a, &run_b);
+        let json = diff_runs_json(&run_a, &run_b, true, None);
         let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
         assert_eq!(entries.len(), 1);
 
@@ -850,5 +916,224 @@ mod tests {
         assert!(obj.get("alloc_bytes_b").is_some(), "missing alloc_bytes_b");
         assert!(obj.get("cpu_self_ms_a").is_some(), "missing cpu_self_ms_a");
         assert!(obj.get("cpu_self_ms_b").is_some(), "missing cpu_self_ms_b");
+    }
+
+    #[test]
+    fn diff_hides_zero_call_entries_by_default() {
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![
+                FnEntry {
+                    name: "active".into(),
+                    calls: 5,
+                    total_ms: Some(10.0),
+                    self_ms: 8.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "unused".into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![
+                FnEntry {
+                    name: "active".into(),
+                    calls: 7,
+                    total_ms: Some(12.0),
+                    self_ms: 9.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "unused".into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let diff = diff_runs(&a, &b, "Before", "After", false, None);
+        assert!(diff.contains("active"), "should show active function");
+        assert!(
+            !diff.contains("unused"),
+            "should hide zero-call entries when show_all=false. Got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn diff_limit_truncates_output() {
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![
+                FnEntry {
+                    name: "fn_a".into(),
+                    calls: 1,
+                    total_ms: Some(10.0),
+                    self_ms: 10.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "fn_b".into(),
+                    calls: 1,
+                    total_ms: Some(5.0),
+                    self_ms: 5.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "fn_c".into(),
+                    calls: 1,
+                    total_ms: Some(2.0),
+                    self_ms: 2.0,
+                    ..Default::default()
+                },
+            ],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![
+                FnEntry {
+                    name: "fn_a".into(),
+                    calls: 2,
+                    total_ms: Some(20.0),
+                    self_ms: 20.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "fn_b".into(),
+                    calls: 2,
+                    total_ms: Some(8.0),
+                    self_ms: 8.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "fn_c".into(),
+                    calls: 2,
+                    total_ms: Some(3.0),
+                    self_ms: 3.0,
+                    ..Default::default()
+                },
+            ],
+        };
+        let diff = diff_runs(&a, &b, "Before", "After", true, Some(2));
+        // Only top 2 by absolute delta should appear.
+        assert!(
+            diff.contains("1 function hidden"),
+            "should show truncation footer. Got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn diff_json_limit_truncates() {
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![
+                FnEntry {
+                    name: "fn_a".into(),
+                    calls: 1,
+                    total_ms: Some(10.0),
+                    self_ms: 10.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "fn_b".into(),
+                    calls: 1,
+                    total_ms: Some(5.0),
+                    self_ms: 5.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "fn_c".into(),
+                    calls: 1,
+                    total_ms: Some(2.0),
+                    self_ms: 2.0,
+                    ..Default::default()
+                },
+            ],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![
+                FnEntry {
+                    name: "fn_a".into(),
+                    calls: 2,
+                    total_ms: Some(20.0),
+                    self_ms: 20.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "fn_b".into(),
+                    calls: 2,
+                    total_ms: Some(8.0),
+                    self_ms: 8.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "fn_c".into(),
+                    calls: 2,
+                    total_ms: Some(3.0),
+                    self_ms: 3.0,
+                    ..Default::default()
+                },
+            ],
+        };
+        let json = diff_runs_json(&a, &b, true, Some(2));
+        let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 2, "limit=2 should produce 2 diff entries");
+    }
+
+    #[test]
+    fn diff_json_hides_zero_call() {
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![
+                FnEntry {
+                    name: "active".into(),
+                    calls: 3,
+                    total_ms: Some(5.0),
+                    self_ms: 4.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "unused".into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![
+                FnEntry {
+                    name: "active".into(),
+                    calls: 5,
+                    total_ms: Some(7.0),
+                    self_ms: 6.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "unused".into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let json = diff_runs_json(&a, &b, false, None);
+        let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 1, "should hide zero-call entries");
+        assert_eq!(entries[0].name, "active");
     }
 }

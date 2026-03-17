@@ -358,6 +358,50 @@ fn filter_piano_internals(rendered: &str) -> String {
     filtered.join("\n")
 }
 
+/// Detect Send-bound errors caused by piano's async wrapping and return user guidance.
+///
+/// Returns `Some(message)` when the error contains a Send-bound pattern AND mentions
+/// piano internals (`PianoFuture` or `piano_runtime`), indicating our wrapping caused it.
+/// Returns `None` for Send errors in user code or non-Send errors.
+fn detect_send_bound_guidance(error_text: &str) -> Option<String> {
+    let has_send_error = error_text.contains("is not Send")
+        || error_text.contains("cannot be sent between threads safely")
+        || error_text.contains("doesn't implement Send")
+        || error_text.contains("which is required by")
+            && error_text.contains("Send");
+
+    if !has_send_error {
+        return None;
+    }
+
+    let piano_involved =
+        error_text.contains("PianoFuture") || error_text.contains("piano_runtime");
+    if !piano_involved {
+        return None;
+    }
+
+    // Try to extract the function name from the error context.
+    // Rustc errors include both diagnostic text (e.g. `function `foo``) and
+    // source code lines (e.g. `fn foo() ->`). We match both patterns.
+    static FN_NAME_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?:fn|function) `?(\w+)`?(?:\(|`)").unwrap()
+    });
+
+    let name = FN_NAME_RE
+        .captures(error_text)
+        .map(|caps| caps[1].to_string());
+
+    let fn_desc = match &name {
+        Some(n) => format!("function '{n}'"),
+        None => "a function".to_string(),
+    };
+
+    Some(format!(
+        "piano: {fn_desc} cannot be wrapped for async profiling \
+         (non-Send type captured). Use --skip <name> to exclude it."
+    ))
+}
+
 /// Find the project root by walking up from `start_dir` looking for Cargo.toml.
 ///
 /// Returns the canonicalized directory containing the nearest Cargo.toml.
@@ -378,30 +422,281 @@ pub fn find_project_root(start_dir: &Path) -> Result<PathBuf, Error> {
     }
 }
 
-/// Build the instrumented binary using `cargo build --release --message-format=json`.
-/// Returns the path to the compiled executable.
+/// Result of pre-building piano-runtime as an rlib.
+pub struct PrebuiltRuntime {
+    /// Path to the compiled libpiano_runtime.rlib
+    pub rlib_path: PathBuf,
+    /// Directory containing the rlib and any transitive deps (for -L dependency=)
+    pub deps_dir: PathBuf,
+}
+
+/// Pre-build piano-runtime as an rlib using the user's toolchain.
 ///
-/// When `package` is `Some`, passes `-p <name>` to cargo to build a specific
-/// workspace member (used when staging an entire workspace).
-/// When `bin` is `Some`, passes `--bin <name>` to cargo to build a specific
-/// binary target.
+/// Creates a minimal crate that depends on `piano-runtime` from crates.io,
+/// builds it with `cargo build --release`, and locates the output rlib.
+pub fn prebuild_runtime(
+    project_dir: &Path,
+    target_dir: &Path,
+    features: &[&str],
+) -> Result<PrebuiltRuntime, Error> {
+    let src_dir = target_dir.join("runtime-src");
+    std::fs::create_dir_all(src_dir.join("src"))
+        .map_err(io_context("create directory", &src_dir))?;
+
+    let version = env!("PIANO_RUNTIME_VERSION");
+
+    let dep_spec = if features.is_empty() {
+        format!("\"{version}\"")
+    } else {
+        let feat_list = features
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{ version = \"{version}\", features = [{feat_list}] }}")
+    };
+
+    let cargo_toml = format!(
+        "[package]\n\
+         name = \"piano-runtime-fetcher\"\n\
+         version = \"0.0.0\"\n\
+         edition = \"2021\"\n\
+         \n\
+         [dependencies]\n\
+         piano-runtime = {dep_spec}\n\
+         \n\
+         [workspace]\n"
+    );
+
+    std::fs::write(src_dir.join("Cargo.toml"), cargo_toml)
+        .map_err(io_context("write Cargo.toml", &src_dir))?;
+    std::fs::write(src_dir.join("src/lib.rs"), "")
+        .map_err(io_context("write src/lib.rs", &src_dir))?;
+
+    // Features are specified in the Cargo.toml dep, so pass empty to the builder.
+    build_runtime_rlib(&src_dir, project_dir, target_dir, &[])
+}
+
+/// Pre-build piano-runtime from a local source path (for --runtime-path).
+///
+/// Copies the runtime source to a standalone directory (with `[workspace]`
+/// injected) so that Cargo doesn't resolve the parent workspace. This prevents
+/// failures when the user's project pins an older toolchain that can't parse
+/// the piano workspace's edition.
+pub fn prebuild_runtime_from_path(
+    runtime_path: &Path,
+    project_dir: &Path,
+    target_dir: &Path,
+    features: &[&str],
+) -> Result<PrebuiltRuntime, Error> {
+    let dest = target_dir.join("runtime-src");
+    copy_runtime_standalone(runtime_path, &dest)?;
+    build_runtime_rlib(&dest, project_dir, target_dir, features)
+}
+
+/// Copy runtime source to a standalone directory with `[workspace]` injected.
+fn copy_runtime_standalone(src: &Path, dest: &Path) -> Result<(), Error> {
+    let src_dir = src.join("src");
+    let dest_src = dest.join("src");
+    std::fs::create_dir_all(&dest_src).map_err(io_context("create directory", &dest_src))?;
+
+    // Copy and patch Cargo.toml
+    let cargo_toml = std::fs::read_to_string(src.join("Cargo.toml"))
+        .map_err(io_context("read Cargo.toml", &src.join("Cargo.toml")))?;
+    let mut doc: DocumentMut = cargo_toml
+        .parse()
+        .map_err(|e| Error::BuildFailed(format!("failed to parse runtime Cargo.toml: {e}")))?;
+    doc.remove("bench");
+    doc.remove("dev-dependencies");
+    doc.remove("test");
+    let mut content = doc.to_string();
+    if !content.contains("[workspace]") {
+        content.push_str("\n[workspace]\n");
+    }
+    std::fs::write(dest.join("Cargo.toml"), content)
+        .map_err(io_context("write Cargo.toml", &dest.join("Cargo.toml")))?;
+
+    // Copy source files recursively
+    copy_rs_files_recursive(&src_dir, &dest_src)?;
+
+    Ok(())
+}
+
+fn copy_rs_files_recursive(src: &Path, dest: &Path) -> Result<(), Error> {
+    std::fs::create_dir_all(dest).map_err(io_context("create directory", dest))?;
+    for entry in std::fs::read_dir(src).map_err(io_context("read directory", src))? {
+        let entry = entry.map_err(io_context("read directory entry", src))?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        if path.is_dir() {
+            copy_rs_files_recursive(&path, &dest.join(file_name))?;
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            std::fs::copy(&path, dest.join(file_name)).map_err(io_context("copy file", &path))?;
+        }
+    }
+    Ok(())
+}
+
+fn build_runtime_rlib(
+    src_dir: &Path,
+    project_dir: &Path,
+    target_dir: &Path,
+    features: &[&str],
+) -> Result<PrebuiltRuntime, Error> {
+    let build_dir = target_dir.join("runtime-build");
+
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build")
+        .arg("--release")
+        .arg("--message-format=json")
+        .arg("--manifest-path")
+        .arg(src_dir.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", &build_dir)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .current_dir(project_dir);
+
+    if !features.is_empty() {
+        cmd.arg("--features").arg(features.join(","));
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| Error::BuildFailed(format!("failed to build piano-runtime: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::BuildFailed(format!(
+            "piano-runtime build failed: {stderr}"
+        )));
+    }
+
+    // Parse JSON to find the rlib artifact
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut rlib_path = None;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        let Some(target) = msg.get("target") else {
+            continue;
+        };
+        if target.get("name").and_then(|n| n.as_str()) != Some("piano_runtime") {
+            continue;
+        }
+        if let Some(filenames) = msg.get("filenames").and_then(|f| f.as_array()) {
+            for f in filenames {
+                if let Some(s) = f.as_str() {
+                    if s.ends_with(".rlib") {
+                        rlib_path = Some(PathBuf::from(s));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: if JSON parsing didn't find it (e.g., older Cargo versions
+    // with different JSON schema or "Fresh" artifacts), search the build dir.
+    let rlib_path = match rlib_path {
+        Some(p) => p,
+        None => {
+            let release_dir = build_dir.join("release");
+            find_rlib_in_dir(&release_dir)
+                .or_else(|_| find_rlib_in_dir(&release_dir.join("deps")))?
+        }
+    };
+    // The deps dir is release/deps/ which contains transitive dependency rlibs
+    // (needed for -L dependency=). The rlib itself may be in release/ or release/deps/
+    // depending on whether piano-runtime is the root crate or a dependency.
+    let deps_dir = build_dir.join("release").join("deps");
+
+    Ok(PrebuiltRuntime {
+        rlib_path,
+        deps_dir,
+    })
+}
+
+/// Search a directory for a `libpiano_runtime*.rlib` file.
+fn find_rlib_in_dir(dir: &Path) -> Result<PathBuf, Error> {
+    if !dir.is_dir() {
+        return Err(Error::BuildFailed(format!(
+            "no rlib found: {} does not exist",
+            dir.display()
+        )));
+    }
+    for entry in std::fs::read_dir(dir).map_err(io_context("read directory", dir))? {
+        let entry = entry.map_err(io_context("read directory entry", dir))?;
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("libpiano_runtime") && name.ends_with(".rlib") {
+                return Ok(path);
+            }
+        }
+    }
+    Err(Error::BuildFailed(
+        "no rlib found in piano-runtime build output".into(),
+    ))
+}
+
+/// Clean up stale .piano.rs temp files left by crashed wrapper invocations.
+pub fn clean_stale_piano_files(src_dir: &Path) -> Result<(), Error> {
+    clean_piano_files_recursive(src_dir)
+}
+
+fn clean_piano_files_recursive(dir: &Path) -> Result<(), Error> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io_context("read directory entry", dir))?;
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip target/ directories
+            if path.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            clean_piano_files_recursive(&path)?;
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with('.') && name.ends_with(".piano.rs") {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build the instrumented binary using the wrapper pipeline.
+///
+/// Sets `RUSTC_WORKSPACE_WRAPPER` to the current piano binary and
+/// `PIANO_WRAPPER_CONFIG` to the config file path, then runs
+/// `cargo build --release --message-format=json`.
 pub fn build_instrumented(
-    staging_dir: &Path,
+    project_dir: &Path,
     target_dir: &Path,
     package: Option<&str>,
     bin: Option<&str>,
-    source_maps: &HashMap<PathBuf, SourceMap>,
+    config_path: &Path,
 ) -> Result<PathBuf, Error> {
-    // Remove RUSTUP_TOOLCHAIN so the target project's rust-toolchain.toml
-    // is respected. Without this, nested cargo invocations inherit the
-    // parent's toolchain, ignoring the project's pinned version.
+    let piano_exe = std::env::current_exe()
+        .map_err(|e| Error::BuildFailed(format!("failed to locate piano binary: {e}")))?;
+
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
         .arg("--release")
         .arg("--message-format=json")
         .env("CARGO_TARGET_DIR", target_dir)
+        .env("RUSTC_WORKSPACE_WRAPPER", &piano_exe)
+        .env(crate::wrapper::CONFIG_ENV, config_path)
+        // Disable LTO: the pre-built piano-runtime rlib is injected via --extern
+        // and won't have LLVM bitcode matching the user's LTO settings. Since
+        // piano already modifies the binary with instrumentation, LTO optimization
+        // differences are irrelevant for profiling.
+        .env("CARGO_PROFILE_RELEASE_LTO", "false")
         .env_remove("RUSTUP_TOOLCHAIN")
-        .current_dir(staging_dir);
+        .current_dir(project_dir);
     if let Some(pkg) = package {
         cmd.arg("-p").arg(pkg);
     }
@@ -417,11 +712,16 @@ pub fn build_instrumented(
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::BuildFailed(stderr.into_owned()));
         }
-        let mut error_text = rendered.join("");
-        if !source_maps.is_empty() {
-            error_text = remap_rendered_error(&error_text, source_maps);
-            error_text = filter_piano_internals(&error_text);
+        let error_text = rendered.join("");
+        // Remap line numbers using source maps written by the wrapper
+        let file_maps = crate::wrapper::read_source_maps(config_path);
+        let error_text = remap_rendered_error(&error_text, &file_maps);
+        // Detect Send-bound errors before filtering piano internals (the
+        // filter strips `piano_runtime` lines that the detector needs).
+        if let Some(guidance) = detect_send_bound_guidance(&error_text) {
+            eprintln!("{guidance}");
         }
+        let error_text = filter_piano_internals(&error_text);
         return Err(Error::BuildFailed(error_text));
     }
 
@@ -824,6 +1124,88 @@ edition = "2021"
         assert!(
             result.contains("expected `i32`"),
             "should keep user error: {result}"
+        );
+    }
+
+    #[test]
+    fn send_bound_error_with_piano_future_returns_guidance() {
+        let error_text = concat!(
+            "error[E0277]: `Rc<Cell<i32>>` cannot be sent between threads safely\n",
+            " --> src/handler.rs:12:5\n",
+            "  |\n",
+            "12 |     some_call().await;\n",
+            "  |     ^^^^^^^^^^ `Rc<Cell<i32>>` cannot be sent between threads safely\n",
+            "  |\n",
+            "  = help: within `PianoFuture<impl Future<Output = ()>>`, ",
+            "the trait `Send` is not implemented for `Rc<Cell<i32>>`\n",
+            "  = note: required by a bound in fn `handle_request`\n",
+        );
+
+        let result = detect_send_bound_guidance(error_text);
+        assert!(result.is_some(), "should detect Send error with PianoFuture");
+        let msg = result.unwrap();
+        assert!(
+            msg.contains("cannot be wrapped for async profiling"),
+            "should contain guidance: {msg}"
+        );
+        assert!(
+            msg.contains("--skip"),
+            "should mention --skip flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn send_bound_error_without_piano_returns_none() {
+        let error_text = concat!(
+            "error[E0277]: `Rc<i32>` cannot be sent between threads safely\n",
+            " --> src/main.rs:5:10\n",
+            "  |\n",
+            "5 |     tokio::spawn(async move { drop(rc); });\n",
+            "  |     ^^^^^^^^^^^^ `Rc<i32>` cannot be sent between threads safely\n",
+        );
+
+        let result = detect_send_bound_guidance(error_text);
+        assert!(
+            result.is_none(),
+            "should not trigger for user's own Send error"
+        );
+    }
+
+    #[test]
+    fn non_send_error_returns_none() {
+        let error_text = concat!(
+            "error[E0308]: mismatched types\n",
+            " --> src/main.rs:3:18\n",
+            "  |\n",
+            "3 |     let x: i32 = \"hello\";\n",
+            "  |                  ^^^^^^^ expected `i32`, found `&str`\n",
+        );
+
+        let result = detect_send_bound_guidance(error_text);
+        assert!(
+            result.is_none(),
+            "should not trigger for non-Send errors"
+        );
+    }
+
+    #[test]
+    fn send_bound_guidance_extracts_function_name() {
+        let error_text = concat!(
+            "error[E0277]: `Rc<Cell<i32>>` is not Send\n",
+            " --> src/api.rs:20:1\n",
+            "  |\n",
+            "20 | fn process_request() -> impl Future<Output = ()> {\n",
+            "  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+            "  = note: within `PianoFuture<impl Future>`, ",
+            "the trait `Send` is not implemented for `Rc<Cell<i32>>`\n",
+        );
+
+        let result = detect_send_bound_guidance(error_text);
+        assert!(result.is_some());
+        let msg = result.unwrap();
+        assert!(
+            msg.contains("function 'process_request'"),
+            "should extract function name: {msg}"
         );
     }
 }

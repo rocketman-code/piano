@@ -236,9 +236,9 @@ fn cross_thread_captures_all_calls() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let runtime_path = manifest_dir.join("piano-runtime");
 
-    // Run piano build on the fixture — instrument both compute and main.
+    // Run piano build on the fixture -- instrument compute (main excluded: lifecycle boundary).
     let piano_build = Command::new(piano_bin)
-        .args(["build", "--fn", "compute", "--fn", "main", "--project"])
+        .args(["build", "--fn", "compute", "--project"])
         .arg(&project_dir)
         .arg("--runtime-path")
         .arg(&runtime_path)
@@ -289,17 +289,10 @@ fn cross_thread_captures_all_calls() {
         "compute should be called 200 times (100 par_iter + 100 thread::scope), got {compute_calls}"
     );
 
-    // Cross-thread wall-time non-propagation: main's self_ns must NOT be
-    // reduced by child-thread compute time. Since compute runs on worker
-    // threads (not as a same-thread child of main), main's self_ns equals
-    // its full wall time. If this invariant were broken, main's self_ns
-    // would be near zero.
-    let main_self_ns = stats.get("main").map(|s| s.self_ns).unwrap_or(0);
-    let compute_self_ns = stats.get("compute").map(|s| s.self_ns).unwrap_or(0);
+    // main() is excluded from the name table -- it is the lifecycle boundary
+    // that creates the root context, not a profiled function.
     assert!(
-        main_self_ns > compute_self_ns / 64,
-        "main self_ns ({main_self_ns}) should be substantial relative to compute \
-         self_ns ({compute_self_ns}) — cross-thread wall time must not be subtracted \
-         from parent self-time"
+        !stats.contains_key("main"),
+        "main should NOT appear in stats (lifecycle boundary, excluded from name table)"
     );
 }
