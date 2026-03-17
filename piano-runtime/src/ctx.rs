@@ -68,16 +68,28 @@ impl Ctx {
 
     /// Enter a sync instrumented function. Returns (Guard, child Ctx).
     ///
-    /// Allocates a new span_id. The Guard stores it (for the
-    /// Measurement's span_id) and self.current_span_id as the
-    /// parent_span_id. The returned child Ctx gets current_span_id
-    /// set to the new span_id (so grandchildren use it as parent).
+    /// Thin #[inline(always)] wrapper: calls enter_inner() for all
+    /// bookkeeping (~190 instructions, one shared copy), then calls
+    /// guard.stamp() to record rdtsc after the struct is materialized.
+    /// Per-call-site cost: ~22 bytes (call + stamp + ret).
+    #[inline(always)]
     pub fn enter(&self, name_id: u32) -> (Guard, Ctx) {
+        let (mut guard, ctx) = self.enter_inner(name_id);
+        guard.stamp();
+        (guard, ctx)
+    }
+
+    /// All bookkeeping for entering a sync function. Regular function
+    /// (not inlined) -- one shared copy across all call sites.
+    ///
+    /// Returns a Guard with start_ns = 0. The caller (enter) stamps
+    /// the actual rdtsc after this returns.
+    fn enter_inner(&self, name_id: u32) -> (Guard, Ctx) {
         if let Some(ref fs) = self.file_sink {
             ensure_thread_file_sink(fs);
         }
         let span_id = next_span_id();
-        let guard = Guard::new(span_id, self.current_span_id, name_id, self.cpu_time_enabled);
+        let guard = Guard::new_uninstrumented(span_id, self.current_span_id, name_id, self.cpu_time_enabled);
         let child = Ctx {
             current_span_id: span_id,
             cpu_time_enabled: self.cpu_time_enabled,

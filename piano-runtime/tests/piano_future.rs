@@ -387,7 +387,8 @@ fn guard_active_during_piano_future_poll() {
         let mut cx = Context::from_waker(&waker);
 
         // Create a sync Guard (outer)
-        let guard = Guard::new(1, 0, 10, false);
+        let mut guard = Guard::new_uninstrumented(1, 0, 10, false);
+        guard.stamp();
 
         // Record some allocs attributed to the Guard's window
         record_alloc(100);
@@ -506,7 +507,7 @@ fn thread_id_captured_on_first_poll() {
 }
 
 // INVARIANT TEST: PianoFuture accumulates CPU time across polls.
-#[cfg(feature = "cpu-time")]
+#[cfg(unix)]
 #[test]
 fn piano_future_accumulates_cpu_time() {
     std::thread::spawn(|| {

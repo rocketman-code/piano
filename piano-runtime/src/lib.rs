@@ -2,7 +2,12 @@
 #![allow(renamed_and_removed_lints)]
 #![allow(clippy::missing_const_for_thread_local)]
 
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
+pub mod cpu_clock;
+#[cfg(not(feature = "_test_internals"))]
 mod cpu_clock;
+
 mod thread_id;
 mod time;
 
@@ -43,15 +48,24 @@ pub mod tsc;
 #[cfg(not(feature = "_test_internals"))]
 mod tsc;
 
-// Injection-only API: public for rewriter-generated code, hidden from docs
+// Rewriter-referenced modules: public because rewriter generates module paths
+// (e.g. __piano_ctx: piano_runtime::ctx::Ctx, piano_runtime::file_sink::FileSink::new)
 #[doc(hidden)]
 pub mod ctx;
 #[doc(hidden)]
 pub mod file_sink;
-#[doc(hidden)]
+
+// Internal modules: rewriter uses crate-root re-exports (PianoAllocator, PianoFuture),
+// not module paths. Private in production, pub for test access only.
+#[cfg(any(test, feature = "_test_internals"))]
 pub mod alloc;
-#[doc(hidden)]
+#[cfg(not(any(test, feature = "_test_internals")))]
+mod alloc;
+
+#[cfg(any(test, feature = "_test_internals"))]
 pub mod piano_future;
+#[cfg(not(any(test, feature = "_test_internals")))]
+mod piano_future;
 
 // User-facing API: visible in docs
 pub use alloc::PianoAllocator;

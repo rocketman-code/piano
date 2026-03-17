@@ -10,7 +10,6 @@ keywords = ["profiling", "instrumentation"]
 categories = ["development-tools::profiling"]
 
 [features]
-cpu-time = []
 _test_internals = []
 
 [dev-dependencies]

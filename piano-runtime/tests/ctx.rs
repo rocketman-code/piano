@@ -260,6 +260,56 @@ fn enter_async_produces_correct_state() {
     .expect("test thread panicked");
 }
 
+// INVARIANT TEST (C12): instrument_async(name_id, body) is equivalent to
+// enter_async(name_id) + PianoFuture::new(state, body). Pure composition.
+#[test]
+fn instrument_async_equivalent_to_enter_async_plus_piano_future() {
+    std::thread::spawn(|| {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let name_id: u32 = 77;
+
+        // --- Manual path: enter_async + PianoFuture::new ---
+        let ctx = Ctx::new(None, false, &[]);
+        let (state, _manual_child) = ctx.enter_async(name_id);
+        let mut manual_fut = piano_runtime::PianoFuture::new(state, async {});
+        let pinned = unsafe { Pin::new_unchecked(&mut manual_fut) };
+        let _ = pinned.poll(&mut cx);
+        drop(manual_fut);
+
+        let manual_measurements = drain_thread_buffer();
+        assert_eq!(manual_measurements.len(), 1, "manual path should emit one measurement");
+
+        // --- Convenience path: instrument_async ---
+        let ctx2 = Ctx::new(None, false, &[]);
+        let (mut conv_fut, _conv_child) = ctx2.instrument_async(name_id, async {});
+        let pinned = unsafe { Pin::new_unchecked(&mut conv_fut) };
+        let _ = pinned.poll(&mut cx);
+        drop(conv_fut);
+
+        let conv_measurements = drain_thread_buffer();
+        assert_eq!(conv_measurements.len(), 1, "convenience path should emit one measurement");
+
+        let manual_m = &manual_measurements[0];
+        let conv_m = &conv_measurements[0];
+
+        // Structure must match: same name_id, same parent_span_id (both root = 0).
+        // span_ids will differ (unique per call) -- that's expected.
+        assert_eq!(manual_m.name_id, conv_m.name_id, "name_id must match");
+        assert_eq!(
+            manual_m.parent_span_id, conv_m.parent_span_id,
+            "parent_span_id must match (both root)"
+        );
+        assert_eq!(manual_m.parent_span_id, 0, "both should be root spans");
+        assert_ne!(
+            manual_m.span_id, conv_m.span_id,
+            "span_ids must differ (unique allocation)"
+        );
+    })
+    .join()
+    .expect("test thread panicked");
+}
+
 // INVARIANT TEST: cross-thread Ctx propagation via clone.
 #[test]
 fn cross_thread_ctx_propagation() {

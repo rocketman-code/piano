@@ -18,24 +18,33 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
 use std::marker::PhantomData;
 
+/// Snapshot of per-thread allocation counters. Copy ensures no TLS destructor —
+/// global allocator TLS with destructors is forbidden on older Rust versions.
+#[derive(Clone, Copy)]
+pub struct AllocSnapshot {
+    pub alloc_count: u64,
+    pub alloc_bytes: u64,
+    pub free_count: u64,
+    pub free_bytes: u64,
+}
+
+impl AllocSnapshot {
+    pub const ZERO: Self = Self {
+        alloc_count: 0,
+        alloc_bytes: 0,
+        free_count: 0,
+        free_bytes: 0,
+    };
+}
+
 thread_local! {
-    static ALLOC_COUNT: Cell<u64> = const { Cell::new(0) };
-    static ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
-    static FREE_COUNT: Cell<u64> = const { Cell::new(0) };
-    static FREE_BYTES: Cell<u64> = const { Cell::new(0) };
+    static ALLOC_COUNTERS: Cell<AllocSnapshot> = const { Cell::new(AllocSnapshot::ZERO) };
     static REENTRANCY: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Snapshot the current thread's allocation counters.
-/// Returns (alloc_count, alloc_bytes, free_count, free_bytes).
-pub fn snapshot_alloc_counters() -> (u64, u64, u64, u64) {
-    ALLOC_COUNT.with(|ac| {
-        ALLOC_BYTES.with(|ab| {
-            FREE_COUNT.with(|fc| {
-                FREE_BYTES.with(|fb| (ac.get(), ab.get(), fc.get(), fb.get()))
-            })
-        })
-    })
+pub fn snapshot_alloc_counters() -> AllocSnapshot {
+    ALLOC_COUNTERS.try_with(|c| c.get()).unwrap_or(AllocSnapshot::ZERO)
 }
 
 /// Record an allocation on the current thread.
@@ -44,8 +53,12 @@ pub fn snapshot_alloc_counters() -> (u64, u64, u64, u64) {
 pub fn record_alloc(size: u64) {
     let _ = REENTRANCY.try_with(|r| {
         if r.get() == 0 {
-            let _ = ALLOC_COUNT.try_with(|c| c.set(c.get() + 1));
-            let _ = ALLOC_BYTES.try_with(|b| b.set(b.get() + size));
+            let _ = ALLOC_COUNTERS.try_with(|c| {
+                let mut s = c.get();
+                s.alloc_count += 1;
+                s.alloc_bytes += size;
+                c.set(s);
+            });
         }
     });
 }
@@ -55,15 +68,19 @@ pub fn record_alloc(size: u64) {
 fn record_dealloc(size: u64) {
     let _ = REENTRANCY.try_with(|r| {
         if r.get() == 0 {
-            let _ = FREE_COUNT.try_with(|c| c.set(c.get() + 1));
-            let _ = FREE_BYTES.try_with(|b| b.set(b.get() + size));
+            let _ = ALLOC_COUNTERS.try_with(|c| {
+                let mut s = c.get();
+                s.free_count += 1;
+                s.free_bytes += size;
+                c.set(s);
+            });
         }
     });
 }
 
 /// Check if currently inside a reentrancy-guarded section.
 pub fn is_reentrant() -> bool {
-    REENTRANCY.with(|r| r.get() > 0)
+    REENTRANCY.try_with(|r| r.get() > 0).unwrap_or(false)
 }
 
 /// RAII guard that prevents allocation tracking during profiler
@@ -90,8 +107,17 @@ impl Drop for ReentrancyGuard {
     fn drop(&mut self) {
         let _ = REENTRANCY.try_with(|r| {
             let prev = r.get();
-            debug_assert!(prev > 0, "ReentrancyGuard dropped without matching enter");
-            r.set(prev.saturating_sub(1));
+            // volatile write: prevents LLVM from reordering the decrement
+            // past a compiler_fence. Without this, LLVM proves the Cell write
+            // is non-aliasing and freely schedules it after rdtsc, adding
+            // ~5 instructions to the measurement window.
+            //
+            // SAFETY: Cell<u32> is repr(transparent) around UnsafeCell<u32>.
+            // We write through its raw pointer, which is what Cell::set does
+            // internally. No other thread can access this TLS cell.
+            unsafe {
+                core::ptr::write_volatile(r.as_ptr(), prev.saturating_sub(1));
+            }
         });
     }
 }

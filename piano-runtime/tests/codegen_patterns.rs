@@ -236,10 +236,11 @@ fn async_desugar_preamble_included_in_timing() {
         assert_eq!(drained.len(), 1);
 
         let m = &drained[0];
+        let wall = m.end_ns.saturating_sub(m.start_ns);
         assert!(
-            m.wall_time_ns() > 0,
+            wall > 0,
             "preamble work must produce nonzero wall time: got {}",
-            m.wall_time_ns()
+            wall
         );
     })
     .join()

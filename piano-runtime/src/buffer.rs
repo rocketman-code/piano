@@ -2,9 +2,10 @@
 
 //! Per-thread measurement storage.
 //!
-//! Buffer is a pure storage mechanism. It accumulates measurements
-//! and drains them on request. It does NOT make flush decisions --
-//! that policy belongs to the output layer.
+//! Each thread gets its own buffer (via TLS + Arc in global registry).
+//! push_measurement() appends and flushes to the file sink when the
+//! buffer reaches FLUSH_THRESHOLD (1024). drain functions collect
+//! remaining measurements at shutdown.
 //!
 //! Invariants:
 //! - Measurements are never duplicated: drain() moves data out,

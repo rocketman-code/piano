@@ -12,14 +12,14 @@ static ALLOC: PianoAllocator<System> = PianoAllocator::new(System);
 #[test]
 fn alloc_is_counted() {
     std::thread::spawn(|| {
-        let (count_before, bytes_before, _fc, _fb) = snapshot_alloc_counters();
+        let before = snapshot_alloc_counters();
 
         let v: Vec<u8> = Vec::with_capacity(1024);
         let v = std::hint::black_box(v);
 
-        let (count_after, bytes_after, _fc, _fb) = snapshot_alloc_counters();
-        assert!(count_after - count_before >= 1, "expected at least 1 alloc event");
-        assert!(bytes_after - bytes_before >= 1024, "expected at least 1024 bytes");
+        let after = snapshot_alloc_counters();
+        assert!(after.alloc_count - before.alloc_count >= 1, "expected at least 1 alloc event");
+        assert!(after.alloc_bytes - before.alloc_bytes >= 1024, "expected at least 1024 bytes");
 
         drop(v);
     })
@@ -33,12 +33,12 @@ fn dealloc_does_not_count() {
         let v: Vec<u8> = Vec::with_capacity(2048);
         let v = std::hint::black_box(v);
 
-        let (count_before, _, _fc, _fb) = snapshot_alloc_counters();
+        let before = snapshot_alloc_counters();
         drop(v);
-        let (count_after, _, _fc, _fb) = snapshot_alloc_counters();
+        let after = snapshot_alloc_counters();
 
         // Delta-based: no alloc events from dealloc
-        assert_eq!(count_after - count_before, 0, "dealloc should not increment count");
+        assert_eq!(after.alloc_count - before.alloc_count, 0, "dealloc should not increment count");
     })
     .join()
     .expect("test thread panicked");
@@ -47,7 +47,7 @@ fn dealloc_does_not_count() {
 #[test]
 fn realloc_counts_as_alloc_event() {
     std::thread::spawn(|| {
-        let (count_before, _, _fc, _fb) = snapshot_alloc_counters();
+        let before = snapshot_alloc_counters();
 
         let mut v: Vec<u8> = Vec::with_capacity(1);
         for i in 0..100u8 {
@@ -55,9 +55,9 @@ fn realloc_counts_as_alloc_event() {
         }
         let v = std::hint::black_box(v);
 
-        let (count_after, _, _fc, _fb) = snapshot_alloc_counters();
+        let after = snapshot_alloc_counters();
         assert!(
-            count_after - count_before >= 1,
+            after.alloc_count - before.alloc_count >= 1,
             "expected allocations to be tracked during realloc growth",
         );
 
@@ -70,7 +70,7 @@ fn realloc_counts_as_alloc_event() {
 #[test]
 fn reentrancy_excludes_profiler_allocs() {
     std::thread::spawn(|| {
-        let (count_before, bytes_before, _fc, _fb) = snapshot_alloc_counters();
+        let before = snapshot_alloc_counters();
 
         {
             let _guard = ReentrancyGuard::enter();
@@ -79,9 +79,9 @@ fn reentrancy_excludes_profiler_allocs() {
             drop(v);
         }
 
-        let (count_after, bytes_after, _fc, _fb) = snapshot_alloc_counters();
-        assert_eq!(count_after - count_before, 0, "guarded allocs should not count");
-        assert_eq!(bytes_after - bytes_before, 0, "guarded bytes should not count");
+        let after = snapshot_alloc_counters();
+        assert_eq!(after.alloc_count - before.alloc_count, 0, "guarded allocs should not count");
+        assert_eq!(after.alloc_bytes - before.alloc_bytes, 0, "guarded bytes should not count");
     })
     .join()
     .expect("test thread panicked");
@@ -106,26 +106,26 @@ fn zero_size_alloc_does_not_panic() {
 #[test]
 fn cross_thread_alloc_isolation() {
     std::thread::spawn(|| {
-        let (parent_count_before, _, _fc, _fb) = snapshot_alloc_counters();
+        let parent_before = snapshot_alloc_counters();
 
         let child_had_alloc = std::thread::spawn(|| {
-            let (before, _, _fc, _fb) = snapshot_alloc_counters();
+            let before = snapshot_alloc_counters();
             let v: Vec<u8> = Vec::with_capacity(2048);
             let v = std::hint::black_box(v);
-            let (after, _, _fc, _fb) = snapshot_alloc_counters();
+            let after = snapshot_alloc_counters();
             drop(v);
-            after - before >= 1
+            after.alloc_count - before.alloc_count >= 1
         })
         .join()
         .expect("child panicked");
 
-        let (parent_count_after, _, _fc, _fb) = snapshot_alloc_counters();
+        let parent_after = snapshot_alloc_counters();
 
         assert!(child_had_alloc, "child should see its own alloc");
         // Parent's delta should not include child's explicit 2048-byte alloc.
         // Thread spawn overhead may cause small parent delta, but the child's
         // Vec allocation is on the child's TLS, not the parent's.
-        let parent_delta = parent_count_after - parent_count_before;
+        let parent_delta = parent_after.alloc_count - parent_before.alloc_count;
         let _ = parent_delta; // verified structurally: child has independent TLS
     })
     .join()

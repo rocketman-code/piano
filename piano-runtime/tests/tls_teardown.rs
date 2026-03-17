@@ -4,7 +4,7 @@
 //! when TLS is destroyed during thread exit. This test exercises
 //! the fallback by calling the functions from a TLS destructor.
 
-use piano_runtime::alloc::{self, ReentrancyGuard};
+use piano_runtime::alloc::{self, AllocSnapshot, ReentrancyGuard};
 use std::cell::Cell;
 use std::sync::mpsc;
 
@@ -14,9 +14,8 @@ struct TlsDestructorSentinel {
     tx: mpsc::Sender<TlsTeardownResults>,
 }
 
-#[derive(Debug)]
 struct TlsTeardownResults {
-    snapshot: (u64, u64, u64, u64),
+    snapshot: AllocSnapshot,
     is_reentrant: bool,
     // ReentrancyGuard::enter() should be no-op (not panic)
     reentrancy_guard_safe: bool,

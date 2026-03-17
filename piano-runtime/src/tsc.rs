@@ -50,9 +50,9 @@ use std::time::Instant;
 static QUOTIENT: AtomicU64 = AtomicU64::new(0);
 static MULTIPLIER: AtomicU64 = AtomicU64::new(0);
 
-/// Calibrated measurement bias in raw ticks. Subtracted from every
-/// elapsed measurement in `drop_cold` to correct for instructions
-/// between the two TSC reads that are not user code.
+/// Calibrated measurement bias in raw ticks. Written to the NDJSON
+/// header/trailer so the report reader can correct per-span wall times.
+/// Measures cost of 2 TSC reads (the irreducible measurement minimum).
 static BIAS_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the hardware cycle counter. Single inline instruction on both

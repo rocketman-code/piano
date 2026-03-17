@@ -144,7 +144,7 @@ fn no_test_backdoors_in_source() {
         panic!(
             "\n\nSpec violation: forbidden patterns found.\n\n\
              Found {} violation(s):\n  {}\n\n\
-             Fix the code, not this test. See spec constraints in cbc-spec.md.\n",
+             Fix the code, not this test. Runtime src/ must not contain #[cfg(test)] blocks or test-only code paths.\n",
             violations.len(),
             msg,
         );

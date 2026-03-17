@@ -87,10 +87,10 @@ impl<F: Future> Future for PianoFuture<F> {
         let this = unsafe { self.get_unchecked_mut() };
 
         // --- Pre-poll bookkeeping (inside reentrancy guard) ---
-        let (ac_start, ab_start, fc_start, fb_start);
+        let snap_start;
         {
             let _reentrancy = ReentrancyGuard::enter();
-            (ac_start, ab_start, fc_start, fb_start) = snapshot_alloc_counters();
+            snap_start = snapshot_alloc_counters();
 
             if this.start_ticks == 0 {
                 this.start_ticks = read();
@@ -101,7 +101,6 @@ impl<F: Future> Future for PianoFuture<F> {
 
         compiler_fence(Ordering::SeqCst);
 
-        #[cfg(feature = "cpu-time")]
         let cpu_poll_start = if this.cpu_time_enabled {
             crate::cpu_clock::cpu_now_ns()
         } else {
@@ -116,7 +115,6 @@ impl<F: Future> Future for PianoFuture<F> {
         let result = inner.poll(cx);
 
         // --- Post-poll bookkeeping (inside reentrancy guard) ---
-        #[cfg(feature = "cpu-time")]
         let cpu_poll_end = if this.cpu_time_enabled {
             crate::cpu_clock::cpu_now_ns()
         } else {
@@ -127,17 +125,14 @@ impl<F: Future> Future for PianoFuture<F> {
 
         {
             let _reentrancy = ReentrancyGuard::enter();
-            let (ac_end, ab_end, fc_end, fb_end) = snapshot_alloc_counters();
+            let snap_end = snapshot_alloc_counters();
 
-            this.alloc_count_acc += ac_end.saturating_sub(ac_start);
-            this.alloc_bytes_acc += ab_end.saturating_sub(ab_start);
-            this.free_count_acc += fc_end.saturating_sub(fc_start);
-            this.free_bytes_acc += fb_end.saturating_sub(fb_start);
+            this.alloc_count_acc += snap_end.alloc_count.saturating_sub(snap_start.alloc_count);
+            this.alloc_bytes_acc += snap_end.alloc_bytes.saturating_sub(snap_start.alloc_bytes);
+            this.free_count_acc += snap_end.free_count.saturating_sub(snap_start.free_count);
+            this.free_bytes_acc += snap_end.free_bytes.saturating_sub(snap_start.free_bytes);
 
-            #[cfg(feature = "cpu-time")]
-            {
-                this.cpu_acc_ns += cpu_poll_end.saturating_sub(cpu_poll_start);
-            }
+            this.cpu_acc_ns += cpu_poll_end.saturating_sub(cpu_poll_start);
         }
 
         if result.is_ready() {

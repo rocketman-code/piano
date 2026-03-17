@@ -31,13 +31,13 @@ fn failed_alloc_not_counted() {
     std::thread::spawn(|| {
         let allocator = PianoAllocator::new(FailingAlloc);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let (count_before, bytes_before, _fc, _fb) = snapshot_alloc_counters();
+        let before = snapshot_alloc_counters();
         // SAFETY: layout is valid (from_size_align succeeded).
         let ptr = unsafe { allocator.alloc(layout) };
         assert!(ptr.is_null());
-        let (count_after, bytes_after, _fc, _fb) = snapshot_alloc_counters();
-        assert_eq!(count_after - count_before, 0, "failed alloc should not be counted");
-        assert_eq!(bytes_after - bytes_before, 0, "failed alloc bytes should be zero");
+        let after = snapshot_alloc_counters();
+        assert_eq!(after.alloc_count - before.alloc_count, 0, "failed alloc should not be counted");
+        assert_eq!(after.alloc_bytes - before.alloc_bytes, 0, "failed alloc bytes should be zero");
     })
     .join()
     .expect("test thread panicked");
@@ -48,13 +48,13 @@ fn failed_alloc_zeroed_not_counted() {
     std::thread::spawn(|| {
         let allocator = PianoAllocator::new(FailingAlloc);
         let layout = Layout::from_size_align(128, 8).unwrap();
-        let (count_before, bytes_before, _fc, _fb) = snapshot_alloc_counters();
+        let before = snapshot_alloc_counters();
         // SAFETY: layout is valid (from_size_align succeeded).
         let ptr = unsafe { allocator.alloc_zeroed(layout) };
         assert!(ptr.is_null());
-        let (count_after, bytes_after, _fc, _fb) = snapshot_alloc_counters();
-        assert_eq!(count_after - count_before, 0, "failed alloc_zeroed should not be counted");
-        assert_eq!(bytes_after - bytes_before, 0, "failed alloc_zeroed bytes should be zero");
+        let after = snapshot_alloc_counters();
+        assert_eq!(after.alloc_count - before.alloc_count, 0, "failed alloc_zeroed should not be counted");
+        assert_eq!(after.alloc_bytes - before.alloc_bytes, 0, "failed alloc_zeroed bytes should be zero");
     })
     .join()
     .expect("test thread panicked");
@@ -65,12 +65,12 @@ fn failed_realloc_not_counted() {
     std::thread::spawn(|| {
         let allocator = PianoAllocator::new(FailingAlloc);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let (count_before, _, _fc, _fb) = snapshot_alloc_counters();
+        let before = snapshot_alloc_counters();
         // SAFETY: layout is valid. ptr is null (FailingAlloc never allocates).
         let ptr = unsafe { allocator.realloc(std::ptr::null_mut(), layout, 128) };
         assert!(ptr.is_null());
-        let (count_after, _, _fc, _fb) = snapshot_alloc_counters();
-        assert_eq!(count_after - count_before, 0, "failed realloc should not be counted");
+        let after = snapshot_alloc_counters();
+        assert_eq!(after.alloc_count - before.alloc_count, 0, "failed realloc should not be counted");
     })
     .join()
     .expect("test thread panicked");
