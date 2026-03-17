@@ -1,7 +1,10 @@
 use piano_runtime::alloc::{record_alloc, snapshot_alloc_counters, PianoAllocator};
-use piano_runtime::buffer::drain_thread_buffer;
+use piano_runtime::buffer::{drain_thread_buffer, Registry};
 use piano_runtime::guard::Guard;
+use piano_runtime::time::CalibrationData;
 use std::alloc::System;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 
 #[global_allocator]
 static ALLOC: PianoAllocator<System> = PianoAllocator::new(System);
@@ -9,12 +12,19 @@ static ALLOC: PianoAllocator<System> = PianoAllocator::new(System);
 // All tests run in spawned threads for TLS isolation.
 // All assertions use deltas, never absolute values.
 
+fn test_registry() -> Arc<Registry> {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
 // INVARIANT TEST: Guard produces a Measurement on drop.
 #[test]
 fn guard_produces_measurement_on_drop() {
     std::thread::spawn(|| {
+        let cal = CalibrationData::calibrate();
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         {
-            let mut _g = Guard::new_uninstrumented(1, 0, 42, false);
+            let mut _g = Guard::new_uninstrumented(1, 0, 42, false, cal, &tid, Arc::clone(&reg));
             _g.stamp();
         } // guard drops, pushes measurement to buffer
 
@@ -34,8 +44,11 @@ fn guard_produces_measurement_on_drop() {
 #[test]
 fn guard_captures_wall_time() {
     std::thread::spawn(|| {
+        let cal = CalibrationData::calibrate();
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         {
-            let mut _g = Guard::new_uninstrumented(1, 0, 0, false);
+            let mut _g = Guard::new_uninstrumented(1, 0, 0, false, cal, &tid, Arc::clone(&reg));
             _g.stamp();
             // Do some work to ensure nonzero wall time
             std::hint::black_box(vec![0u8; 1024]);
@@ -58,8 +71,11 @@ fn guard_captures_wall_time() {
 #[test]
 fn guard_captures_alloc_deltas() {
     std::thread::spawn(|| {
+        let cal = CalibrationData::calibrate();
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         {
-            let mut _g = Guard::new_uninstrumented(1, 0, 0, false);
+            let mut _g = Guard::new_uninstrumented(1, 0, 0, false, cal, &tid, Arc::clone(&reg));
             _g.stamp();
             // Record user allocations while guard is active
             record_alloc(100);
@@ -81,9 +97,12 @@ fn guard_captures_alloc_deltas() {
 #[test]
 fn guard_excludes_own_bookkeeping_allocs() {
     std::thread::spawn(|| {
+        let cal = CalibrationData::calibrate();
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         let before = snapshot_alloc_counters();
         {
-            let mut _g = Guard::new_uninstrumented(1, 0, 0, false);
+            let mut _g = Guard::new_uninstrumented(1, 0, 0, false, cal, &tid, Arc::clone(&reg));
             _g.stamp();
             // No explicit user allocs
         }
@@ -116,8 +135,11 @@ fn guard_excludes_own_bookkeeping_allocs() {
 #[test]
 fn guard_sets_thread_id() {
     std::thread::spawn(|| {
+        let cal = CalibrationData::calibrate();
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         {
-            let mut _g = Guard::new_uninstrumented(1, 0, 0, false);
+            let mut _g = Guard::new_uninstrumented(1, 0, 0, false, cal, &tid, Arc::clone(&reg));
             _g.stamp();
         }
 
@@ -133,12 +155,15 @@ fn guard_sets_thread_id() {
 #[test]
 fn guard_thread_id_consistent_on_same_thread() {
     std::thread::spawn(|| {
+        let cal = CalibrationData::calibrate();
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         {
-            let mut _g = Guard::new_uninstrumented(1, 0, 0, false);
+            let mut _g = Guard::new_uninstrumented(1, 0, 0, false, cal, &tid, Arc::clone(&reg));
             _g.stamp();
         }
         {
-            let mut _g = Guard::new_uninstrumented(2, 0, 0, false);
+            let mut _g = Guard::new_uninstrumented(2, 0, 0, false, cal, &tid, Arc::clone(&reg));
             _g.stamp();
         }
 
@@ -157,16 +182,21 @@ fn guard_thread_id_consistent_on_same_thread() {
 #[test]
 fn guard_thread_id_differs_across_threads() {
     std::thread::spawn(|| {
+        let cal = CalibrationData::calibrate();
+        let tid = Arc::new(AtomicU64::new(1));
+        let reg = test_registry();
         {
-            let mut _g = Guard::new_uninstrumented(1, 0, 0, false);
+            let mut _g = Guard::new_uninstrumented(1, 0, 0, false, cal, &tid, Arc::clone(&reg));
             _g.stamp();
         }
         let parent_drain = drain_thread_buffer();
         let parent_tid = parent_drain[0].thread_id;
 
-        let child_tid = std::thread::spawn(|| {
+        let tid_clone = Arc::clone(&tid);
+        let reg_clone = Arc::clone(&reg);
+        let child_tid = std::thread::spawn(move || {
             {
-                let mut _g = Guard::new_uninstrumented(2, 0, 0, false);
+                let mut _g = Guard::new_uninstrumented(2, 0, 0, false, cal, &tid_clone, reg_clone);
                 _g.stamp();
             }
             let child_drain = drain_thread_buffer();
@@ -188,8 +218,11 @@ fn guard_thread_id_differs_across_threads() {
 #[test]
 fn guard_cpu_time_is_zero() {
     std::thread::spawn(|| {
+        let cal = CalibrationData::calibrate();
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         {
-            let mut _g = Guard::new_uninstrumented(1, 0, 0, false);
+            let mut _g = Guard::new_uninstrumented(1, 0, 0, false, cal, &tid, Arc::clone(&reg));
             _g.stamp();
         }
 
@@ -206,11 +239,14 @@ fn guard_cpu_time_is_zero() {
 #[test]
 fn nested_guards_produce_measurements() {
     std::thread::spawn(|| {
+        let cal = CalibrationData::calibrate();
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         {
-            let mut _outer = Guard::new_uninstrumented(1, 0, 10, false);
+            let mut _outer = Guard::new_uninstrumented(1, 0, 10, false, cal, &tid, Arc::clone(&reg));
             _outer.stamp();
             {
-                let mut _inner = Guard::new_uninstrumented(2, 1, 20, false);
+                let mut _inner = Guard::new_uninstrumented(2, 1, 20, false, cal, &tid, Arc::clone(&reg));
                 _inner.stamp();
                 // inner drops first
             }
@@ -249,11 +285,14 @@ fn nested_guards_produce_measurements() {
 #[test]
 fn alloc_deltas_scoped_to_guard_lifetime() {
     std::thread::spawn(|| {
+        let cal = CalibrationData::calibrate();
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         // Allocs before the guard -- should NOT be counted
         record_alloc(999);
 
         {
-            let mut _g = Guard::new_uninstrumented(1, 0, 0, false);
+            let mut _g = Guard::new_uninstrumented(1, 0, 0, false, cal, &tid, Arc::clone(&reg));
             _g.stamp();
             record_alloc(50);
             record_alloc(75);
@@ -275,8 +314,11 @@ fn alloc_deltas_scoped_to_guard_lifetime() {
 #[test]
 fn guard_captures_free_deltas() {
     std::thread::spawn(|| {
+        let cal = CalibrationData::calibrate();
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         {
-            let mut _g = Guard::new_uninstrumented(1, 0, 0, false);
+            let mut _g = Guard::new_uninstrumented(1, 0, 0, false, cal, &tid, Arc::clone(&reg));
             _g.stamp();
             // Allocate and immediately drop to trigger dealloc tracking
             let v: Vec<u8> = Vec::with_capacity(100);
@@ -298,8 +340,11 @@ fn guard_captures_free_deltas() {
 #[test]
 fn guard_captures_cpu_time_when_enabled() {
     std::thread::spawn(|| {
+        let cal = CalibrationData::calibrate();
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         {
-            let mut _g = Guard::new_uninstrumented(1, 0, 0, true);
+            let mut _g = Guard::new_uninstrumented(1, 0, 0, true, cal, &tid, Arc::clone(&reg));
             _g.stamp();
             // Do some CPU work
             let mut sum: u64 = 0;
@@ -338,10 +383,14 @@ fn guard_captures_cpu_time_when_enabled() {
 // both debug and release modes without panic, the claim holds.
 #[test]
 fn guard_never_panics_on_underflow() {
+    let cal = CalibrationData::calibrate();
+
     // Case 1: Guard with cpu_time_enabled = true, normal drop
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         {
-            let mut g = Guard::new_uninstrumented(1, 0, 0, true);
+            let mut g = Guard::new_uninstrumented(1, 0, 0, true, cal, &tid, Arc::clone(&reg));
             g.stamp();
         } // drops without panic
         drain_thread_buffer(); // clear buffer
@@ -351,9 +400,11 @@ fn guard_never_panics_on_underflow() {
 
     // Case 2: Guard on a fresh thread (exercises TLS init for thread_id,
     // alloc counters, reentrancy counter, and thread buffer)
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         {
-            let mut g = Guard::new_uninstrumented(2, 1, 99, true);
+            let mut g = Guard::new_uninstrumented(2, 1, 99, true, cal, &tid, Arc::clone(&reg));
             g.stamp();
             // Do some work so timing is nonzero
             std::hint::black_box(42u64.wrapping_mul(7));
@@ -364,9 +415,11 @@ fn guard_never_panics_on_underflow() {
     .expect("case 2: guard on fresh thread panicked");
 
     // Case 3: Guard with cpu_time_enabled = false (exercises the else-branch)
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
         {
-            let mut g = Guard::new_uninstrumented(3, 0, 0, false);
+            let mut g = Guard::new_uninstrumented(3, 0, 0, false, cal, &tid, Arc::clone(&reg));
             g.stamp();
         }
         drain_thread_buffer();

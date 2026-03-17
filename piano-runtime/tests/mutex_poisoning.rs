@@ -4,7 +4,7 @@
 //! to heal poisoned mutexes. This test poisons a mutex and verifies
 //! the healing works.
 
-use piano_runtime::buffer::{self, ThreadBuffer};
+use piano_runtime::buffer::{self, Registry, ThreadBuffer};
 use piano_runtime::measurement::Measurement;
 use std::sync::{Arc, Mutex};
 
@@ -50,7 +50,7 @@ fn buffer_mutex_heals_poisoning() {
 }
 
 /// B6: registry mutex heals poisoning.
-/// The global registry uses the same healing pattern.
+/// The registry uses the same healing pattern.
 /// We test push_measurement after buffer poisoning to verify
 /// the registry path heals.
 #[test]
@@ -59,10 +59,11 @@ fn push_measurement_survives_poisoned_registry() {
     // Even if the registry was poisoned by a previous thread panic,
     // subsequent pushes should work (healing via into_inner).
     //
-    // We can't easily poison the global registry directly, but we
+    // We can't easily poison the registry directly, but we
     // CAN verify that push_measurement doesn't panic when called
     // normally — the healing code path is exercised by inspection
     // (unwrap_or_else pattern is present at every lock site).
+    let reg: Arc<Registry> = Arc::new(Mutex::new(Vec::new()));
     let m = Measurement {
         span_id: 99,
         parent_span_id: 0,
@@ -80,7 +81,7 @@ fn push_measurement_survives_poisoned_registry() {
 
     // This should not panic, even in the presence of other test-induced
     // mutex poisoning in the same process.
-    buffer::push_measurement(m);
+    buffer::push_measurement(m, &reg);
 
     // Drain to verify it was stored
     let drained = buffer::drain_thread_buffer();

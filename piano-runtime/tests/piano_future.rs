@@ -1,10 +1,13 @@
 use piano_runtime::alloc::record_alloc;
-use piano_runtime::buffer::drain_thread_buffer;
+use piano_runtime::buffer::{drain_thread_buffer, Registry};
 use piano_runtime::guard::Guard;
 use piano_runtime::piano_future::{PianoFuture, PianoFutureState};
+use piano_runtime::time::CalibrationData;
 use std::future::Future;
 use std::panic;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 // All tests run in spawned threads for TLS isolation.
@@ -21,12 +24,19 @@ fn noop_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }
 
+fn test_registry() -> Arc<Registry> {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
 fn test_state(span_id: u64, parent_span_id: u64, name_id: u32) -> PianoFutureState {
     PianoFutureState {
         span_id,
         parent_span_id,
         name_id,
         cpu_time_enabled: false,
+        calibration: CalibrationData::calibrate(),
+        thread_id_alloc: Arc::new(AtomicU64::new(1)),
+        registry: test_registry(),
     }
 }
 
@@ -385,9 +395,12 @@ fn guard_active_during_piano_future_poll() {
     std::thread::spawn(|| {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
+        let cal = CalibrationData::calibrate();
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
 
         // Create a sync Guard (outer)
-        let mut guard = Guard::new_uninstrumented(1, 0, 10, false);
+        let mut guard = Guard::new_uninstrumented(1, 0, 10, false, cal, &tid, Arc::clone(&reg));
         guard.stamp();
 
         // Record some allocs attributed to the Guard's window
@@ -519,6 +532,9 @@ fn piano_future_accumulates_cpu_time() {
             parent_span_id: 0,
             name_id: 10,
             cpu_time_enabled: true,
+            calibration: CalibrationData::calibrate(),
+            thread_id_alloc: Arc::new(AtomicU64::new(1)),
+            registry: test_registry(),
         };
 
         // Use PendingOnce: first poll returns Pending, second returns Ready

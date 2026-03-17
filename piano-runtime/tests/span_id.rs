@@ -1,10 +1,13 @@
 use piano_runtime::span_id::next_span_id;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 // INVARIANT TEST: IDs are non-zero.
 #[test]
 fn ids_are_nonzero() {
+    let alloc = AtomicU64::new(1);
     for _ in 0..100 {
-        assert_ne!(next_span_id(), 0, "span_id must never be 0 (reserved for root)");
+        assert_ne!(next_span_id(&alloc), 0, "span_id must never be 0 (reserved for root)");
     }
 }
 
@@ -12,9 +15,10 @@ fn ids_are_nonzero() {
 // Uses deltas (relative ordering), not absolute values.
 #[test]
 fn ids_are_monotonically_increasing() {
-    let a = next_span_id();
-    let b = next_span_id();
-    let c = next_span_id();
+    let alloc = AtomicU64::new(1);
+    let a = next_span_id(&alloc);
+    let b = next_span_id(&alloc);
+    let c = next_span_id(&alloc);
     assert!(b > a, "span_ids must be strictly increasing");
     assert!(c > b, "span_ids must be strictly increasing");
 }
@@ -24,10 +28,13 @@ fn ids_are_monotonically_increasing() {
 fn cross_thread_uniqueness() {
     use std::collections::HashSet;
 
+    let alloc = Arc::new(AtomicU64::new(1));
+
     let handles: Vec<_> = (0..4)
         .map(|_| {
-            std::thread::spawn(|| {
-                (0..1000).map(|_| next_span_id()).collect::<Vec<_>>()
+            let alloc = Arc::clone(&alloc);
+            std::thread::spawn(move || {
+                (0..1000).map(|_| next_span_id(&alloc)).collect::<Vec<_>>()
             })
         })
         .collect();

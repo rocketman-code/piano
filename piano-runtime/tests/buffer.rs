@@ -1,14 +1,19 @@
-use piano_runtime::buffer::{drain_thread_buffer, push_measurement, ThreadBuffer};
+use piano_runtime::buffer::{drain_thread_buffer, push_measurement, Registry, ThreadBuffer};
 use piano_runtime::measurement::Measurement;
+use std::sync::{Arc, Mutex};
 
 // All tests run in spawned threads for TLS isolation.
 // All assertions use deltas, never absolute values (except fresh-thread properties).
 //
 // This file MUST NOT call drain_all_buffers. That function drains ALL
-// registered thread buffers through the shared global registry, which
+// registered thread buffers through the shared registry, which
 // races with other tests' spawned threads within the same binary.
 // drain_all_buffers tests live in buffer_global.rs (separate binary,
 // separate process, independent registry).
+
+fn test_registry() -> Arc<Registry> {
+    Arc::new(Mutex::new(Vec::new()))
+}
 
 // ---------------------------------------------------------------------------
 // ThreadBuffer unit tests (no TLS, no registry)
@@ -68,9 +73,10 @@ fn thread_buffer_no_silent_drops() {
 #[test]
 fn push_measurement_accumulates() {
     std::thread::spawn(|| {
-        push_measurement(Measurement { span_id: 1, ..Measurement::default() });
-        push_measurement(Measurement { span_id: 2, ..Measurement::default() });
-        push_measurement(Measurement { span_id: 3, ..Measurement::default() });
+        let reg = test_registry();
+        push_measurement(Measurement { span_id: 1, ..Measurement::default() }, &reg);
+        push_measurement(Measurement { span_id: 2, ..Measurement::default() }, &reg);
+        push_measurement(Measurement { span_id: 3, ..Measurement::default() }, &reg);
 
         let drained = drain_thread_buffer();
         assert_eq!(drained.len(), 3, "all pushed measurements must be drainable");
@@ -86,9 +92,10 @@ fn push_measurement_accumulates() {
 #[test]
 fn drain_thread_buffer_no_duplicates() {
     std::thread::spawn(|| {
-        push_measurement(Measurement { span_id: 1, ..Measurement::default() });
-        push_measurement(Measurement { span_id: 2, ..Measurement::default() });
-        push_measurement(Measurement { span_id: 3, ..Measurement::default() });
+        let reg = test_registry();
+        push_measurement(Measurement { span_id: 1, ..Measurement::default() }, &reg);
+        push_measurement(Measurement { span_id: 2, ..Measurement::default() }, &reg);
+        push_measurement(Measurement { span_id: 3, ..Measurement::default() }, &reg);
 
         let first = drain_thread_buffer();
         assert_eq!(first.len(), 3, "first drain should return all");
@@ -104,12 +111,14 @@ fn drain_thread_buffer_no_duplicates() {
 #[test]
 fn cross_thread_buffer_isolation() {
     std::thread::spawn(|| {
+        let reg = test_registry();
         // Push on parent thread
-        push_measurement(Measurement { span_id: 100, ..Measurement::default() });
+        push_measurement(Measurement { span_id: 100, ..Measurement::default() }, &reg);
 
         // Child thread should have independent buffer
-        let child_drain = std::thread::spawn(|| {
-            push_measurement(Measurement { span_id: 200, ..Measurement::default() });
+        let reg_clone = Arc::clone(&reg);
+        let child_drain = std::thread::spawn(move || {
+            push_measurement(Measurement { span_id: 200, ..Measurement::default() }, &reg_clone);
             drain_thread_buffer()
         })
         .join()
@@ -133,7 +142,12 @@ fn cross_thread_buffer_isolation() {
 // whether try_with returned Ok (TLS alive) or Err (TLS gone).
 #[test]
 fn push_measurement_safe_during_tls_teardown() {
-    struct PushOnDrop;
+    // We need a registry that survives the thread. Using Arc.
+    let reg = test_registry();
+
+    struct PushOnDrop {
+        registry: Arc<Registry>,
+    }
     impl Drop for PushOnDrop {
         fn drop(&mut self) {
             // This runs during TLS destruction. push_measurement must
@@ -143,7 +157,7 @@ fn push_measurement_safe_during_tls_teardown() {
             push_measurement(Measurement {
                 span_id: 999,
                 ..Measurement::default()
-            });
+            }, &self.registry);
         }
     }
 
@@ -152,19 +166,21 @@ fn push_measurement_safe_during_tls_teardown() {
             const { std::cell::RefCell::new(None) };
     }
 
-    let handle = std::thread::spawn(|| {
+    let reg_clone = Arc::clone(&reg);
+    let handle = std::thread::spawn(move || {
         // Initialize THREAD_BUFFER first by pushing a real measurement
         push_measurement(Measurement {
             span_id: 1,
             ..Measurement::default()
-        });
+        }, &reg_clone);
 
         // Then initialize the sentinel TLS. During thread teardown,
         // TLS destructors run in reverse initialization order, so
         // the sentinel may drop before or after THREAD_BUFFER depending
         // on platform. Either path must be safe.
+        let reg_for_sentinel = Arc::clone(&reg_clone);
         TEARDOWN_SENTINEL.with(|cell| {
-            *cell.borrow_mut() = Some(PushOnDrop);
+            *cell.borrow_mut() = Some(PushOnDrop { registry: reg_for_sentinel });
         });
 
         // Drain what we can before teardown

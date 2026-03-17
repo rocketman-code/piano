@@ -6,15 +6,21 @@
 // Guard, which includes overhead not relevant to the user-visible data.
 
 use piano_runtime::alloc::PianoAllocator;
-use piano_runtime::buffer::drain_thread_buffer;
+use piano_runtime::buffer::{drain_thread_buffer, Registry};
 use piano_runtime::cpu_clock;
 use piano_runtime::guard::Guard;
-use piano_runtime::time;
+use piano_runtime::time::{self, CalibrationData};
 use std::alloc::System;
 use std::hint::black_box;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 
 #[global_allocator]
 static ALLOC: PianoAllocator<System> = PianoAllocator::new(System);
+
+fn test_registry() -> Arc<Registry> {
+    Arc::new(Mutex::new(Vec::new()))
+}
 
 #[test]
 fn bias_impact() {
@@ -22,6 +28,7 @@ fn bias_impact() {
     time::calibrate();
     time::calibrate_bias();
     cpu_clock::calibrate_bias();
+    let cal = CalibrationData::calibrate();
 
     // ---- Step 2: Read calibrated bias values ----
     let tsc_bias_ticks = time::bias_ticks();
@@ -39,12 +46,14 @@ fn bias_impact() {
     // Create Guard, immediately drop. Guard pushes Measurement to buffer.
     // Drain buffer, read wall_time_ns() from the Measurement itself.
     // This is what the user sees in the profiling report.
-    let wall_results = std::thread::spawn(|| {
+    let wall_results = std::thread::spawn(move || {
         const N: usize = 10_000;
         let mut wall_times: Vec<u64> = Vec::with_capacity(N);
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
 
         for i in 0..N {
-            let mut g = Guard::new_uninstrumented((i + 1) as u64, 0, 0, false);
+            let mut g = Guard::new_uninstrumented((i + 1) as u64, 0, 0, false, cal, &tid, Arc::clone(&reg));
             g.stamp();
             drop(black_box(g));
 
@@ -83,12 +92,14 @@ fn bias_impact() {
     println!();
 
     // ---- Step 4: Empty Guard CPU time FROM THE MEASUREMENT ----
-    let cpu_results = std::thread::spawn(|| {
+    let cpu_results = std::thread::spawn(move || {
         const N: usize = 10_000;
         let mut cpu_times: Vec<u64> = Vec::with_capacity(N);
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
 
         for i in 0..N {
-            let mut g = Guard::new_uninstrumented((i + 1) as u64, 0, 0, true);
+            let mut g = Guard::new_uninstrumented((i + 1) as u64, 0, 0, true, cal, &tid, Arc::clone(&reg));
             g.stamp();
             drop(black_box(g));
 
@@ -131,14 +142,16 @@ fn bias_impact() {
     // Drain buffer: 101 measurements (100 children pushed first, parent last).
     // Compute parent self_time = parent.wall_time - sum(child.wall_time).
     // Then corrected self_time = self_time - 100 * guard_overhead.
-    let parent_child_results = std::thread::spawn(|| {
+    let parent_child_results = std::thread::spawn(move || {
         const N_CHILDREN: usize = 100;
+        let tid = AtomicU64::new(1);
+        let reg = test_registry();
 
-        let mut parent = Guard::new_uninstrumented(1, 0, 0, true);
+        let mut parent = Guard::new_uninstrumented(1, 0, 0, true, cal, &tid, Arc::clone(&reg));
         parent.stamp();
 
         for i in 0..N_CHILDREN {
-            let mut child = Guard::new_uninstrumented((i + 2) as u64, 1, 1, true);
+            let mut child = Guard::new_uninstrumented((i + 2) as u64, 1, 1, true, cal, &tid, Arc::clone(&reg));
             child.stamp();
             drop(black_box(child));
         }
