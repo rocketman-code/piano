@@ -7,9 +7,8 @@
 
 use piano_runtime::alloc::PianoAllocator;
 use piano_runtime::buffer::{drain_thread_buffer, Registry};
-use piano_runtime::cpu_clock;
 use piano_runtime::guard::Guard;
-use piano_runtime::time::{self, CalibrationData};
+use piano_runtime::time::CalibrationData;
 use std::alloc::System;
 use std::hint::black_box;
 use std::sync::atomic::AtomicU64;
@@ -25,20 +24,16 @@ fn test_registry() -> Arc<Registry> {
 #[test]
 fn bias_impact() {
     // ---- Step 1: Trigger startup calibration ----
-    time::calibrate();
-    time::calibrate_bias();
-    cpu_clock::calibrate_bias();
     let cal = CalibrationData::calibrate();
 
     // ---- Step 2: Read calibrated bias values ----
-    let tsc_bias_ticks = time::bias_ticks();
-    let tsc_bias_ns = time::ticks_to_ns(tsc_bias_ticks);
-    let cpu_bias_ns = cpu_clock::bias_ns();
+    let tsc_bias_ns = cal.bias_ns();
+    let cpu_bias_ns = cal.cpu_bias_f64() as u64;
 
     println!("\n========================================");
     println!("  CALIBRATED BIAS VALUES");
     println!("========================================");
-    println!("  TSC bias:      {} ticks = {} ns", tsc_bias_ticks, tsc_bias_ns);
+    println!("  TSC bias:      {} ns", tsc_bias_ns);
     println!("  CPU-time bias: {} ns", cpu_bias_ns);
     println!();
 

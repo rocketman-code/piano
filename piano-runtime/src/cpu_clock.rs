@@ -35,24 +35,15 @@ extern "C" {
 }
 
 #[cfg(unix)]
-use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
-
-/// CPU-time bias stored as f64 bits in AtomicU64. Amortized measurement
-/// gives sub-nanosecond precision, eliminating the 42ns quantum systematic
-/// bias that per-call saturating_sub creates on Apple Silicon.
-#[cfg(unix)]
-static CPU_BIAS_F64: AtomicU64 = AtomicU64::new(0);
-
-/// Guard instrumentation overhead (guard_cost - bias) stored as f64 bits.
-/// Added to parent.cpu_children per child call to correct parent inflation.
-#[cfg(unix)]
-static GUARD_OVERHEAD_F64: AtomicU64 = AtomicU64::new(0);
+use std::sync::atomic::{compiler_fence, Ordering};
 
 /// Calibrate the measurement bias: amortized cost of time::read() per call,
 /// matching the exit sequence overhead between body-end and cpu_end capture.
-/// Called once from epoch() after TSC calibration.
+/// Called once from CalibrationData::calibrate() after TSC calibration.
+///
+/// Returns the bias as f64 bits (f64::to_bits).
 #[cfg(unix)]
-pub fn calibrate_bias() {
+pub fn calibrate_bias() -> u64 {
     const N: usize = 100_000;
     let start = cpu_now_ns();
     for _ in 0..N {
@@ -61,78 +52,7 @@ pub fn calibrate_bias() {
     }
     let end = cpu_now_ns();
     let bias = (end - start) as f64 / N as f64;
-    CPU_BIAS_F64.store(bias.to_bits(), Ordering::Release);
-}
-
-/// Return the calibrated CPU-time bias as f64 nanoseconds.
-/// Used at aggregation for amortized correction: corrected = raw - calls * bias.
-#[cfg(unix)]
-#[inline(always)]
-pub fn bias_f64() -> f64 {
-    f64::from_bits(CPU_BIAS_F64.load(Ordering::Relaxed))
-}
-
-/// Return the raw bits of the calibrated CPU-time bias.
-/// Used by CalibrationData to snapshot the value.
-#[cfg(unix)]
-#[inline(always)]
-pub(crate) fn bias_f64_bits() -> u64 {
-    CPU_BIAS_F64.load(Ordering::Relaxed)
-}
-
-/// Return the raw bits of the guard overhead.
-/// Used by CalibrationData to snapshot the value.
-#[cfg(unix)]
-#[inline(always)]
-pub(crate) fn guard_overhead_f64_bits() -> u64 {
-    GUARD_OVERHEAD_F64.load(Ordering::Relaxed)
-}
-
-/// Return the calibrated CPU-time bias as integer nanoseconds.
-#[cfg(all(any(test, feature = "_test_internals"), unix))]
-#[inline(always)]
-pub fn bias_ns() -> u64 {
-    bias_f64() as u64
-}
-
-/// Return the guard instrumentation overhead as f64 nanoseconds.
-/// This is the per-child-call cost that falls inside the parent's CPU bracket
-/// but outside the child's raw elapsed.
-#[cfg(unix)]
-#[inline(always)]
-pub fn guard_overhead_f64() -> f64 {
-    f64::from_bits(GUARD_OVERHEAD_F64.load(Ordering::Relaxed))
-}
-
-/// Return the guard instrumentation overhead as integer nanoseconds.
-/// Truncates the f64 value (~0.5ns/call error, <0.1% of typical ~50ns value).
-#[cfg(unix)]
-#[inline(always)]
-pub fn guard_overhead_ns() -> u64 {
-    guard_overhead_f64() as u64
-}
-
-/// Store the calibrated guard overhead (called from collector after calibration).
-#[cfg(unix)]
-pub fn store_guard_overhead(val: f64) {
-    GUARD_OVERHEAD_F64.store(val.to_bits(), Ordering::Release);
-}
-
-#[cfg(all(feature = "_test_internals", unix))]
-pub fn store_cpu_bias_ns(val: u64) {
-    CPU_BIAS_F64.store((val as f64).to_bits(), Ordering::Release);
-}
-#[cfg(all(feature = "_test_internals", unix))]
-pub fn load_cpu_bias_ns() -> u64 {
-    bias_ns()
-}
-#[cfg(all(feature = "_test_internals", unix))]
-pub fn store_guard_overhead_ns(val: u64) {
-    store_guard_overhead(val as f64);
-}
-#[cfg(all(feature = "_test_internals", unix))]
-pub fn load_guard_overhead_ns() -> u64 {
-    guard_overhead_ns()
+    bias.to_bits()
 }
 
 /// Return the current thread's CPU time in nanoseconds.
@@ -165,18 +85,8 @@ pub(crate) fn cpu_now_ns() -> u64 {
     unreachable!("cpu_now_ns called on non-Unix; gated by cpu_time_enabled bool")
 }
 
-/// No CPU-time calibration on non-Unix platforms.
+/// No CPU-time calibration on non-Unix platforms. Returns 0 (no bias).
 #[cfg(not(unix))]
-pub fn calibrate_bias() {}
-
-/// No CPU bias on non-Unix platforms.
-#[cfg(not(unix))]
-pub(crate) fn bias_f64_bits() -> u64 {
-    0
-}
-
-/// No guard overhead on non-Unix platforms.
-#[cfg(not(unix))]
-pub(crate) fn guard_overhead_f64_bits() -> u64 {
+pub fn calibrate_bias() -> u64 {
     0
 }
