@@ -1,8 +1,7 @@
 use std::path::Path;
 
 fn main() {
-    // Read piano-runtime version at compile time so the CLI injects the correct
-    // crates.io dependency, not its own package version.
+    // --- Existing: PIANO_RUNTIME_VERSION ---
     let runtime_cargo = Path::new("piano-runtime").join("Cargo.toml");
     println!("cargo::rerun-if-changed={}", runtime_cargo.display());
 

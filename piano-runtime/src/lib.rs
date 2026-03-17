@@ -66,6 +66,9 @@ pub mod piano_future;
 #[cfg(not(any(test, feature = "_test_internals")))]
 mod piano_future;
 
+#[cfg(feature = "channels-crossbeam")]
+pub mod channel;
+
 // User-facing API: visible in docs
 pub use alloc::PianoAllocator;
 #[doc(hidden)]

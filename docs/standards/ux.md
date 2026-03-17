@@ -87,3 +87,22 @@ If a case should not happen, restructure the internals so it cannot. Do not writ
 graceful error handling for failures your architecture should prevent. Handling a
 failure that should not exist is admitting the architecture allows it. Eliminate
 the case, do not catch it.
+
+### 10. Signal escalation for long-running programs
+
+When Piano stops a profiled program (`--duration` or Ctrl-C), it follows a
+three-step escalation:
+
+1. SIGTERM -- requests graceful shutdown. The runtime's signal handler or
+   atexit hook flushes profiling data.
+2. Grace period -- waits `--kill-timeout` seconds (default 10) for the
+   program to exit.
+3. SIGKILL -- if the program has not exited, kills it unconditionally.
+
+Data written to disk before SIGKILL (via streaming mode) is preserved. If the
+program is killed before any instrumented functions complete, no data can be
+recovered. This is a fundamental limit of in-process profiling.
+
+`--duration` automatically enables frame streaming so that timing data reaches
+disk incrementally. Function names are written in the NDJSON header at file
+creation, not at shutdown, so partial files have real function names.

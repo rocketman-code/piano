@@ -365,6 +365,239 @@ fn process() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Nested module pattern (foo.rs + foo/ directory)
+// ---------------------------------------------------------------------------
+
+/// Create a project using the foo.rs + foo/ directory module pattern.
+/// This is the pattern that breaks with #[path] redirects (#578):
+/// src/args.rs declares `mod command;` with src/args/command.rs.
+fn create_nested_module_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src/args")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "nested"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "nested"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src/main.rs"),
+        r#"mod args;
+
+fn main() {
+    args::run();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src/args.rs"),
+        r#"mod command;
+
+pub fn run() {
+    let result = command::execute();
+    println!("result: {result}");
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src/args/command.rs"),
+        r#"pub fn execute() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..1000 {
+        sum += i;
+    }
+    sum
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn nested_module_foo_rs_plus_foo_dir_pattern() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("nested");
+    create_nested_module_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano build failed for nested module project:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let binary_path = stdout.trim();
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let run_output = Command::new(binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run_output.status.success(),
+        "instrumented binary failed:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let program_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        program_stdout.contains("result: 499500"),
+        "program should produce correct output, got: {program_stdout}"
+    );
+
+    // All three functions should be profiled
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+    let stats = common::aggregate_ndjson(&content);
+
+    // main() is the lifecycle boundary (creates Ctx), not profiled.
+    // The test validates nested module naming: foo.rs + foo/ pattern.
+    assert!(
+        stats.contains_key("args::run"),
+        "should have 'args::run', got keys: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        stats.contains_key("args::command::execute"),
+        "should have 'args::command::execute', got keys: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// include_str! with relative paths
+// ---------------------------------------------------------------------------
+
+/// Create a project where a module file uses include_str! with a relative
+/// path that traverses up through parent directories.
+fn create_include_str_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src/reader")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "include-test"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "include-test"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(dir.join("data.txt"), "hello from data").unwrap();
+
+    fs::write(
+        dir.join("src/main.rs"),
+        r#"mod reader;
+
+fn main() {
+    reader::show();
+}
+"#,
+    )
+    .unwrap();
+
+    // reader/mod.rs uses include_str! to go up two levels to project root
+    fs::write(
+        dir.join("src/reader/mod.rs"),
+        r#"const DATA: &str = include_str!("../../data.txt");
+
+pub fn show() {
+    println!("data: {DATA}");
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn include_str_with_relative_path_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("include-test");
+    create_include_str_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano build failed for include_str project:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let binary_path = stdout.trim();
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let run_output = Command::new(binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run_output.status.success(),
+        "instrumented binary failed:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let program_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        program_stdout.contains("data: hello from data"),
+        "include_str! should resolve correctly, got: {program_stdout}"
+    );
+
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+    assert!(
+        content.contains("show") || content.contains("reader"),
+        "output should contain profiled function name"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Signal recovery
 // ---------------------------------------------------------------------------
 

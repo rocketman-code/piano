@@ -1,12 +1,14 @@
 //! Async function instrumentation -- PianoFuture wrapper.
 //!
-//! PianoFuture wraps an inner Future and accumulates per-poll alloc
-//! and CPU deltas. On completion or cancellation (drop), it emits
-//! a single Measurement to the per-thread buffer.
+//! PianoFuture wraps an inner Future and accumulates per-poll alloc,
+//! CPU, and wall-time deltas. On completion or cancellation (drop),
+//! it emits a single Measurement to the per-thread buffer.
 //!
 //! Invariants:
 //! - Wall time starts on first poll, not construction. A future that
 //!   is constructed but never polled emits no measurement.
+//! - Wall time is accumulated per-poll (raw tick deltas around inner.poll()),
+//!   so suspension time between polls is excluded from the measurement.
 //! - Alloc deltas are accumulated across polls using snapshot_alloc_counters.
 //!   Each poll takes a before/after snapshot and adds the delta.
 //! - Bookkeeping allocs (snapshots, push_measurement) are excluded
@@ -60,6 +62,7 @@ pub struct PianoFuture<F> {
     free_count_acc: u64,
     free_bytes_acc: u64,
     cpu_acc_ns: u64,
+    wall_ticks_acc: u64,
     emitted: bool,
     calibration: CalibrationData,
     thread_id_alloc: Arc<AtomicU64>,
@@ -81,6 +84,7 @@ impl<F: Future> PianoFuture<F> {
             free_count_acc: 0,
             free_bytes_acc: 0,
             cpu_acc_ns: 0,
+            wall_ticks_acc: 0,
             emitted: false,
             calibration: state.calibration,
             thread_id_alloc: state.thread_id_alloc,
@@ -123,8 +127,10 @@ impl<F: Future> Future for PianoFuture<F> {
         // SAFETY: We project Pin from self to inner. inner is the only
         // !Unpin field. We never move inner out of self, and we do not
         // access it again after this poll returns Ready.
+        let poll_start_ticks = read();
         let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
         let result = inner.poll(cx);
+        this.wall_ticks_acc += read().wrapping_sub(poll_start_ticks);
 
         // --- Post-poll bookkeeping (inside reentrancy guard) ---
         let cpu_poll_end = if this.cpu_time_enabled {
@@ -167,7 +173,7 @@ impl<F> PianoFuture<F> {
             parent_span_id: self.parent_span_id,
             name_id: self.name_id,
             start_ns: self.calibration.now_ns(self.start_ticks),
-            end_ns: self.calibration.now_ns(read()),
+            end_ns: self.calibration.now_ns(self.start_ticks).wrapping_add(self.calibration.ticks_to_ns(self.wall_ticks_acc)),
             thread_id: self.thread_id,
             cpu_start_ns: 0,
             cpu_end_ns: self.cpu_acc_ns,
