@@ -1111,11 +1111,11 @@ edition = "2021"
 
     #[test]
     fn filter_piano_internals_from_errors() {
-        let rendered = "error[E0308]: mismatched types\n --> src/main.rs:5:10\n  |\n3 |     let __piano_guard = piano_runtime::enter(\"foo\");\n  |         -------------- this is of type `Guard`\n4 |     let x: i32 = \"hello\";\n  |                  ^^^^^^^ expected `i32`, found `&str`\n";
+        let rendered = "error[E0308]: mismatched types\n --> src/main.rs:5:10\n  |\n3 |     let (__piano_guard, __piano_ctx) = __piano_ctx.enter(0);\n  |         -------------- this is of type `Guard`\n4 |     let x: i32 = \"hello\";\n  |                  ^^^^^^^ expected `i32`, found `&str`\n";
         let result = filter_piano_internals(rendered);
         assert!(
-            !result.contains("piano_runtime"),
-            "should filter piano_runtime: {result}"
+            !result.contains("__piano_ctx"),
+            "should filter __piano_ctx: {result}"
         );
         assert!(
             !result.contains("__piano_guard"),
