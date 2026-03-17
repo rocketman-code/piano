@@ -9,7 +9,7 @@ use piano_runtime::alloc::PianoAllocator;
 use piano_runtime::buffer::drain_thread_buffer;
 use piano_runtime::cpu_clock;
 use piano_runtime::guard::Guard;
-use piano_runtime::tsc;
+use piano_runtime::time;
 use std::alloc::System;
 use std::hint::black_box;
 
@@ -19,13 +19,13 @@ static ALLOC: PianoAllocator<System> = PianoAllocator::new(System);
 #[test]
 fn bias_impact() {
     // ---- Step 1: Trigger startup calibration ----
-    tsc::calibrate();
-    tsc::calibrate_bias();
+    time::calibrate();
+    time::calibrate_bias();
     cpu_clock::calibrate_bias();
 
     // ---- Step 2: Read calibrated bias values ----
-    let tsc_bias_ticks = tsc::bias_ticks();
-    let tsc_bias_ns = tsc::ticks_to_ns(tsc_bias_ticks);
+    let tsc_bias_ticks = time::bias_ticks();
+    let tsc_bias_ns = time::ticks_to_ns(tsc_bias_ticks);
     let cpu_bias_ns = cpu_clock::bias_ns();
 
     println!("\n========================================");

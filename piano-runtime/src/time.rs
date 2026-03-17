@@ -42,7 +42,7 @@ pub(crate) fn init() {
 /// On aarch64: mrs cntvct_el0 (~2-5ns).
 /// Fallback: Instant-based epoch-relative nanoseconds.
 #[inline(always)]
-pub(crate) fn read() -> u64 {
+pub fn read() -> u64 {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: _rdtsc is a stable intrinsic that reads the timestamp counter.
     // No memory safety implications — returns a u64 counter value.
@@ -86,7 +86,7 @@ pub(crate) fn read() -> u64 {
 /// On aarch64, the (ticks * M >> 64) compiles to a single umulh instruction.
 /// On fallback platforms (Q=1, M=0), this is a no-op multiplication.
 #[inline(always)]
-pub(crate) fn ticks_to_ns(ticks: u64) -> u64 {
+pub fn ticks_to_ns(ticks: u64) -> u64 {
     let q = QUOTIENT.load(Ordering::Relaxed);
     let m = MULTIPLIER.load(Ordering::Relaxed);
     if q == 0 && m == 0 {
@@ -103,7 +103,7 @@ pub(crate) fn ticks_to_ns(ticks: u64) -> u64 {
 /// construction in tests). The init() call is a no-op after first
 /// invocation (Once atomic load on fast path).
 #[inline(always)]
-pub(crate) fn now_ns(raw_ticks: u64) -> u64 {
+pub fn now_ns(raw_ticks: u64) -> u64 {
     init();
     ticks_to_ns(raw_ticks.wrapping_sub(EPOCH_TSC.load(Ordering::Relaxed)))
 }
@@ -111,7 +111,7 @@ pub(crate) fn now_ns(raw_ticks: u64) -> u64 {
 /// Return the calibrated measurement bias in nanoseconds.
 /// This is the cost of two clock reads (the irreducible minimum).
 /// Written to NDJSON header/trailer for report reader correction.
-pub(crate) fn bias_ns() -> u64 {
+pub fn bias_ns() -> u64 {
     ticks_to_ns(BIAS_TICKS.load(Ordering::Relaxed))
 }
 
@@ -133,7 +133,7 @@ fn compute_multiplier(remainder: u64, divisor: u64) -> u64 {
 
 /// Calibrate the tick-to-nanosecond ratio. Spins for ~2ms measuring
 /// TSC ticks against Instant::now() as reference clock.
-fn calibrate() {
+pub fn calibrate() {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         // Fallback: read() already returns nanoseconds, so Q=1, M=0.
@@ -174,7 +174,7 @@ fn calibrate() {
 
 /// Calibrate the measurement bias (cost of a TSC read pair in ticks).
 /// Uses trimmed mean (2% trim) for robustness against VM preemption.
-fn calibrate_bias() {
+pub fn calibrate_bias() {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         return;
@@ -197,4 +197,92 @@ fn calibrate_bias() {
         let mean_ticks = sum / trimmed.len() as u64;
         BIAS_TICKS.store(mean_ticks, Ordering::Release);
     }
+}
+
+/// Return the calibrated bias in raw ticks.
+#[inline(always)]
+pub fn bias_ticks() -> u64 {
+    BIAS_TICKS.load(Ordering::Relaxed)
+}
+
+/// Convert a tick delta to nanoseconds using the calibrated ratio.
+#[cfg(feature = "_test_internals")]
+#[inline(always)]
+pub fn elapsed_ns(start: u64, end: u64) -> u64 {
+    ticks_to_ns(end.wrapping_sub(start))
+}
+
+/// Convert a tick value to nanoseconds-since-epoch for absolute timestamps.
+#[cfg(any(test, feature = "_test_internals"))]
+#[inline]
+pub fn ticks_to_epoch_ns(ticks: u64, epoch_tsc: u64) -> u64 {
+    ticks_to_ns(ticks.wrapping_sub(epoch_tsc))
+}
+
+/// Store the TSC value captured at epoch.
+pub fn set_epoch_tsc(val: u64) {
+    EPOCH_TSC.store(val, Ordering::Release);
+}
+
+/// Return the TSC value captured at epoch.
+#[cfg(any(test, feature = "_test_internals"))]
+pub fn epoch_tsc() -> u64 {
+    EPOCH_TSC.load(Ordering::Relaxed)
+}
+
+// ---- Test accessor functions ----
+//
+// Load/store accessors for calibration state. Used by integration tests
+// (which run in separate binaries to avoid corrupting globals visible to
+// other in-process tests).
+
+#[cfg(feature = "_test_internals")]
+pub fn load_quotient() -> u64 {
+    QUOTIENT.load(Ordering::Relaxed)
+}
+#[cfg(feature = "_test_internals")]
+pub fn load_multiplier() -> u64 {
+    MULTIPLIER.load(Ordering::Relaxed)
+}
+#[cfg(feature = "_test_internals")]
+pub fn store_quotient(val: u64) {
+    QUOTIENT.store(val, Ordering::Release);
+}
+#[cfg(feature = "_test_internals")]
+pub fn store_multiplier(val: u64) {
+    MULTIPLIER.store(val, Ordering::Release);
+}
+
+/// Set conversion from a numer/denom ratio (test convenience).
+///
+/// Computes Q and M from a fractional ratio so tests can express intent
+/// as "set ratio to 3/2" without computing fixed-point values manually.
+#[cfg(feature = "_test_internals")]
+pub fn store_ratio(numer: u64, denom: u64) {
+    if denom == 0 {
+        QUOTIENT.store(0, Ordering::Release);
+        MULTIPLIER.store(0, Ordering::Release);
+        return;
+    }
+    let q = numer / denom;
+    let r = numer % denom;
+    let m = compute_multiplier(r, denom);
+    QUOTIENT.store(q, Ordering::Release);
+    MULTIPLIER.store(m, Ordering::Release);
+}
+#[cfg(feature = "_test_internals")]
+pub fn store_bias_ticks(val: u64) {
+    BIAS_TICKS.store(val, Ordering::Release);
+}
+#[cfg(feature = "_test_internals")]
+pub fn load_bias_ticks() -> u64 {
+    BIAS_TICKS.load(Ordering::Relaxed)
+}
+#[cfg(feature = "_test_internals")]
+pub fn store_epoch_tsc(val: u64) {
+    EPOCH_TSC.store(val, Ordering::Release);
+}
+#[cfg(feature = "_test_internals")]
+pub fn load_epoch_tsc() -> u64 {
+    EPOCH_TSC.load(Ordering::Relaxed)
 }

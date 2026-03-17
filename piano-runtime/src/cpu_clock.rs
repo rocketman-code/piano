@@ -48,7 +48,7 @@ static CPU_BIAS_F64: AtomicU64 = AtomicU64::new(0);
 #[cfg(unix)]
 static GUARD_OVERHEAD_F64: AtomicU64 = AtomicU64::new(0);
 
-/// Calibrate the measurement bias: amortized cost of tsc::read() per call,
+/// Calibrate the measurement bias: amortized cost of time::read() per call,
 /// matching the exit sequence overhead between body-end and cpu_end capture.
 /// Called once from epoch() after TSC calibration.
 #[cfg(unix)]
@@ -57,7 +57,7 @@ pub fn calibrate_bias() {
     let start = cpu_now_ns();
     for _ in 0..N {
         compiler_fence(Ordering::SeqCst);
-        crate::tsc::read();
+        crate::time::read();
     }
     let end = cpu_now_ns();
     let bias = (end - start) as f64 / N as f64;

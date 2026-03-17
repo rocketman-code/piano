@@ -9,6 +9,11 @@ pub mod cpu_clock;
 mod cpu_clock;
 
 mod thread_id;
+
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
+pub mod time;
+#[cfg(not(feature = "_test_internals"))]
 mod time;
 
 // Modules exposed conditionally for integration tests
@@ -41,12 +46,6 @@ mod shutdown;
 pub mod span_id;
 #[cfg(not(any(test, feature = "_test_internals")))]
 mod span_id;
-
-#[cfg(feature = "_test_internals")]
-#[doc(hidden)]
-pub mod tsc;
-#[cfg(not(feature = "_test_internals"))]
-mod tsc;
 
 // Rewriter-referenced modules: public because rewriter generates module paths
 // (e.g. __piano_ctx: piano_runtime::ctx::Ctx, piano_runtime::file_sink::FileSink::new)
