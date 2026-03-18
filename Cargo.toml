@@ -1,6 +1,5 @@
 [workspace]
 members = ["piano-runtime"]
-resolver = "2"
 
 [package]
 name = "piano"
@@ -12,22 +11,6 @@ license = "MIT"
 repository = "https://github.com/rocketman-code/piano"
 keywords = ["profiling", "profiler", "instrumentation", "performance", "timing"]
 categories = ["development-tools::profiling"]
-
-include = [
-    "src/**",
-    "tests/**",
-    "build.rs",
-    "LICENSE",
-    "README.md",
-    "CHANGELOG.md",
-    "CONTRIBUTING.md",
-    ".cargo/**",
-    ".github/**",
-    ".gitignore",
-    "codecov.yml",
-    "docs/standards/**",
-    "rust-toolchain.toml",
-]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

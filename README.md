@@ -144,14 +144,13 @@ $ piano report --frames
 
 ## How it works
 
-1. Intercepts the Rust compiler via `RUSTC_WORKSPACE_WRAPPER` -- your source files are never modified or copied
-2. For each source file in the target crate, creates a temporary instrumented copy in the same directory (preserving module resolution) and redirects the compiler to it
+1. Copies your project to `target/piano/staging/` (your source is never modified). The staging directory lives inside `target/` so `cargo clean` removes it. Because the path is stable across runs, cargo caches incremental builds there -- dependencies compile once and only instrumented source files recompile.
+2. Adds `piano-runtime` as a dependency in the staged Cargo.toml
 3. Parses source with `syn` and injects timing guards into matched functions (including `impl Future` functions, trait implementations, and functions defined inside `macro_rules!`)
-4. Injects `piano-runtime` via `--extern` -- no Cargo.toml modifications, no Cargo.lock changes
-5. Wraps your global allocator for heap tracking. If the allocator is behind `#[cfg(...)]` (e.g., tikv-jemallocator on Linux only), piano wraps it under the same cfg gate and injects a fallback wrapper for all other platforms automatically.
-6. Builds with `cargo build --release`, outputs to `target/piano/`
+4. Wraps your global allocator for heap tracking. If the allocator is behind `#[cfg(...)]` (e.g., tikv-jemallocator on Linux only), piano wraps it under the same cfg gate and injects a fallback wrapper for all other platforms automatically.
+5. Builds with `cargo build --release`, outputs to `target/piano/`
 
-Dependencies compile once and only instrumented source files recompile. The runtime has zero external dependencies to avoid conflicts with your project.
+The runtime has zero external dependencies to avoid conflicts with your project.
 
 ## When to use something else
 
@@ -160,7 +159,7 @@ Dependencies compile once and only instrumented source files recompile. The runt
 ## Limitations
 
 - Measurement bias is calibrated at startup; residual bias is ~0.8ns Apple Silicon, ~3.3ns x86-64. Functions faster than the residual floor will show inflated times.
-- `const fn` and `extern fn` are skipped (use `piano build --list-skipped` to see them)
+- `const fn`, `unsafe fn`, and `extern fn` are skipped (use `piano build --list-skipped` to see them)
 - Allocation tracking covers heap operations only (stack allocations are not tracked)
 - Binary crates only (no libraries)
 

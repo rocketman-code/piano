@@ -1,8 +1,6 @@
 pub(crate) mod allocator;
 pub(crate) mod macro_rules;
-mod select_inject;
 pub(crate) mod shutdown;
-mod token_util;
 
 use std::collections::{HashMap, HashSet};
 
@@ -75,8 +73,6 @@ pub fn instrument_source(
     // string-injection path). Apply it on the rewritten source if needed.
     // Token-stream rendering invalidates our source_map,
     // so we reset it to empty when this path is taken.
-    let has_crossbeam = select_inject::source_has_crossbeam_select(source);
-
     let (final_source, final_map, macro_fn_names) = if instrument_macros {
         let mut rewritten_file: syn::File =
             syn::parse_str(&rewritten).map_err(|e| e.to_string())?;
@@ -86,20 +82,11 @@ pub fn instrument_source(
             name_ids: macro_name_ids.clone(),
         };
         macro_visitor.visit_file_mut(&mut rewritten_file);
-        let mut tokens = rewritten_file.to_token_stream();
-        if has_crossbeam {
-            tokens = select_inject::inject_select_arm_stats(tokens);
-        }
         (
-            tokens.to_string(),
+            rewritten_file.to_token_stream().to_string(),
             SourceMap::default(),
             macro_visitor.collected_names,
         )
-    } else if has_crossbeam {
-        let tokens: proc_macro2::TokenStream =
-            rewritten.parse().map_err(|e: proc_macro2::LexError| e.to_string())?;
-        let injected = select_inject::inject_select_arm_stats(tokens);
-        (injected.to_string(), SourceMap::default(), Vec::new())
     } else {
         (rewritten, source_map, Vec::new())
     };

@@ -60,7 +60,7 @@ Eight jobs:
 
 1. `fmt` (ubuntu-latest) -- `cargo fmt --check`
 2. `clippy` (ubuntu-latest) -- `cargo clippy --workspace --all-targets -- -D warnings`
-3. `test` (matrix: ubuntu-latest + macos-latest) -- `cargo test --workspace` then `cargo test --workspace --features piano-runtime/cpu-time,piano-runtime/_test_internals`
+3. `test` (matrix: ubuntu-latest + macos-latest) -- `cargo test --workspace` then `cargo test --workspace --features piano-runtime/cpu-time`
 4. `msrv` (ubuntu-latest) -- tests on Rust 1.88 (CLI MSRV) + installs 1.59 for runtime MSRV test
 5. `doc` (ubuntu-latest) -- `cargo doc --workspace --no-deps` with `-D warnings`
 6. `coverage` (ubuntu-latest) -- `cargo llvm-cov --workspace --features piano-runtime/cpu-time --lcov`, uploads to Codecov

@@ -567,16 +567,20 @@ fn async_nested_select_self_time() {
         "output should contain child_a. Got:\n{content}"
     );
 
-    // All functions here only sleep (no CPU work). With the hybrid timing
-    // model, self_ns reflects active poll time, so sleeping functions have
-    // near-zero self_ns. The key invariant: self_ns is small (overhead
-    // only, not inflated by select! mechanics or child sleep time).
+    // parent_select does zero computation -- its body is just a select! macro.
+    // Its self_ns should be much smaller than child_a's self_ns (~50ms of sleep).
     let parent = stats.get("parent_select").unwrap();
+    let child = stats.get("child_a").unwrap();
     assert!(
-        parent.self_ns < 30_000_000,
-        "parent_select.self_ns ({}) should be small (< 30ms) -- \
-         sleep time should not inflate self_ns",
+        child.self_ns > 0,
+        "child_a should have non-zero self_ns (it sleeps 50ms)"
+    );
+    assert!(
+        parent.self_ns < child.self_ns,
+        "parent_select.self_ns ({}) must be < child_a.self_ns ({}) -- \
+         parent does no computation, select! overhead should be negligible",
         parent.self_ns,
+        child.self_ns,
     );
 }
 
@@ -846,19 +850,13 @@ fn impl_future_self_time_attribution() {
     let foo = stats.get("foo").unwrap();
     let bar = stats.get("bar").unwrap();
 
-    // foo sleeps 80ms (no CPU work). bar just awaits foo.
-    // With the hybrid timing model, self_ns = active poll time.
-    // Neither function does CPU work, so both have near-zero self_ns.
-    // The key invariant: neither self_ns is inflated by sleep time.
+    // foo does the work (80ms sleep x3 calls). bar does nothing.
+    // foo.self_ns must be greater than bar.self_ns.
     assert!(
-        foo.self_ns < 30_000_000,
-        "foo.self_ns ({}) should be small (< 30ms) -- \
-         sleep time should not inflate self_ns",
+        foo.self_ns > bar.self_ns,
+        "foo.self_ns ({}) must be > bar.self_ns ({}) -- \
+         foo does the 80ms sleep, bar just awaits foo",
         foo.self_ns,
-    );
-    assert!(
-        bar.self_ns < 30_000_000,
-        "bar.self_ns ({}) should be small (< 30ms)",
         bar.self_ns,
     );
 }

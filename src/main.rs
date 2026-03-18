@@ -109,11 +109,6 @@ enum Commands {
         #[arg(long, value_name = "SECONDS", value_parser = parse_duration_secs)]
         duration: Option<f64>,
 
-        /// Grace period before escalating SIGTERM to SIGKILL (seconds).
-        /// Set to 0 to disable escalation. Default: 10.
-        #[arg(long, value_name = "SECONDS", default_value = "10", value_parser = parse_kill_timeout)]
-        kill_timeout: f64,
-
         /// Directory for profiling output files.
         /// Overrides PIANO_RUNS_DIR env var and the default (target/piano/runs/).
         #[arg(long, value_name = "DIR")]
@@ -156,11 +151,6 @@ enum Commands {
         /// Stop profiling after N seconds (sends SIGTERM to the binary).
         #[arg(long, value_name = "SECONDS", value_parser = parse_duration_secs)]
         duration: Option<f64>,
-
-        /// Grace period before escalating SIGTERM to SIGKILL (seconds).
-        /// Set to 0 to disable escalation. Default: 10.
-        #[arg(long, value_name = "SECONDS", default_value = "10", value_parser = parse_kill_timeout)]
-        kill_timeout: f64,
 
         /// Arguments to pass to the instrumented binary (after --).
         #[arg(last = true)]
@@ -251,19 +241,6 @@ fn parse_duration_secs(s: &str) -> Result<f64, String> {
     Ok(secs)
 }
 
-fn parse_kill_timeout(s: &str) -> Result<f64, String> {
-    let secs: f64 = s
-        .parse()
-        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
-    if secs.is_nan() || secs.is_infinite() {
-        return Err("invalid timeout".to_string());
-    }
-    if secs < 0.0 {
-        return Err("timeout cannot be negative".to_string());
-    }
-    Ok(secs)
-}
-
 /// Default number of functions shown in report output.
 const DEFAULT_TOP_N: usize = 10;
 
@@ -300,10 +277,9 @@ fn run(cli: Cli) -> Result<(), Error> {
         Commands::Build { opts } => cmd_build(opts, &project_root),
         Commands::Run {
             duration,
-            kill_timeout,
             output_dir,
             args,
-        } => cmd_run(duration, kill_timeout, output_dir, args, &project_root),
+        } => cmd_run(duration, output_dir, args, &project_root),
         Commands::Profile {
             opts,
             all,
@@ -313,7 +289,6 @@ fn run(cli: Cli) -> Result<(), Error> {
             threads,
             ignore_exit_code,
             duration,
-            kill_timeout,
             args,
         } => {
             let (show_all, limit) = resolve_display_limit(all, top);
@@ -327,7 +302,6 @@ fn run(cli: Cli) -> Result<(), Error> {
                 threads,
                 ignore_exit_code,
                 duration,
-                kill_timeout,
                 args,
             )
         }
@@ -855,8 +829,6 @@ enum StopReason {
     Duration,
     /// User pressed Ctrl-C and we forwarded SIGTERM to the child.
     Interrupted,
-    /// Child did not respond to SIGTERM within kill-timeout; escalated to SIGKILL.
-    ForceKilled,
 }
 
 /// Result of running a child process, including why it stopped.
@@ -868,7 +840,6 @@ struct ChildOutcome {
 static CHILD_PID: AtomicU32 = AtomicU32::new(0);
 static DURATION_EXPIRED: AtomicBool = AtomicBool::new(false);
 static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
-static FORCE_KILLED: AtomicBool = AtomicBool::new(false);
 
 /// Spawn a child process, optionally killing it after a timeout.
 ///
@@ -884,14 +855,12 @@ fn run_child(
     binary: &Path,
     args: &[String],
     timeout: Option<Duration>,
-    kill_timeout: Duration,
     suppress_stdout: bool,
     env: &[(&str, &str)],
 ) -> Result<ChildOutcome, Error> {
     // Reset flags from any previous invocation.
     DURATION_EXPIRED.store(false, Ordering::SeqCst);
     SIGINT_RECEIVED.store(false, Ordering::SeqCst);
-    FORCE_KILLED.store(false, Ordering::SeqCst);
 
     let mut cmd = process::Command::new(binary);
     cmd.args(args);
@@ -931,32 +900,6 @@ fn run_child(
 
     CHILD_PID.store(child.id(), Ordering::SeqCst);
 
-    // Spawn a background thread to escalate SIGINT->SIGTERM to SIGKILL.
-    if kill_timeout > Duration::ZERO {
-        std::thread::spawn(move || {
-            // Wait for SIGINT to be received, then start the grace period.
-            loop {
-                if SIGINT_RECEIVED.load(Ordering::SeqCst) {
-                    break;
-                }
-                // If child exited before SIGINT, stop waiting.
-                if CHILD_PID.load(Ordering::SeqCst) == 0 {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            std::thread::sleep(kill_timeout);
-            let pid = CHILD_PID.load(Ordering::SeqCst);
-            if pid != 0 {
-                FORCE_KILLED.store(true, Ordering::SeqCst);
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
-        });
-    }
-
     if let Some(mut dur) = timeout {
         const MIN_DURATION: Duration = Duration::from_millis(1);
         if dur < MIN_DURATION {
@@ -981,18 +924,7 @@ fn run_child(
                     }
                 }
             }
-            // Escalate to SIGKILL if child doesn't exit within kill_timeout.
-            if kill_timeout > Duration::ZERO {
-                std::thread::sleep(kill_timeout);
-                let pid = CHILD_PID.load(Ordering::SeqCst);
-                if pid != 0 {
-                    FORCE_KILLED.store(true, Ordering::SeqCst);
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
-                }
-            }
+            // TODO: Windows --duration kill is not implemented.
         });
     }
 
@@ -1000,9 +932,7 @@ fn run_child(
         .wait()
         .map_err(|e| Error::RunFailed(format!("failed to wait for {}: {e}", binary.display())))?;
 
-    let stop_reason = if FORCE_KILLED.load(Ordering::SeqCst) {
-        StopReason::ForceKilled
-    } else if DURATION_EXPIRED.load(Ordering::SeqCst) {
+    let stop_reason = if DURATION_EXPIRED.load(Ordering::SeqCst) {
         StopReason::Duration
     } else if SIGINT_RECEIVED.load(Ordering::SeqCst) {
         StopReason::Interrupted
@@ -1028,7 +958,6 @@ fn run_child(
 
 fn cmd_run(
     duration: Option<f64>,
-    kill_timeout: f64,
     output_dir: Option<PathBuf>,
     args: Vec<String>,
     project_root: &Option<PathBuf>,
@@ -1046,11 +975,10 @@ fn cmd_run(
     };
 
     let timeout = duration.map(Duration::from_secs_f64);
-    let kill_dur = Duration::from_secs_f64(kill_timeout);
-    let outcome = run_child(&binary, &args, timeout, kill_dur, false, &env)?;
+    let outcome = run_child(&binary, &args, timeout, false, &env)?;
 
     match outcome.stop_reason {
-        StopReason::Duration | StopReason::ForceKilled => std::process::exit(0),
+        StopReason::Duration => std::process::exit(0),
         StopReason::Interrupted => std::process::exit(130),
         StopReason::Normal => std::process::exit(outcome.status.code().unwrap_or(1)),
     }
@@ -1067,7 +995,6 @@ fn cmd_profile(
     threads: bool,
     ignore_exit_code: bool,
     duration: Option<f64>,
-    kill_timeout: f64,
     args: Vec<String>,
 ) -> Result<(), Error> {
     let Some((binary, runs_dir, total_fns)) = build_project(opts, project_root)? else {
@@ -1092,16 +1019,11 @@ fn cmd_profile(
     };
 
     let timeout = duration.map(Duration::from_secs_f64);
-    let kill_dur = Duration::from_secs_f64(kill_timeout);
-    let outcome = run_child(&binary, &args, timeout, kill_dur, json, &child_env)?;
+    let outcome = run_child(&binary, &args, timeout, json, &child_env)?;
     let intentional_stop = matches!(
         outcome.stop_reason,
-        StopReason::Duration | StopReason::Interrupted | StopReason::ForceKilled
+        StopReason::Duration | StopReason::Interrupted
     );
-
-    if matches!(outcome.stop_reason, StopReason::ForceKilled) {
-        eprintln!("warning: program did not respond to SIGTERM -- terminated after --kill-timeout");
-    }
 
     if !outcome.status.success() && !ignore_exit_code && !intentional_stop {
         if let Some(code) = outcome.status.code() {
