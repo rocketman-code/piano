@@ -14,14 +14,11 @@ categories = ["development-tools::profiling"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-syn = { version = "2", features = ["full", "visit", "visit-mut"] }
-quote = "1"
 toml_edit = "0.22"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ignore = "0.4"
-proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 anstyle = "1"
 anstream = "0.6"
 regex = "1"

@@ -176,11 +176,12 @@ fn main() {
         .expect("instrument_source should succeed");
 
     // The instrumented source must parse as valid Rust.
-    let parsed: Result<syn::File, _> = syn::parse_str(&result.source);
+    let re_parse = ra_ap_syntax::SourceFile::parse(&result.source, ra_ap_syntax::Edition::Edition2024);
+    let errors: Vec<_> = re_parse.errors().to_vec();
     assert!(
-        parsed.is_ok(),
-        "instrumented macro output should be valid Rust syntax. Error: {:?}\nSource:\n{}",
-        parsed.err(),
+        errors.is_empty(),
+        "instrumented macro output should be valid Rust syntax. Errors: {:?}\nSource:\n{}",
+        errors,
         result.source
     );
 

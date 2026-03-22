@@ -255,7 +255,7 @@ proptest! {
     #[test]
     fn output_parses_as_valid_rust((names, source, _instrumentable) in rust_file()) {
         // Only test inputs that are valid Rust (syn can parse them).
-        if syn::parse_str::<syn::File>(&source).is_err() {
+        if !ra_ap_syntax::SourceFile::parse(&source, ra_ap_syntax::Edition::Edition2024).errors().is_empty() {
             return Ok(());
         }
         let measured: HashMap<String, u32> = names.iter().enumerate()
@@ -264,19 +264,20 @@ proptest! {
         let result = instrument_source(&source, &measured, &all_instrumentable, false, "", &std::collections::HashMap::new())
             .expect("instrument_source should succeed on valid Rust input");
         // Core invariant: output must be parseable Rust.
-        let parse = syn::parse_str::<syn::File>(&result.source);
+        let re_parse = ra_ap_syntax::SourceFile::parse(&result.source, ra_ap_syntax::Edition::Edition2024);
+        let errors: Vec<_> = re_parse.errors().to_vec();
         prop_assert!(
-            parse.is_ok(),
-            "output failed to parse:\n{}\nerror: {:?}",
+            errors.is_empty(),
+            "output failed to parse:\n{}\nerrors: {:?}",
             result.source,
-            parse.err()
+            errors
         );
     }
 
     /// Every targeted instrumentable function should have a guard injected.
     #[test]
     fn targeted_functions_get_guards((names, source, instrumentable) in rust_file()) {
-        if syn::parse_str::<syn::File>(&source).is_err() {
+        if !ra_ap_syntax::SourceFile::parse(&source, ra_ap_syntax::Edition::Edition2024).errors().is_empty() {
             return Ok(());
         }
         let measured: HashMap<String, u32> = names.iter().enumerate()
@@ -311,7 +312,7 @@ proptest! {
         if !has_instrumentable_async {
             return Ok(());
         }
-        if syn::parse_str::<syn::File>(&source).is_err() {
+        if !ra_ap_syntax::SourceFile::parse(&source, ra_ap_syntax::Edition::Edition2024).errors().is_empty() {
             return Ok(());
         }
         let measured: HashMap<String, u32> = names.iter().enumerate()
@@ -332,7 +333,7 @@ proptest! {
         if names.len() < 2 {
             return Ok(());
         }
-        if syn::parse_str::<syn::File>(&source).is_err() {
+        if !ra_ap_syntax::SourceFile::parse(&source, ra_ap_syntax::Edition::Edition2024).errors().is_empty() {
             return Ok(());
         }
         // Target only the first function, check the rest don't get guards.
@@ -355,7 +356,7 @@ proptest! {
     /// Uninstrumentable functions (const, extern "C") should NOT get guards.
     #[test]
     fn uninstrumentable_functions_skipped((names, source, instrumentable) in rust_file()) {
-        if syn::parse_str::<syn::File>(&source).is_err() {
+        if !ra_ap_syntax::SourceFile::parse(&source, ra_ap_syntax::Edition::Edition2024).errors().is_empty() {
             return Ok(());
         }
         let instrumentable_set: HashSet<&str> =

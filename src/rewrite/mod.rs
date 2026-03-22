@@ -10,8 +10,6 @@ use ra_ap_syntax::ast::HasGenericArgs;
 use ra_ap_syntax::ast::HasModuleItem;
 use ra_ap_syntax::ast::HasName;
 use ra_ap_syntax::{AstNode, AstToken, Edition, SyntaxKind, ast};
-use quote::ToTokens;
-use syn::visit_mut::VisitMut;
 
 use crate::resolve::{Classification, classify};
 use crate::source_map::{SourceMap, StringInjector};
@@ -20,7 +18,6 @@ pub use allocator::{AllocatorKind, detect_allocator_kind, inject_global_allocato
 pub use shutdown::inject_shutdown;
 
 pub use macro_rules::discover_macro_fn_names;
-use macro_rules::MacroInstrumenter;
 
 /// Result of instrumenting a source file.
 pub struct InstrumentResult {
@@ -67,33 +64,26 @@ pub fn instrument_source(
     };
     collector.walk_file(&file);
 
+    // Macro instrumentation: inject ctx params and guards into fn items
+    // inside macro_rules! bodies using the same StringInjector approach.
+    // This operates on the original source (same byte offsets as the CST walk),
+    // so all injections are collected into the same injector.
+    let mut macro_fn_names = Vec::new();
+    if instrument_macros {
+        macro_rules::instrument_macro_fns(
+            source,
+            &mut collector.injector,
+            module_prefix,
+            macro_name_ids,
+            &mut macro_fn_names,
+        );
+    }
+
     let (rewritten, source_map) = collector.injector.apply(source);
 
-    // Macro instrumentation uses token-stream mutation (separate from the
-    // string-injection path). Apply it on the rewritten source if needed.
-    // Token-stream rendering invalidates our source_map,
-    // so we reset it to empty when this path is taken.
-    let (final_source, final_map, macro_fn_names) = if instrument_macros {
-        let mut rewritten_file: syn::File =
-            syn::parse_str(&rewritten).map_err(|e| e.to_string())?;
-        let mut macro_visitor = MacroInstrumenter {
-            module_prefix: module_prefix.to_string(),
-            collected_names: Vec::new(),
-            name_ids: macro_name_ids.clone(),
-        };
-        macro_visitor.visit_file_mut(&mut rewritten_file);
-        (
-            rewritten_file.to_token_stream().to_string(),
-            SourceMap::default(),
-            macro_visitor.collected_names,
-        )
-    } else {
-        (rewritten, source_map, Vec::new())
-    };
-
     Ok(InstrumentResult {
-        source: final_source,
-        source_map: final_map,
+        source: rewritten,
+        source_map,
         concurrency: collector.concurrency,
         macro_fn_names,
     })
@@ -2414,8 +2404,9 @@ fn work() {
             .source;
 
         // Must re-parse successfully.
-        syn::parse_str::<syn::File>(&result)
-            .unwrap_or_else(|e| panic!("rewritten source should parse: {e}\n\n{result}"));
+        let re_parse = ast::SourceFile::parse(&result, Edition::Edition2024);
+        let errors: Vec<_> = re_parse.errors().to_vec();
+        assert!(errors.is_empty(), "rewritten source should parse without errors: {errors:?}\n\n{result}");
 
         // Inner attr must precede the guard.
         let attr_pos = result.find("#![allow(unused_variables)]").unwrap();
@@ -2436,8 +2427,9 @@ fn main() {
 "#;
         let (result, _map) = inject_registrations(source, &[(0, "work")]).unwrap();
 
-        syn::parse_str::<syn::File>(&result)
-            .unwrap_or_else(|e| panic!("rewritten source should parse: {e}\n\n{result}"));
+        let re_parse = ast::SourceFile::parse(&result, Edition::Edition2024);
+        let errors: Vec<_> = re_parse.errors().to_vec();
+        assert!(errors.is_empty(), "rewritten source should parse without errors: {errors:?}\n\n{result}");
 
         let attr_pos = result.find("#![allow(unused)]").unwrap();
         let names_pos = result.find("PIANO_NAMES").unwrap();
@@ -2477,8 +2469,9 @@ fn work() -> u64 {
         map.merge(m);
 
         // The final source must parse.
-        syn::parse_str::<syn::File>(&s)
-            .unwrap_or_else(|e| panic!("full pipeline output should parse: {e}\n\n{s}"));
+        let re_parse = ast::SourceFile::parse(&s, Edition::Edition2024);
+        let errors: Vec<_> = re_parse.errors().to_vec();
+        assert!(errors.is_empty(), "full pipeline output should parse without errors: {errors:?}\n\n{s}");
 
         // Inner attrs must be at the top.
         assert!(
@@ -2600,9 +2593,10 @@ fn fetch(flag: bool) -> Pin<Box<dyn Future<Output = i32>>> {
             future_count >= 2,
             "should wrap return inside Assign with PianoFuture (expected >= 2, got {future_count}). Got:\n{result}"
         );
-        let parsed: syn::File = syn::parse_str(&result)
-            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
-        assert!(!parsed.items.is_empty());
+        let re_parse = ast::SourceFile::parse(&result, Edition::Edition2024);
+        let errors: Vec<_> = re_parse.errors().to_vec();
+        assert!(errors.is_empty(), "rewritten code should parse without errors: {errors:?}\n\n{result}");
+        assert!(re_parse.tree().items().next().is_some());
     }
 
     #[test]
