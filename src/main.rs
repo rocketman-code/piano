@@ -14,18 +14,15 @@ use piano::build::{
 use piano::error::{Error, io_context};
 use piano::report::{
     diff_runs, diff_runs_json, find_latest_run_file, find_latest_run_file_since,
-    find_ndjson_by_run_id, format_frames_json, format_frames_table, format_json,
-    format_json_with_frames, format_per_thread_json, format_per_thread_tables,
-    format_per_thread_tables_from_frames, format_table, format_table_with_frames, load_latest_run,
-    load_latest_runs_per_thread, load_ndjson, load_run, load_run_by_id, load_tagged_run,
-    load_two_latest_runs, relative_time, resolve_tag, reverse_resolve_tag, save_tag,
+    find_ndjson_by_run_id, format_json, format_per_thread_tables, format_table, load_latest_run,
+    load_latest_runs_per_thread, load_ndjson, load_ndjson_per_thread, load_run, load_run_by_id,
+    load_tagged_run, load_two_latest_runs, relative_time, resolve_tag, reverse_resolve_tag,
+    save_tag,
 };
 use piano::resolve::{
     ResolveResult, ResolvedTarget, SkippedFunction, TargetSpec, module_prefix, qualify,
     resolve_targets,
 };
-use piano::rewrite::discover_macro_fn_names;
-
 #[derive(Parser)]
 #[command(
     name = "piano",
@@ -109,6 +106,11 @@ enum Commands {
         #[arg(long, value_name = "SECONDS", value_parser = parse_duration_secs)]
         duration: Option<f64>,
 
+        /// Grace period before escalating SIGTERM to SIGKILL (seconds).
+        /// Set to 0 to disable escalation. Default: 10.
+        #[arg(long, value_name = "SECONDS", default_value = "10", value_parser = parse_kill_timeout)]
+        kill_timeout: f64,
+
         /// Directory for profiling output files.
         /// Overrides PIANO_RUNS_DIR env var and the default (target/piano/runs/).
         #[arg(long, value_name = "DIR")]
@@ -132,10 +134,6 @@ enum Commands {
         #[arg(long, value_name = "N", conflicts_with = "all")]
         top: Option<usize>,
 
-        /// Show per-frame breakdown.
-        #[arg(long)]
-        frames: bool,
-
         /// Output structured JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -151,6 +149,11 @@ enum Commands {
         /// Stop profiling after N seconds (sends SIGTERM to the binary).
         #[arg(long, value_name = "SECONDS", value_parser = parse_duration_secs)]
         duration: Option<f64>,
+
+        /// Grace period before escalating SIGTERM to SIGKILL (seconds).
+        /// Set to 0 to disable escalation. Default: 10.
+        #[arg(long, value_name = "SECONDS", default_value = "10", value_parser = parse_kill_timeout)]
+        kill_timeout: f64,
 
         /// Arguments to pass to the instrumented binary (after --).
         #[arg(last = true)]
@@ -168,10 +171,6 @@ enum Commands {
         /// Show top N functions by self-time (default: 10).
         #[arg(long, value_name = "N", conflicts_with = "all")]
         top: Option<usize>,
-
-        /// Show per-frame breakdown.
-        #[arg(long)]
-        frames: bool,
 
         /// Output structured JSON instead of a table.
         #[arg(long)]
@@ -241,6 +240,19 @@ fn parse_duration_secs(s: &str) -> Result<f64, String> {
     Ok(secs)
 }
 
+fn parse_kill_timeout(s: &str) -> Result<f64, String> {
+    let secs: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    if secs.is_nan() || secs.is_infinite() {
+        return Err("invalid timeout".to_string());
+    }
+    if secs < 0.0 {
+        return Err("timeout cannot be negative".to_string());
+    }
+    Ok(secs)
+}
+
 /// Default number of functions shown in report output.
 const DEFAULT_TOP_N: usize = 10;
 
@@ -277,18 +289,19 @@ fn run(cli: Cli) -> Result<(), Error> {
         Commands::Build { opts } => cmd_build(opts, &project_root),
         Commands::Run {
             duration,
+            kill_timeout,
             output_dir,
             args,
-        } => cmd_run(duration, output_dir, args, &project_root),
+        } => cmd_run(duration, kill_timeout, output_dir, args, &project_root),
         Commands::Profile {
             opts,
             all,
             top,
-            frames,
             json,
             threads,
             ignore_exit_code,
             duration,
+            kill_timeout,
             args,
         } => {
             let (show_all, limit) = resolve_display_limit(all, top);
@@ -297,11 +310,11 @@ fn run(cli: Cli) -> Result<(), Error> {
                 &project_root,
                 show_all,
                 limit,
-                frames,
                 json,
                 threads,
                 ignore_exit_code,
                 duration,
+                kill_timeout,
                 args,
             )
         }
@@ -309,13 +322,12 @@ fn run(cli: Cli) -> Result<(), Error> {
             run,
             all,
             top,
-            frames,
             json,
             threads,
             output_dir,
         } => {
             let (show_all, limit) = resolve_display_limit(all, top);
-            cmd_report(run, show_all, limit, frames, json, threads, &project_root, output_dir)
+            cmd_report(run, show_all, limit, json, threads, &project_root, output_dir)
         }
         Commands::Diff {
             a,
@@ -343,9 +355,47 @@ fn unique_skip_reasons(skipped: &[SkippedFunction]) -> String {
         .join(", ")
 }
 
+/// Pre-assign name_ids for all qualified functions, excluding main().
+///
+/// main() is the lifecycle boundary -- it creates the root context, not a profiled
+/// function, so it is excluded from the name table.
+///
+/// Returns (name_ids, display_names, next_available_id).
+fn assign_name_ids(
+    all_qualified: &[piano::naming::QualifiedFunction],
+    display_names: &[String],
+) -> (HashMap<String, u32>, HashMap<String, String>, u32) {
+    let mut next_id: u32 = 0;
+    let mut name_ids: HashMap<String, u32> = HashMap::new();
+    let mut displays: HashMap<String, String> = HashMap::new();
+    for (qf, display) in all_qualified.iter().zip(display_names.iter()) {
+        if qf.minimal == "main" {
+            continue;
+        }
+        name_ids.entry(qf.minimal.clone()).or_insert_with(|| {
+            let id = next_id;
+            next_id += 1;
+            id
+        });
+        displays
+            .entry(qf.minimal.clone())
+            .or_insert_with(|| display.clone());
+    }
+    (name_ids, displays, next_id)
+}
+
 /// Build an instrumented binary and return (binary_path, runs_dir, instrumented_fn_count).
 ///
 /// Returns `Ok(None)` when `--list-skipped` is used (early exit after printing).
+/// Build an instrumented binary.
+///
+/// Pipeline:
+///   1. Resolve project path, cargo metadata, binary target, source dir
+///   2. Resolve target functions (selectors, --skip, --list-skipped early exit)
+///   3. Qualify names, disambiguate, assign numeric IDs, discover macro functions
+///   4. Pre-build piano-runtime, clean stale files, create runs dir
+///   5. Compute workspace-relative paths, assemble WrapperConfig, write config
+///   6. Build with RUSTC_WORKSPACE_WRAPPER, warn about concurrency
 fn build_project(
     opts: BuildOpts,
     project_root: &Option<PathBuf>,
@@ -511,8 +561,8 @@ fn build_project(
     const INSTRUMENT_ALL_WARN_THRESHOLD: usize = 200;
     if specs.is_empty() && total_fns > INSTRUMENT_ALL_WARN_THRESHOLD {
         eprintln!(
-            "warning: instrumenting {total_fns} functions may add overhead — \
-             use --fn, --file, or --mod to narrow scope"
+            "warning: instrumenting {total_fns} functions may add overhead. \
+             Use --fn, --file, or --mod to narrow scope"
         );
     }
     for target in &targets {
@@ -552,50 +602,11 @@ fn build_project(
     }
     let display_names = piano::naming::disambiguate(&all_qualified);
 
-    // Pre-assign name_ids globally so instrument_source receives the correct u32 ids
-    // that match what inject_registrations will later write.
-    // Keys are the fully-qualified minimal names (used as lookup keys by InjectionCollector).
-    // Display names (post-disambiguation) are used only in the name table.
-    let mut next_id: u32 = 0;
-    let mut global_name_ids: HashMap<String, u32> = HashMap::new();
-    let mut global_display_names: HashMap<String, String> = HashMap::new();
-    for (qf, display) in all_qualified.iter().zip(display_names.iter()) {
-        // main() is the lifecycle boundary -- it creates the root context, not a profiled
-        // function, so exclude it from the name table.
-        if qf.minimal == "main" {
-            continue;
-        }
-        let id = *global_name_ids.entry(qf.minimal.clone()).or_insert_with(|| {
-            let id = next_id;
-            next_id += 1;
-            id
-        });
-        global_display_names.entry(qf.minimal.clone()).or_insert_with(|| display.clone());
-        let _ = id;
-    }
+    let (mut global_name_ids, mut global_display_names, mut next_id) =
+        assign_name_ids(&all_qualified, &display_names);
 
-    // Discover macro function names via pre-scan before instrument_source runs.
-    // IDs are assigned sequentially after regular function IDs.
-    // Read from original source files (wrapper rewrites from originals too).
-    if instrument_macros {
-        for target in &targets {
-            let prefix =
-                module_prefix(target.file.strip_prefix(&src_dir).unwrap_or(&target.file));
-            let source = std::fs::read_to_string(&target.file).unwrap_or_default();
-            if let Ok(names) = discover_macro_fn_names(&source, &prefix) {
-                for name in names {
-                    global_name_ids.entry(name.clone()).or_insert_with(|| {
-                        let id = next_id;
-                        next_id += 1;
-                        id
-                    });
-                    // Macro-discovered names use themselves as display names
-                    // (no disambiguation needed -- they come from macro bodies).
-                    global_display_names.entry(name.clone()).or_insert_with(|| name.clone());
-                }
-            }
-        }
-    }
+    // TODO(rewriter-rebuild): macro function name discovery will be
+    // reimplemented as part of the new guard-only rewriter.
 
     // Build set of all instrumentable function names across the entire workspace.
     // Uses all_functions (not just measured targets) so that non-measured functions
@@ -825,10 +836,12 @@ fn find_latest_binary(project_root: &Option<PathBuf>) -> Result<PathBuf, Error> 
 enum StopReason {
     /// Child exited on its own (normal exit or crash).
     Normal,
-    /// The `--duration` timeout expired and we sent SIGTERM.
+    /// The `--duration` timeout expired; SIGTERM sent to child.
     Duration,
-    /// User pressed Ctrl-C and we forwarded SIGTERM to the child.
+    /// User pressed Ctrl-C; SIGTERM forwarded to child.
     Interrupted,
+    /// Child did not respond to SIGTERM within kill-timeout; escalated to SIGKILL.
+    ForceKilled,
 }
 
 /// Result of running a child process, including why it stopped.
@@ -840,13 +853,50 @@ struct ChildOutcome {
 static CHILD_PID: AtomicU32 = AtomicU32::new(0);
 static DURATION_EXPIRED: AtomicBool = AtomicBool::new(false);
 static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
+static FORCE_KILLED: AtomicBool = AtomicBool::new(false);
+
+/// Send a termination signal to a child process by PID.
+///
+/// Unix: sends SIGTERM (triggers graceful shutdown in the instrumented binary).
+/// Windows: calls TerminateProcess (immediate kill -- the runtime does not
+/// register Windows signal handlers, so graceful flush is not available).
+fn kill_child(pid: u32) {
+    #[cfg(unix)]
+    // SAFETY: sending a signal to a known PID. The PID comes from
+    // Child::id() stored in CHILD_PID and is valid while the child runs.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+
+    #[cfg(windows)]
+    // SAFETY: OpenProcess/TerminateProcess/CloseHandle are safe to call with
+    // a valid PID (from Child::id()). OpenProcess returns null on failure
+    // (checked before use). The handle is closed immediately after use.
+    unsafe {
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+            fn TerminateProcess(handle: *mut std::ffi::c_void, exit_code: u32) -> i32;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        const PROCESS_TERMINATE: u32 = 0x0001;
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if !handle.is_null() {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
+}
 
 /// Spawn a child process, optionally killing it after a timeout.
 ///
 /// When `timeout` is `Some`, a background thread sleeps for the given duration
-/// then sends SIGTERM to the child (Unix only; Windows is not yet supported). The existing
-/// signal handler in the instrumented binary flushes profiling data on SIGTERM,
-/// so this composes cleanly with signal recovery.
+/// then sends SIGTERM to the child. The existing signal handler in the
+/// instrumented binary flushes profiling data on SIGTERM, so this composes
+/// cleanly with signal recovery.
+///
+/// When `kill_timeout` is non-zero, a second background thread waits for
+/// SIGTERM to be sent (via --duration or Ctrl-C), then sleeps the grace
+/// period. If the child has not exited, it escalates to SIGKILL (Unix).
 ///
 /// On Unix, a SIGINT handler forwards SIGTERM to the child so that Ctrl-C
 /// triggers graceful shutdown instead of orphaning the child. The handler
@@ -855,12 +905,14 @@ fn run_child(
     binary: &Path,
     args: &[String],
     timeout: Option<Duration>,
+    kill_timeout: Duration,
     suppress_stdout: bool,
     env: &[(&str, &str)],
 ) -> Result<ChildOutcome, Error> {
     // Reset flags from any previous invocation.
     DURATION_EXPIRED.store(false, Ordering::SeqCst);
     SIGINT_RECEIVED.store(false, Ordering::SeqCst);
+    FORCE_KILLED.store(false, Ordering::SeqCst);
 
     let mut cmd = process::Command::new(binary);
     cmd.args(args);
@@ -914,17 +966,51 @@ fn run_child(
         std::thread::spawn(move || {
             std::thread::sleep(dur);
             DURATION_EXPIRED.store(true, Ordering::SeqCst);
+            let pid = CHILD_PID.load(Ordering::SeqCst);
+            if pid != 0 {
+                kill_child(pid);
+            }
+            // Escalate to SIGKILL if child doesn't exit within kill_timeout.
             #[cfg(unix)]
-            {
+            if kill_timeout > Duration::ZERO {
+                std::thread::sleep(kill_timeout);
                 let pid = CHILD_PID.load(Ordering::SeqCst);
                 if pid != 0 {
-                    // SAFETY: sending a signal to a known PID is safe.
+                    FORCE_KILLED.store(true, Ordering::SeqCst);
+                    // SAFETY: sending SIGKILL to a known PID.
                     unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
                     }
                 }
             }
-            // TODO: Windows --duration kill is not implemented.
+        });
+    }
+
+    // Spawn a background thread to escalate SIGINT→SIGKILL after the grace
+    // period. This covers the Ctrl-C case (--duration has its own escalation
+    // inside the timeout thread above).
+    #[cfg(unix)]
+    if kill_timeout > Duration::ZERO {
+        std::thread::spawn(move || {
+            // Wait for SIGINT to be received, then start the grace period.
+            loop {
+                if SIGINT_RECEIVED.load(Ordering::SeqCst) {
+                    break;
+                }
+                if CHILD_PID.load(Ordering::SeqCst) == 0 {
+                    return; // Child already exited, nothing to escalate.
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::thread::sleep(kill_timeout);
+            let pid = CHILD_PID.load(Ordering::SeqCst);
+            if pid != 0 {
+                FORCE_KILLED.store(true, Ordering::SeqCst);
+                // SAFETY: sending SIGKILL to a known PID.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
         });
     }
 
@@ -932,7 +1018,9 @@ fn run_child(
         .wait()
         .map_err(|e| Error::RunFailed(format!("failed to wait for {}: {e}", binary.display())))?;
 
-    let stop_reason = if DURATION_EXPIRED.load(Ordering::SeqCst) {
+    let stop_reason = if FORCE_KILLED.load(Ordering::SeqCst) {
+        StopReason::ForceKilled
+    } else if DURATION_EXPIRED.load(Ordering::SeqCst) {
         StopReason::Duration
     } else if SIGINT_RECEIVED.load(Ordering::SeqCst) {
         StopReason::Interrupted
@@ -958,6 +1046,7 @@ fn run_child(
 
 fn cmd_run(
     duration: Option<f64>,
+    kill_timeout: f64,
     output_dir: Option<PathBuf>,
     args: Vec<String>,
     project_root: &Option<PathBuf>,
@@ -975,10 +1064,15 @@ fn cmd_run(
     };
 
     let timeout = duration.map(Duration::from_secs_f64);
-    let outcome = run_child(&binary, &args, timeout, false, &env)?;
+    let kill_dur = Duration::from_secs_f64(kill_timeout);
+    let outcome = run_child(&binary, &args, timeout, kill_dur, false, &env)?;
+
+    if matches!(outcome.stop_reason, StopReason::ForceKilled) {
+        eprintln!("warning: program did not respond to SIGTERM -- terminated after --kill-timeout");
+    }
 
     match outcome.stop_reason {
-        StopReason::Duration => std::process::exit(0),
+        StopReason::Duration | StopReason::ForceKilled => std::process::exit(0),
         StopReason::Interrupted => std::process::exit(130),
         StopReason::Normal => std::process::exit(outcome.status.code().unwrap_or(1)),
     }
@@ -990,11 +1084,11 @@ fn cmd_profile(
     project_root: &Option<PathBuf>,
     show_all: bool,
     limit: Option<usize>,
-    frames: bool,
     json: bool,
     threads: bool,
     ignore_exit_code: bool,
     duration: Option<f64>,
+    kill_timeout: f64,
     args: Vec<String>,
 ) -> Result<(), Error> {
     let Some((binary, runs_dir, total_fns)) = build_project(opts, project_root)? else {
@@ -1012,37 +1106,38 @@ fn cmd_profile(
         .unwrap_or_default()
         .as_millis();
 
-    let child_env: Vec<(&str, &str)> = if frames {
-        vec![("PIANO_STREAM_FRAMES", "1")]
-    } else {
-        vec![]
-    };
+    let child_env: Vec<(&str, &str)> = vec![];
 
     let timeout = duration.map(Duration::from_secs_f64);
-    let outcome = run_child(&binary, &args, timeout, json, &child_env)?;
+    let kill_dur = Duration::from_secs_f64(kill_timeout);
+    let outcome = run_child(&binary, &args, timeout, kill_dur, json, &child_env)?;
     let intentional_stop = matches!(
         outcome.stop_reason,
-        StopReason::Duration | StopReason::Interrupted
+        StopReason::Duration | StopReason::Interrupted | StopReason::ForceKilled
     );
+
+    if matches!(outcome.stop_reason, StopReason::ForceKilled) {
+        eprintln!("warning: program did not respond to SIGTERM -- terminated after --kill-timeout");
+    }
 
     if !outcome.status.success() && !ignore_exit_code && !intentional_stop {
         if let Some(code) = outcome.status.code() {
             eprintln!(
-                "warning: program exited with code {code} — profiling results may be incomplete"
+                "warning: program exited with code {code}; profiling results may be incomplete"
             );
         } else {
             eprintln!(
-                "warning: program terminated by signal — profiling results may be incomplete"
+                "warning: program terminated by signal; profiling results may be incomplete"
             );
         }
     }
 
     // Point cmd_report at the project's runs directory so it works even when
-    // CWD differs from the --project path. Skip if already set — the user
+    // CWD differs from the --project path. Skip if already set: the user
     // or test harness may have overridden it, and the runtime's shutdown_to()
     // respects PIANO_RUNS_DIR too.
     if std::env::var_os("PIANO_RUNS_DIR").is_none() {
-        // SAFETY: single-threaded CLI at this point — no concurrent env reads.
+        // SAFETY: single-threaded CLI at this point, no concurrent env reads.
         unsafe { std::env::set_var("PIANO_RUNS_DIR", &runs_dir) };
     }
 
@@ -1061,7 +1156,7 @@ fn cmd_profile(
     }
 
     eprintln!("--- profiling report ---");
-    let report_result = match cmd_report(None, show_all, limit, frames, json, threads, project_root, None) {
+    let report_result = match cmd_report(None, show_all, limit, json, threads, project_root, None) {
         Ok(()) => Ok(()),
         Err(Error::NoRuns)
             if !outcome.status.success() && !ignore_exit_code && !intentional_stop =>
@@ -1098,12 +1193,10 @@ fn cmd_profile(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_report(
     run_path: Option<PathBuf>,
     show_all: bool,
     limit: Option<usize>,
-    frames: bool,
     json: bool,
     threads: bool,
     project_root: &Option<PathBuf>,
@@ -1118,7 +1211,7 @@ fn cmd_report(
     let resolved_path = match &run_path {
         Some(p) if p.exists() => Some(p.clone()),
         Some(p) => {
-            // Tag lookup — resolve to NDJSON file if available.
+            // Tag lookup: resolve to NDJSON file if available.
             let tag = p.to_string_lossy();
             let tags_dir = default_tags_dir(project_root)?;
             let runs_dir = default_runs_dir(project_root)?;
@@ -1126,18 +1219,13 @@ fn cmd_report(
             match find_ndjson_by_run_id(&runs_dir, &run_id)? {
                 Some(ndjson_path) => Some(ndjson_path),
                 None => {
-                    // No NDJSON — fall back to basic JSON table.
+                    // No NDJSON file found; fall back to basic JSON table.
                     let run = load_run_by_id(&runs_dir, &run_id).map_err(|e| match e {
                         Error::NoRuns => Error::RunNotFound {
                             tag: tag.to_string(),
                         },
                         other => other,
                     })?;
-                    if frames {
-                        eprintln!(
-                            "warning: --frames requires NDJSON data; showing aggregated view"
-                        );
-                    }
                     if json {
                         println!("{}", format_json(&run, show_all, limit));
                     } else {
@@ -1154,41 +1242,60 @@ fn cmd_report(
         }
     };
 
-    // If we have a .ndjson file, load frame data for richer output.
+    // If we have a .ndjson file, load and display using Run-based formatters.
     if let Some(path) = &resolved_path
         && path.extension().and_then(|e| e.to_str()) == Some("ndjson")
     {
-        let (_run, frame_data, _completeness) = load_ndjson(path)?;
-
-        let has_tid = frame_data
-            .frames
-            .iter()
-            .any(|f| f.iter().any(|e| e.tid.is_some()));
-
-        if threads && !has_tid {
-            eprintln!(
-                "warning: --threads requires per-thread data; this file predates thread tracking"
-            );
-            eprintln!("warning: showing aggregated view instead");
-        }
-
-        if threads && has_tid {
-            if json {
-                println!("{}", format_per_thread_json(&frame_data, show_all, limit));
-            } else {
-                anstream::print!(
-                    "{}",
-                    format_per_thread_tables_from_frames(&frame_data, show_all, limit)
-                );
+        if threads {
+            let thread_runs = load_ndjson_per_thread(path)?;
+            match thread_runs {
+                Some(runs) => {
+                    if json {
+                        // Per-thread JSON: serialize each thread's Run as a JSON array.
+                        let entries: Vec<_> = runs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, run)| {
+                                serde_json::json!({
+                                    "thread": i + 1,
+                                    "functions": serde_json::from_str::<serde_json::Value>(
+                                        &format_json(run, show_all, limit)
+                                    ).unwrap_or_default()
+                                })
+                            })
+                            .collect();
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&entries)
+                                .expect("JSON serialization should not fail")
+                        );
+                    } else {
+                        anstream::print!(
+                            "{}",
+                            format_per_thread_tables(&runs, show_all, limit)
+                        );
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "warning: --threads requires per-thread data; this file predates thread tracking"
+                    );
+                    eprintln!("warning: showing aggregated view instead");
+                    let (run, _completeness) = load_ndjson(path)?;
+                    if json {
+                        println!("{}", format_json(&run, show_all, limit));
+                    } else {
+                        anstream::print!("{}", format_table(&run, show_all, limit));
+                    }
+                }
             }
-        } else if json && frames {
-            println!("{}", format_frames_json(&frame_data, show_all, limit));
-        } else if json {
-            println!("{}", format_json_with_frames(&frame_data, show_all, limit));
-        } else if frames {
-            anstream::print!("{}", format_frames_table(&frame_data));
         } else {
-            anstream::print!("{}", format_table_with_frames(&frame_data, show_all, limit));
+            let (run, _completeness) = load_ndjson(path)?;
+            if json {
+                println!("{}", format_json(&run, show_all, limit));
+            } else {
+                anstream::print!("{}", format_table(&run, show_all, limit));
+            }
         }
         return Ok(());
     }
@@ -1385,9 +1492,6 @@ fn default_runs_dir(project_root: &Option<PathBuf>) -> Result<PathBuf, Error> {
 }
 
 fn default_tags_dir(project_root: &Option<PathBuf>) -> Result<PathBuf, Error> {
-    if let Ok(dir) = std::env::var("PIANO_TAGS_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
     let project = project_root.as_ref().ok_or(Error::NoRuns)?;
     let local = project.join("target/piano/tags");
     if local.is_dir() {
@@ -1490,38 +1594,22 @@ mod tests {
         ];
         let display_names = piano::naming::disambiguate(&all_qualified);
 
-        let mut next_id: u32 = 0;
-        let mut global_name_ids: HashMap<String, u32> = HashMap::new();
-        let mut global_display_names: HashMap<String, String> = HashMap::new();
-        for (qf, display) in all_qualified.iter().zip(display_names.iter()) {
-            if qf.minimal == "main" {
-                continue;
-            }
-            let id = *global_name_ids.entry(qf.minimal.clone()).or_insert_with(|| {
-                let id = next_id;
-                next_id += 1;
-                id
-            });
-            global_display_names
-                .entry(qf.minimal.clone())
-                .or_insert_with(|| display.clone());
-            let _ = id;
-        }
+        let (name_ids, display_map, _next_id) = assign_name_ids(&all_qualified, &display_names);
 
         assert!(
-            !global_name_ids.contains_key("main"),
+            !name_ids.contains_key("main"),
             "main must not appear in the name table"
         );
         assert!(
-            !global_display_names.contains_key("main"),
+            !display_map.contains_key("main"),
             "main must not appear in the display names"
         );
         assert!(
-            global_name_ids.contains_key("process"),
+            name_ids.contains_key("process"),
             "non-main functions must be in the name table"
         );
         assert!(
-            global_name_ids.contains_key("db::query"),
+            name_ids.contains_key("db::query"),
             "module-qualified functions must be in the name table"
         );
     }

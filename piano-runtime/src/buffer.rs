@@ -56,23 +56,18 @@ impl ThreadBuffer {
         }
     }
 
-    /// Push a measurement into the buffer.
     pub fn push(&mut self, m: Measurement) {
         self.measurements.push(m);
     }
 
-    /// Drain all measurements from the buffer, returning them.
-    /// After drain, the buffer is empty but retains its capacity.
     pub fn drain(&mut self) -> Vec<Measurement> {
         self.measurements.drain(..).collect()
     }
 
-    /// Number of measurements currently buffered.
     pub fn len(&self) -> usize {
         self.measurements.len()
     }
 
-    /// Whether the buffer is empty.
     pub fn is_empty(&self) -> bool {
         self.measurements.is_empty()
     }
@@ -87,6 +82,21 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+/// Get or create the current thread's buffer, registering it on first access.
+fn get_or_init_buffer<'a>(
+    borrow: &'a mut Option<Arc<Mutex<ThreadBuffer>>>,
+    registry: &Registry,
+) -> &'a Arc<Mutex<ThreadBuffer>> {
+    borrow.get_or_insert_with(|| {
+        let arc = Arc::new(Mutex::new(ThreadBuffer::new()));
+        registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::clone(&arc));
+        arc
+    })
+}
+
 /// Ensure the current thread's buffer has a reference to the file sink.
 /// Called by Ctx::enter() to propagate the file handle to each thread.
 pub(crate) fn ensure_thread_file_sink(file_sink: &Arc<FileSink>, registry: &Registry) {
@@ -96,14 +106,7 @@ pub(crate) fn ensure_thread_file_sink(file_sink: &Arc<FileSink>, registry: &Regi
             Err(_) => return,
         };
 
-        let arc = borrow.get_or_insert_with(|| {
-            let arc = Arc::new(Mutex::new(ThreadBuffer::new()));
-            registry
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(Arc::clone(&arc));
-            arc
-        });
+        let arc = get_or_init_buffer(&mut borrow, registry);
 
         let mut buf = arc.lock().unwrap_or_else(|e| e.into_inner());
         if buf.file_sink.is_none() {
@@ -121,22 +124,14 @@ pub(crate) fn ensure_thread_file_sink(file_sink: &Arc<FileSink>, registry: &Regi
 pub fn push_measurement(m: Measurement, registry: &Registry) {
     let _ = THREAD_BUFFER.try_with(|cell| {
         // try_borrow_mut: silent no-op on reentrant borrow.
-        // Same degradation principle as TLS teardown — data loss
+        // Same degradation principle as TLS teardown: data loss
         // over host crash.
         let mut borrow = match cell.try_borrow_mut() {
             Ok(b) => b,
             Err(_) => return,
         };
 
-        // Lazy init: create buffer and register on first push
-        let arc = borrow.get_or_insert_with(|| {
-            let arc = Arc::new(Mutex::new(ThreadBuffer::new()));
-            registry
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) // heal poisoned mutex
-                .push(Arc::clone(&arc));
-            arc
-        });
+        let arc = get_or_init_buffer(&mut borrow, registry);
 
         // Push and check threshold under buffer lock.
         // If threshold reached, drain and clone file_sink while locked,
@@ -168,6 +163,7 @@ pub fn push_measurement(m: Measurement, registry: &Registry) {
 /// Used for per-thread cleanup and test isolation. Returns empty Vec
 /// if no buffer has been initialized on this thread or if TLS is
 /// destroyed (thread teardown).
+#[cfg(feature = "_test_internals")]
 pub fn drain_thread_buffer() -> Vec<Measurement> {
     THREAD_BUFFER
         .try_with(|cell| {
@@ -181,6 +177,15 @@ pub fn drain_thread_buffer() -> Vec<Measurement> {
             }
         })
         .unwrap_or_default()
+}
+
+/// Get the current thread's buffer Arc for direct mutex testing.
+/// Returns None if no buffer has been initialized on this thread.
+#[cfg(feature = "_test_internals")]
+pub fn get_thread_buffer_arc() -> Option<Arc<Mutex<ThreadBuffer>>> {
+    THREAD_BUFFER
+        .try_with(|cell| cell.borrow().clone())
+        .unwrap_or(None)
 }
 
 /// Drain buffers associated with the given file_sink.

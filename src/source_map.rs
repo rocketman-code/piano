@@ -69,7 +69,7 @@ impl SourceMap {
     ///
     /// `other` was computed relative to the output of `self` (i.e., its
     /// injection lines are in self's output coordinate space). To remap a
-    /// final-output line back to the original, we first undo `other`'s
+    /// final-output line back to the original, first undo `other`'s
     /// injections (getting a line in self's output space), then undo
     /// `self`'s injections (getting the original line).
     pub fn merge(&mut self, other: SourceMap) {
@@ -305,7 +305,7 @@ mod tests {
         //   line 5: "}" (original line 3)
         assert!(result.starts_with("\n// injected\nfn main()"));
 
-        // Line 3 is original content — must map to Some(1), not None.
+        // Line 3 is original content: must map to Some(1), not None.
         assert_eq!(
             map.remap_line(3),
             Some(1),
@@ -358,7 +358,7 @@ mod tests {
         let (result, map) = inj.apply(source);
 
         assert!(result.contains("let _guard = enter();"));
-        // Line 2 has injected content — should be None
+        // Line 2 has injected content, should be None
         assert_eq!(map.remap_line(2), None);
         // Line 1 is original
         assert_eq!(map.remap_line(1), Some(1));
@@ -366,88 +366,5 @@ mod tests {
         assert_eq!(map.remap_line(3), Some(2));
     }
 
-    #[test]
-    fn full_pipeline_remaps_main_signature() {
-        use crate::rewrite::{
-            AllocatorKind, inject_global_allocator, inject_registrations, inject_shutdown,
-            instrument_source,
-        };
-        let source = "fn main() {\n    let result = work();\n    println!(\"result: {result}\");\n}\n\nfn work() -> u64 {\n    let mut sum: u64 = 0;\n    let bad: i32 = \"hello\";\n    sum\n}\n";
-        let targets: std::collections::HashMap<String, u32> = [("work".to_string(), 0u32)].into_iter().collect();
-        let all_instrumentable: std::collections::HashSet<String> = targets.keys().cloned().collect();
-
-        let macro_name_ids: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-        let result = instrument_source(source, &targets, &all_instrumentable, false, "", &macro_name_ids).unwrap();
-        let mut map = result.source_map;
-        let mut current = result.source;
-
-        let (s, m) = inject_registrations(&current, &[(0, "work")]).unwrap();
-        map.merge(m);
-        current = s;
-        let (s, m) = inject_global_allocator(&current, AllocatorKind::Absent).unwrap();
-        map.merge(m);
-        current = s;
-        let (s, m) = inject_shutdown(&current, "/tmp/piano/runs", false, false).unwrap();
-        map.merge(m);
-
-        // fn main() should remap to original line 1
-        let main_line = s
-            .lines()
-            .enumerate()
-            .find(|(_, l)| l.contains("fn main("))
-            .map(|(i, _)| (i + 1) as u32)
-            .unwrap();
-        assert_eq!(
-            map.remap_line(main_line),
-            Some(1),
-            "fn main() at rewritten line {main_line} should map to original line 1"
-        );
-
-        // Body lines should still be correct
-        let bad_line = s
-            .lines()
-            .enumerate()
-            .find(|(_, l)| l.contains("bad"))
-            .map(|(i, _)| (i + 1) as u32)
-            .unwrap();
-        assert_eq!(map.remap_line(bad_line), Some(8));
-    }
-
-    #[test]
-    fn merge_full_pipeline_remaps_correctly() {
-        use crate::rewrite::{
-            AllocatorKind, inject_global_allocator, inject_registrations, inject_shutdown,
-            instrument_source,
-        };
-        let source = "fn main() {\n    let result = work();\n    println!(\"result: {result}\");\n}\n\nfn work() -> u64 {\n    let mut sum: u64 = 0;\n    let bad: i32 = \"hello\";\n    sum\n}\n";
-        let targets: std::collections::HashMap<String, u32> = [("work".to_string(), 0u32)].into_iter().collect();
-        let all_instrumentable: std::collections::HashSet<String> = targets.keys().cloned().collect();
-
-        let macro_name_ids: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-        let result = instrument_source(source, &targets, &all_instrumentable, false, "", &macro_name_ids).unwrap();
-        let mut map = result.source_map;
-        let mut current = result.source;
-
-        let (s, m) = inject_registrations(&current, &[(0, "work")]).unwrap();
-        map.merge(m);
-        current = s;
-
-        let (s, m) = inject_global_allocator(&current, AllocatorKind::Absent).unwrap();
-        map.merge(m);
-        current = s;
-
-        let (s, m) = inject_shutdown(&current, "/tmp/piano/runs", false, false).unwrap();
-        map.merge(m);
-
-        // "let bad: i32" is on original line 8.
-        // Find it in the final source and verify remapping.
-        let bad_line = s
-            .lines()
-            .enumerate()
-            .find(|(_, l)| l.contains("bad"))
-            .map(|(i, _)| (i + 1) as u32)
-            .unwrap();
-        assert_eq!(map.remap_line(bad_line), Some(8));
-    }
-
+    // Pipeline remap tests removed: they depend on the deleted rewriter.
 }

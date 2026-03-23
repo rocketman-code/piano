@@ -3,7 +3,6 @@ pub mod error;
 pub mod naming;
 pub mod report;
 pub mod resolve;
-pub mod rewrite;
 pub mod source_map;
 pub mod staging;
 pub mod wrapper;

@@ -12,61 +12,74 @@ mod thread_id;
 
 #[cfg(feature = "_test_internals")]
 #[doc(hidden)]
+pub mod parent;
+#[cfg(not(feature = "_test_internals"))]
+pub(crate) mod parent;
+
+#[doc(hidden)]
+pub mod session;
+
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
 pub mod time;
 #[cfg(not(feature = "_test_internals"))]
 mod time;
 
-// Modules exposed conditionally for integration tests
-#[cfg(any(test, feature = "_test_internals"))]
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
 pub mod buffer;
-#[cfg(not(any(test, feature = "_test_internals")))]
+#[cfg(not(feature = "_test_internals"))]
 mod buffer;
 
-#[cfg(any(test, feature = "_test_internals"))]
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
 pub mod guard;
-#[cfg(not(any(test, feature = "_test_internals")))]
+#[cfg(not(feature = "_test_internals"))]
 mod guard;
 
-#[cfg(any(test, feature = "_test_internals"))]
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
 pub mod measurement;
-#[cfg(not(any(test, feature = "_test_internals")))]
+#[cfg(not(feature = "_test_internals"))]
 mod measurement;
 
-#[cfg(any(test, feature = "_test_internals"))]
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
 pub mod output;
-#[cfg(not(any(test, feature = "_test_internals")))]
+#[cfg(not(feature = "_test_internals"))]
 mod output;
 
-#[cfg(any(test, feature = "_test_internals"))]
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
 pub mod shutdown;
-#[cfg(not(any(test, feature = "_test_internals")))]
+#[cfg(not(feature = "_test_internals"))]
 mod shutdown;
 
-#[cfg(any(test, feature = "_test_internals"))]
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
 pub mod span_id;
-#[cfg(not(any(test, feature = "_test_internals")))]
+#[cfg(not(feature = "_test_internals"))]
 mod span_id;
 
-// Rewriter-referenced modules: public because rewriter generates module paths
-// (e.g. __piano_ctx: piano_runtime::ctx::Ctx, piano_runtime::file_sink::FileSink::new)
-#[doc(hidden)]
-pub mod ctx;
+// Rewriter-referenced modules
 #[doc(hidden)]
 pub mod file_sink;
 
 // Internal modules: rewriter uses crate-root re-exports (PianoAllocator, PianoFuture),
 // not module paths. Private in production, pub for test access only.
-#[cfg(any(test, feature = "_test_internals"))]
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
 pub mod alloc;
-#[cfg(not(any(test, feature = "_test_internals")))]
+#[cfg(not(feature = "_test_internals"))]
 mod alloc;
 
-#[cfg(any(test, feature = "_test_internals"))]
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
 pub mod piano_future;
-#[cfg(not(any(test, feature = "_test_internals")))]
+#[cfg(not(feature = "_test_internals"))]
 mod piano_future;
 
-// User-facing API: visible in docs
+// Public API for rewriter-generated code
 pub use alloc::PianoAllocator;
-#[doc(hidden)]
-pub use piano_future::PianoFuture;
+pub use guard::enter;
+pub use piano_future::{enter_async, PianoFuture};

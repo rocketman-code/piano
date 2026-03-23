@@ -1,6 +1,6 @@
 [package]
 name = "piano-runtime"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.59"
 description = "Zero-dependency timing and allocation tracking runtime for piano profiler"
@@ -13,8 +13,9 @@ categories = ["development-tools::profiling"]
 _test_internals = []
 
 [dev-dependencies]
+piano-runtime = { path = ".", features = ["_test_internals"] }
 criterion = { version = "0.5", features = ["html_reports"] }
-serial_test = "3"
+
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 

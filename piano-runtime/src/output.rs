@@ -30,6 +30,79 @@ pub fn write_trailer(w: &mut impl Write, names: &[(u32, &str)], bias_ns: u64) ->
     write_name_table(w, "trailer", names, bias_ns)
 }
 
+/// Serialize the trailer to a byte vector for signal-safe writing.
+/// Called once at startup; the bytes are stored in atomic global storage
+/// and written via raw write() in the signal handler.
+pub fn serialize_trailer(names: &[(u32, &str)], bias_ns: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // Leading newline: if a signal interrupts a write mid-line, the
+    // trailer must start on its own line for the reader to parse it.
+    buf.push(b'\n');
+    // write_trailer can't fail on a Vec (infallible writer)
+    let _ = write_trailer(&mut buf, names, bias_ns);
+    buf
+}
+
+// ---------------------------------------------------------------------------
+// Signal-safe serialization (no allocation, stack buffer only)
+// ---------------------------------------------------------------------------
+
+/// Format a u64 as decimal digits into a byte buffer. Returns the number
+/// of bytes written. No allocation. Signal-safe.
+fn itoa(mut n: u64, buf: &mut [u8]) -> usize {
+    if n == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 20]; // u64::MAX is 20 digits
+    let mut i = 0;
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    for j in 0..i {
+        buf[j] = tmp[i - 1 - j];
+    }
+    i
+}
+
+/// Serialize a measurement as an NDJSON line into a stack-allocated buffer.
+/// Returns the number of bytes written. Max output: 395 bytes (all u64::MAX).
+/// No allocation, no format!(), no String. Signal-safe.
+pub fn serialize_measurement_to_stack(buf: &mut [u8; 512], m: &Measurement) -> usize {
+    let mut pos = 0;
+
+    macro_rules! put {
+        ($bytes:expr) => {
+            let b: &[u8] = $bytes;
+            buf[pos..pos + b.len()].copy_from_slice(b);
+            pos += b.len();
+        };
+    }
+    macro_rules! put_u64 {
+        ($n:expr) => {
+            pos += itoa($n, &mut buf[pos..]);
+        };
+    }
+
+    put!(b"{\"span_id\":");        put_u64!(m.span_id);
+    put!(b",\"parent_span_id\":"); put_u64!(m.parent_span_id);
+    put!(b",\"name_id\":");        put_u64!(m.name_id as u64);
+    put!(b",\"start_ns\":");       put_u64!(m.start_ns);
+    put!(b",\"end_ns\":");         put_u64!(m.end_ns);
+    put!(b",\"thread_id\":");      put_u64!(m.thread_id);
+    put!(b",\"cpu_start_ns\":");   put_u64!(m.cpu_start_ns);
+    put!(b",\"cpu_end_ns\":");     put_u64!(m.cpu_end_ns);
+    put!(b",\"alloc_count\":");    put_u64!(m.alloc_count);
+    put!(b",\"alloc_bytes\":");    put_u64!(m.alloc_bytes);
+    put!(b",\"free_count\":");     put_u64!(m.free_count);
+    put!(b",\"free_bytes\":");     put_u64!(m.free_bytes);
+    put!(b"}\n");
+
+    pos
+}
+
 /// Write a single measurement as an NDJSON event line.
 ///
 /// One line per completed function call. Each line is self-contained

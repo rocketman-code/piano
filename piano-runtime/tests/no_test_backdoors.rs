@@ -10,6 +10,8 @@
 ///   - #[doc(hidden)] pub fn (backdoor exports for test convenience)
 ///   - #[cfg(test)] blocks in production source (test-only code paths)
 ///   - unsafe block/impl without a preceding // SAFETY: comment
+///   - any type with both Clone and Drop (composition bomb: clone copies
+///     state that Drop acts on, causing duplicate side effects)
 ///
 /// Test code (tests/) forbidden patterns:
 ///   - drain_all_buffers usage outside buffer.rs (global mutation race)
@@ -120,11 +122,95 @@ fn no_test_backdoors_in_source() {
         }
     });
 
+    // --- Clone + Drop composition bomb check ---
+    // Any type with both Clone and Drop is a composition bomb:
+    // Clone copies fields that Drop acts on, causing duplicate
+    // side effects. Split into two types instead (e.g., RootCtx + Ctx).
+    visit_rs_files(&src_dir, &mut |path, contents| {
+        let rel = path.strip_prefix(&src_dir).unwrap_or(path);
+        let mut clone_types: Vec<String> = Vec::new();
+        let mut drop_types: Vec<String> = Vec::new();
+
+        for line in contents.lines() {
+            let trimmed = line.trim();
+
+            // Track #[derive(..., Clone, ...)]
+            if trimmed.starts_with("#[derive(") && trimmed.contains("Clone") {
+                // The struct/enum name is on the next non-attribute, non-empty line
+                // We'll match it when we see the struct/enum declaration
+            }
+
+            // Track `impl Clone for TypeName`
+            if trimmed.starts_with("impl Clone for ") {
+                if let Some(name) = trimmed
+                    .strip_prefix("impl Clone for ")
+                    .and_then(|s| s.split_whitespace().next())
+                {
+                    clone_types.push(name.to_string());
+                }
+            }
+
+            // Track `impl Drop for TypeName`
+            if trimmed.starts_with("impl Drop for ") {
+                if let Some(name) = trimmed
+                    .strip_prefix("impl Drop for ")
+                    .and_then(|s| s.split_whitespace().next())
+                {
+                    drop_types.push(name.to_string());
+                }
+            }
+        }
+
+        // Also detect #[derive(Clone)] by scanning for derive + next struct
+        let mut in_derive_clone = false;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("#[derive(") && trimmed.contains("Clone") {
+                in_derive_clone = true;
+                continue;
+            }
+            if in_derive_clone {
+                if trimmed.starts_with("pub struct ")
+                    || trimmed.starts_with("struct ")
+                    || trimmed.starts_with("pub enum ")
+                    || trimmed.starts_with("enum ")
+                {
+                    let name = trimmed
+                        .split_whitespace()
+                        .nth(if trimmed.starts_with("pub") { 2 } else { 1 })
+                        .unwrap_or("")
+                        .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                    if !name.is_empty() {
+                        clone_types.push(name.to_string());
+                    }
+                    in_derive_clone = false;
+                }
+                // Skip other attributes between derive and struct
+                if !trimmed.starts_with("#[") {
+                    in_derive_clone = false;
+                }
+            }
+        }
+
+        for ty in &clone_types {
+            if drop_types.contains(ty) {
+                violations.push(format!(
+                    "{}: type '{}' has both Clone and Drop -- \
+                     this is a composition bomb. Clone copies state that Drop \
+                     acts on, causing duplicate side effects. Split into \
+                     separate types (owner with Drop, handle with Clone).",
+                    rel.display(), ty,
+                ));
+            }
+        }
+    });
+
     // --- Test code checks ---
     visit_rs_files(&test_dir, &mut |path, contents| {
         let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        // buffer_global.rs tests drain_all_buffers itself; this file references it
-        if filename == "buffer_global.rs" || filename == "no_test_backdoors.rs" {
+        // buffer_global.rs tests drain_all_buffers itself.
+        // shutdown.rs uses drain_all_buffers in the deadlock composition proof.
+        if filename == "buffer_global.rs" || filename == "shutdown.rs" || filename == "no_test_backdoors.rs" {
             return;
         }
         for (line_num, line) in contents.lines().enumerate() {
