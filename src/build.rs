@@ -298,7 +298,7 @@ fn remap_rendered_error(rendered: &str, file_maps: &HashMap<PathBuf, SourceMap>)
             let map = file_maps.get(Path::new(file));
             current_map = map;
             if let Some(m) = map {
-                let remapped = m.remap_line(line_num).unwrap_or(line_num);
+                let remapped = m.remap_line(line_num);
                 lines.push(
                     SPAN_RE
                         .replace(line, format!(" --> {file}:{remapped}:{col}"))
@@ -312,7 +312,7 @@ fn remap_rendered_error(rendered: &str, file_maps: &HashMap<PathBuf, SourceMap>)
                 let spaces = &caps[1];
                 let line_num: u32 = caps[2].parse().unwrap_or(0);
                 let suffix = &caps[3];
-                let remapped = map.remap_line(line_num).unwrap_or(line_num);
+                let remapped = map.remap_line(line_num);
                 let width = caps[2].len();
                 let rest = &line[caps[0].len()..];
                 lines.push(format!("{spaces}{remapped:>width$}{suffix}{rest}"));
@@ -1098,7 +1098,7 @@ edition = "2021"
         let rendered = "error[E0308]: mismatched types\n --> src/main.rs:7:18\n  |\n7 |     let x: i32 = \"hello\";\n  |                  ^^^^^^^ expected `i32`, found `&str`\n";
         let mut file_maps = std::collections::HashMap::new();
         let mut map = crate::source_map::SourceMap::new();
-        map.record(1, 2, 2);
+        map.record(1, 2);
         file_maps.insert(PathBuf::from("src/main.rs"), map);
 
         let result = remap_rendered_error(rendered, &file_maps);

@@ -91,9 +91,7 @@ pub(super) struct NdjsonNameTable {
 }
 
 /// NDJSON measurement line -- one per completed function invocation.
-///
-/// All timing values are inclusive (include children's contributions).
-/// Self-attribution is computed by the report reader from the span tree.
+/// Used by --raw-spans mode.
 #[derive(serde::Deserialize)]
 pub(super) struct NdjsonMeasurement {
     pub(super) span_id: u64,
@@ -101,10 +99,36 @@ pub(super) struct NdjsonMeasurement {
     pub(super) name_id: u32,
     pub(super) start_ns: u64,
     pub(super) end_ns: u64,
+    #[serde(default)]
     pub(super) thread_id: u64,
+    #[serde(default)]
     pub(super) cpu_start_ns: u64,
+    #[serde(default)]
     pub(super) cpu_end_ns: u64,
     pub(super) alloc_count: u64,
+    pub(super) alloc_bytes: u64,
+    #[serde(default)]
+    pub(super) free_count: u64,
+    #[serde(default)]
+    pub(super) free_bytes: u64,
+}
+
+/// NDJSON aggregate line -- one per function (default mode).
+/// Self-time is pre-computed by the runtime.
+#[derive(serde::Deserialize)]
+pub(super) struct NdjsonAggregate {
+    #[serde(default)]
+    pub(super) thread: u64,
+    pub(super) name_id: u32,
+    pub(super) calls: u64,
+    pub(super) self_ns: u64,
+    #[serde(default)]
+    pub(super) inclusive_ns: u64,
+    #[serde(default)]
+    pub(super) cpu_self_ns: u64,
+    #[serde(default)]
+    pub(super) alloc_count: u64,
+    #[serde(default)]
     pub(super) alloc_bytes: u64,
     #[serde(default)]
     pub(super) free_count: u64,

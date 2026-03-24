@@ -12,9 +12,7 @@ use std::io::Write as _;
 use crate::error::{Error, io_context};
 use crate::rewrite::{
     instrument_source,
-    allocator::inject_global_allocator,
-    registrations::inject_registrations,
-    shutdown::inject_shutdown,
+    EntryPointParams,
 };
 use crate::source_map::SourceMap;
 
@@ -179,7 +177,19 @@ fn rewrite_and_compile(
     let mut instrumented_files: Vec<(PathBuf, String)> = Vec::new();
     let mut all_source_maps: Vec<(String, SourceMap)> = Vec::new();
 
-    // Phase 1: Instrument all target files that belong to this crate
+    // Build entry point params (shared across all entry point calls)
+    let name_refs: Vec<(u32, &str)> = config.entry_point.name_table
+        .iter()
+        .map(|(id, name)| (*id, name.as_str()))
+        .collect();
+    let runs_dir_str = config.entry_point.runs_dir.to_string_lossy().to_string();
+    let ep_params = EntryPointParams {
+        name_table: &name_refs,
+        runs_dir: &runs_dir_str,
+        cpu_time: config.entry_point.cpu_time,
+    };
+
+    // Instrument all target files that belong to this crate
     for (target_path, target_measured) in &config.targets {
         let file_path = if target_path == source_key {
             source_path.to_string()
@@ -192,76 +202,30 @@ fn rewrite_and_compile(
         let file_source = std::fs::read_to_string(&file_path)
             .map_err(io_context("read source", Path::new(&file_path)))?;
 
-        let result = instrument_source(&file_source, target_measured)
+        // Single call: guards + (if entry point) registrations + allocator + lifecycle
+        let ep = if *target_path == config.entry_point.source_path {
+            Some(&ep_params)
+        } else {
+            None
+        };
+        let result = instrument_source(&file_source, target_measured, ep)
             .map_err(|e| Error::BuildFailed(format!("rewrite failed for {}: {e}", file_path)))?;
 
-        let mut rewritten = result.source;
-        let mut merged_map = result.source_map;
-
-        // Entry point gets extra injections
-        if *target_path == config.entry_point.source_path {
-            let name_refs: Vec<(u32, &str)> = config.entry_point.name_table
-                .iter()
-                .map(|(id, name)| (*id, name.as_str()))
-                .collect();
-
-            let (r, reg_map) = inject_registrations(&rewritten, &name_refs)
-                .map_err(|e| Error::BuildFailed(format!("registration injection failed: {e}")))?;
-            merged_map.merge(reg_map);
-            rewritten = r;
-
-            let (r, alloc_map) = inject_global_allocator(&rewritten)
-                .map_err(|e| Error::BuildFailed(format!("allocator injection failed: {e}")))?;
-            merged_map.merge(alloc_map);
-            rewritten = r;
-
-            let runs_dir_str = config.entry_point.runs_dir.to_string_lossy().to_string();
-            let (r, shutdown_map) = inject_shutdown(&rewritten, &runs_dir_str, config.entry_point.cpu_time)
-                .map_err(|e| Error::BuildFailed(format!("shutdown injection failed: {e}")))?;
-            merged_map.merge(shutdown_map);
-            rewritten = r;
-        }
-
-        all_source_maps.push((file_path, merged_map));
-        instrumented_files.push((target_path.clone(), rewritten));
+        all_source_maps.push((file_path, result.source_map));
+        instrumented_files.push((target_path.clone(), result.source));
     }
 
-    // If the root file wasn't in targets, still need to instrument it
-    // for entry point injections (name table, allocator, lifecycle)
+    // If the root file wasn't in targets, still need entry point injections
     if is_entry_point && !config.targets.contains_key(source_key) {
         let source = std::fs::read_to_string(source_path)
             .map_err(io_context("read source", Path::new(source_path)))?;
 
         let empty = HashMap::new();
-        let result = instrument_source(&source, &empty)
+        let result = instrument_source(&source, &empty, Some(&ep_params))
             .map_err(|e| Error::BuildFailed(format!("rewrite failed: {e}")))?;
 
-        let mut rewritten = result.source;
-        let mut merged_map = result.source_map;
-
-        let name_refs: Vec<(u32, &str)> = config.entry_point.name_table
-            .iter()
-            .map(|(id, name)| (*id, name.as_str()))
-            .collect();
-
-        let (r, reg_map) = inject_registrations(&rewritten, &name_refs)
-            .map_err(|e| Error::BuildFailed(format!("registration injection failed: {e}")))?;
-        merged_map.merge(reg_map);
-        rewritten = r;
-
-        let (r, alloc_map) = inject_global_allocator(&rewritten)
-            .map_err(|e| Error::BuildFailed(format!("allocator injection failed: {e}")))?;
-        merged_map.merge(alloc_map);
-        rewritten = r;
-
-        let runs_dir_str = config.entry_point.runs_dir.to_string_lossy().to_string();
-        let (r, shutdown_map) = inject_shutdown(&rewritten, &runs_dir_str, config.entry_point.cpu_time)
-            .map_err(|e| Error::BuildFailed(format!("shutdown injection failed: {e}")))?;
-        merged_map.merge(shutdown_map);
-        rewritten = r;
-
-        all_source_maps.push((source_path.to_string(), merged_map));
-        instrumented_files.push((source_key.to_path_buf(), rewritten));
+        all_source_maps.push((source_path.to_string(), result.source_map));
+        instrumented_files.push((source_key.to_path_buf(), result.source));
     }
 
     write_source_maps(&all_source_maps, config_path);

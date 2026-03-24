@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::Error;
 
-use super::{NdjsonMeasurement, NdjsonNameTable, FnAgg, FnEntry, Run, RunCompleteness, RunFormat};
+use super::{NdjsonAggregate, NdjsonMeasurement, NdjsonNameTable, FnAgg, FnEntry, Run, RunCompleteness, RunFormat};
 
 const NS_PER_MS: f64 = 1_000_000.0;
 
@@ -45,9 +45,32 @@ pub fn load_run(path: &Path) -> Result<Run, Error> {
 /// Aggregation groups self-attributed values by name_id.
 pub fn load_ndjson(path: &Path) -> Result<(Run, RunCompleteness), Error> {
     let parsed = parse_ndjson(path)?;
-    let self_values = compute_self_attribution(&parsed.measurements);
-    let has_cpu = parsed.measurements.iter().any(|m| m.cpu_end_ns > 0);
-    let fn_agg = aggregate_self_values(&self_values);
+
+    let (fn_agg, has_cpu) = if !parsed.aggregates.is_empty() {
+        // Aggregated format: self-time pre-computed by runtime
+        let mut agg: HashMap<u32, FnAgg> = HashMap::new();
+        let mut has_cpu = false;
+        for a in &parsed.aggregates {
+            let entry = agg.entry(a.name_id).or_default();
+            entry.calls += a.calls;
+            entry.self_ns += a.self_ns;
+            entry.alloc_count += a.alloc_count;
+            entry.alloc_bytes += a.alloc_bytes;
+            entry.free_count += a.free_count;
+            entry.free_bytes += a.free_bytes;
+            entry.cpu_self_ns += a.cpu_self_ns;
+            if a.cpu_self_ns > 0 {
+                has_cpu = true;
+            }
+        }
+        (agg, has_cpu)
+    } else {
+        // Raw spans format: compute self-time from span tree
+        let self_values = compute_self_attribution(&parsed.measurements);
+        let has_cpu = parsed.measurements.iter().any(|m| m.cpu_end_ns > 0);
+        (aggregate_self_values(&self_values), has_cpu)
+    };
+
     let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu);
 
     let run = Run {
@@ -65,7 +88,42 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, RunCompleteness), Error> {
 pub fn load_ndjson_per_thread(path: &Path) -> Result<Option<Vec<Run>>, Error> {
     let parsed = parse_ndjson(path)?;
 
-    // Check if there are distinct thread IDs.
+    // Aggregated format: group by thread field
+    if !parsed.aggregates.is_empty() {
+        let mut thread_ids: Vec<u64> = parsed.aggregates.iter().map(|a| a.thread).collect();
+        thread_ids.sort_unstable();
+        thread_ids.dedup();
+        if thread_ids.len() <= 1 {
+            return Ok(None);
+        }
+
+        let has_cpu = parsed.aggregates.iter().any(|a| a.cpu_self_ns > 0);
+        let mut runs: Vec<(u64, Run)> = Vec::new();
+        for &tid in &thread_ids {
+            let mut fn_agg: HashMap<u32, FnAgg> = HashMap::new();
+            for a in parsed.aggregates.iter().filter(|a| a.thread == tid) {
+                let entry = fn_agg.entry(a.name_id).or_default();
+                entry.calls += a.calls;
+                entry.self_ns += a.self_ns;
+                entry.alloc_count += a.alloc_count;
+                entry.alloc_bytes += a.alloc_bytes;
+                entry.free_count += a.free_count;
+                entry.free_bytes += a.free_bytes;
+                entry.cpu_self_ns += a.cpu_self_ns;
+            }
+            let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu);
+            runs.push((tid, Run {
+                run_id: parsed.run_id.clone(),
+                timestamp_ms: parsed.timestamp_ms,
+                functions,
+                source_format: RunFormat::Ndjson,
+            }));
+        }
+        runs.sort_by_key(|(tid, _)| *tid);
+        return Ok(Some(runs.into_iter().map(|(_, run)| run).collect()));
+    }
+
+    // Raw spans format: group by thread_id field
     let mut thread_ids: Vec<u64> = parsed.measurements.iter().map(|m| m.thread_id).collect();
     thread_ids.sort_unstable();
     thread_ids.dedup();
@@ -193,6 +251,7 @@ struct ParsedNdjson {
     timestamp_ms: u128,
     fn_names: Vec<String>,
     measurements: Vec<NdjsonMeasurement>,
+    aggregates: Vec<NdjsonAggregate>,
     completeness: RunCompleteness,
 }
 
@@ -237,9 +296,10 @@ fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u128;
 
-    // Parse body lines: measurements and possibly a trailer.
+    // Parse body lines: aggregates, raw measurements, and trailer.
     let body = &all_lines[1..];
     let mut measurements: Vec<NdjsonMeasurement> = Vec::new();
+    let mut aggregates: Vec<NdjsonAggregate> = Vec::new();
     let mut trailer_names: Option<HashMap<String, String>> = None;
     let mut completeness = RunCompleteness::Recovered;
 
@@ -248,8 +308,6 @@ fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
         if line.is_empty() {
             continue;
         }
-        // Try to detect header/trailer lines (they have a "type" field).
-        // Measurements never have a "type" field.
         if let Ok(name_table) = serde_json::from_str::<NdjsonNameTable>(line) {
             if name_table.kind == "trailer" {
                 trailer_names = Some(name_table.names);
@@ -257,15 +315,19 @@ fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
                 continue;
             }
         }
-        // Gracefully skip lines that fail JSON parsing -- a truncated last
-        // line (from SIGKILL mid-write) is common and should not abort.
-        match serde_json::from_str::<NdjsonMeasurement>(line) {
-            Ok(m) => measurements.push(m),
-            Err(_) => continue,
+        // Try aggregated format first (has "calls" field, no "span_id")
+        if let Ok(agg) = serde_json::from_str::<NdjsonAggregate>(line) {
+            if agg.calls > 0 {
+                aggregates.push(agg);
+                continue;
+            }
+        }
+        // Fall back to raw measurement format
+        if let Ok(m) = serde_json::from_str::<NdjsonMeasurement>(line) {
+            measurements.push(m);
         }
     }
 
-    // Resolve the name table: prefer trailer (authoritative), fall back to header.
     let raw_names = trailer_names.unwrap_or(header.names);
     let fn_names = build_name_table(&raw_names);
 
@@ -274,6 +336,7 @@ fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
         timestamp_ms,
         fn_names,
         measurements,
+        aggregates,
         completeness,
     })
 }

@@ -487,6 +487,7 @@ impl FnCollector {
             ast::Item::Fn(func) => self.visit_top_level_fn(func),
             ast::Item::Impl(imp) => self.visit_impl(imp),
             ast::Item::Trait(tr) => self.visit_trait(tr),
+            ast::Item::MacroRules(mac) => self.visit_macro_rules(mac),
             _ => {}
         }
     }
@@ -614,6 +615,59 @@ impl FnCollector {
                 self.walk_fn_body(&body);
             }
             self.scope.pop();
+        }
+    }
+
+    /// Walk token trees inside a macro_rules! body to find literal fn items.
+    ///
+    /// ra_ap_syntax does not parse macro bodies into AST nodes. The body is a
+    /// flat token stream. We scan for the pattern `fn IDENT` and record each
+    /// as an instrumentable function (unless preceded by `const`).
+    fn visit_macro_rules(&mut self, mac: &ast::MacroRules) {
+        let Some(body) = mac.token_tree() else { return };
+
+        let tokens: Vec<_> = body
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .collect();
+
+        let mut i = 0;
+        while i < tokens.len() {
+            if tokens[i].kind() != SyntaxKind::FN_KW {
+                i += 1;
+                continue;
+            }
+
+            // Skip const fn
+            if i >= 2
+                && tokens[i - 1].kind() == SyntaxKind::WHITESPACE
+                && tokens[i - 2].kind() == SyntaxKind::CONST_KW
+            {
+                i += 1;
+                continue;
+            }
+            if i > 0 && tokens[i - 1].kind() == SyntaxKind::CONST_KW {
+                i += 1;
+                continue;
+            }
+
+            // Find next IDENT (function name), skipping whitespace
+            let mut j = i + 1;
+            while j < tokens.len() && tokens[j].kind() == SyntaxKind::WHITESPACE {
+                j += 1;
+            }
+            if j < tokens.len() && tokens[j].kind() == SyntaxKind::IDENT {
+                let fn_name = tokens[j].text().to_string();
+                let minimal = self.scope.render_minimal(&fn_name);
+                let medium = self.scope.render_medium(&fn_name);
+                let full = self.scope.render_full(&fn_name);
+                self.functions.push(crate::naming::QualifiedFunction::new(
+                    &minimal, &medium, &full,
+                ));
+            }
+
+            i = j + 1;
         }
     }
 
