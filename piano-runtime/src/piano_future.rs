@@ -1,22 +1,19 @@
 //! Async function instrumentation -- PianoFuture wrapper.
 //!
 //! PianoFuture wraps an inner Future and accumulates per-poll alloc
-//! and CPU deltas. On completion or cancellation (drop), it emits
-//! a single Measurement to the per-thread buffer.
+//! and CPU deltas. On completion or cancellation (drop), it computes
+//! self-time via the TLS children-time accumulator and aggregates
+//! into the per-thread FnAgg vec.
 //!
-//! Reads from &'static ProfileSession + TLS parent_span_id. No
-//! function parameters. No closure captures.
+//! Same exit path as Guard: children TLS save/restore + aggregate.
+//! No Measurement struct. No push_measurement. No span tree.
 //!
 //! Invariants:
-//! - Wall time starts on first poll, not construction. Never-polled
-//!   futures emit no measurement.
-//! - Parent span_id is captured at CONSTRUCTION (from TLS), not at
-//!   poll time. This captures the correct caller context.
-//! - Each poll sets TLS to this future's span_id (so nested calls
-//!   see it as parent), then restores TLS after the poll.
+//! - Wall time starts on first poll, not construction.
+//! - Each poll saves/restores TLS children_ns (nested guards contribute).
 //! - Alloc deltas accumulated per-poll via snapshot_alloc_counters.
 //! - Bookkeeping allocs excluded via ReentrancyGuard.
-//! - Cancelled/panicking futures emit best-effort measurement via Drop.
+//! - Cancelled/panicking futures emit best-effort aggregate via Drop.
 //! - Never double-emits (emitted flag).
 
 use core::future::Future;
@@ -24,36 +21,29 @@ use core::pin::Pin;
 use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::{Context, Poll};
 
+use crate::aggregator;
 use crate::alloc::{snapshot_alloc_counters, ReentrancyGuard};
-use crate::buffer::push_measurement;
-use crate::measurement::Measurement;
-use crate::parent;
+use crate::children;
 use crate::session::ProfileSession;
-use crate::thread_id::current_thread_id;
 use crate::time::read;
 
 /// Future wrapper for async function instrumentation.
 pub struct PianoFuture<F> {
     inner: F,
     session: Option<&'static ProfileSession>,
-    span_id: u64,
-    parent_span_id: u64,
     name_id: u32,
     start_ticks: u64,
-    thread_id: u64,
+    saved_children_ns: u64,
     alloc_count_acc: u64,
     alloc_bytes_acc: u64,
     free_count_acc: u64,
     free_bytes_acc: u64,
     cpu_acc_ns: u64,
+    children_ns_acc: u64,
     emitted: bool,
 }
 
-/// Wrap an async function body for profiling. Returns a PianoFuture
-/// that accumulates timing and allocation data across polls.
-///
-/// Reads parent_span_id from TLS at construction time (captures the
-/// caller's context). No parameters needed. No closure captures.
+/// Wrap an async function body for profiling.
 ///
 /// If profiling is not active, returns a transparent wrapper whose
 /// poll delegates directly to the inner future with no overhead.
@@ -64,39 +54,36 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
             return PianoFuture {
                 inner: body,
                 session: None,
-                span_id: 0,
-                parent_span_id: 0,
                 name_id: 0,
                 start_ticks: 0,
-                thread_id: 0,
+                saved_children_ns: 0,
                 alloc_count_acc: 0,
                 alloc_bytes_acc: 0,
                 free_count_acc: 0,
                 free_bytes_acc: 0,
                 cpu_acc_ns: 0,
+                children_ns_acc: 0,
                 emitted: true, // prevent emit on drop
             };
         }
     };
 
-    // Capture parent from TLS NOW (construction time).
-    // This is the caller's span_id, which is the correct parent.
-    let parent_span_id = parent::current_parent();
-    let span_id = session.next_span_id();
+    // Save parent's children_ns accumulator at construction time.
+    // This future's inclusive time will be reported to the parent on completion.
+    let saved_children_ns = children::save_and_zero();
 
     PianoFuture {
         inner: body,
         session: Some(session),
-        span_id,
-        parent_span_id,
         name_id,
         start_ticks: 0,
-        thread_id: 0,
+        saved_children_ns,
         alloc_count_acc: 0,
         alloc_bytes_acc: 0,
         free_count_acc: 0,
         free_bytes_acc: 0,
         cpu_acc_ns: 0,
+        children_ns_acc: 0,
         emitted: false,
     }
 }
@@ -113,14 +100,15 @@ impl<F: Future> Future for PianoFuture<F> {
             Some(s) => s,
             None => {
                 // Inactive: transparent passthrough.
+                // SAFETY: inner is pinned through self. We never move it.
                 let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
                 return inner.poll(cx);
             }
         };
 
-        // Set TLS to this future's span_id for the duration of the poll.
-        // Nested enter() calls will see this as their parent.
-        let saved_tls = parent::set_parent(this.span_id);
+        // Save TLS children_ns for this poll. Nested sync Guards and
+        // PianoFutures will add their inclusive times to TLS during this poll.
+        let poll_children_saved = children::save_and_zero();
 
         // Pre-poll bookkeeping
         let snap_start;
@@ -130,7 +118,6 @@ impl<F: Future> Future for PianoFuture<F> {
 
             if this.start_ticks == 0 {
                 this.start_ticks = read();
-                this.thread_id = current_thread_id(&session.thread_id_alloc);
             }
         }
 
@@ -143,6 +130,7 @@ impl<F: Future> Future for PianoFuture<F> {
         };
 
         // Poll inner future
+        // SAFETY: inner is pinned through self. We never move it.
         let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
         let result = inner.poll(cx);
 
@@ -166,8 +154,12 @@ impl<F: Future> Future for PianoFuture<F> {
             this.cpu_acc_ns += cpu_poll_end.saturating_sub(cpu_poll_start);
         }
 
-        // Restore TLS (this future is no longer "active")
-        parent::restore_parent(saved_tls);
+        // Accumulate children's inclusive time from this poll.
+        this.children_ns_acc += children::current_children_ns();
+
+        // Restore TLS children_ns for the outer scope.
+        // Don't report our time yet (we might have more polls).
+        children::restore_and_report(poll_children_saved, 0);
 
         if result.is_ready() {
             this.emit(session);
@@ -184,22 +176,26 @@ impl<F> PianoFuture<F> {
         }
         self.emitted = true;
 
-        let m = Measurement {
-            span_id: self.span_id,
-            parent_span_id: self.parent_span_id,
-            name_id: self.name_id,
-            start_ns: session.calibration.now_ns(self.start_ticks),
-            end_ns: session.calibration.now_ns(read()),
-            thread_id: self.thread_id,
-            cpu_start_ns: 0,
-            cpu_end_ns: self.cpu_acc_ns,
-            alloc_count: self.alloc_count_acc,
-            alloc_bytes: self.alloc_bytes_acc,
-            free_count: self.free_count_acc,
-            free_bytes: self.free_bytes_acc,
-        };
+        let end_ticks = read();
+        let start_ns = session.calibration.now_ns(self.start_ticks);
+        let end_ns = session.calibration.now_ns(end_ticks);
+        let inclusive_ns = end_ns.saturating_sub(start_ns);
+        let self_ns = inclusive_ns.saturating_sub(self.children_ns_acc);
 
-        push_measurement(m, &session.registry);
+        aggregator::aggregate(
+            self.name_id,
+            self_ns,
+            inclusive_ns,
+            self.cpu_acc_ns,
+            self.alloc_count_acc,
+            self.alloc_bytes_acc,
+            self.free_count_acc,
+            self.free_bytes_acc,
+            &session.agg_registry,
+        );
+
+        // Report our inclusive time to the parent scope.
+        children::restore_and_report(self.saved_children_ns, inclusive_ns);
     }
 }
 
@@ -212,8 +208,6 @@ impl<F> Drop for PianoFuture<F> {
 }
 
 // PianoFuture is Send if the inner future is Send.
-// All our fields are Send-safe: primitives, Option<&'static ProfileSession>
-// (ProfileSession is Sync, &'static T is Send when T is Sync).
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _check() {

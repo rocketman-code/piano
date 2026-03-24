@@ -24,15 +24,14 @@
 //! - Signal handler uses only: atomic loads, try_lock, raw write(), signal(),
 //!   raise(). All POSIX async-signal-safe (IEEE 1003.1 Section 2.4.3).
 
-use crate::buffer::{drain_all_buffers, Registry};
+use crate::aggregator::{self, AggRegistry};
 use crate::file_sink::FileSink;
-use crate::time::CalibrationData;
 use std::sync::{Arc, Mutex, Once};
 
 struct ShutdownState {
     file_sink: Arc<FileSink>,
     names: &'static [(u32, &'static str)],
-    registry: Arc<Registry>,
+    agg_registry: Arc<AggRegistry>,
 }
 
 fn shutdown_state() -> &'static Mutex<Option<ShutdownState>> {
@@ -56,15 +55,15 @@ fn shutdown_state() -> &'static Mutex<Option<ShutdownState>> {
 pub(crate) fn register(
     file_sink: Arc<FileSink>,
     names: &'static [(u32, &'static str)],
-    registry: Arc<Registry>,
+    agg_registry: Arc<AggRegistry>,
 ) {
     #[cfg(unix)]
-    signal::register(names, &file_sink, &registry);
+    signal::register(names, &file_sink, &agg_registry);
 
     let mut state = shutdown_state()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    *state = Some(ShutdownState { file_sink, names, registry });
+    *state = Some(ShutdownState { file_sink, names, agg_registry });
 
     // Register atexit handler. Multiple registrations are safe --
     // each invocation drains (first finds data, subsequent find empty).
@@ -79,21 +78,46 @@ pub(crate) fn register(
 }
 
 extern "C" fn atexit_handler() {
-    // Clone the Arc and names pointer, then release the shutdown state
+    // Clone Arcs and names pointer, then release the shutdown state
     // lock before doing any I/O. Minimizes lock hold time.
-    let (file_sink, names, registry) = {
+    let (file_sink, names, agg_registry) = {
         let state = shutdown_state()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         match state.as_ref() {
-            Some(s) => (Arc::clone(&s.file_sink), s.names, Arc::clone(&s.registry)),
+            Some(s) => (
+                Arc::clone(&s.file_sink),
+                s.names,
+                Arc::clone(&s.agg_registry),
+            ),
             None => return,
         }
-    }; // shutdown state mutex released here
+    };
 
-    let remaining = drain_all_buffers(&registry);
-    let calibration = CalibrationData::calibrate();
-    file_sink.flush_remaining(&remaining, names, calibration.bias_ns());
+    let aggregates = aggregator::drain_all_agg(&agg_registry);
+    let calibration = crate::time::CalibrationData::calibrate();
+
+    let _reentry = crate::alloc::ReentrancyGuard::enter();
+    let mut file = file_sink.lock();
+    if !aggregates.is_empty() {
+        if crate::output::write_aggregates(&mut *file, &aggregates).is_err() {
+            file_sink.record_io_error();
+        }
+    }
+    if crate::output::write_trailer(&mut *file, names, calibration.bias_ns()).is_err() {
+        file_sink.record_io_error();
+    }
+    if std::io::Write::flush(&mut *file).is_err() {
+        file_sink.record_io_error();
+    }
+
+    let errors = file_sink.io_error_count();
+    if errors > 0 {
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!("piano: profiling data may be incomplete ({errors} write errors)\n"),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -102,10 +126,9 @@ extern "C" fn atexit_handler() {
 
 #[cfg(unix)]
 mod signal {
-    use crate::buffer::{Registry, ThreadBuffer};
+    use crate::aggregator::{AggRegistry, FnAgg};
     use crate::file_sink::FileSink;
-    use crate::measurement::Measurement;
-    use crate::output::{serialize_measurement_to_stack, serialize_trailer};
+    use crate::output::{serialize_aggregate_to_stack, serialize_trailer};
     use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, Once};
 
@@ -119,8 +142,8 @@ mod signal {
     /// Raw file descriptor for signal-safe write.
     static FILE_FD: AtomicI32 = AtomicI32::new(-1);
 
-    /// Registry pointer for signal-safe buffer access (leaked Arc contents).
-    static REGISTRY: AtomicUsize = AtomicUsize::new(0);
+    /// Leaked AggRegistry pointer for signal-safe access.
+    static AGG_REGISTRY: AtomicUsize = AtomicUsize::new(0);
 
     /// Previous handlers saved at registration time.
     static PREV_SIGINT: AtomicUsize = AtomicUsize::new(0);
@@ -138,9 +161,10 @@ mod signal {
 
     /// Signal handler. Fully POSIX async-signal-safe.
     ///
-    /// Phase 1: try_lock drain each registered buffer. For each successful
-    ///   lock, serialize measurements to a 512-byte stack buffer and write
-    ///   via raw write(). Contested buffers are skipped (no deadlock).
+    /// Phase 1: try_lock drain each thread's aggregate buffer. For each
+    ///   successful lock, serialize FnAgg entries to a stack buffer and
+    ///   write via raw write(). Contested buffers are skipped (data loss
+    ///   over deadlock).
     ///
     /// Phase 2: write pre-serialized trailer via raw write().
     ///
@@ -148,31 +172,24 @@ mod signal {
     extern "C" fn handler(sig: std::os::raw::c_int) {
         let fd = FILE_FD.load(Ordering::Relaxed);
         if fd < 0 {
-            // No file registered. Just restore and re-raise.
             restore_and_reraise(sig);
             return;
         }
 
-        // Phase 1: best-effort try_lock drain
-        let reg_ptr = REGISTRY.load(Ordering::Relaxed);
+        // Phase 1: best-effort try_lock drain of aggregates
+        let reg_ptr = AGG_REGISTRY.load(Ordering::Relaxed);
         if reg_ptr != 0 {
-            // SAFETY: reg_ptr points to a leaked Mutex<Vec<Arc<Mutex<ThreadBuffer>>>>
-            // that is never freed. The outer Mutex guards the Vec of buffer Arcs.
+            // SAFETY: reg_ptr points to a leaked AggRegistry that is never freed.
             unsafe {
-                let registry = &*(reg_ptr as *const Mutex<Vec<Arc<Mutex<ThreadBuffer>>>>);
-
-                // try_lock the registry to get the buffer list.
-                // If the registry mutex is held (e.g., during buffer registration),
-                // skip the entire drain. Data loss over deadlock.
-                if let Ok(buffers) = registry.try_lock() {
-                    for buf_arc in buffers.iter() {
-                        // try_lock each buffer. Skip if held (mid-push).
+                let registry = &*(reg_ptr as *const AggRegistry);
+                if let Ok(threads) = registry.try_lock() {
+                    for (thread_idx, buf_arc) in threads.iter().enumerate() {
                         if let Ok(mut buf) = buf_arc.try_lock() {
-                            let drained: Vec<Measurement> = buf.drain();
-                            // Serialize each measurement to stack buffer and write
-                            for m in &drained {
+                            for a in buf.drain(..) {
                                 let mut stack_buf = [0u8; 512];
-                                let len = serialize_measurement_to_stack(&mut stack_buf, m);
+                                let len = serialize_aggregate_to_stack(
+                                    &mut stack_buf, &a, thread_idx as u64,
+                                );
                                 write(fd, stack_buf.as_ptr(), len);
                             }
                         }
@@ -214,28 +231,26 @@ mod signal {
     pub(super) fn register(
         names: &'static [(u32, &'static str)],
         file_sink: &Arc<FileSink>,
-        registry: &Arc<Registry>,
+        agg_registry: &Arc<AggRegistry>,
     ) {
         use std::os::unix::io::AsRawFd;
 
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
-            // Pre-serialize trailer (one-time allocation at startup).
             let calibration = crate::time::CalibrationData::calibrate();
             let trailer_bytes = serialize_trailer(names, calibration.bias_ns());
             let trailer = Box::new(SignalTrailer { bytes: trailer_bytes });
             TRAILER.store(Box::into_raw(trailer) as usize, Ordering::Relaxed);
 
-            // Extract raw fd from FileSink.
             let file = file_sink.lock();
-            FILE_FD.store(file.as_raw_fd(), Ordering::Relaxed);
+            FILE_FD.store(file.get_ref().as_raw_fd(), Ordering::Relaxed);
             drop(file);
 
-            // Leak a clone of the Registry Arc so the signal handler can
-            // access it without going through shutdown_state's mutex.
-            let reg_arc: Arc<Registry> = Arc::clone(registry);
+            // Leak a clone of the AggRegistry Arc so the signal handler can
+            // try_lock drain aggregates without going through shutdown_state.
+            let reg_arc = Arc::clone(agg_registry);
             let reg_ptr = Arc::into_raw(reg_arc) as usize;
-            REGISTRY.store(reg_ptr, Ordering::Relaxed);
+            AGG_REGISTRY.store(reg_ptr, Ordering::Relaxed);
 
             // SAFETY: signal() is safe to call during initialization.
             unsafe {

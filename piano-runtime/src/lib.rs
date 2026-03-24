@@ -8,13 +8,13 @@ pub mod cpu_clock;
 #[cfg(not(feature = "_test_internals"))]
 mod cpu_clock;
 
-mod thread_id;
+pub(crate) mod children;
 
 #[cfg(feature = "_test_internals")]
 #[doc(hidden)]
-pub mod parent;
+pub mod aggregator;
 #[cfg(not(feature = "_test_internals"))]
-pub(crate) mod parent;
+pub(crate) mod aggregator;
 
 #[doc(hidden)]
 pub mod session;
@@ -27,21 +27,9 @@ mod time;
 
 #[cfg(feature = "_test_internals")]
 #[doc(hidden)]
-pub mod buffer;
-#[cfg(not(feature = "_test_internals"))]
-mod buffer;
-
-#[cfg(feature = "_test_internals")]
-#[doc(hidden)]
 pub mod guard;
 #[cfg(not(feature = "_test_internals"))]
 mod guard;
-
-#[cfg(feature = "_test_internals")]
-#[doc(hidden)]
-pub mod measurement;
-#[cfg(not(feature = "_test_internals"))]
-mod measurement;
 
 #[cfg(feature = "_test_internals")]
 #[doc(hidden)]
@@ -55,18 +43,10 @@ pub mod shutdown;
 #[cfg(not(feature = "_test_internals"))]
 mod shutdown;
 
-#[cfg(feature = "_test_internals")]
-#[doc(hidden)]
-pub mod span_id;
-#[cfg(not(feature = "_test_internals"))]
-mod span_id;
-
 // Rewriter-referenced modules
 #[doc(hidden)]
 pub mod file_sink;
 
-// Internal modules: rewriter uses crate-root re-exports (PianoAllocator, PianoFuture),
-// not module paths. Private in production, pub for test access only.
 #[cfg(feature = "_test_internals")]
 #[doc(hidden)]
 pub mod alloc;

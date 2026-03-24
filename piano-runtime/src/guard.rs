@@ -1,9 +1,8 @@
 //! Sync function instrumentation -- RAII sentinel.
 //!
 //! Guard is created when entering a profiled function and dropped when
-//! exiting. On drop, it computes timing and allocation deltas, pushes
-//! a Measurement to the per-thread buffer, and restores the TLS parent
-//! span_id.
+//! exiting. On drop, it computes self-time via the TLS children-time
+//! accumulator and aggregates into the per-thread FnAgg vec.
 //!
 //! Invariants:
 //! - Guard is !Send. Alloc deltas are computed on the same thread as
@@ -11,32 +10,28 @@
 //! - Profiler bookkeeping allocs are excluded from user counts.
 //!   Enforcement: ReentrancyGuard (RAII) wraps creation and drop.
 //! - Guard never panics. All arithmetic uses saturating_sub.
-//!   Profiler never crashes the host.
-//! - TLS parent_span_id is restored on drop (RAII stack discipline).
+//! - TLS children_ns is saved/restored on create/drop (RAII stack discipline).
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
+use crate::aggregator;
 use crate::alloc::{snapshot_alloc_counters, ReentrancyGuard};
-use crate::buffer::{push_measurement, ensure_thread_file_sink};
+use crate::children;
 use crate::cpu_clock::cpu_now_ns;
-use crate::measurement::Measurement;
-use crate::parent;
 use crate::session::ProfileSession;
-use crate::thread_id::current_thread_id;
 use crate::time::read;
 use std::marker::PhantomData;
 
 /// RAII sentinel for sync function instrumentation.
 ///
 /// Created by `piano_runtime::enter(name_id)`. Dropped at function exit.
-/// On drop: end timestamp, alloc delta, push measurement, restore TLS parent.
+/// On drop: end timestamp, self-time computation, aggregate.
 ///
 /// !Send because alloc counters are per-thread TLS.
 pub struct Guard {
     /// None = inactive (profiling not initialized). Drop is a no-op.
     session: Option<&'static ProfileSession>,
-    span_id: u64,
-    saved_parent: u64,
+    saved_children_ns: u64,
     name_id: u32,
     cpu_time_enabled: bool,
     cpu_start_ns: u64,
@@ -45,13 +40,12 @@ pub struct Guard {
     alloc_bytes_start: u64,
     free_count_start: u64,
     free_bytes_start: u64,
-    thread_id: u64,
     _not_send: PhantomData<*const ()>,
 }
 
-/// Enter a profiled function. Returns a Guard that restores state on drop.
+/// Enter a profiled function. Returns a Guard that aggregates on drop.
 ///
-/// Reads profiling context from &'static ProfileSession + TLS parent_span_id.
+/// Reads profiling context from &'static ProfileSession.
 /// No function parameters needed. No closure captures created.
 ///
 /// If profiling is not active (ProfileSession not initialized), returns an
@@ -72,8 +66,7 @@ impl Guard {
     fn inactive() -> Self {
         Self {
             session: None,
-            span_id: 0,
-            saved_parent: 0,
+            saved_children_ns: 0,
             name_id: 0,
             cpu_time_enabled: false,
             cpu_start_ns: 0,
@@ -82,30 +75,26 @@ impl Guard {
             alloc_bytes_start: 0,
             free_count_start: 0,
             free_bytes_start: 0,
-            thread_id: 0,
             _not_send: PhantomData,
         }
     }
 
     /// Create a guard with all bookkeeping done but start_ns = 0.
     /// Caller must call stamp() after the struct is materialized.
+    ///
+    /// NOT inlined: keeps the heavy bookkeeping (TLS, alloc snapshot)
+    /// out of the caller. Only stamp() (one TSC read) is inlined.
+    #[inline(never)]
     fn create(session: &'static ProfileSession, name_id: u32) -> Self {
-        if let Some(ref fs) = session.file_sink {
-            ensure_thread_file_sink(fs, &session.registry);
-        }
-
         let _reentrancy = ReentrancyGuard::enter();
-        let span_id = session.next_span_id();
-        let saved_parent = parent::set_parent(span_id);
+        let saved_children_ns = children::save_and_zero();
         let snap = snapshot_alloc_counters();
         let cpu_start_ns = if session.cpu_time_enabled { cpu_now_ns() } else { 0 };
-        let thread_id = current_thread_id(&session.thread_id_alloc);
         drop(_reentrancy);
 
         Self {
             session: Some(session),
-            span_id,
-            saved_parent,
+            saved_children_ns,
             name_id,
             cpu_time_enabled: session.cpu_time_enabled,
             cpu_start_ns,
@@ -114,7 +103,6 @@ impl Guard {
             alloc_bytes_start: snap.alloc_bytes,
             free_count_start: snap.free_count,
             free_bytes_start: snap.free_bytes,
-            thread_id,
             _not_send: PhantomData,
         }
     }
@@ -130,35 +118,38 @@ impl Guard {
 impl Drop for Guard {
     #[inline(always)]
     fn drop(&mut self) {
+        let end_ticks = read();
+        compiler_fence(Ordering::SeqCst);
+
         let session = match self.session {
             Some(s) => s,
             None => return,
         };
-
-        let end_ticks = read();
-        compiler_fence(Ordering::SeqCst);
         let _reentrancy = ReentrancyGuard::enter();
         let cpu_end_ns = if self.cpu_time_enabled { cpu_now_ns() } else { 0 };
         let snap_end = snapshot_alloc_counters();
 
-        let m = Measurement {
-            span_id: self.span_id,
-            parent_span_id: self.saved_parent,
-            name_id: self.name_id,
-            start_ns: session.calibration.now_ns(self.start_ns),
-            end_ns: session.calibration.now_ns(end_ticks),
-            thread_id: self.thread_id,
-            cpu_start_ns: self.cpu_start_ns,
-            cpu_end_ns,
-            alloc_count: snap_end.alloc_count.saturating_sub(self.alloc_count_start),
-            alloc_bytes: snap_end.alloc_bytes.saturating_sub(self.alloc_bytes_start),
-            free_count: snap_end.free_count.saturating_sub(self.free_count_start),
-            free_bytes: snap_end.free_bytes.saturating_sub(self.free_bytes_start),
-        };
+        let start_ns = session.calibration.now_ns(self.start_ns);
+        let end_ns = session.calibration.now_ns(end_ticks);
+        let inclusive_ns = end_ns.saturating_sub(start_ns);
 
-        push_measurement(m, &session.registry);
+        let my_children_ns = children::current_children_ns();
+        let self_ns = inclusive_ns.saturating_sub(my_children_ns);
+        let cpu_self_ns = cpu_end_ns.saturating_sub(self.cpu_start_ns);
 
-        // Restore TLS parent span_id (RAII stack discipline).
-        parent::restore_parent(self.saved_parent);
+        aggregator::aggregate(
+            self.name_id,
+            self_ns,
+            inclusive_ns,
+            cpu_self_ns,
+            snap_end.alloc_count.saturating_sub(self.alloc_count_start),
+            snap_end.alloc_bytes.saturating_sub(self.alloc_bytes_start),
+            snap_end.free_count.saturating_sub(self.free_count_start),
+            snap_end.free_bytes.saturating_sub(self.free_bytes_start),
+            &session.agg_registry,
+        );
+
+        // Report inclusive time to parent scope.
+        children::restore_and_report(self.saved_children_ns, inclusive_ns);
     }
 }
