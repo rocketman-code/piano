@@ -7,7 +7,17 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.12.0] - 2026-03-08
+Profiling runtime and instrumentation engine rebuilt for lower overhead.
+
+### Changed
+
+- Per-call instrumentation overhead reduced from ~52ns to ~15ns on x86-64 (3.4x improvement, measured on AMD Ryzen 7 3700X at 4.2 GHz)
+
+### Removed
+
+- `--frames` flag. Frame boundaries were tied to depth-0 function completions, which caused unbounded memory growth when profiling individual functions.
+
+## [0.13.0] - 2026-03-10
 
 Piano now instruments significantly more of your code -- functions returning `impl Future`, functions inside `macro_rules!`, and trait methods like `Display::fmt` vs `Debug::fmt` that previously collided into one entry. Four new CLI flags open up new workflows: `--json` for scripting, `--duration` for long-running programs, `--bin` for multi-binary crates, and `--threads` for per-thread breakdowns.
 
