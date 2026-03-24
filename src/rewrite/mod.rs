@@ -74,16 +74,21 @@ pub fn instrument_source(
                 .ok_or_else(|| format!("no closing brace for fn {fn_name}"))?;
             let close_offset: usize = close_brace.text_range().start().into();
 
-            injector.insert(
-                inject_offset,
-                format!("\npiano_runtime::enter_async({name_id}, async move {{"),
-            );
-            // async fn: .await the PianoFuture (body expects the return type, not PianoFuture)
-            // impl Future: return the PianoFuture directly (it IS the return value)
             if is_async_fn {
+                // async fn: wrap body in async move { body }, .await the PianoFuture
+                injector.insert(
+                    inject_offset,
+                    format!("\npiano_runtime::enter_async({name_id}, async move {{"),
+                );
                 injector.insert(close_offset, "}).await");
             } else {
-                injector.insert(close_offset, "})");
+                // impl Future: body already evaluates to a future. Pass it to
+                // enter_async directly (no async move wrapper, no .await).
+                injector.insert(
+                    inject_offset,
+                    format!("\npiano_runtime::enter_async({name_id},"),
+                );
+                injector.insert(close_offset, ")");
             }
         } else {
             // Sync: inject guard at body start

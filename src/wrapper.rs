@@ -12,7 +12,7 @@ use std::io::Write as _;
 use crate::error::{Error, io_context};
 use crate::rewrite::{
     instrument_source,
-    allocator::{detect_allocator_kind, inject_global_allocator},
+    allocator::inject_global_allocator,
     registrations::inject_registrations,
     shutdown::inject_shutdown,
 };
@@ -200,8 +200,7 @@ fn rewrite_and_compile(
         merged_map.merge(reg_map);
         rewritten = r;
 
-        let alloc_kind = detect_allocator_kind(&rewritten);
-        let (r, alloc_map) = inject_global_allocator(&rewritten, &alloc_kind)
+        let (r, alloc_map) = inject_global_allocator(&rewritten)
             .map_err(|e| Error::BuildFailed(format!("allocator injection failed: {e}")))?;
         merged_map.merge(alloc_map);
         rewritten = r;
