@@ -174,22 +174,71 @@ fn rewrite_and_compile(
     crate_name: &str,
 ) -> Result<i32, Error> {
     let is_entry_point = config.entry_point.source_path == source_key;
+    let source_parent = source_key.parent().unwrap_or(Path::new(""));
 
-    let source = std::fs::read_to_string(source_path)
-        .map_err(io_context("read source", Path::new(source_path)))?;
+    let mut instrumented_files: Vec<(PathBuf, String)> = Vec::new();
+    let mut all_source_maps: Vec<(String, SourceMap)> = Vec::new();
 
-    let empty_measured = HashMap::new();
-    let measured = config.targets.get(source_key).unwrap_or(&empty_measured);
+    // Phase 1: Instrument all target files that belong to this crate
+    for (target_path, target_measured) in &config.targets {
+        let file_path = if target_path == source_key {
+            source_path.to_string()
+        } else if target_path.starts_with(source_parent) {
+            target_path.to_string_lossy().to_string()
+        } else {
+            continue;
+        };
 
-    // Phase 1: Inject guards
-    let result = instrument_source(&source, measured)
-        .map_err(|e| Error::BuildFailed(format!("rewrite failed: {e}")))?;
+        let file_source = std::fs::read_to_string(&file_path)
+            .map_err(io_context("read source", Path::new(&file_path)))?;
 
-    let mut rewritten = result.source;
-    let mut merged_map = result.source_map;
+        let result = instrument_source(&file_source, target_measured)
+            .map_err(|e| Error::BuildFailed(format!("rewrite failed for {}: {e}", file_path)))?;
 
-    // Phase 2: Entry point injections (name table, allocator, lifecycle)
-    if is_entry_point {
+        let mut rewritten = result.source;
+        let mut merged_map = result.source_map;
+
+        // Entry point gets extra injections
+        if *target_path == config.entry_point.source_path {
+            let name_refs: Vec<(u32, &str)> = config.entry_point.name_table
+                .iter()
+                .map(|(id, name)| (*id, name.as_str()))
+                .collect();
+
+            let (r, reg_map) = inject_registrations(&rewritten, &name_refs)
+                .map_err(|e| Error::BuildFailed(format!("registration injection failed: {e}")))?;
+            merged_map.merge(reg_map);
+            rewritten = r;
+
+            let (r, alloc_map) = inject_global_allocator(&rewritten)
+                .map_err(|e| Error::BuildFailed(format!("allocator injection failed: {e}")))?;
+            merged_map.merge(alloc_map);
+            rewritten = r;
+
+            let runs_dir_str = config.entry_point.runs_dir.to_string_lossy().to_string();
+            let (r, shutdown_map) = inject_shutdown(&rewritten, &runs_dir_str, config.entry_point.cpu_time)
+                .map_err(|e| Error::BuildFailed(format!("shutdown injection failed: {e}")))?;
+            merged_map.merge(shutdown_map);
+            rewritten = r;
+        }
+
+        all_source_maps.push((file_path, merged_map));
+        instrumented_files.push((target_path.clone(), rewritten));
+    }
+
+    // If the root file wasn't in targets, still need to instrument it
+    // for entry point injections (name table, allocator, lifecycle)
+    if is_entry_point && !config.targets.contains_key(source_key) {
+        let source = std::fs::read_to_string(source_path)
+            .map_err(io_context("read source", Path::new(source_path)))?;
+
+        let empty = HashMap::new();
+        let result = instrument_source(&source, &empty)
+            .map_err(|e| Error::BuildFailed(format!("rewrite failed: {e}")))?;
+
+        let mut rewritten = result.source;
+        let mut merged_map = result.source_map;
+
         let name_refs: Vec<(u32, &str)> = config.entry_point.name_table
             .iter()
             .map(|(id, name)| (*id, name.as_str()))
@@ -210,18 +259,18 @@ fn rewrite_and_compile(
             .map_err(|e| Error::BuildFailed(format!("shutdown injection failed: {e}")))?;
         merged_map.merge(shutdown_map);
         rewritten = r;
+
+        all_source_maps.push((source_path.to_string(), merged_map));
+        instrumented_files.push((source_key.to_path_buf(), rewritten));
     }
 
-    // Phase 3: Write source maps
-    write_source_maps(&[(source_path.to_string(), merged_map)], config_path);
+    write_source_maps(&all_source_maps, config_path);
 
-    // Phase 4: Create staging overlay
+    // Phase 2: Create staging overlay
     let ws_root = std::env::current_dir()
         .map_err(io_context("get working directory", Path::new(".")))?;
     let staging_root = config_path.parent().unwrap_or(Path::new("."))
         .join(format!("staging-{crate_name}"));
-
-    let instrumented_files = vec![(source_key.to_path_buf(), rewritten)];
     crate::staging::create_staging_overlay(&ws_root, &staging_root, &instrumented_files)?;
     let _staging_guard = crate::staging::StagingGuard(staging_root.clone());
 
