@@ -424,16 +424,11 @@ fn cpu_time_flag_produces_cpu_data() {
     // Verify the run file contains CPU time data.
     let content = fs::read_to_string(&run_file).unwrap();
 
-    // NDJSON measurements contain cpu_start_ns and cpu_end_ns fields.
-    // With --cpu-time, at least one measurement should have non-zero cpu_end_ns.
+    // With --cpu-time, aggregate lines should contain cpu_self_ns.
     assert!(
-        content.contains("\"cpu_start_ns\":"),
-        "measurements should contain cpu_start_ns field. Got:\n{}",
+        content.contains("\"cpu_self_ns\":"),
+        "aggregates should contain cpu_self_ns field. Got:\n{}",
         content.lines().next().unwrap_or("")
-    );
-    assert!(
-        content.contains("\"cpu_end_ns\":"),
-        "measurements should contain cpu_end_ns field"
     );
 
     // Verify `piano report` shows CPU column.
@@ -700,5 +695,658 @@ fn workspace_member_with_inherited_fields_builds() {
     assert!(
         content.contains("compute"),
         "output should contain instrumented function name 'compute'"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Integration glue: allocator case 2 (user has #[global_allocator], no cfg)
+//
+// User wraps System in their own allocator. Piano must detect it, wrap
+// their allocator in PianoAllocator, and produce nonzero alloc tracking.
+// ---------------------------------------------------------------------------
+
+fn create_custom_allocator_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "custom-alloc"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "custom-alloc"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"use std::alloc::{GlobalAlloc, Layout, System};
+
+struct MyAlloc;
+
+unsafe impl GlobalAlloc for MyAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: MyAlloc = MyAlloc;
+
+fn do_allocs() -> usize {
+    let mut total = 0usize;
+    for i in 0..50 {
+        let v: Vec<u8> = vec![0u8; (i + 1) * 64];
+        total += v.len();
+        std::hint::black_box(&v);
+    }
+    total
+}
+
+fn main() {
+    let n = do_allocs();
+    println!("total: {n}");
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn custom_allocator_wrapped_reports_nonzero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("custom-alloc");
+    create_custom_allocator_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let binary_path = stdout.trim();
+    let run_output = Command::new(binary_path)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run_output.status.success(),
+        "instrumented binary failed:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let runs_dir = project_dir.join("target/piano/runs");
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+
+    let stats = common::aggregate_ndjson(&content);
+    let do_allocs = stats
+        .get("do_allocs")
+        .expect("do_allocs should be in output");
+
+    assert!(
+        do_allocs.alloc_count > 0,
+        "custom allocator wrapping must produce nonzero alloc_count, got 0"
+    );
+    assert!(
+        do_allocs.alloc_bytes > 0,
+        "custom allocator wrapping must produce nonzero alloc_bytes, got 0"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Integration glue: multi-file instrumentation
+//
+// Project with `mod db;` where functions in db.rs also need instrumentation.
+// The wrapper must instrument BOTH main.rs and db.rs.
+// ---------------------------------------------------------------------------
+
+fn create_multi_file_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "multi-file"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "multi-file"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"mod db;
+
+fn process() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..100 {
+        sum += i;
+    }
+    sum
+}
+
+fn main() {
+    let a = process();
+    let b = db::query();
+    println!("results: {a} {b}");
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("db.rs"),
+        r#"pub fn query() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..200 {
+        sum += i;
+    }
+    sum
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn multi_file_both_files_instrumented() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("multi-file");
+    create_multi_file_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let binary_path = stdout.trim();
+    let run_output = Command::new(binary_path)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run_output.status.success(),
+        "instrumented binary failed:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let program_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        program_stdout.contains("results: 4950 19900"),
+        "program should produce correct output, got: {program_stdout}"
+    );
+
+    let runs_dir = project_dir.join("target/piano/runs");
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+
+    let stats = common::aggregate_ndjson(&content);
+
+    // Both process (main.rs) and query (db.rs) must be instrumented
+    assert!(
+        stats.contains_key("process"),
+        "process() from main.rs must be instrumented. Found: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        stats.contains_key("db::query"),
+        "db::query() from db.rs must be instrumented. Found: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+
+    // Both must have been called
+    let process = stats.get("process").unwrap();
+    assert_eq!(process.calls, 1, "process should be called once");
+
+    let query = stats.get("db::query").unwrap();
+    assert_eq!(query.calls, 1, "db::query should be called once");
+}
+
+// ---------------------------------------------------------------------------
+// Integration glue: source map 4-pass chain
+//
+// Entry point gets 4 injection passes (guard, registrations, allocator,
+// shutdown). A compilation error after all injections must show the
+// ORIGINAL line number, not a shifted one.
+// ---------------------------------------------------------------------------
+
+fn create_four_pass_error_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "four-pass-error"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "four-pass-error"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    // The type error is on line 8 of the original source.
+    // After 4 injection passes (guard, registrations, allocator, shutdown),
+    // the actual line in the instrumented file is much higher.
+    // --remap-path-prefix + source map must recover line 8.
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"fn work() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..100 {
+        sum += i;
+    }
+    sum
+}
+fn main() {
+    let x: u32 = work();
+    println!("{x}");
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn four_pass_source_map_preserves_line_numbers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("four-pass-error");
+    create_four_pass_error_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    // Build should FAIL (type error: u64 assigned to u32)
+    assert!(
+        !output.status.success(),
+        "build should fail due to type error"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The error should reference line 9 (the `let x: u32 = work();` line)
+    // not a shifted line from the instrumented source.
+    assert!(
+        stderr.contains(":9:") || stderr.contains("main.rs:9"),
+        "error should reference original line 9, got:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Integration glue: entry point NOT in targets
+//
+// User does `piano build --fn work` where work() is in db.rs but main.rs
+// has no measured functions. The wrapper must still inject the lifecycle
+// (name table, allocator, shutdown) into main.rs even though main.rs
+// has zero measured functions.
+// ---------------------------------------------------------------------------
+
+fn create_entry_point_not_in_targets_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "ep-not-target"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ep-not-target"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"mod worker;
+
+fn main() {
+    let result = worker::heavy_work();
+    println!("result: {result}");
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("worker.rs"),
+        r#"pub fn heavy_work() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..1000 {
+        sum += i;
+    }
+    sum
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn entry_point_not_in_targets_still_instruments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("ep-not-target");
+    create_entry_point_not_in_targets_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Only instrument heavy_work, not main. main.rs is the entry point
+    // but has no measured functions.
+    let output = Command::new(piano_bin)
+        .args(["build", "--fn", "heavy_work", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let binary_path = stdout.trim();
+    let run_output = Command::new(binary_path)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run_output.status.success(),
+        "instrumented binary failed:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let runs_dir = project_dir.join("target/piano/runs");
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+
+    let stats = common::aggregate_ndjson(&content);
+
+    assert!(
+        stats.contains_key("worker::heavy_work"),
+        "heavy_work must be instrumented even though entry point is not a target. Found: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+
+    let hw = stats.get("worker::heavy_work").unwrap();
+    assert_eq!(hw.calls, 1, "heavy_work should be called once");
+}
+
+// ---------------------------------------------------------------------------
+// Integration glue: multiple inner attributes in main()
+//
+// If main() has multiple #![...] inner attributes, the guard/shutdown
+// injection must go AFTER all of them, not between them.
+// ---------------------------------------------------------------------------
+
+fn create_multi_inner_attr_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "multi-attr"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "multi-attr"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"fn work() -> u64 {
+    #![allow(unused_variables)]
+    #![allow(unused_assignments)]
+    let mut x = 0u64;
+    x = 42;
+    x
+}
+
+fn main() {
+    let result = work();
+    println!("result: {result}");
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn multiple_inner_attributes_handled_correctly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("multi-attr");
+    create_multi_inner_attr_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano build with multiple inner attrs failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let binary_path = stdout.trim();
+    let run_output = Command::new(binary_path)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run_output.status.success(),
+        "instrumented binary with multiple inner attrs failed:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let program_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        program_stdout.contains("result: 42"),
+        "program should produce correct output, got: {program_stdout}"
+    );
+
+    let runs_dir = project_dir.join("target/piano/runs");
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+
+    let stats = common::aggregate_ndjson(&content);
+    assert!(
+        stats.contains_key("work"),
+        "work() with multiple inner attrs must be instrumented"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Integration glue: allocator with complex cfg predicate
+//
+// #[cfg(all(target_os = "linux", feature = "custom-alloc"))]
+// Piano must negate this correctly for the fallback.
+// ---------------------------------------------------------------------------
+
+fn create_complex_cfg_allocator_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "complex-cfg-alloc"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+custom-alloc = []
+
+[[bin]]
+name = "complex-cfg-alloc"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    // Allocator behind #[cfg(all(...))] -- never active in test
+    // (feature "custom-alloc" is not enabled)
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"use std::alloc::{GlobalAlloc, Layout, System};
+
+struct MyAlloc;
+
+unsafe impl GlobalAlloc for MyAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[cfg(all(target_os = "foobar", feature = "custom-alloc"))]
+#[global_allocator]
+static ALLOC: MyAlloc = MyAlloc;
+
+fn do_allocs() -> usize {
+    let mut total = 0usize;
+    for i in 0..50 {
+        let v: Vec<u8> = vec![0u8; (i + 1) * 64];
+        total += v.len();
+        std::hint::black_box(&v);
+    }
+    total
+}
+
+fn main() {
+    let n = do_allocs();
+    println!("total: {n}");
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn complex_cfg_allocator_negation_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("complex-cfg-alloc");
+    create_complex_cfg_allocator_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano build with complex cfg allocator failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let binary_path = stdout.trim();
+    let run_output = Command::new(binary_path)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run_output.status.success(),
+        "instrumented binary with complex cfg allocator failed:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let runs_dir = project_dir.join("target/piano/runs");
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+
+    let stats = common::aggregate_ndjson(&content);
+    let do_allocs = stats.get("do_allocs").expect("do_allocs should be in output");
+
+    assert!(
+        do_allocs.alloc_count > 0,
+        "complex cfg allocator with fallback must produce nonzero alloc_count"
     );
 }

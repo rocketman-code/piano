@@ -138,7 +138,7 @@ fn main() {
 
     let measured: HashMap<String, u32> =
         [("initialize".into(), 0), ("main".into(), 1)].into_iter().collect();
-    let result = piano::rewrite::instrument_source(source, &measured)
+    let result = piano::rewrite::instrument_source(source, &measured, None)
         .expect("instrument_source should succeed");
 
     let re_parse = ra_ap_syntax::SourceFile::parse(
@@ -171,7 +171,7 @@ setup!();
 fn main() {}
 "#;
     let measured: HashMap<String, u32> = [("initialize".into(), 0)].into_iter().collect();
-    let result = piano::rewrite::instrument_source(source, &measured)
+    let result = piano::rewrite::instrument_source(source, &measured, None)
         .expect("instrument_source should succeed");
 
     assert!(

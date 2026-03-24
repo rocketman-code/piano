@@ -137,7 +137,7 @@ proptest! {
         }
         let measured: HashMap<String, u32> = names.iter().enumerate()
             .map(|(i, n)| (n.clone(), i as u32)).collect();
-        let result = instrument_source(&source, &measured)
+        let result = instrument_source(&source, &measured, None)
             .expect("instrument_source should succeed on valid Rust input");
         let re_parse = ra_ap_syntax::SourceFile::parse(&result.source, ra_ap_syntax::Edition::Edition2024);
         let errors: Vec<_> = re_parse.errors().to_vec();
@@ -157,7 +157,7 @@ proptest! {
         }
         let measured: HashMap<String, u32> = names.iter().enumerate()
             .map(|(i, n)| (n.clone(), i as u32)).collect();
-        let result = instrument_source(&source, &measured)
+        let result = instrument_source(&source, &measured, None)
             .expect("instrument_source should succeed on valid Rust input");
         for name in &instrumentable {
             let name_id = measured.get(name).unwrap();
@@ -188,7 +188,7 @@ proptest! {
         }
         let measured: HashMap<String, u32> = names.iter().enumerate()
             .map(|(i, n)| (n.clone(), i as u32)).collect();
-        let result = instrument_source(&source, &measured)
+        let result = instrument_source(&source, &measured, None)
             .expect("instrument_source should succeed on valid Rust input");
         prop_assert!(
             result.source.contains("enter_async"),
@@ -208,7 +208,7 @@ proptest! {
         }
         // Target only the first function.
         let measured: HashMap<String, u32> = HashMap::from([(names[0].clone(), 0u32)]);
-        let result = instrument_source(&source, &measured)
+        let result = instrument_source(&source, &measured, None)
             .expect("instrument_source should succeed on valid Rust input");
         // Only ID 0 should appear in guards. No other IDs.
         let guard_count = result.source.matches("piano_runtime::enter(").count()
@@ -237,7 +237,7 @@ proptest! {
         }
         let measured: HashMap<String, u32> = names.iter().enumerate()
             .map(|(i, n)| (n.clone(), i as u32)).collect();
-        let result = instrument_source(&source, &measured)
+        let result = instrument_source(&source, &measured, None)
             .expect("instrument_source should succeed on valid Rust input");
         for name in &skipped {
             if let Some(&id) = measured.get(*name) {

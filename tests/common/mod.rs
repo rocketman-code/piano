@@ -52,6 +52,7 @@ pub fn aggregate_ndjson(content: &str) -> HashMap<String, FnStats> {
     let mut header_names: Option<HashMap<String, String>> = None;
     let mut trailer_names: Option<HashMap<String, String>> = None;
     let mut measurements: Vec<Measurement> = Vec::new();
+    let mut pre_aggregated: HashMap<u64, FnStats> = HashMap::new();
 
     for &line in &all_lines {
         let v: serde_json::Value = match serde_json::from_str(line) {
@@ -75,7 +76,18 @@ pub fn aggregate_ndjson(content: &str) -> HashMap<String, FnStats> {
             continue;
         }
 
-        // Lines without "type" are measurements (they have span_id).
+        // Aggregated lines (default mode): have "calls" and "self_ns", no "span_id"
+        if let Some(calls) = v.get("calls").and_then(|c| c.as_u64()) {
+            let name_id = v.get("name_id").and_then(|n| n.as_u64()).unwrap_or(0);
+            let agg = pre_aggregated.entry(name_id).or_insert_with(FnStats::default);
+            agg.calls += calls;
+            agg.self_ns += v.get("self_ns").and_then(|n| n.as_u64()).unwrap_or(0);
+            agg.alloc_count += v.get("alloc_count").and_then(|n| n.as_u64()).unwrap_or(0);
+            agg.alloc_bytes += v.get("alloc_bytes").and_then(|n| n.as_u64()).unwrap_or(0);
+            continue;
+        }
+
+        // Raw span lines (--raw-spans mode): have "span_id"
         if let Some(span_id) = v.get("span_id").and_then(|s| s.as_u64()) {
             measurements.push(Measurement {
                 span_id,
@@ -103,29 +115,36 @@ pub fn aggregate_ndjson(content: &str) -> HashMap<String, FnStats> {
         .or(header_names)
         .expect("NDJSON should have a header or trailer with names");
 
-    // Build ordered name table: sorted by name_id (numeric key).
     let fn_names = build_name_table(&raw_names);
 
-    // Compute self-attribution from span tree.
-    // Index: span_id -> index into measurements.
+    // If we have pre-aggregated data (default mode), use it directly.
+    if !pre_aggregated.is_empty() {
+        return pre_aggregated
+            .into_iter()
+            .filter_map(|(id, stats)| {
+                let idx = id as usize;
+                fn_names.get(idx).map(|name| (name.clone(), stats))
+            })
+            .collect();
+    }
+
+    // Otherwise, compute self-attribution from span tree (raw-spans mode).
     let span_index: HashMap<u64, usize> = measurements
         .iter()
         .enumerate()
         .map(|(i, m)| (m.span_id, i))
         .collect();
 
-    // For each span, accumulate the sum of its direct children's inclusive values.
     let mut children_sums: HashMap<u64, (u64, u64, u64)> = HashMap::new();
     for m in &measurements {
         if m.parent_span_id != 0 && span_index.contains_key(&m.parent_span_id) {
             let entry = children_sums.entry(m.parent_span_id).or_default();
-            entry.0 += m.end_ns.saturating_sub(m.start_ns); // wall
+            entry.0 += m.end_ns.saturating_sub(m.start_ns);
             entry.1 += m.alloc_count;
             entry.2 += m.alloc_bytes;
         }
     }
 
-    // Aggregate self-attributed values by name_id.
     let mut stats_by_id: HashMap<u64, FnStats> = HashMap::new();
     for m in &measurements {
         let wall = m.end_ns.saturating_sub(m.start_ns);
@@ -139,7 +158,6 @@ pub fn aggregate_ndjson(content: &str) -> HashMap<String, FnStats> {
         agg.alloc_bytes += m.alloc_bytes.saturating_sub(child_ab);
     }
 
-    // Map name_id -> function name.
     stats_by_id
         .into_iter()
         .filter_map(|(id, stats)| {
