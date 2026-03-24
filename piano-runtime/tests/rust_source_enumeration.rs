@@ -247,3 +247,4 @@ fn future_trait_methods_exhaustive() {
          Found: {methods:?}"
     );
 }
+

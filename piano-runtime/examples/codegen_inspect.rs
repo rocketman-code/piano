@@ -13,88 +13,98 @@
 //
 // Compiled with `--features _test_internals` so private modules are
 // accessible.
+//
+// IMPORTANT: every function body must be unique. LLVM merges identical
+// functions in release mode, making cargo-asm unable to find the symbol.
 
-use piano_runtime::ctx::{Ctx, RootCtx};
-use piano_runtime::piano_future::{PianoFuture, PianoFutureState};
-use std::future::Future;
+#![allow(unused)]
+
+use piano_runtime::time::read;
 use std::hint::black_box;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 // ---------------------------------------------------------------------------
-// TM6 positive control: real Guard::stamp + Guard::drop
-//
-// stamp(): compiler_fence(SeqCst) then rdtsc -- TSC read is the LAST
-//          thing stamp does.
-// drop():  rdtsc then compiler_fence(SeqCst) then bookkeeping -- TSC
-//          read is the FIRST thing drop does.
-//
-// Between the two rdtsc reads (start and end), only user code runs.
+// Metrological controls
 // ---------------------------------------------------------------------------
+
+/// Contains a TSC read (rdtsc on x86, mrs cntvct_el0 on aarch64).
 #[inline(never)]
-pub fn tm6_positive(ctx: &Ctx) -> u64 {
-    let (__g, _ctx) = ctx.enter(1);
-    black_box(42u64)
+pub fn metrology_has_rdtsc() -> u64 {
+    read()
+}
+
+/// Does NOT contain a TSC read.
+#[inline(never)]
+pub fn metrology_no_rdtsc() -> u64 {
+    black_box(100) + black_box(1)
+}
+
+/// Contains a compiler fence (#MEMBARRIER in LLVM asm output).
+#[inline(never)]
+pub fn metrology_has_fence() -> u64 {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    black_box(1)
+}
+
+/// Does NOT contain a compiler fence.
+#[inline(never)]
+pub fn metrology_no_fence() -> u64 {
+    black_box(200) + black_box(2)
 }
 
 // ---------------------------------------------------------------------------
-// TM6 negative control: broken measurement window
+// TM6: Guard measurement window tightness
 //
-// Inserts black_box "bookkeeping" between the fence and the TSC read,
-// breaking the tight window property. The verification tool MUST
-// detect that this function has extra instructions between the fence
-// and rdtsc.
+// enter() inlines stamp() which does fence -> TSC (tight).
+// Guard::drop inlines to TSC -> fence (tight).
 // ---------------------------------------------------------------------------
+
+/// Positive: enter(1) produces fence-then-TSC (stamp) and TSC-then-fence (drop).
+#[inline(never)]
+pub fn tm6_positive() -> u64 {
+    let _g = piano_runtime::enter(1);
+    black_box(42)
+}
+
+/// Negative: bookkeeping between fence and TSC (broken pattern).
 #[inline(never)]
 pub fn tm6_negative() -> u64 {
-    use core::sync::atomic::{compiler_fence, Ordering};
-    compiler_fence(Ordering::SeqCst);
-    // "Bookkeeping" between fence and TSC read -- breaks TM6
-    let garbage = black_box(123u64);
-    let ticks = piano_runtime::time::read();
-    black_box(garbage.wrapping_add(ticks))
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    black_box(99u64);
+    read()
 }
 
 // ---------------------------------------------------------------------------
-// TM7 positive control: enter/stamp split
+// TM7: enter/stamp split (code size)
 //
-// Ctx::enter() is #[inline(always)], calling enter_inner() (regular fn)
-// then stamp(). In the ASM:
-//   - enter_inner must appear as a `call` instruction
-//   - rdtsc must appear inline (from stamp())
+// enter() inlines to: call Guard::create (not inlined) + inline rdtsc.
+// Guard::create holds the heavy bookkeeping. stamp() is one inline TSC read.
 // ---------------------------------------------------------------------------
+
+/// Positive: enter(2) = call to Guard::create + inline TSC from stamp().
+/// Uses name_id=2 (different from tm6_positive's 1) to prevent LLVM merging.
 #[inline(never)]
-pub fn tm7_positive(ctx: &Ctx) -> u64 {
-    let (__g, _ctx) = ctx.enter(1);
-    black_box(99u64)
+pub fn tm7_positive() -> u64 {
+    let _g = piano_runtime::enter(2);
+    black_box(77)
 }
 
-// ---------------------------------------------------------------------------
-// TM7 negative control: everything inlined (no call to enter_inner)
-//
-// Directly calls time::read() inline -- no function call at all.
-// The verification tool must see that there is NO `call` to enter_inner.
-// ---------------------------------------------------------------------------
+/// Negative: inline TSC only, no function call.
 #[inline(never)]
 pub fn tm7_negative() -> u64 {
-    // Just an inline rdtsc with no function call -- violates the
-    // "enter_inner is a call instruction" property.
-    let ticks = piano_runtime::time::read();
-    black_box(ticks)
+    let t = read();
+    black_box(t)
 }
 
 // ---------------------------------------------------------------------------
-// TM8 positive control: PianoFuture::poll CPU ordering
+// TM8: PianoFuture::poll CPU time ordering
 //
-// Wraps a trivial future with PianoFuture (cpu_time_enabled = true) and
-// polls it once. PianoFuture::poll is generic, so this monomorphization
-// creates a concrete symbol the verification tool can inspect.
-//
-// The claim: cpu_now_ns() calls (clock_gettime) bracket the inner poll,
-// with compiler_fence markers separating bookkeeping from measurement.
-// In the ASM, clock_gettime must appear twice, and #MEMBARRIER must
-// appear between the pre-poll bookkeeping and the first clock_gettime.
+// Poll structure: fence -> cpu_now_ns -> (inner poll) -> cpu_now_ns -> fence
 // ---------------------------------------------------------------------------
+
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
 struct ReadyFuture(u64);
 
 impl Future for ReadyFuture {
@@ -104,92 +114,48 @@ impl Future for ReadyFuture {
     }
 }
 
+fn noop_waker() -> Waker {
+    fn no_op(_: *const ()) {}
+    fn clone_fn(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, no_op, no_op, no_op);
+    // SAFETY: vtable functions are valid no-ops.
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+}
+
+/// Positive: PianoFuture::poll has fence -> cpu_now_ns -> poll -> cpu_now_ns -> fence.
 #[inline(never)]
-pub fn tm8_positive(state: PianoFutureState) -> Poll<u64> {
-    let mut fut = PianoFuture::new(state, ReadyFuture(42));
-    // SAFETY: fut is a local, never moved after pinning.
-    let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+pub fn tm8_positive() -> u64 {
+    let mut fut = piano_runtime::enter_async(1, ReadyFuture(42));
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
-    pinned.poll(&mut cx)
+    // SAFETY: fut is local and never moved after pinning.
+    let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    match pinned.poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => 0,
+    }
 }
 
-// ---------------------------------------------------------------------------
-// TM8 negative control: clock_gettime with no fence between bookkeeping
-//
-// Calls cpu_now_ns() twice but with black_box "bookkeeping" between
-// the fence position and the clock read. The verification tool must
-// detect that bookkeeping intrudes into the measurement window.
-// ---------------------------------------------------------------------------
+/// Negative: bookkeeping between fence and cpu_now_ns (broken pattern).
 #[inline(never)]
 pub fn tm8_negative() -> u64 {
-    use core::sync::atomic::{compiler_fence, Ordering};
-    // "Pre-poll bookkeeping" then fence, but bookkeeping AFTER the fence
-    compiler_fence(Ordering::SeqCst);
-    let garbage = black_box(999u64);
-    let cpu_start = piano_runtime::cpu_clock::cpu_now_ns();
-    // Simulate inner poll
-    let result = black_box(42u64);
-    let cpu_end = piano_runtime::cpu_clock::cpu_now_ns();
-    compiler_fence(Ordering::SeqCst);
-    black_box(garbage + cpu_start + result + cpu_end)
-}
-
-// ---------------------------------------------------------------------------
-// Metrological controls: prove the tool can detect rdtsc / call / fence
-// ---------------------------------------------------------------------------
-
-// Must contain exactly one rdtsc and zero calls to enter_inner.
-// Uses wrapping_add(1) to prevent merging with tm7_negative.
-#[inline(never)]
-pub fn metrology_has_rdtsc() -> u64 {
-    let ticks = piano_runtime::time::read();
-    black_box(ticks.wrapping_add(1))
-}
-
-// Must contain zero rdtsc instructions.
-#[inline(never)]
-pub fn metrology_no_rdtsc() -> u64 {
-    black_box(42u64)
-}
-
-// Must contain a #MEMBARRIER annotation.
-#[inline(never)]
-pub fn metrology_has_fence() -> u64 {
-    use core::sync::atomic::{compiler_fence, Ordering};
-    compiler_fence(Ordering::SeqCst);
-    black_box(77u64)
-}
-
-// Must contain zero #MEMBARRIER annotations.
-#[inline(never)]
-pub fn metrology_no_fence() -> u64 {
-    black_box(88u64)
-}
-
-fn noop_waker() -> std::task::Waker {
-    fn no_op(_: *const ()) {}
-    fn clone_fn(p: *const ()) -> std::task::RawWaker {
-        std::task::RawWaker::new(p, &VTABLE)
-    }
-    static VTABLE: std::task::RawWakerVTable =
-        std::task::RawWakerVTable::new(clone_fn, no_op, no_op, no_op);
-    unsafe { std::task::Waker::from_raw(std::task::RawWaker::new(std::ptr::null(), &VTABLE)) }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    black_box(99u64);
+    piano_runtime::cpu_clock::cpu_now_ns()
 }
 
 fn main() {
-    // Prevent DCE. Each function must be reachable.
-    let root = RootCtx::new(None, true, &[]);
-    let ctx = root.ctx();
-    black_box(tm6_positive(&ctx));
-    black_box(tm6_negative());
-    black_box(tm7_positive(&ctx));
-    black_box(tm7_negative());
-    let (state, _ctx) = ctx.enter_async(1);
-    let _ = black_box(tm8_positive(state));
-    black_box(tm8_negative());
+    // Functions are called to prevent dead-code elimination.
     black_box(metrology_has_rdtsc());
     black_box(metrology_no_rdtsc());
     black_box(metrology_has_fence());
     black_box(metrology_no_fence());
+    black_box(tm6_positive());
+    black_box(tm6_negative());
+    black_box(tm7_positive());
+    black_box(tm7_negative());
+    black_box(tm8_positive());
+    black_box(tm8_negative());
 }

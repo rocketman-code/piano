@@ -30,8 +30,9 @@ const TSC_PATTERN: &str = "__UNSUPPORTED_ARCH__";
 /// The compiler fence annotation emitted by LLVM.
 const FENCE_PATTERN: &str = "#MEMBARRIER";
 
-/// Substring that identifies a call to enter_inner in the ASM.
-const ENTER_INNER_CALL: &str = "enter_inner";
+/// Substring that identifies a call to Guard::create in the ASM.
+/// enter() is #[inline(always)], Guard::create is NOT inlined.
+const GUARD_CREATE_CALL: &str = "Guard::create";
 
 /// Substring that identifies a call to cpu_now_ns in the ASM.
 const CPU_NOW_CALL: &str = "cpu_now_ns";
@@ -268,19 +269,19 @@ fn tm6_stamp_fence_then_tsc() {
         "tm6_positive: must contain a TSC read (from stamp)"
     );
 
-    // enter_inner must be called BEFORE the fence (bookkeeping done first).
-    let enter_inner_indices = find_indices(&lines, ENTER_INNER_CALL);
+    // Guard::create must be called BEFORE the fence (bookkeeping done first).
+    let create_indices = find_indices(&lines, GUARD_CREATE_CALL);
     assert!(
-        !enter_inner_indices.is_empty(),
-        "tm6_positive: enter_inner call not found"
+        !create_indices.is_empty(),
+        "tm6_positive: Guard::create call not found"
     );
-    let last_enter_inner = *enter_inner_indices.last().unwrap();
+    let last_create = *create_indices.last().unwrap();
 
-    // The stamp fence comes after enter_inner returns.
+    // The stamp fence comes after Guard::create returns.
     let stamp_fence = fences
         .iter()
-        .find(|&&f| f > last_enter_inner)
-        .expect("tm6_positive: no fence after enter_inner");
+        .find(|&&f| f > last_create)
+        .expect("tm6_positive: no fence after Guard::create");
     let stamp_tsc = tscs
         .iter()
         .find(|&&t| t > *stamp_fence)
@@ -385,14 +386,14 @@ fn tm6_drop_tsc_then_fence() {
 
 // ---- TM7: enter/stamp split (code size) ------------------------------------
 //
-// Claim: Ctx::enter() inlines to a call enter_inner() + inline rdtsc.
-//        enter_inner is NOT inlined (one shared copy via function call).
+// Claim: Ctx::enter() inlines to a call Guard::create() + inline rdtsc.
+//        Guard::create is NOT inlined (one shared copy via function call).
 //
 // What we verify:
-// (a) Positive: tm7_positive has a `call` to enter_inner AND an
+// (a) Positive: tm7_positive has a `call` to Guard::create AND an
 //     inline TSC read (rdtsc/cntvct).
 // (b) Negative: tm7_negative has an inline TSC read but NO call to
-//     enter_inner.
+//     Guard::create.
 
 #[test]
 fn tm7_enter_stamp_split() {
@@ -400,18 +401,18 @@ fn tm7_enter_stamp_split() {
         return;
     }
 
-    // Positive: must have both a call to enter_inner AND inline TSC.
+    // Positive: must have both a call to Guard::create AND inline TSC.
     let asm = extract_asm("tm7_positive");
     let lines = instruction_lines(&asm);
 
-    let has_enter_inner_call = lines.iter().any(|l| {
-        l.contains(ENTER_INNER_CALL) && (l.contains("call") || l.contains("bl"))
+    let has_create_call = lines.iter().any(|l| {
+        l.contains(GUARD_CREATE_CALL) && (l.contains("call") || l.contains("bl"))
     });
     let has_inline_tsc = count_pattern(&lines, TSC_PATTERN) >= 1;
 
     assert!(
-        has_enter_inner_call,
-        "tm7_positive: enter_inner must appear as a call instruction\nASM:\n{}",
+        has_create_call,
+        "tm7_positive: Guard::create must appear as a call instruction\nASM:\n{}",
         asm
     );
     assert!(
@@ -420,18 +421,18 @@ fn tm7_enter_stamp_split() {
         asm
     );
 
-    // Negative: inline TSC but NO call to enter_inner.
+    // Negative: inline TSC but NO call to Guard::create.
     let asm = extract_asm("tm7_negative");
     let lines = instruction_lines(&asm);
 
-    let has_enter_inner_call = lines.iter().any(|l| {
-        l.contains(ENTER_INNER_CALL) && (l.contains("call") || l.contains("bl"))
+    let has_create_call = lines.iter().any(|l| {
+        l.contains(GUARD_CREATE_CALL) && (l.contains("call") || l.contains("bl"))
     });
     let has_inline_tsc = count_pattern(&lines, TSC_PATTERN) >= 1;
 
     assert!(
-        !has_enter_inner_call,
-        "tm7_negative: must NOT have a call to enter_inner (everything is inline)\nASM:\n{}",
+        !has_create_call,
+        "tm7_negative: must NOT have a call to Guard::create (everything is inline)\nASM:\n{}",
         asm
     );
     assert!(

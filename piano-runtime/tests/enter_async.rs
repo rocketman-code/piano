@@ -1,12 +1,8 @@
-use piano_runtime::buffer::drain_thread_buffer;
-use piano_runtime::parent::current_parent;
+use piano_runtime::aggregator::drain_thread_agg;
 use piano_runtime::piano_future::enter_async;
 use piano_runtime::session::ProfileSession;
 
-// Level 2: enter_async composes session + parent + PianoFuture.
-
 fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
-    // Minimal single-threaded executor for testing.
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     let raw = RawWaker::new(
         std::ptr::null(),
@@ -28,78 +24,33 @@ fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
 #[test]
 fn async_enter_inactive_is_transparent() {
     std::thread::spawn(|| {
-        // No session initialized. enter_async should be transparent.
         let fut = enter_async(0, async { 42 });
         let result = block_on(fut);
-        assert_eq!(result, 42, "inactive future must pass through return value");
-    })
-    .join()
-    .unwrap();
-}
-
-#[test]
-fn async_enter_captures_parent_at_construction() {
-    std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
-
-        // Set up a parent via sync guard
-        let _outer = piano_runtime::guard::enter(0);
-        let outer_span = current_parent();
-
-        // enter_async captures parent from TLS at construction time
-        let fut = enter_async(1, async { 42 });
-        let result = block_on(fut);
-
         assert_eq!(result, 42);
-
-        // Check the measurement
-        drop(_outer);
-        let drained = drain_thread_buffer();
-        // Two measurements: the async future + the outer sync guard
-        assert_eq!(drained.len(), 2, "expected 2 measurements");
-
-        // The async measurement's parent should be the outer sync span
-        let async_m = drained.iter().find(|m| m.name_id == 1).expect("async measurement");
-        assert_eq!(
-            async_m.parent_span_id, outer_span,
-            "async parent must be the sync span that was active at construction"
-        );
-    })
-    .join()
-    .unwrap();
+    }).join().unwrap();
 }
 
 #[test]
-fn async_enter_emits_measurement_on_completion() {
+fn async_enter_emits_aggregate_on_completion() {
     std::thread::spawn(|| {
         ProfileSession::init(None, false, &[]);
-
         let fut = enter_async(0, async { 42 });
         let _ = block_on(fut);
-
-        let drained = drain_thread_buffer();
-        assert_eq!(drained.len(), 1, "completed future must emit one measurement");
-
-        let m = &drained[0];
-        assert_ne!(m.span_id, 0);
-        assert_eq!(m.name_id, 0);
-        assert!(m.end_ns >= m.start_ns);
-    })
-    .join()
-    .unwrap();
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 1);
+        assert_eq!(agg[0].calls, 1);
+        assert_eq!(agg[0].name_id, 0);
+    }).join().unwrap();
 }
 
 #[test]
 fn async_enter_emits_on_drop_if_cancelled() {
     std::thread::spawn(|| {
         ProfileSession::init(None, false, &[]);
-
         {
-            // Create and poll once, then drop (simulate cancellation)
-            let mut _fut = enter_async(0, async {
+            let mut fut = enter_async(0, async {
                 std::future::pending::<()>().await;
             });
-            // Poll once to start timing
             use std::future::Future;
             use std::task::{Context, RawWaker, RawWakerVTable, Waker};
             let raw = RawWaker::new(
@@ -110,58 +61,148 @@ fn async_enter_emits_on_drop_if_cancelled() {
                 RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
             let waker = unsafe { Waker::from_raw(raw) };
             let mut cx = Context::from_waker(&waker);
-            let mut pinned = unsafe { std::pin::Pin::new_unchecked(&mut _fut) };
-            let _ = pinned.as_mut().poll(&mut cx); // returns Pending
-            // _fut drops here (cancelled)
+            let pinned = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+            let _ = pinned.poll(&mut cx);
         }
-
-        let drained = drain_thread_buffer();
-        assert_eq!(drained.len(), 1, "cancelled future must emit measurement on drop");
-    })
-    .join()
-    .unwrap();
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 1, "cancelled future must emit aggregate");
+    }).join().unwrap();
 }
 
 #[test]
 fn never_polled_future_emits_nothing() {
     std::thread::spawn(|| {
         ProfileSession::init(None, false, &[]);
+        { let _fut = enter_async(0, async { 42 }); }
+        let agg = drain_thread_agg();
+        assert!(agg.is_empty(), "never-polled future must emit nothing");
+    }).join().unwrap();
+}
 
-        {
-            let _fut = enter_async(0, async { 42 });
-            // Drop without polling
+#[test]
+fn wall_time_starts_on_first_poll_not_construction() {
+    std::thread::spawn(|| {
+        ProfileSession::init(None, false, &[]);
+
+        let fut = enter_async(0, async { 42 });
+        // 10ms gap between construction and polling
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _ = block_on(fut);
+
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 1);
+        // If timing started at construction, self_ns would be >= 10ms.
+        // If timing started at first poll, self_ns should be < 1ms.
+        assert!(
+            agg[0].self_ns < 1_000_000,
+            "self_ns ({} ns) should be < 1ms; wall time must start at first poll, not construction",
+            agg[0].self_ns
+        );
+    }).join().unwrap();
+}
+
+#[test]
+fn panicking_inner_future_emits_aggregate() {
+    std::thread::spawn(|| {
+        ProfileSession::init(None, false, &[]);
+
+        struct PanickingFuture;
+        impl std::future::Future for PanickingFuture {
+            type Output = ();
+            fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>)
+                -> std::task::Poll<()> {
+                panic!("intentional panic in poll");
+            }
         }
 
-        let drained = drain_thread_buffer();
-        assert_eq!(drained.len(), 0, "never-polled future must emit nothing");
-    })
-    .join()
-    .unwrap();
+        use std::future::Future;
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+        let raw = RawWaker::new(
+            std::ptr::null(),
+            &RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {}),
+        );
+        const VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+        let waker = unsafe { Waker::from_raw(raw) };
+        let mut cx = Context::from_waker(&waker);
+
+        let mut pf = enter_async(0, PanickingFuture);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let pinned = unsafe { std::pin::Pin::new_unchecked(&mut pf) };
+            let _ = pinned.poll(&mut cx);
+        }));
+        assert!(result.is_err(), "poll should have panicked");
+
+        drop(pf);
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 1, "panicking future must emit aggregate via Drop");
+    }).join().unwrap();
+}
+
+#[test]
+fn multi_poll_alloc_accumulation() {
+    std::thread::spawn(|| {
+        use piano_runtime::alloc::record_alloc;
+
+        ProfileSession::init(None, false, &[]);
+
+        struct AllocPerPoll {
+            polled: bool,
+        }
+        impl std::future::Future for AllocPerPoll {
+            type Output = ();
+            fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>)
+                -> std::task::Poll<()> {
+                let this = self.get_mut();
+                if this.polled {
+                    record_alloc(200);
+                    std::task::Poll::Ready(())
+                } else {
+                    record_alloc(100);
+                    this.polled = true;
+                    std::task::Poll::Pending
+                }
+            }
+        }
+
+        use std::future::Future;
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+        let raw = RawWaker::new(
+            std::ptr::null(),
+            &RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {}),
+        );
+        const VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+        let waker = unsafe { Waker::from_raw(raw) };
+        let mut cx = Context::from_waker(&waker);
+
+        let mut pf = enter_async(0, AllocPerPoll { polled: false });
+
+        // First poll: Pending, 100 bytes
+        let pinned = unsafe { std::pin::Pin::new_unchecked(&mut pf) };
+        assert!(pinned.poll(&mut cx).is_pending());
+
+        // Second poll: Ready, 200 bytes
+        let pinned = unsafe { std::pin::Pin::new_unchecked(&mut pf) };
+        assert!(pinned.poll(&mut cx).is_ready());
+
+        drop(pf);
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 1);
+        assert_eq!(agg[0].alloc_count, 2, "allocs from both polls must accumulate");
+        assert_eq!(agg[0].alloc_bytes, 300, "bytes from both polls must accumulate");
+    }).join().unwrap();
 }
 
 #[test]
 fn async_closure_no_capture() {
-    // The critical proof: enter_async inside a closure creates NO captures.
     std::thread::spawn(|| {
         ProfileSession::init(None, false, &[]);
-
         let handle = std::thread::spawn(|| {
             let fut = enter_async(0, async { 42 });
             block_on(fut)
         });
         assert_eq!(handle.join().unwrap(), 42);
-
-        // In method chain
-        let results: Vec<u32> = (0..3)
-            .map(|_| {
-                let fut = enter_async(1, async { 7 });
-                block_on(fut)
-            })
-            .collect();
-        assert_eq!(results, vec![7, 7, 7]);
-
-        drain_thread_buffer();
-    })
-    .join()
-    .unwrap();
+        drain_thread_agg();
+    }).join().unwrap();
 }

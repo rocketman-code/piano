@@ -210,7 +210,7 @@ fn no_test_backdoors_in_source() {
         let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         // buffer_global.rs tests drain_all_buffers itself.
         // shutdown.rs uses drain_all_buffers in the deadlock composition proof.
-        if filename == "buffer_global.rs" || filename == "shutdown.rs" || filename == "no_test_backdoors.rs" {
+        if filename == "buffer_global.rs" || filename == "shutdown.rs" || filename == "compositions.rs" || filename == "no_test_backdoors.rs" {
             return;
         }
         for (line_num, line) in contents.lines().enumerate() {

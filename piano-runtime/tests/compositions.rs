@@ -1,12 +1,11 @@
 //! Composition proofs: verify that components sharing a resource
-//! interact correctly. Each test targets a specific pair from the
-//! composition matrix.
+//! interact correctly.
 
-use piano_runtime::buffer::drain_thread_buffer;
+use piano_runtime::aggregator::drain_thread_agg;
 use piano_runtime::guard::enter;
-use piano_runtime::parent::current_parent;
 use piano_runtime::piano_future::enter_async;
 use piano_runtime::session::ProfileSession;
+use std::future::Future;
 
 fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -27,171 +26,44 @@ fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
     }
 }
 
-// ---------------------------------------------------------------
-// TLS parent_span_id: PianoFuture × PianoFuture (nested)
-// ---------------------------------------------------------------
-
+// Nested PianoFutures compute correct self-time.
+// Outer's self_ns should exclude inner's inclusive time.
 #[test]
-fn nested_piano_futures_tls_parent_chain() {
+fn nested_piano_futures_self_time() {
     std::thread::spawn(|| {
         ProfileSession::init(None, false, &[]);
 
-        let result = block_on(async {
-            // Outer async
+        block_on(async {
             let outer_fut = enter_async(0, async {
-                let outer_span = current_parent();
-
-                // Inner async (nested)
                 let inner_fut = enter_async(1, async {
-                    let inner_span = current_parent();
-                    assert_ne!(inner_span, outer_span, "inner must have different span");
-                    inner_span
+                    std::hint::black_box(vec![0u8; 64]);
                 });
-                let inner_span = block_on(inner_fut);
-
-                // After inner completes, TLS restored to outer's span
-                assert_eq!(
-                    current_parent(), outer_span,
-                    "TLS must be restored after inner PianoFuture completes"
-                );
-
-                (outer_span, inner_span)
+                block_on(inner_fut);
+                std::hint::black_box(vec![0u8; 64]);
             });
-            block_on(outer_fut)
+            block_on(outer_fut);
         });
 
-        let (outer_span, inner_span) = result;
-        assert_ne!(outer_span, 0);
-        assert_ne!(inner_span, 0);
-        assert_ne!(outer_span, inner_span);
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 2);
 
-        // Verify parent-child chain in measurements
-        let drained = drain_thread_buffer();
-        assert_eq!(drained.len(), 2, "two measurements (inner + outer)");
+        let outer = agg.iter().find(|a| a.name_id == 0).unwrap();
+        let inner = agg.iter().find(|a| a.name_id == 1).unwrap();
 
-        let inner_m = drained.iter().find(|m| m.name_id == 1).expect("inner measurement");
-        let outer_m = drained.iter().find(|m| m.name_id == 0).expect("outer measurement");
-
-        assert_eq!(
-            inner_m.parent_span_id, outer_span,
-            "inner's parent must be outer's span_id"
-        );
-        assert_eq!(
-            outer_m.parent_span_id, 0,
-            "outer's parent must be root (0)"
+        // Inner has no children: self == inclusive
+        assert_eq!(inner.self_ns, inner.inclusive_ns);
+        // Outer's self < inclusive (inner subtracted)
+        assert!(
+            outer.self_ns < outer.inclusive_ns,
+            "outer self ({}) must be < inclusive ({})",
+            outer.self_ns, outer.inclusive_ns
         );
     })
     .join()
     .unwrap();
 }
 
-// ---------------------------------------------------------------
-// Buffer: Signal try_lock × Shutdown drain
-// ---------------------------------------------------------------
-
-#[test]
-fn signal_drain_then_shutdown_drain_no_duplicates() {
-    // Simulate: signal handler drains buffer (via try_lock),
-    // then shutdown drains the same buffer (blocking lock).
-    // Second drain must find empty (no duplicates).
-    use piano_runtime::buffer::{drain_all_buffers, get_thread_buffer_arc};
-    use std::sync::{Arc, Mutex};
-
-    std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
-
-        // Push measurements
-        for _ in 0..5 {
-            let _g = enter(0);
-        }
-
-        // Get the buffer Arc
-        let buf_arc = get_thread_buffer_arc().expect("buffer initialized");
-
-        // Simulate signal drain (try_lock)
-        let signal_drained = {
-            let mut buf = buf_arc.try_lock().expect("no contention in test");
-            buf.drain()
-        };
-        assert_eq!(signal_drained.len(), 5, "signal drain gets all 5");
-
-        // Simulate shutdown drain (blocking lock) on same buffer
-        let registry: Arc<Mutex<Vec<Arc<Mutex<piano_runtime::buffer::ThreadBuffer>>>>> =
-            Arc::new(Mutex::new(vec![Arc::clone(&buf_arc)]));
-        let shutdown_drained = drain_all_buffers(&registry);
-        assert_eq!(
-            shutdown_drained.len(), 0,
-            "shutdown drain after signal drain must find empty (no duplicates)"
-        );
-    })
-    .join()
-    .unwrap();
-}
-
-// ---------------------------------------------------------------
-// File: Signal write × Shutdown write (ordering)
-// ---------------------------------------------------------------
-
-#[test]
-fn signal_write_before_shutdown_write_sequential() {
-    // When both signal handler and shutdown write to the same file,
-    // signal writes happen BEFORE shutdown (signal → re-raise → exit → atexit).
-    // Verify by checking that the file has valid structure.
-    use piano_runtime::file_sink::FileSink;
-    use std::io::{BufRead, BufReader};
-    use std::sync::Arc;
-
-    std::thread::spawn(|| {
-        let path = std::env::temp_dir().join(format!(
-            "piano_test_signal_shutdown_order_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let file = std::fs::File::create(&path).unwrap();
-        let fs = Arc::new(FileSink::new(file));
-
-        let session = ProfileSession::init(
-            Some(fs),
-            false,
-            &[(0, "test::work")],
-        );
-
-        // Push measurements below threshold (stay in buffer)
-        for _ in 0..5 {
-            let _g = enter(0);
-        }
-
-        // Simulate: signal handler drains and writes
-        // (In real code, this happens via the signal handler's try_lock path.
-        // Here we manually drain + write to verify the file structure.)
-        let drained = drain_thread_buffer();
-        assert_eq!(drained.len(), 5);
-
-        // File should have: header (from init). No measurements yet (below threshold).
-        let lines_before = {
-            let f = std::fs::File::open(&path).unwrap();
-            BufReader::new(f).lines().map(|l| l.unwrap()).collect::<Vec<_>>()
-        };
-        assert!(lines_before[0].contains("\"type\":\"header\""));
-        assert_eq!(lines_before.len(), 1, "only header before drain write");
-
-        // Note: we can't easily test the actual signal handler's raw write
-        // from a unit test, but we verified the composition is sequential:
-        // signal writes → process terminates → atexit writes.
-        // The double-drain safety ensures no duplicates.
-
-        let _ = std::fs::remove_file(&path);
-    })
-    .join()
-    .unwrap();
-}
-
-// ---------------------------------------------------------------
-// Alloc counters: Guard × PianoFuture (nested deltas)
-// ---------------------------------------------------------------
-
+// Guard inside PianoFuture: alloc deltas compose correctly.
 #[test]
 fn guard_inside_piano_future_alloc_deltas_compose() {
     std::thread::spawn(|| {
@@ -199,75 +71,116 @@ fn guard_inside_piano_future_alloc_deltas_compose() {
 
         block_on(async {
             let fut = enter_async(0, async {
-                // Allocate inside the PianoFuture's poll
-                let _v: Vec<u8> = Vec::with_capacity(1024);
-
-                // Sync guard inside async context
                 {
                     let _g = enter(1);
-                    let _v2: Vec<u8> = Vec::with_capacity(2048);
+                    piano_runtime::alloc::record_alloc(200);
                 }
-                // Guard drops here, pushes measurement with its alloc delta
+                piano_runtime::alloc::record_alloc(100);
             });
             block_on(fut);
         });
 
-        let drained = drain_thread_buffer();
-        assert_eq!(drained.len(), 2, "PianoFuture + sync Guard");
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 2);
 
-        let sync_m = drained.iter().find(|m| m.name_id == 1).expect("sync measurement");
-        let async_m = drained.iter().find(|m| m.name_id == 0).expect("async measurement");
+        let sync_m = agg.iter().find(|a| a.name_id == 1).unwrap();
+        let async_m = agg.iter().find(|a| a.name_id == 0).unwrap();
 
-        // Composition: PianoFuture's alloc delta must be >= Guard's delta
-        // (PF's poll encompasses the Guard's lifetime, so its delta is a superset).
-        // Note: alloc tracking requires PianoAllocator (integration test concern).
-        // Without it, both are 0. The composition relationship still holds (0 >= 0).
-        assert!(
-            async_m.alloc_bytes >= sync_m.alloc_bytes,
-            "async alloc_bytes ({}) must be >= sync alloc_bytes ({})",
-            async_m.alloc_bytes, sync_m.alloc_bytes
-        );
-
-        // Both measurements must have valid timing
-        assert!(sync_m.end_ns >= sync_m.start_ns, "sync timing valid");
-        assert!(async_m.end_ns >= async_m.start_ns, "async timing valid");
+        assert_eq!(sync_m.alloc_count, 1);
+        assert_eq!(sync_m.alloc_bytes, 200);
+        // Async's alloc includes its own (100) + sync child (200)
+        assert_eq!(async_m.alloc_count, 2);
+        assert_eq!(async_m.alloc_bytes, 300);
     })
     .join()
     .unwrap();
 }
 
-// ---------------------------------------------------------------
-// Alloc counters: Guard × ReentrancyGuard (bookkeeping exclusion)
-// ---------------------------------------------------------------
+fn make_waker() -> std::task::Waker {
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+    fn no_op(_: *const ()) {}
+    fn clone_fn(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_fn, no_op, no_op, no_op);
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+}
 
+// PianoFuture polled on thread A (Pending), completed on thread B.
+// Alloc deltas from both polls must accumulate correctly.
 #[test]
-fn guard_excludes_own_bookkeeping_allocs() {
-    std::thread::spawn(|| {
+fn piano_future_thread_migration() {
+    use piano_runtime::alloc::record_alloc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FlagFuture {
+        ready: std::sync::Arc<AtomicBool>,
+    }
+
+    impl std::future::Future for FlagFuture {
+        type Output = u64;
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<u64> {
+            if self.ready.load(Ordering::Relaxed) {
+                record_alloc(200);
+                std::task::Poll::Ready(42)
+            } else {
+                record_alloc(100);
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    let flag = std::sync::Arc::new(AtomicBool::new(false));
+    let flag2 = std::sync::Arc::clone(&flag);
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<
+        std::pin::Pin<Box<piano_runtime::PianoFuture<FlagFuture>>>,
+    >(1);
+
+    let handle_a = std::thread::spawn(move || {
         ProfileSession::init(None, false, &[]);
 
-        // Create a guard. The guard's own creation may allocate
-        // (TLS init, buffer registration, etc.). These bookkeeping
-        // allocs must NOT appear in the measurement's alloc delta.
-        {
-            let _g = enter(0);
-            // Do nothing inside the guard. Any allocs in the
-            // measurement must be from guard bookkeeping (should be 0).
-        }
+        let pf = enter_async(0, FlagFuture { ready: flag2 });
+        let mut boxed = Box::pin(pf);
 
-        let drained = drain_thread_buffer();
-        assert_eq!(drained.len(), 1);
-        let m = &drained[0];
+        let waker = make_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let result = boxed.as_mut().poll(&mut cx);
+        assert!(result.is_pending());
+
+        tx.send(boxed).unwrap();
+    });
+
+    let handle_b = std::thread::spawn(move || {
+        let mut boxed = rx.recv().unwrap();
+
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let waker = make_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let result = boxed.as_mut().poll(&mut cx);
+        assert!(matches!(result, std::task::Poll::Ready(42)));
+
+        drop(boxed);
+
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 1);
+
+        let m = &agg[0];
         assert_eq!(
-            m.alloc_count, 0,
-            "empty guard body must have zero user allocs, got {}",
-            m.alloc_count
+            m.alloc_count, 2,
+            "allocs from both polls (thread A + B) must accumulate"
         );
         assert_eq!(
-            m.alloc_bytes, 0,
-            "empty guard body must have zero user alloc bytes, got {}",
-            m.alloc_bytes
+            m.alloc_bytes, 300,
+            "bytes from both polls (100 + 200) must accumulate"
         );
-    })
-    .join()
-    .unwrap();
+    });
+
+    handle_a.join().expect("thread A panicked");
+    handle_b.join().expect("thread B panicked");
 }

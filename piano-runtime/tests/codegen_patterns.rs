@@ -1,414 +1,272 @@
-use piano_runtime::buffer::drain_thread_buffer;
-use piano_runtime::ctx::{Ctx, RootCtx};
-use piano_runtime::file_sink::FileSink;
-use piano_runtime::piano_future::PianoFuture;
-use std::fs::{self, File};
-use std::future::Future;
-use std::io::{BufRead, BufReader};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+//! Code generation pattern tests.
+//!
+//! Each function below mirrors the EXACT code the rewriter produces.
+//! If these compile and pass, the injection patterns are correct.
 
-// Code generation pattern tests.
-//
-// These prove that the exact code patterns the rewriter generates
-// produce correct measurements when compiled against the runtime.
-// Each test IS a theorem. If it passes, the pattern is correct.
-// All tests run in spawned threads for TLS isolation.
+use piano_runtime::aggregator::drain_thread_agg;
+use piano_runtime::session::ProfileSession;
+use piano_runtime::PianoAllocator;
+use std::alloc::System;
 
-fn noop_waker() -> Waker {
-    fn no_op(_: *const ()) {}
-    fn clone_fn(p: *const ()) -> RawWaker {
-        RawWaker::new(p, &VTABLE)
+const PIANO_NAMES: &[(u32, &str)] = &[
+    (0, "measured_sync"),
+    (1, "measured_async"),
+    (2, "inner_fn"),
+    (3, "unsafe_measured"),
+];
+
+// --- Rewriter output patterns ---
+
+fn measured_sync(x: i32) -> i32 {
+    let __piano_guard = piano_runtime::enter(0);
+    x + 1
+}
+
+async fn measured_async(x: i32) -> i32 {
+    piano_runtime::enter_async(1, async move {
+        x * 2
+    })
+    .await
+}
+
+fn outer_with_inner(x: i32) -> i32 {
+    let __piano_guard = piano_runtime::enter(0);
+    fn inner_fn(y: i32) -> i32 {
+        let __piano_guard = piano_runtime::enter(2);
+        y * 3
     }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, no_op, no_op, no_op);
-    // SAFETY: The vtable functions are valid no-ops. The data pointer is
-    // null and never dereferenced.
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    inner_fn(x)
 }
 
-fn test_file(label: &str) -> (Arc<FileSink>, std::path::PathBuf) {
-    let path = std::env::temp_dir().join(format!(
-        "piano_test_codegen_{}_{}", label,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let file = File::create(&path).expect("create temp file");
-    (Arc::new(FileSink::new(file)), path)
+fn with_closure(items: &[i32]) -> Vec<i32> {
+    let __piano_guard = piano_runtime::enter(0);
+    items.iter().map(|x| x + 1).collect()
 }
 
-fn read_lines(path: &std::path::Path) -> Vec<String> {
-    let file = File::open(path).expect("open temp file for reading");
-    BufReader::new(file)
-        .lines()
-        .map(|l| l.expect("read line"))
-        .collect()
+unsafe fn unsafe_measured(ptr: *const i32) -> i32 {
+    let __piano_guard = piano_runtime::enter(3);
+    unsafe { *ptr }
 }
 
-// ---------------------------------------------------------------------------
-// PoC: Context shadowing (G4 + T3)
-// ---------------------------------------------------------------------------
+#[allow(unused_variables)]
+fn with_inner_attr(x: i32) -> i32 {
+    #![allow(unused)]
+    let __piano_guard = piano_runtime::enter(0);
+    let unused = 42;
+    x
+}
 
-// PROOF: The rewriter generates `let (__g, ctx) = ctx.enter(ID);` which
-// shadows the outer ctx. This test uses the EXACT shadowing pattern and
-// verifies the parent-child chain is correct across 3 levels.
-//
-// DISCRIMINATES: If shadowing broke parent propagation (e.g., if the child
-// ctx somehow retained the outer's span_id), the parent_span_id chain
-// would be wrong.
+// --- Compilation pattern tests ---
+
 #[test]
-fn context_shadowing_three_levels() {
+fn sync_guard_injection_compiles_and_runs() {
     std::thread::spawn(|| {
-        let _root = RootCtx::new(None, false, &[]);
-        let ctx = _root.ctx();
+        ProfileSession::init(None, false, PIANO_NAMES);
+        let result = measured_sync(10);
+        assert_eq!(result, 11);
+        drain_thread_agg();
+    })
+    .join()
+    .expect("test thread panicked");
+}
 
-        // Exact rewriter pattern: shadow ctx at each level
+#[test]
+fn async_whole_body_wrapping_compiles_and_runs() {
+    std::thread::spawn(|| {
+        ProfileSession::init(None, false, PIANO_NAMES);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let result = rt.block_on(measured_async(5));
+        assert_eq!(result, 10);
+        drain_thread_agg();
+    })
+    .join()
+    .expect("test thread panicked");
+}
+
+#[test]
+fn inner_function_instrumented() {
+    std::thread::spawn(|| {
+        ProfileSession::init(None, false, PIANO_NAMES);
+        let result = outer_with_inner(4);
+        assert_eq!(result, 12);
+        drain_thread_agg();
+    })
+    .join()
+    .expect("test thread panicked");
+}
+
+#[test]
+fn closure_not_instrumented() {
+    std::thread::spawn(|| {
+        ProfileSession::init(None, false, PIANO_NAMES);
+        let result = with_closure(&[1, 2, 3]);
+        assert_eq!(result, vec![2, 3, 4]);
+        drain_thread_agg();
+    })
+    .join()
+    .expect("test thread panicked");
+}
+
+#[test]
+fn unsafe_fn_instrumented() {
+    std::thread::spawn(|| {
+        let val: i32 = 99;
+        ProfileSession::init(None, false, PIANO_NAMES);
+        let result = unsafe { unsafe_measured(&val) };
+        assert_eq!(result, 99);
+        drain_thread_agg();
+    })
+    .join()
+    .expect("test thread panicked");
+}
+
+#[test]
+fn inner_attrs_before_guard() {
+    std::thread::spawn(|| {
+        ProfileSession::init(None, false, PIANO_NAMES);
+        let result = with_inner_attr(5);
+        assert_eq!(result, 5);
+        drain_thread_agg();
+    })
+    .join()
+    .expect("test thread panicked");
+}
+
+// --- Static verification tests ---
+
+#[test]
+fn name_table_format() {
+    assert_eq!(PIANO_NAMES[0], (0, "measured_sync"));
+    assert_eq!(PIANO_NAMES[1], (1, "measured_async"));
+    assert_eq!(PIANO_NAMES[2], (2, "inner_fn"));
+    assert_eq!(PIANO_NAMES[3], (3, "unsafe_measured"));
+}
+
+#[test]
+fn allocator_wrapping_const() {
+    const _: PianoAllocator<System> = PianoAllocator::new(System);
+}
+
+// --- Behavioral correctness ---
+
+#[test]
+fn nested_guards_compute_correct_self_time() {
+    std::thread::spawn(|| {
+        ProfileSession::init(None, false, PIANO_NAMES);
+
         {
-            let (__g, ctx) = ctx.enter(1);
+            let _g1 = piano_runtime::enter(0);
+            std::hint::black_box(vec![0u8; 64]);
             {
-                let (__g, ctx) = ctx.enter(2);
+                let _g2 = piano_runtime::enter(1);
+                std::hint::black_box(vec![0u8; 64]);
                 {
-                    let (__g, _ctx) = ctx.enter(3);
-                    drop(__g);
+                    let _g3 = piano_runtime::enter(2);
+                    std::hint::black_box(vec![0u8; 64]);
                 }
-                drop(__g);
             }
-            drop(__g);
         }
 
-        let drained = drain_thread_buffer();
-        assert_eq!(drained.len(), 3, "3 levels = 3 measurements");
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 3, "3 functions = 3 aggregate entries");
 
-        // Drop order: level 3 first, level 1 last
-        let m3 = &drained[0];
-        let m2 = &drained[1];
-        let m1 = &drained[2];
+        let f0 = agg.iter().find(|a| a.name_id == 0).unwrap();
+        let f1 = agg.iter().find(|a| a.name_id == 1).unwrap();
+        let f2 = agg.iter().find(|a| a.name_id == 2).unwrap();
 
-        // Parent chain: 3 -> 2 -> 1 -> root(0)
-        assert_eq!(m1.parent_span_id, 0, "level 1 parent is root");
-        assert_eq!(m2.parent_span_id, m1.span_id, "level 2 parent is level 1");
-        assert_eq!(m3.parent_span_id, m2.span_id, "level 3 parent is level 2");
-
-        // Name IDs preserved
-        assert_eq!(m1.name_id, 1);
-        assert_eq!(m2.name_id, 2);
-        assert_eq!(m3.name_id, 3);
+        // Innermost has no children: self == inclusive
+        assert_eq!(f2.self_ns, f2.inclusive_ns);
+        // Middle's self < inclusive (inner subtracted)
+        assert!(f1.self_ns < f1.inclusive_ns);
+        // Outer's self < inclusive (middle+inner subtracted)
+        assert!(f0.self_ns < f0.inclusive_ns);
     })
     .join()
     .expect("test thread panicked");
 }
 
-// PROOF: Shadowing with sibling calls. The rewriter generates:
-//   let (__g, ctx) = ctx.enter(1);
-//   callee_a(ctx.clone());
-//   callee_b(ctx.clone());
-// Both siblings must have the SAME parent (level 1's span_id).
 #[test]
-fn context_shadowing_with_siblings() {
+fn siblings_both_aggregated() {
     std::thread::spawn(|| {
-        let _root = RootCtx::new(None, false, &[]);
-        let ctx = _root.ctx();
+        ProfileSession::init(None, false, PIANO_NAMES);
 
         {
-            let (__g, ctx) = ctx.enter(1);
-
-            // Sibling A
-            {
-                let (__g, _ctx) = ctx.clone().enter(2);
-                drop(__g);
-            }
-
-            // Sibling B
-            {
-                let (__g, _ctx) = ctx.clone().enter(3);
-                drop(__g);
-            }
-
-            drop(__g);
+            let _g1 = piano_runtime::enter(0);
+            { let _g2 = piano_runtime::enter(1); }
+            { let _g3 = piano_runtime::enter(2); }
         }
 
-        let drained = drain_thread_buffer();
-        assert_eq!(drained.len(), 3);
-
-        let sib_a = &drained[0];
-        let sib_b = &drained[1];
-        let parent = &drained[2];
-
-        assert_eq!(sib_a.parent_span_id, parent.span_id);
-        assert_eq!(sib_b.parent_span_id, parent.span_id);
-        assert_ne!(sib_a.span_id, sib_b.span_id, "siblings have distinct span_ids");
-        assert_eq!(sib_a.name_id, 2);
-        assert_eq!(sib_b.name_id, 3);
-        assert_eq!(parent.name_id, 1);
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 3);
+        for a in &agg {
+            assert_eq!(a.calls, 1);
+        }
     })
     .join()
     .expect("test thread panicked");
 }
 
-// ---------------------------------------------------------------------------
-// PoC: Async desugar pattern (A1 + A4 + A5)
-// ---------------------------------------------------------------------------
-
-// PROOF: The rewriter desugars async fn into fn -> impl Future with
-// PianoFuture wrapping. This test uses the EXACT desugared pattern.
-//
-// DISCRIMINATES: If the pattern didn't compile, ctx wasn't captured,
-// or timing didn't start on first poll, the test would fail.
 #[test]
-fn async_desugar_pattern_compiles_and_works() {
+fn async_preamble_has_nonzero_self_time() {
     std::thread::spawn(|| {
+        ProfileSession::init(None, false, PIANO_NAMES);
+
+        use std::future::Future;
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+        fn noop_waker() -> Waker {
+            fn no_op(_: *const ()) {}
+            fn clone_fn(p: *const ()) -> RawWaker {
+                RawWaker::new(p, &VTABLE)
+            }
+            static VTABLE: RawWakerVTable =
+                RawWakerVTable::new(clone_fn, no_op, no_op, no_op);
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        }
+
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        let _root = RootCtx::new(None, false, &[]);
-        let ctx = _root.ctx();
-
-        // Exact rewriter desugar: fn returning impl Future
-        fn desugared_async(ctx: Ctx) -> impl Future<Output = u64> {
-            let (state, ctx) = ctx.enter_async(10);
-            PianoFuture::new(state, async move {
-                // ctx is captured -- prove it by entering a nested call
-                let (__g, _ctx) = ctx.enter(11);
-                drop(__g);
-                42u64
-            })
-        }
-
-        let mut fut = desugared_async(ctx);
-        // SAFETY: fut is a local, never moved after pinning.
-        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
-        let result = pinned.poll(&mut cx);
-
-        assert!(
-            matches!(result, std::task::Poll::Ready(42)),
-            "desugared async must complete with correct value"
-        );
-        drop(fut);
-
-        let drained = drain_thread_buffer();
-        assert_eq!(drained.len(), 2, "PianoFuture + nested Guard = 2 measurements");
-
-        // Nested sync guard drops first, then PianoFuture
-        let nested = &drained[0];
-        let outer = &drained[1];
-
-        assert_eq!(outer.name_id, 10);
-        assert_eq!(nested.name_id, 11);
-        assert_eq!(
-            nested.parent_span_id, outer.span_id,
-            "nested sync call inside async must have async's span_id as parent"
-        );
-    })
-    .join()
-    .expect("test thread panicked");
-}
-
-// PROOF: Preamble work (before first .await) is included in timing
-// because the entire body is inside async move {}.
-//
-// DISCRIMINATES: If preamble leaked outside async move, its wall time
-// would not be captured by PianoFuture (which starts timing on first poll).
-#[test]
-fn async_desugar_preamble_included_in_timing() {
-    std::thread::spawn(|| {
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        let _root = RootCtx::new(None, false, &[]);
-        let ctx = _root.ctx();
-
-        fn desugared_with_preamble(ctx: Ctx) -> impl Future<Output = ()> {
-            let (state, _ctx) = ctx.enter_async(20);
-            PianoFuture::new(state, async move {
-                // Preamble work: busy loop INSIDE async move, before any .await
-                let mut sum = 0u64;
-                for i in 0..100_000 {
-                    sum = sum.wrapping_add(i);
-                }
-                std::hint::black_box(sum);
-            })
-        }
-
-        let mut fut = desugared_with_preamble(ctx);
-        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        let mut fut = piano_runtime::enter_async(0, async move {
+            let mut sum = 0u64;
+            for i in 0..100_000 {
+                sum = sum.wrapping_add(i);
+            }
+            std::hint::black_box(sum);
+        });
+        let pinned = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
         let _ = pinned.poll(&mut cx);
         drop(fut);
 
-        let drained = drain_thread_buffer();
-        assert_eq!(drained.len(), 1);
-
-        let m = &drained[0];
-        let wall = m.end_ns.saturating_sub(m.start_ns);
-        assert!(
-            wall > 0,
-            "preamble work must produce nonzero wall time: got {}",
-            wall
-        );
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 1);
+        assert!(agg[0].self_ns > 0, "preamble must produce nonzero self_ns");
     })
     .join()
     .expect("test thread panicked");
 }
 
-// ---------------------------------------------------------------------------
-// PoC: Clone-and-spawn (C1 + C2)
-// ---------------------------------------------------------------------------
-
-// PROOF: ctx.clone() moved to a spawned thread produces measurements
-// with correct parent_span_id (matching the clone site's span_id).
-//
-// DISCRIMINATES: If clone didn't copy current_span_id, or if the spawned
-// thread's measurement had parent_span_id == 0, the parent chain would
-// be wrong.
 #[test]
-fn clone_and_spawn_correct_parent() {
+fn spawn_no_capture_required() {
     std::thread::spawn(|| {
-        let _root = RootCtx::new(None, false, &[]);
-        let ctx = _root.ctx();
+        ProfileSession::init(None, false, PIANO_NAMES);
 
-        let (__g, ctx) = ctx.enter(1);
-        let parent_span_id = {
-            // We need the span_id assigned by enter(1) above.
-            // That span_id is the current_span_id of the child ctx.
-            // When the spawned thread calls ctx.enter(2), the Guard gets
-            // ctx.current_span_id as parent_span_id.
-
-            let ctx_clone = ctx.clone();
-
-            let child_parent = std::thread::spawn(move || {
-                let (__g, _ctx) = ctx_clone.enter(2);
-                drop(__g);
-                let drained = drain_thread_buffer();
-                assert_eq!(drained.len(), 1, "spawned thread: 1 measurement");
-                drained[0].parent_span_id
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let _g = piano_runtime::enter(0);
+                    std::hint::black_box(42)
+                })
             })
-            .join()
-            .expect("child panicked");
-
-            child_parent
-        };
-
-        drop(__g);
-        let drained = drain_thread_buffer();
-        assert_eq!(drained.len(), 1, "parent thread: 1 measurement");
-
-        let parent_m = &drained[0];
-        assert_eq!(
-            parent_span_id, parent_m.span_id,
-            "spawned thread's parent_span_id must equal the clone site's span_id"
-        );
-    })
-    .join()
-    .expect("test thread panicked");
-}
-
-// ---------------------------------------------------------------------------
-// PoC: End-to-end instrumented program (E2E)
-// ---------------------------------------------------------------------------
-
-// PROOF: A complete instrumented program using all patterns produces
-// correct NDJSON output: header with name table, measurements with
-// correct parent-child relationships, trailer matching header.
-//
-// DISCRIMINATES: Wrong parent assignment, missing measurements, missing
-// names, lost alloc data, wrong timing. Each produces a specific
-// assertion failure.
-#[test]
-fn end_to_end_instrumented_program() {
-    let (fs, path) = test_file("e2e");
-    let path_clone = path.clone();
-
-    std::thread::spawn(move || {
-        {
-            let root = RootCtx::new(
-                Some(fs),
-                false,
-                &[(1, "main"), (2, "compute"), (3, "helper")],
-            );
-            let ctx = root.ctx();
-
-            // Simulate: main calls compute, main calls helper
-            let (__g, ctx) = ctx.enter(1); // main
-
-            // compute(ctx.clone())
-            {
-                let (__g, _ctx) = ctx.clone().enter(2);
-                // Busy work to produce nonzero wall time
-                let mut sum = 0u64;
-                for i in 0..100_000 {
-                    sum = sum.wrapping_add(i);
-                }
-                std::hint::black_box(sum);
-                drop(__g);
-            }
-
-            // helper(ctx.clone())
-            {
-                let (__g, _ctx) = ctx.clone().enter(3);
-                // Allocate to produce nonzero alloc counts
-                let _v: Vec<u8> = vec![0u8; 1024];
-                drop(__g);
-            }
-
-            drop(__g);
-            // root drops here -> drain + trailer
-        }
-
-        let lines = read_lines(&path_clone);
-
-        // Structure: header + measurements + trailer
-        assert!(
-            lines.len() >= 5,
-            "need header + 3 measurements + trailer, got {}",
-            lines.len()
-        );
-
-        // Header
-        let header = &lines[0];
-        assert!(header.contains("\"type\":\"header\""), "first line is header");
-        assert!(header.contains("\"1\":\"main\""), "header has main");
-        assert!(header.contains("\"2\":\"compute\""), "header has compute");
-        assert!(header.contains("\"3\":\"helper\""), "header has helper");
-
-        // Trailer
-        let trailer = lines.last().unwrap();
-        assert!(trailer.contains("\"type\":\"trailer\""), "last line is trailer");
-
-        // Header and trailer have same name content
-        let normalized = header.replace("\"type\":\"header\"", "\"type\":\"trailer\"");
-        assert_eq!(
-            &normalized, trailer,
-            "header and trailer must have identical name content"
-        );
-
-        // Measurements (between header and trailer)
-        let measurements: Vec<&String> = lines[1..lines.len() - 1]
-            .iter()
-            .filter(|l| l.contains("\"span_id\""))
             .collect();
-        assert_eq!(
-            measurements.len(),
-            3,
-            "should have 3 measurements (main, compute, helper)"
-        );
 
-        // Every measurement line is valid JSON-ish (starts with {, ends with })
-        for m in &measurements {
-            assert!(m.starts_with('{'), "measurement must start with {{");
-            assert!(m.ends_with('}'), "measurement must end with }}");
+        for h in handles {
+            h.join().unwrap();
         }
 
-        // All name_ids from measurements appear in the header
-        for m in &measurements {
-            assert!(
-                m.contains("\"name_id\""),
-                "measurement must contain name_id"
-            );
-        }
+        drain_thread_agg();
     })
     .join()
     .expect("test thread panicked");
-
-    let _ = fs::remove_file(&path);
 }
