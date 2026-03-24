@@ -138,8 +138,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
     // The program has a parent that uses select! over two children.
     // Each child sleeps for 50ms. The parent does no computation.
-    // With the old phantom-based system, select! cancellation could inflate
-    // the parent's self_ns. With PianoFuture, self_ns should be ~0.
+    // select! cancellation must not inflate the parent's self_ns.
+    // PianoFuture tracks per-poll wall time, so self_ns should be ~0.
     fs::write(
         dir.join("src").join("main.rs"),
         r#"use tokio::time::{sleep, Duration};
@@ -728,7 +728,7 @@ fn async_tokio_pipeline() {
         "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
     );
 
-    // The old behavior was to skip async functions with a warning.
+    // Async functions must be instrumented, not skipped.
     // Verify no "skipped" + "async" message appears in stderr.
     let stderr_lower = stderr.to_lowercase();
     assert!(

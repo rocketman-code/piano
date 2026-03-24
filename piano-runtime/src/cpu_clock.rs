@@ -44,14 +44,17 @@ use std::sync::atomic::{compiler_fence, Ordering};
 /// Returns the bias as f64 bits (f64::to_bits).
 #[cfg(unix)]
 pub fn calibrate_bias() -> u64 {
-    const N: usize = 100_000;
+    // 100K iterations: enough to amortize syscall jitter while keeping
+    // calibration under 1ms. Higher than time.rs's 10K because CPU-time
+    // reads are noisier (syscall vs TSC instruction).
+    const SAMPLES: usize = 100_000;
     let start = cpu_now_ns();
-    for _ in 0..N {
+    for _ in 0..SAMPLES {
         compiler_fence(Ordering::SeqCst);
         crate::time::read();
     }
     let end = cpu_now_ns();
-    let bias = (end - start) as f64 / N as f64;
+    let bias = (end - start) as f64 / SAMPLES as f64;
     bias.to_bits()
 }
 
@@ -72,7 +75,8 @@ pub fn cpu_now_ns() -> u64 {
     if ret != 0 {
         return 0;
     }
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    const NS_PER_SEC: u64 = 1_000_000_000;
+    ts.tv_sec as u64 * NS_PER_SEC + ts.tv_nsec as u64
 }
 
 /// Compilation stub for non-Unix platforms.

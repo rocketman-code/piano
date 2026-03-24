@@ -14,7 +14,7 @@
 // Compiled with `--features _test_internals` so private modules are
 // accessible.
 
-use piano_runtime::ctx::Ctx;
+use piano_runtime::ctx::{Ctx, RootCtx};
 use piano_runtime::piano_future::{PianoFuture, PianoFutureState};
 use std::future::Future;
 use std::hint::black_box;
@@ -179,7 +179,8 @@ fn noop_waker() -> std::task::Waker {
 
 fn main() {
     // Prevent DCE. Each function must be reachable.
-    let ctx = Ctx::new(None, true, &[]);
+    let root = RootCtx::new(None, true, &[]);
+    let ctx = root.ctx();
     black_box(tm6_positive(&ctx));
     black_box(tm6_negative());
     black_box(tm7_positive(&ctx));

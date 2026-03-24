@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use super::{DIM, FnEntry, HEADER, Run};
 
+/// Delta column width. "+12345.67ms" = 11 chars.
+const DELTA_W: usize = 11;
+
 /// Truncate a label to `max_len` characters, appending '...' if truncated.
 fn truncate_label(label: &str, max_len: usize) -> String {
     if label.chars().count() <= max_len {
@@ -33,13 +36,20 @@ pub struct JsonDiffEntry {
     pub cpu_self_ms_b: Option<f64>,
 }
 
-/// Serialize a diff between two runs as a JSON array.
-///
-/// Each entry contains the function name, self time from each run,
-/// the absolute delta, and the percentage change (null when the base is zero).
-/// When `show_all` is false, entries where both runs have zero calls are hidden.
-/// When `limit` is `Some(n)`, only the top `n` entries (by absolute delta) are included.
-pub fn diff_runs_json(a: &Run, b: &Run, show_all: bool, limit: Option<usize>) -> String {
+/// Shared setup for diff functions: build lookup maps, collect unique function
+/// names sorted by absolute self-time delta, filter zero-call entries, and
+/// apply the truncation limit.
+struct DiffSetup<'a> {
+    a_map: HashMap<&'a str, &'a FnEntry>,
+    b_map: HashMap<&'a str, &'a FnEntry>,
+    names: Vec<&'a str>,
+    /// Total before any filtering.
+    total_count: usize,
+    /// After zero-call filtering, before truncation.
+    after_filter_count: usize,
+}
+
+fn prepare_diff<'a>(a: &'a Run, b: &'a Run, show_all: bool, limit: Option<usize>) -> DiffSetup<'a> {
     let a_map: HashMap<&str, &FnEntry> = a.functions.iter().map(|f| (f.name.as_str(), f)).collect();
     let b_map: HashMap<&str, &FnEntry> = b.functions.iter().map(|f| (f.name.as_str(), f)).collect();
 
@@ -58,6 +68,7 @@ pub fn diff_runs_json(a: &Run, b: &Run, show_all: bool, limit: Option<usize>) ->
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    let total_count = names.len();
     if !show_all {
         names.retain(|name| {
             let calls_a = a_map.get(name).map_or(0, |e| e.calls);
@@ -65,10 +76,23 @@ pub fn diff_runs_json(a: &Run, b: &Run, show_all: bool, limit: Option<usize>) ->
             calls_a > 0 || calls_b > 0
         });
     }
+    let after_filter_count = names.len();
 
     if let Some(n) = limit {
         names.truncate(n);
     }
+
+    DiffSetup { a_map, b_map, names, total_count, after_filter_count }
+}
+
+/// Serialize a diff between two runs as a JSON array.
+///
+/// Each entry contains the function name, self time from each run,
+/// the absolute delta, and the percentage change (null when the base is zero).
+/// When `show_all` is false, entries where both runs have zero calls are hidden.
+/// When `limit` is `Some(n)`, only the top `n` entries (by absolute delta) are included.
+pub fn diff_runs_json(a: &Run, b: &Run, show_all: bool, limit: Option<usize>) -> String {
+    let DiffSetup { a_map, b_map, names, .. } = prepare_diff(a, b, show_all, limit);
 
     let json_entries: Vec<JsonDiffEntry> = names
         .iter()
@@ -123,38 +147,8 @@ pub fn diff_runs(
         eprintln!("warning: comparing runs with different source formats (JSON vs NDJSON)");
     }
 
-    let a_map: HashMap<&str, &FnEntry> = a.functions.iter().map(|f| (f.name.as_str(), f)).collect();
-    let b_map: HashMap<&str, &FnEntry> = b.functions.iter().map(|f| (f.name.as_str(), f)).collect();
-
-    // Collect unique function names, sorted by absolute self-time delta descending
-    // so the biggest changes appear first.
-    let mut names: Vec<&str> = a_map.keys().chain(b_map.keys()).copied().collect();
-    names.sort_unstable();
-    names.dedup();
-    names.sort_by(|na, nb| {
-        let delta_a = (b_map.get(na).map_or(0.0, |e| e.self_ms)
-            - a_map.get(na).map_or(0.0, |e| e.self_ms))
-        .abs();
-        let delta_b = (b_map.get(nb).map_or(0.0, |e| e.self_ms)
-            - a_map.get(nb).map_or(0.0, |e| e.self_ms))
-        .abs();
-        delta_b
-            .partial_cmp(&delta_a)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let total_count = names.len();
-    if !show_all {
-        names.retain(|name| {
-            let calls_a = a_map.get(name).map_or(0, |e| e.calls);
-            let calls_b = b_map.get(name).map_or(0, |e| e.calls);
-            calls_a > 0 || calls_b > 0
-        });
-    }
-    let after_filter_count = names.len();
-    if let Some(n) = limit {
-        names.truncate(n);
-    }
+    let DiffSetup { a_map, b_map, names, total_count, after_filter_count } =
+        prepare_diff(a, b, show_all, limit);
 
     // Check if either run has alloc data or CPU data.
     let has_allocs = a.functions.iter().any(|f| f.alloc_count > 0)
@@ -177,7 +171,7 @@ pub fn diff_runs(
     // Build header based on available columns.
     {
         let mut header = format!(
-            "{:<40} {:>col_a$} {:>col_b$} {:>10}",
+            "{:<40} {:>col_a$} {:>col_b$} {:>DELTA_W$}",
             "Function", label_a, label_b, "Delta"
         );
         if has_cpu {
@@ -198,8 +192,9 @@ pub fn diff_runs(
         let after = b_map.get(name).map_or(0.0, |e| e.self_ms);
         let delta = after - before;
 
+        let delta_val = format!("{delta:+.2}ms");
         out.push_str(&format!(
-            "{name:<40} {before:>w_a$.2}ms {after:>w_b$.2}ms {delta:>+9.2}ms",
+            "{name:<40} {before:>w_a$.2}ms {after:>w_b$.2}ms {delta_val:>DELTA_W$}",
             w_a = col_a - 2,
             w_b = col_b - 2,
         ));
@@ -305,6 +300,7 @@ mod tests {
                 cpu_self_ms: None,
                 alloc_count: 100,
                 alloc_bytes: 8192,
+                ..Default::default()
             }],
         };
         let b = Run {
@@ -319,6 +315,7 @@ mod tests {
                 cpu_self_ms: None,
                 alloc_count: 50,
                 alloc_bytes: 4096,
+                ..Default::default()
             }],
         };
         let diff = diff_runs(&a, &b, "Before", "After", true, None);
@@ -344,6 +341,7 @@ mod tests {
                 cpu_self_ms: None,
                 alloc_count: large_count,
                 alloc_bytes: 0,
+                ..Default::default()
             }],
         };
         let b = Run {
@@ -358,12 +356,13 @@ mod tests {
                 cpu_self_ms: None,
                 alloc_count: 0,
                 alloc_bytes: 0,
+                ..Default::default()
             }],
         };
         let diff = diff_runs(&a, &b, "Before", "After", true, None);
         // Extract the A.Delta column value from the alloc_heavy row.
-        // With the old `as i64` cast, large_count wraps to negative i64 and
-        // the delta becomes a large positive number (wrong direction).
+        // Saturating arithmetic prevents u64 wrapping to negative i64
+        // (which would produce a large positive delta in the wrong direction).
         let line = diff.lines().find(|l| l.contains("alloc_heavy")).unwrap();
         let fields: Vec<&str> = line.split_whitespace().collect();
         // Last field is A.Delta (alloc delta).
@@ -668,8 +667,8 @@ mod tests {
         fs::write(dir.path().join("1000.ndjson"), ndjson_a).unwrap();
         fs::write(dir.path().join("2000.ndjson"), ndjson_b).unwrap();
 
-        let (run_a, _, _) = load_ndjson(&dir.path().join("1000.ndjson")).unwrap();
-        let (run_b, _, _) = load_ndjson(&dir.path().join("2000.ndjson")).unwrap();
+        let (run_a, _) = load_ndjson(&dir.path().join("1000.ndjson")).unwrap();
+        let (run_b, _) = load_ndjson(&dir.path().join("2000.ndjson")).unwrap();
 
         // Both runs should have total_ms == None
         assert!(run_a.functions[0].total_ms.is_none());
@@ -789,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_tagged_ndjson_runs_uses_frame_data() {
+    fn diff_tagged_ndjson_runs() {
         let dir = TempDir::new().unwrap();
         let runs_dir = dir.path().join("runs");
         let tags_dir = dir.path().join("tags");
@@ -878,6 +877,7 @@ mod tests {
                 cpu_self_ms: Some(12.0),
                 alloc_count: 100,
                 alloc_bytes: 8192,
+                ..Default::default()
             }],
         };
         let run_b = Run {
@@ -892,6 +892,7 @@ mod tests {
                 cpu_self_ms: Some(14.0),
                 alloc_count: 200,
                 alloc_bytes: 16384,
+                ..Default::default()
             }],
         };
 

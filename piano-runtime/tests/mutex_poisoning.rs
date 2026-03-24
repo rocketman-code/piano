@@ -25,7 +25,7 @@ fn buffer_mutex_heals_poisoning() {
     // Verify the mutex is poisoned
     assert!(buf.lock().is_err(), "mutex should be poisoned");
 
-    // Heal the poisoned mutex — this is exactly what the runtime does
+    // Heal the poisoned mutex. This is exactly what the runtime does.
     let mut guard = buf.lock().unwrap_or_else(|e| e.into_inner());
 
     // Verify we can still use the buffer
@@ -61,7 +61,7 @@ fn push_measurement_survives_poisoned_registry() {
     //
     // We can't easily poison the registry directly, but we
     // CAN verify that push_measurement doesn't panic when called
-    // normally — the healing code path is exercised by inspection
+    // normally. The healing code path is exercised by inspection
     // (unwrap_or_else pattern is present at every lock site).
     let reg: Arc<Registry> = Arc::new(Mutex::new(Vec::new()));
     let m = Measurement {

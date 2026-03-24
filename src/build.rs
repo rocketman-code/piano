@@ -361,7 +361,7 @@ fn filter_piano_internals(rendered: &str) -> String {
 /// Detect Send-bound errors caused by piano's async wrapping and return user guidance.
 ///
 /// Returns `Some(message)` when the error contains a Send-bound pattern AND mentions
-/// piano internals (`PianoFuture` or `piano_runtime`), indicating our wrapping caused it.
+/// piano internals (`PianoFuture` or `piano_runtime`), indicating the wrapping caused it.
 /// Returns `None` for Send errors in user code or non-Send errors.
 fn detect_send_bound_guidance(error_text: &str) -> Option<String> {
     let has_send_error = error_text.contains("is not Send")

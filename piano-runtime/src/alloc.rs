@@ -18,8 +18,8 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
 use std::marker::PhantomData;
 
-/// Snapshot of per-thread allocation counters. Copy ensures no TLS destructor —
-/// global allocator TLS with destructors is forbidden on older Rust versions.
+/// Snapshot of per-thread allocation counters. Copy ensures no TLS destructor
+/// (global allocator TLS with destructors is forbidden on older Rust versions).
 #[derive(Clone, Copy)]
 pub struct AllocSnapshot {
     pub alloc_count: u64,
@@ -79,6 +79,7 @@ fn record_dealloc(size: u64) {
 }
 
 /// Check if currently inside a reentrancy-guarded section.
+#[cfg(feature = "_test_internals")]
 pub fn is_reentrant() -> bool {
     REENTRANCY.try_with(|r| r.get() > 0).unwrap_or(false)
 }

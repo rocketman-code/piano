@@ -223,7 +223,7 @@ fn sample_cross_validation() {
     let pid = child.id();
     let sample_file = tmp.path().join("sample.txt");
 
-    // Sample for 15 seconds — enough to cover the full ~10s runtime
+    // Sample for 15 seconds, enough to cover the full ~10s runtime
     let sample_out = Command::new("sample")
         .args([
             &pid.to_string(),

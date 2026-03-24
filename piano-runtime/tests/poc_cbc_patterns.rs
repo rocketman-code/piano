@@ -1,29 +1,29 @@
-//! PoC: CBC API injection patterns
+//! Runtime API injection patterns.
 //!
 //! Each test is a hand-written "golden sample" of what the rewriter will
 //! produce. If these compile and pass, the injection patterns are proven
-//! correct against the CBC runtime API.
+//! correct against the runtime API.
 //!
 //! Claim coverage (compilation patterns):
-//!   GI1, GI4, GI5, GI6, GI8, GI9 — guard injection, async wrapping,
+//!   GI1, GI4, GI5, GI6, GI8, GI9: guard injection, async wrapping,
 //!     pass-through, parameter position, inner-attr placement
-//!   GI2 — inner function instrumentation, closure exclusion
-//!   GI7 — unsafe fn instrumentation (not skipped)
-//!   NT1, NT6, NT8 — name table format, IDs from 0, file-level const
-//!   NT9 — proven by construction (PIANO_NAMES excludes main)
-//!   LI1, LI4 — Ctx::new, enter shadows
-//!   LI7 — non-move closure borrows ctx (Sync)
-//!   LI8 — move closure pre-clone in for-loop
-//!   LI10 — __piano_ prefix collision safety
-//!   AI2, AI3 — allocator const wrapping (System case)
-//!   T1, T3 — all functions receive ctx; pass-through = zero overhead
-//!   T4 — runtime agnostic to pass-through vs measured
+//!   GI2: inner function instrumentation, closure exclusion
+//!   GI7: unsafe fn instrumentation (not skipped)
+//!   NT1, NT6, NT8: name table format, IDs from 0, file-level const
+//!   NT9: proven by construction (PIANO_NAMES excludes main)
+//!   LI1, LI4: RootCtx::new, enter shadows
+//!   LI7: non-move closure borrows ctx (Sync)
+//!   LI8: move closure pre-clone in for-loop
+//!   LI10: __piano_ prefix collision safety
+//!   AI2, AI3: allocator const wrapping (System case)
+//!   T1, T3: all functions receive ctx; pass-through = zero overhead
+//!   T4: runtime agnostic to pass-through vs measured
 //!
 //! Behavioral correctness in codegen_patterns.rs:
-//!   LI2, LI3, LI4, LI6 — clone propagation, root drop, parent chains
-//!   NT5 — NDJSON output format, L8 — header crash-recovery contract
+//!   LI2, LI3, LI4, LI6: clone propagation, root drop, parent chains
+//!   NT5: NDJSON output format. L8: header crash-recovery contract
 
-use piano_runtime::ctx::Ctx;
+use piano_runtime::ctx::{Ctx, RootCtx};
 use piano_runtime::PianoAllocator;
 use std::alloc::System;
 
@@ -71,7 +71,7 @@ fn pass_through(x: i32, __piano_ctx: Ctx) -> i32 {
 fn outer_with_inner(x: i32, __piano_ctx: Ctx) -> i32 {
     let (__piano_guard, __piano_ctx) = __piano_ctx.enter(0);
 
-    // Inner fn item — gets its own ctx parameter and guard
+    // Inner fn item: gets its own ctx parameter and guard
     fn inner_fn(y: i32, __piano_ctx: Ctx) -> i32 {
         let (__piano_guard, __piano_ctx) = __piano_ctx.enter(2);
         y * 3
@@ -154,7 +154,8 @@ fn user_has_ctx_variable(__piano_ctx: Ctx) -> i32 {
 #[test]
 fn sync_guard_injection_compiles_and_runs() {
     // GI4 + GI8 + LI4: sync function with guard
-    let ctx = Ctx::new(None, false, PIANO_NAMES);
+    let _root = RootCtx::new(None, false, PIANO_NAMES);
+    let ctx = _root.ctx();
     let result = measured_sync(10, ctx);
     assert_eq!(result, 11);
 }
@@ -162,7 +163,8 @@ fn sync_guard_injection_compiles_and_runs() {
 #[test]
 fn async_whole_body_wrapping_compiles_and_runs() {
     // GI1 + GI5: async fn wrapped in PianoFuture
-    let ctx = Ctx::new(None, false, PIANO_NAMES);
+    let _root = RootCtx::new(None, false, PIANO_NAMES);
+    let ctx = _root.ctx();
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -173,7 +175,8 @@ fn async_whole_body_wrapping_compiles_and_runs() {
 #[test]
 fn pass_through_no_guard_compiles_and_runs() {
     // GI6 + T3 + T4: pass-through forwards ctx, runtime doesn't know
-    let ctx = Ctx::new(None, false, PIANO_NAMES);
+    let _root = RootCtx::new(None, false, PIANO_NAMES);
+    let ctx = _root.ctx();
     let result = pass_through(7, ctx);
     assert_eq!(result, 8);
 }
@@ -181,7 +184,8 @@ fn pass_through_no_guard_compiles_and_runs() {
 #[test]
 fn inner_function_instrumented() {
     // GI2: inner fn gets its own guard and ctx
-    let ctx = Ctx::new(None, false, PIANO_NAMES);
+    let _root = RootCtx::new(None, false, PIANO_NAMES);
+    let ctx = _root.ctx();
     let result = outer_with_inner(4, ctx);
     assert_eq!(result, 12);
 }
@@ -189,7 +193,8 @@ fn inner_function_instrumented() {
 #[test]
 fn closure_not_instrumented() {
     // GI2: closure has no ctx, attributed to enclosing function
-    let ctx = Ctx::new(None, false, PIANO_NAMES);
+    let _root = RootCtx::new(None, false, PIANO_NAMES);
+    let ctx = _root.ctx();
     let result = with_closure(&[1, 2, 3], ctx);
     assert_eq!(result, vec![2, 3, 4]);
 }
@@ -198,7 +203,8 @@ fn closure_not_instrumented() {
 fn unsafe_fn_instrumented() {
     // GI7: unsafe fn gets guard (safe code inside unsafe fn is fine)
     let val: i32 = 99;
-    let ctx = Ctx::new(None, false, PIANO_NAMES);
+    let _root = RootCtx::new(None, false, PIANO_NAMES);
+    let ctx = _root.ctx();
     let result = unsafe { unsafe_measured(&val, ctx) };
     assert_eq!(result, 99);
 }
@@ -206,21 +212,24 @@ fn unsafe_fn_instrumented() {
 #[test]
 fn non_move_closure_borrows_ctx() {
     // LI7: Ctx is Sync, closure can borrow
-    let ctx = Ctx::new(None, false, PIANO_NAMES);
+    let _root = RootCtx::new(None, false, PIANO_NAMES);
+    let ctx = _root.ctx();
     with_non_move_closure(ctx); // must not panic
 }
 
 #[test]
 fn move_closure_loop_preclone() {
     // LI8: each iteration gets its own clone
-    let ctx = Ctx::new(None, false, PIANO_NAMES);
+    let _root = RootCtx::new(None, false, PIANO_NAMES);
+    let ctx = _root.ctx();
     with_move_closure_loop(ctx); // must not panic
 }
 
 #[test]
 fn piano_prefix_no_collision() {
     // LI10: __piano_ prefix doesn't interfere with user code
-    let ctx = Ctx::new(None, false, PIANO_NAMES);
+    let _root = RootCtx::new(None, false, PIANO_NAMES);
+    let ctx = _root.ctx();
     let result = user_has_ctx_variable(ctx);
     assert_eq!(result, 43);
 }
@@ -238,7 +247,7 @@ fn name_table_format() {
 fn allocator_wrapping_const() {
     // AI2 + AI3: PianoAllocator::new is const, wraps System
     const _: PianoAllocator<System> = PianoAllocator::new(System);
-    // Compiles — const fn requirement met
+    // Compiles: const fn requirement met
 }
 
 #[test]
@@ -255,8 +264,8 @@ fn ctx_is_send_and_sync() {
 #[test]
 fn inner_attrs_before_guard() {
     // GI9: guard must go AFTER inner attributes, not before.
-    // This test simulates a function with #![allow(unused)] —
-    // the guard line comes after the attribute.
+    // This test simulates a function with #![allow(unused)].
+    // The guard line comes after the attribute.
     // The function below is what the rewriter would produce:
 
     #[allow(unused_variables)]
@@ -268,7 +277,8 @@ fn inner_attrs_before_guard() {
         x
     }
 
-    let ctx = Ctx::new(None, false, PIANO_NAMES);
+    let _root = RootCtx::new(None, false, PIANO_NAMES);
+    let ctx = _root.ctx();
     let result = with_inner_attr(5, ctx);
     assert_eq!(result, 5);
 }

@@ -1,5 +1,5 @@
 use piano_runtime::buffer::drain_thread_buffer;
-use piano_runtime::ctx::Ctx;
+use piano_runtime::ctx::{Ctx, RootCtx};
 use piano_runtime::file_sink::FileSink;
 use piano_runtime::piano_future::PianoFuture;
 use std::fs::{self, File};
@@ -12,7 +12,7 @@ use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 // Code generation pattern tests.
 //
 // These prove that the exact code patterns the rewriter generates
-// produce correct measurements when compiled against the CBC runtime.
+// produce correct measurements when compiled against the runtime.
 // Each test IS a theorem. If it passes, the pattern is correct.
 // All tests run in spawned threads for TLS isolation.
 
@@ -61,7 +61,8 @@ fn read_lines(path: &std::path::Path) -> Vec<String> {
 #[test]
 fn context_shadowing_three_levels() {
     std::thread::spawn(|| {
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
 
         // Exact rewriter pattern: shadow ctx at each level
         {
@@ -107,7 +108,8 @@ fn context_shadowing_three_levels() {
 #[test]
 fn context_shadowing_with_siblings() {
     std::thread::spawn(|| {
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
 
         {
             let (__g, ctx) = ctx.enter(1);
@@ -160,7 +162,8 @@ fn async_desugar_pattern_compiles_and_works() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
 
         // Exact rewriter desugar: fn returning impl Future
         fn desugared_async(ctx: Ctx) -> impl Future<Output = u64> {
@@ -213,7 +216,8 @@ fn async_desugar_preamble_included_in_timing() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
 
         fn desugared_with_preamble(ctx: Ctx) -> impl Future<Output = ()> {
             let (state, _ctx) = ctx.enter_async(20);
@@ -260,7 +264,8 @@ fn async_desugar_preamble_included_in_timing() {
 #[test]
 fn clone_and_spawn_correct_parent() {
     std::thread::spawn(|| {
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
 
         let (__g, ctx) = ctx.enter(1);
         let parent_span_id = {
@@ -307,7 +312,7 @@ fn clone_and_spawn_correct_parent() {
 // correct parent-child relationships, trailer matching header.
 //
 // DISCRIMINATES: Wrong parent assignment, missing measurements, missing
-// names, lost alloc data, wrong timing — each produces a specific
+// names, lost alloc data, wrong timing. Each produces a specific
 // assertion failure.
 #[test]
 fn end_to_end_instrumented_program() {
@@ -316,11 +321,12 @@ fn end_to_end_instrumented_program() {
 
     std::thread::spawn(move || {
         {
-            let ctx = Ctx::new(
+            let root = RootCtx::new(
                 Some(fs),
                 false,
                 &[(1, "main"), (2, "compute"), (3, "helper")],
             );
+            let ctx = root.ctx();
 
             // Simulate: main calls compute, main calls helper
             let (__g, ctx) = ctx.enter(1); // main
@@ -346,7 +352,7 @@ fn end_to_end_instrumented_program() {
             }
 
             drop(__g);
-            // ctx (root) drops here -> drain + trailer
+            // root drops here -> drain + trailer
         }
 
         let lines = read_lines(&path_clone);

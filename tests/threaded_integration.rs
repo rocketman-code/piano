@@ -25,7 +25,7 @@ fn has_toolchain(version: &str) -> bool {
 fn create_rayon_alloc_project(dir: &Path) {
     fs::create_dir_all(dir.join("src")).unwrap();
 
-    // Pin Rust 1.91.0 — this version has the strict TLS destructor check
+    // Pin Rust 1.91.0. This version has the strict TLS destructor check
     // that aborts if the global allocator uses TLS with destructors.
     fs::write(
         dir.join("rust-toolchain.toml"),
@@ -148,12 +148,11 @@ fn compute(x: u64) -> u64 {
 /// PianoAllocator in a multi-threaded program.
 ///
 /// The allocator must not crash when threads that performed allocations exit.
-/// Previously, `track_alloc` accessed `STACK` (RefCell<Vec>) which has a
-/// destructor -- forbidden for global allocators on Rust < 1.93.1.
+/// Global allocator TLS with destructors is forbidden on Rust < 1.93.1.
 ///
-/// This test pins Rust 1.91.0 (via rust-toolchain.toml in the test project)
+/// Pins Rust 1.91.0 (via rust-toolchain.toml in the test project)
 /// because 1.93.1 relaxed the TLS restriction and silently masks the bug.
-/// It also uses rayon (common real-world pattern) to exercise thread pool
+/// Uses rayon (common real-world pattern) to exercise thread pool
 /// allocation paths.
 #[test]
 fn rayon_program_with_alloc_tracking_does_not_crash_on_older_rust() {
@@ -192,7 +191,7 @@ fn rayon_program_with_alloc_tracking_does_not_crash_on_older_rust() {
         "built binary should exist at: {binary_path}"
     );
 
-    // Run the instrumented binary — should NOT crash.
+    // Run the instrumented binary. Should NOT crash.
     let runs_dir = tmp.path().join("runs");
     fs::create_dir_all(&runs_dir).unwrap();
 

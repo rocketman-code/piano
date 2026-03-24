@@ -1,5 +1,5 @@
 use piano_runtime::buffer::drain_thread_buffer;
-use piano_runtime::ctx::Ctx;
+use piano_runtime::ctx::RootCtx;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, RawWaker, RawWakerVTable, Waker};
@@ -21,7 +21,8 @@ fn noop_waker() -> Waker {
 #[test]
 fn root_enter_has_zero_parent() {
     std::thread::spawn(|| {
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
         {
             let (_guard, _child) = ctx.enter(100);
         }
@@ -41,7 +42,8 @@ fn root_enter_has_zero_parent() {
 #[test]
 fn child_inherits_parent_span_id() {
     std::thread::spawn(|| {
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
         {
             let (_outer_guard, child_ctx) = ctx.enter(10);
             {
@@ -70,7 +72,8 @@ fn child_inherits_parent_span_id() {
 #[test]
 fn three_level_nesting() {
     std::thread::spawn(|| {
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
         {
             let (_g1, ctx1) = ctx.enter(1);
             {
@@ -106,7 +109,8 @@ fn three_level_nesting() {
 #[test]
 fn siblings_share_parent() {
     std::thread::spawn(|| {
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
         {
             let (_guard, child_ctx) = ctx.enter(10);
             {
@@ -137,7 +141,8 @@ fn siblings_share_parent() {
 #[test]
 fn enter_allocates_unique_span_ids() {
     std::thread::spawn(|| {
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
         let mut span_ids = Vec::new();
         for _ in 0..10 {
             let (guard, _) = ctx.enter(0);
@@ -162,7 +167,8 @@ fn enter_allocates_unique_span_ids() {
 #[test]
 fn clone_produces_independent_children() {
     std::thread::spawn(|| {
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
         let (_guard, child) = ctx.enter(10);
 
         let clone1 = child.clone();
@@ -196,7 +202,8 @@ fn clone_produces_independent_children() {
 #[test]
 fn cpu_time_enabled_inherited() {
     std::thread::spawn(|| {
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
         let (_guard, child) = ctx.enter(10);
         let (_, grandchild) = child.enter(20);
 
@@ -226,7 +233,8 @@ fn enter_async_produces_correct_state() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
         let (pf, child_ctx) = ctx.instrument_async(42, async {});
 
         // Poll the PianoFuture to completion
@@ -270,7 +278,8 @@ fn instrument_async_equivalent_to_enter_async_plus_piano_future() {
         let name_id: u32 = 77;
 
         // --- Manual path: enter_async + PianoFuture::new ---
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
         let (state, _manual_child) = ctx.enter_async(name_id);
         let mut manual_fut = piano_runtime::PianoFuture::new(state, async {});
         let pinned = unsafe { Pin::new_unchecked(&mut manual_fut) };
@@ -281,7 +290,8 @@ fn instrument_async_equivalent_to_enter_async_plus_piano_future() {
         assert_eq!(manual_measurements.len(), 1, "manual path should emit one measurement");
 
         // --- Convenience path: instrument_async ---
-        let ctx2 = Ctx::new(None, false, &[]);
+        let _root2 = RootCtx::new(None, false, &[]);
+        let ctx2 = _root2.ctx();
         let (mut conv_fut, _conv_child) = ctx2.instrument_async(name_id, async {});
         let pinned = unsafe { Pin::new_unchecked(&mut conv_fut) };
         let _ = pinned.poll(&mut cx);
@@ -313,7 +323,8 @@ fn instrument_async_equivalent_to_enter_async_plus_piano_future() {
 #[test]
 fn cross_thread_ctx_propagation() {
     std::thread::spawn(|| {
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
         let (_guard, child_ctx) = ctx.enter(10);
 
         // Clone ctx and send to child thread

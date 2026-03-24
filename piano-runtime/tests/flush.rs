@@ -1,5 +1,5 @@
 use piano_runtime::buffer::{drain_thread_buffer, FLUSH_THRESHOLD};
-use piano_runtime::ctx::Ctx;
+use piano_runtime::ctx::RootCtx;
 use piano_runtime::file_sink::FileSink;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -47,7 +47,8 @@ fn flush_at_threshold() {
     let path_clone = path.clone();
 
     std::thread::spawn(move || {
-        let ctx = Ctx::new(Some(fs), false, &[(1, "test::func")]);
+        let _root = RootCtx::new(Some(fs), false, &[(1, "test::func")]);
+        let ctx = _root.ctx();
 
         for _ in 0..FLUSH_THRESHOLD {
             let (guard, _) = ctx.enter(1);
@@ -81,7 +82,8 @@ fn no_flush_below_threshold() {
     let path_clone = path.clone();
 
     std::thread::spawn(move || {
-        let ctx = Ctx::new(Some(fs), false, &[(1, "test::func")]);
+        let _root = RootCtx::new(Some(fs), false, &[(1, "test::func")]);
+        let ctx = _root.ctx();
 
         // Push exactly FLUSH_THRESHOLD - 1 (should NOT trigger flush)
         for _ in 0..(FLUSH_THRESHOLD - 1) {
@@ -117,7 +119,8 @@ fn flushed_data_is_valid_ndjson() {
     let path_clone = path.clone();
 
     std::thread::spawn(move || {
-        let ctx = Ctx::new(Some(fs), false, &[(1, "test::func")]);
+        let _root = RootCtx::new(Some(fs), false, &[(1, "test::func")]);
+        let ctx = _root.ctx();
 
         for _ in 0..FLUSH_THRESHOLD {
             let (guard, _) = ctx.enter(1);
@@ -160,14 +163,14 @@ fn flushed_data_is_valid_ndjson() {
     let _ = fs::remove_file(&path);
 }
 
-// INVARIANT TEST: header contains the name table from Ctx::new.
+// INVARIANT TEST: header contains the name table from RootCtx::new.
 #[test]
 fn header_contains_name_table() {
     let (fs, path) = test_file("name_table");
     let path_clone = path.clone();
 
     std::thread::spawn(move || {
-        let _ctx = Ctx::new(Some(fs), false, &[(1, "my_crate::foo"), (2, "my_crate::bar")]);
+        let _root = RootCtx::new(Some(fs), false, &[(1, "my_crate::foo"), (2, "my_crate::bar")]);
 
         let lines = read_lines(&path_clone);
         assert_eq!(lines.len(), 1, "should have exactly the header line");
@@ -183,12 +186,13 @@ fn header_contains_name_table() {
     let _ = fs::remove_file(&path);
 }
 
-// INVARIANT TEST: Ctx::new with no file_sink does not write anything.
+// INVARIANT TEST: RootCtx::new with no file_sink does not write anything.
 // (All existing tests use None -- this explicitly verifies no panic.)
 #[test]
 fn no_file_sink_no_flush() {
     std::thread::spawn(|| {
-        let ctx = Ctx::new(None, false, &[]);
+        let _root = RootCtx::new(None, false, &[]);
+        let ctx = _root.ctx();
 
         // Push more than threshold -- no file_sink, so no flush, no panic
         for _ in 0..(FLUSH_THRESHOLD + 100) {
@@ -215,7 +219,8 @@ fn multiple_flushes() {
     let path_clone = path.clone();
 
     std::thread::spawn(move || {
-        let ctx = Ctx::new(Some(fs), false, &[(1, "test::func")]);
+        let _root = RootCtx::new(Some(fs), false, &[(1, "test::func")]);
+        let ctx = _root.ctx();
 
         for _ in 0..(2 * FLUSH_THRESHOLD) {
             let (guard, _) = ctx.enter(1);

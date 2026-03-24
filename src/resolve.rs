@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use syn::visit::Visit;
+use ra_ap_syntax::ast::HasAttrs;
+use ra_ap_syntax::ast::HasModuleItem;
+use ra_ap_syntax::ast::HasName;
+use ra_ap_syntax::{AstNode, AstToken, Edition, SyntaxKind, ast};
 
 use crate::error::{Error, io_context};
 
@@ -43,7 +46,7 @@ impl std::fmt::Display for SkipReason {
 
 /// Whether a function signature is safe to instrument.
 ///
-/// Explicit enum — no implicit "everything else is fine" default.
+/// Explicit enum with no implicit "everything else is fine" default.
 /// Every code path through `classify()` returns a named variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Classification {
@@ -330,14 +333,20 @@ pub(crate) fn extract_functions(
     source: &str,
     rel_path: PathBuf,
 ) -> (Vec<crate::naming::QualifiedFunction>, Vec<SkippedFunction>) {
-    let syntax = match syn::parse_file(source) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("warning: skipping {}: {e}", rel_path.display());
-            return (Vec::new(), Vec::new());
-        }
-    };
+    let parse = ast::SourceFile::parse(source, Edition::Edition2024);
 
+    // ra_ap_syntax does error recovery, so we always get a tree.
+    // If there are errors, warn but continue (like syn did -- we just get
+    // fewer functions from broken regions).
+    if !parse.errors().is_empty() {
+        eprintln!(
+            "warning: parse errors in {} ({} errors, continuing with recovered tree)",
+            rel_path.display(),
+            parse.errors().len()
+        );
+    }
+
+    let file = parse.tree();
     let mut collector = FnCollector {
         functions: Vec::new(),
         skipped: Vec::new(),
@@ -346,42 +355,81 @@ pub(crate) fn extract_functions(
         current_trait: None,
         scope: crate::naming::ScopeState::new(),
     };
-    collector.visit_file(&syntax);
+    collector.walk_source_file(&file);
     (collector.functions, collector.skipped)
 }
 
-/// Check whether an attribute list contains a specific simple attribute (e.g. `#[test]`).
-fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
-    attrs.iter().any(|a| a.path().is_ident(name))
+/// Check whether a CST node's attributes contain a specific simple attribute (e.g. `#[test]`).
+fn has_attr_cst(attrs: impl Iterator<Item = ast::Attr>, name: &str) -> bool {
+    attrs.into_iter().any(|a| {
+        // Simple path attribute: `#[test]` has a single path segment.
+        a.path()
+            .and_then(|p| p.segment())
+            .and_then(|seg| seg.name_ref())
+            .is_some_and(|n| n.text() == name)
+    })
 }
 
-/// Check whether an attribute list contains `#[cfg(test)]`.
-fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        if !a.path().is_ident("cfg") {
+/// Check whether a CST node's attributes contain `#[cfg(test)]`.
+fn has_cfg_test_cst(attrs: impl Iterator<Item = ast::Attr>) -> bool {
+    attrs.into_iter().any(|a| {
+        let path_is_cfg = a
+            .path()
+            .and_then(|p| p.segment())
+            .and_then(|seg| seg.name_ref())
+            .is_some_and(|n| n.text() == "cfg");
+        if !path_is_cfg {
             return false;
         }
-        a.parse_args::<syn::Ident>()
-            .map(|id| id == "test")
-            .unwrap_or(false)
+        // Check if the token tree content is just "test".
+        // The token tree text is "(test)" -- strip parens and check.
+        a.token_tree()
+            .is_some_and(|tt| {
+                let text = tt.syntax().text().to_string();
+                let inner = text.trim_start_matches('(').trim_end_matches(')').trim();
+                inner == "test"
+            })
     })
+}
+
+/// Extract the ABI string from a CST `ast::Fn`, stripping surrounding quotes.
+///
+/// Returns `None` when there is no `extern` keyword (default Rust ABI).
+/// Returns `Some("")` for bare `extern fn` (no ABI string, defaults to C).
+/// Returns `Some("C")`, `Some("Rust")`, etc. for explicit ABI strings.
+fn extract_cst_abi(func: &ast::Fn) -> Option<String> {
+    let abi = func.abi()?;
+    match abi.abi_string() {
+        Some(abi_str) => {
+            // abi_string().text() returns the token including quotes, e.g. "\"Rust\"".
+            let raw = abi_str.text();
+            let unquoted = raw
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(raw);
+            Some(unquoted.to_string())
+        }
+        None => {
+            // bare `extern fn` (no ABI string) defaults to "C"
+            Some(String::new())
+        }
+    }
 }
 
 /// Classify whether a function is safe to instrument based on primitive properties.
 ///
 /// Takes parser-agnostic bools and an optional ABI string so that both the
-/// resolver (syn-based) and the rewriter (ra_ap_syntax-based) call the same
-/// implementation. One function, one proof.
+/// resolver and the rewriter call the same implementation. One function, one proof.
 ///
 /// `abi` semantics: `None` means no explicit ABI (default Rust ABI, instrumentable).
 /// `Some("Rust")` is also instrumentable. Any other value (including `Some("")`
 /// for bare `extern fn`) causes a skip.
 ///
-/// Checkpoint coverage for the "wrong function filtering" bug class:
-/// - CP1 (this function): signature modifiers via is_const, abi
-/// - CP2: return type via `returns_future()` in the strategy layer (rewrite/mod.rs)
-/// - CP3: attributes via caller-level checks (#[test]) + structural coverage
-/// - CP4: syntactic context via Visit method selection (FnCollector/InjectionCollector)
+/// Defense against the "wrong function filtering" bug class:
+/// - This function: signature modifiers via is_const, abi
+/// - Return type: `returns_future()` in the strategy layer (rewrite/mod.rs)
+/// - Attributes: caller-level checks (#[test]) + structural coverage
+/// - Syntactic context: item walking (FnCollector/InjectionCollector)
 ///
 /// unsafe fn is NOT skipped -- it receives ctx parameter and guard like any
 /// other instrumentable function.
@@ -406,41 +454,13 @@ pub(crate) fn classify(is_const: bool, abi: Option<&str>) -> Classification {
     Classification::Instrumentable
 }
 
-/// Extract classification properties from a `syn::Signature`.
-///
-/// Uses exhaustive destructuring so that adding a new field to `Signature`
-/// (e.g., for `gen fn`) causes a compile error, forcing an explicit decision
-/// about the new modifier's instrumentability.
-///
-/// NEVER use `..` in this destructuring -- it defeats the compile-time safety.
-fn classify_sig(sig: &syn::Signature) -> Classification {
-    let syn::Signature {
-        constness,
-        asyncness: _, // strategy concern, not filtering (PianoFuture wrapping)
-        unsafety: _,  // unsafe fn IS instrumentable (guard is pure safe code)
-        abi,
-        fn_token: _,    // syntax token, irrelevant to instrumentability
-        ident: _,       // function name, irrelevant to instrumentability
-        generics: _,    // guard is monomorphic, works with any generics
-        paren_token: _, // syntax token, irrelevant to instrumentability
-        inputs: _,      // parameter types don't affect guard injection
-        variadic: _,    // only valid in extern fns, already caught by abi check
-        output: _,      // strategy concern (returns_future), not filtering
-    } = sig;
-
-    classify(
-        constness.is_some(),
-        abi.as_ref().map(|a| {
-            a.name
-                .as_ref()
-                .map(|name| name.value())
-                .unwrap_or_default()
-        })
-        .as_deref(),
-    )
+/// Classify a CST function node using primitive properties extracted from the CST.
+fn classify_cst_fn(func: &ast::Fn) -> Classification {
+    let cst_abi = extract_cst_abi(func);
+    classify(func.const_token().is_some(), cst_abi.as_deref())
 }
 
-/// AST visitor that collects function names from a parsed Rust file.
+/// CST-based collector that walks module items to extract function names.
 struct FnCollector {
     functions: Vec<crate::naming::QualifiedFunction>,
     skipped: Vec<SkippedFunction>,
@@ -454,123 +474,231 @@ struct FnCollector {
     scope: crate::naming::ScopeState,
 }
 
-impl<'ast> Visit<'ast> for FnCollector {
-    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if has_cfg_test(&node.attrs) {
+impl FnCollector {
+    fn walk_source_file(&mut self, file: &ast::SourceFile) {
+        for item in file.items() {
+            self.walk_item(&item);
+        }
+    }
+
+    fn walk_item(&mut self, item: &ast::Item) {
+        match item {
+            ast::Item::Module(module) => self.visit_module(module),
+            ast::Item::Fn(func) => self.visit_top_level_fn(func),
+            ast::Item::Impl(imp) => self.visit_impl(imp),
+            ast::Item::Trait(tr) => self.visit_trait(tr),
+            _ => {}
+        }
+    }
+
+    fn walk_item_list(&mut self, item_list: &ast::ItemList) {
+        for item in item_list.items() {
+            self.walk_item(&item);
+        }
+    }
+
+    fn visit_module(&mut self, module: &ast::Module) {
+        if has_cfg_test_cst(module.attrs()) {
             return; // skip entire #[cfg(test)] module
         }
-        self.scope.push_mod(&node.ident.to_string());
-        syn::visit::visit_item_mod(self, node);
+        let mod_name = module
+            .name()
+            .map(|n| n.text().to_string())
+            .unwrap_or_else(|| "_".to_string());
+        self.scope.push_mod(&mod_name);
+        if let Some(item_list) = module.item_list() {
+            self.walk_item_list(&item_list);
+        }
         self.scope.pop();
     }
 
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if !has_attr(&node.attrs, "test") {
-            let name = node.sig.ident.to_string();
-            let minimal = self.scope.render_minimal(&name);
-            match classify_sig(&node.sig) {
-                Classification::Skip(reason) => {
-                    self.skipped.push(SkippedFunction {
-                        name: minimal,
-                        reason,
-                        path: self.path.clone(),
-                    });
-                }
-                Classification::Instrumentable => {
-                    let medium = self.scope.render_medium(&name);
-                    let full = self.scope.render_full(&name);
-                    self.functions.push(crate::naming::QualifiedFunction::new(
-                        &minimal, &medium, &full,
-                    ));
+    fn visit_top_level_fn(&mut self, func: &ast::Fn) {
+        if !has_attr_cst(func.attrs(), "test") {
+            let name = func
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_default();
+            self.record_function(func, &name);
+        }
+        // Push fn scope for nested items, then walk the body for nested fns.
+        let fn_name = func
+            .name()
+            .map(|n| n.text().to_string())
+            .unwrap_or_default();
+        self.scope.push_fn(&fn_name);
+        if let Some(body) = func.body() {
+            self.walk_fn_body(&body);
+        }
+        self.scope.pop();
+    }
+
+    fn visit_impl(&mut self, imp: &ast::Impl) {
+        let self_ty = imp.self_ty();
+        let trait_ty = imp.trait_();
+        let impl_name = crate::naming::render_impl_name(
+            self_ty.as_ref().expect("impl should have self type"),
+            trait_ty.as_ref(),
+        );
+        let prev = self.current_impl.replace(impl_name);
+        if let Some(assoc_list) = imp.assoc_item_list() {
+            for assoc in assoc_list.assoc_items() {
+                if let ast::AssocItem::Fn(func) = assoc {
+                    self.visit_impl_fn(&func);
                 }
             }
         }
-        // Push fn scope for nested items, then visit ONLY the block body.
-        self.scope.push_fn(&node.sig.ident.to_string());
-        syn::visit::visit_block(self, &node.block);
-        self.scope.pop();
-    }
-
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        let impl_name = crate::naming::render_impl_name(
-            &node.self_ty,
-            node.trait_.as_ref().map(|(_, path, _)| path),
-        );
-        let prev = self.current_impl.replace(impl_name);
-        syn::visit::visit_item_impl(self, node);
         self.current_impl = prev;
     }
 
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if !has_attr(&node.attrs, "test") {
-            let method_name = node.sig.ident.to_string();
+    fn visit_impl_fn(&mut self, func: &ast::Fn) {
+        if !has_attr_cst(func.attrs(), "test") {
+            let method_name = func
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_default();
             let impl_qualified = if let Some(ref impl_name) = self.current_impl {
                 format!("{impl_name}::{method_name}")
             } else {
                 method_name
             };
-            let minimal = self.scope.render_minimal(&impl_qualified);
-            match classify_sig(&node.sig) {
-                Classification::Skip(reason) => {
-                    self.skipped.push(SkippedFunction {
-                        name: minimal,
-                        reason,
-                        path: self.path.clone(),
-                    });
-                }
-                Classification::Instrumentable => {
-                    let medium = self.scope.render_medium(&impl_qualified);
-                    let full = self.scope.render_full(&impl_qualified);
-                    self.functions.push(crate::naming::QualifiedFunction::new(
-                        &minimal, &medium, &full,
-                    ));
-                }
-            }
+            self.record_function(func, &impl_qualified);
         }
         // Push fn scope for nested items.
-        self.scope.push_fn(&node.sig.ident.to_string());
-        syn::visit::visit_block(self, &node.block);
+        let fn_name = func
+            .name()
+            .map(|n| n.text().to_string())
+            .unwrap_or_default();
+        self.scope.push_fn(&fn_name);
+        if let Some(body) = func.body() {
+            self.walk_fn_body(&body);
+        }
         self.scope.pop();
     }
 
-    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
-        let trait_name = node.ident.to_string();
+    fn visit_trait(&mut self, tr: &ast::Trait) {
+        let trait_name = tr
+            .name()
+            .map(|n| n.text().to_string())
+            .unwrap_or_else(|| "_".to_string());
         let prev = self.current_trait.replace(trait_name);
-        syn::visit::visit_item_trait(self, node);
+        if let Some(assoc_list) = tr.assoc_item_list() {
+            for assoc in assoc_list.assoc_items() {
+                if let ast::AssocItem::Fn(func) = assoc {
+                    self.visit_trait_fn(&func);
+                }
+            }
+        }
         self.current_trait = prev;
     }
 
-    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-        if let Some(ref block) = node.default {
-            let method_name = node.sig.ident.to_string();
+    fn visit_trait_fn(&mut self, func: &ast::Fn) {
+        // Only collect trait fns with default bodies.
+        if func.body().is_some() {
+            let method_name = func
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_default();
             let trait_qualified = if let Some(ref trait_name) = self.current_trait {
                 format!("{trait_name}::{method_name}")
             } else {
                 method_name
             };
-            let minimal = self.scope.render_minimal(&trait_qualified);
-            match classify_sig(&node.sig) {
-                Classification::Skip(reason) => {
-                    self.skipped.push(SkippedFunction {
-                        name: minimal,
-                        reason,
-                        path: self.path.clone(),
-                    });
-                }
-                Classification::Instrumentable => {
-                    let medium = self.scope.render_medium(&trait_qualified);
-                    let full = self.scope.render_full(&trait_qualified);
-                    self.functions.push(crate::naming::QualifiedFunction::new(
-                        &minimal, &medium, &full,
-                    ));
-                }
-            }
+            self.record_function(func, &trait_qualified);
             // Push fn scope for nested items in the default body.
-            self.scope.push_fn(&node.sig.ident.to_string());
-            syn::visit::visit_block(self, block);
+            let fn_name = func
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_default();
+            self.scope.push_fn(&fn_name);
+            if let Some(body) = func.body() {
+                self.walk_fn_body(&body);
+            }
             self.scope.pop();
         }
     }
+
+    /// Walk descendants of a function body to find nested items
+    /// (inner fns, impls, traits, modules defined inside function bodies).
+    fn walk_fn_body(&mut self, body: &ast::BlockExpr) {
+        // Walk direct statement-level items in the block.
+        // We need to handle nested items like:
+        //   fn outer() {
+        //     struct S;
+        //     impl S { fn m() {} }
+        //     fn inner() {}
+        //   }
+        // Use descendants to find nested items at any depth within the block.
+        for node in body.syntax().descendants() {
+            if node.kind() == SyntaxKind::FN {
+                // Skip the function itself (body's parent fn is already handled).
+                if node.text_range() == body.syntax().text_range() {
+                    continue;
+                }
+                if let Some(inner_fn) = ast::Fn::cast(node.clone()) {
+                    // Only process if the parent is NOT another FN we already handle
+                    // via recursive visit. Check if this fn is a direct item
+                    // (not inside another nested fn's body that would be visited
+                    // by its own walk_fn_body call).
+                    // The ancestor walking approach: find the enclosing context.
+                    let context = find_ancestor_impl_context(&node);
+                    self.visit_nested_fn(&inner_fn, context.as_deref());
+                }
+            }
+        }
+    }
+
+    /// Process a nested function found inside another function's body.
+    fn visit_nested_fn(&mut self, func: &ast::Fn, impl_context: Option<&str>) {
+        if !has_attr_cst(func.attrs(), "test") {
+            let name = func
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_default();
+            let fn_qualified = match impl_context {
+                Some(prefix) => format!("{prefix}::{name}"),
+                None => name,
+            };
+            self.record_function(func, &fn_qualified);
+        }
+    }
+
+    /// Classify a function and record it as instrumentable or skipped.
+    /// Single site for classification -> push, so adding a Classification
+    /// variant or SkippedFunction field can't silently break one of the callers.
+    fn record_function(&mut self, func: &ast::Fn, qualified: &str) {
+        let minimal = self.scope.render_minimal(qualified);
+        match classify_cst_fn(func) {
+            Classification::Skip(reason) => {
+                self.skipped.push(SkippedFunction {
+                    name: minimal,
+                    reason,
+                    path: self.path.clone(),
+                });
+            }
+            Classification::Instrumentable => {
+                let medium = self.scope.render_medium(qualified);
+                let full = self.scope.render_full(qualified);
+                self.functions.push(crate::naming::QualifiedFunction::new(
+                    &minimal, &medium, &full,
+                ));
+            }
+        }
+    }
+}
+
+/// Walk up the syntax tree from a FN node to find the nearest enclosing `impl`
+/// block and extract its qualified type name (e.g. "Local" or "<Local as Trait>").
+fn find_ancestor_impl_context(fn_node: &ra_ap_syntax::SyntaxNode) -> Option<String> {
+    let mut current = fn_node.parent();
+    while let Some(node) = current {
+        if let Some(imp) = ast::Impl::cast(node.clone()) {
+            let self_ty = imp.self_ty()?;
+            let trait_ty = imp.trait_();
+            return Some(crate::naming::render_impl_name(&self_ty, trait_ty.as_ref()));
+        }
+        current = node.parent();
+    }
+    None
 }
 
 /// Levenshtein edit distance between two strings.
@@ -1478,61 +1606,69 @@ fn main() {}
     }
 
     #[test]
-    fn classify_sig_delegates_to_classify() {
-        use syn::parse_quote;
+    fn classify_cst_fn_delegates_to_classify() {
+        /// Parse a function signature string into a CST `ast::Fn` node.
+        fn parse_fn(sig: &str) -> ast::Fn {
+            let source = format!("{sig} {{}}");
+            let parse = ast::SourceFile::parse(&source, Edition::Edition2024);
+            let file = parse.tree();
+            file.syntax()
+                .descendants()
+                .find_map(ast::Fn::cast)
+                .expect("should parse fn")
+        }
 
-        // Verify classify_sig extracts properties from syn::Signature
+        // Verify classify_cst_fn extracts properties from CST ast::Fn
         // and delegates to the unified classify().
-        let sig: syn::Signature = parse_quote! { fn foo() };
-        assert!(matches!(classify_sig(&sig), Classification::Instrumentable));
+        let func = parse_fn("fn foo()");
+        assert!(matches!(classify_cst_fn(&func), Classification::Instrumentable));
 
-        let sig: syn::Signature = parse_quote! { const fn foo() };
+        let func = parse_fn("const fn foo()");
         assert!(matches!(
-            classify_sig(&sig),
+            classify_cst_fn(&func),
             Classification::Skip(SkipReason::Const)
         ));
 
         // unsafe fn -> Instrumentable (guard is pure safe code)
-        let sig: syn::Signature = parse_quote! { unsafe fn foo() };
+        let func = parse_fn("unsafe fn foo()");
         assert!(matches!(
-            classify_sig(&sig),
+            classify_cst_fn(&func),
             Classification::Instrumentable
         ));
 
-        let sig: syn::Signature = parse_quote! { extern "C" fn foo() };
+        let func = parse_fn("extern \"C\" fn foo()");
         assert!(matches!(
-            classify_sig(&sig),
+            classify_cst_fn(&func),
             Classification::Skip(SkipReason::ExternAbi)
         ));
 
-        let sig: syn::Signature = parse_quote! { extern fn foo() };
+        let func = parse_fn("extern fn foo()");
         assert!(matches!(
-            classify_sig(&sig),
+            classify_cst_fn(&func),
             Classification::Skip(SkipReason::ExternAbi)
         ));
 
-        let sig: syn::Signature = parse_quote! { extern "Rust" fn foo() };
+        let func = parse_fn("extern \"Rust\" fn foo()");
         assert!(matches!(
-            classify_sig(&sig),
+            classify_cst_fn(&func),
             Classification::Instrumentable
         ));
 
-        let sig: syn::Signature = parse_quote! { async fn foo() };
+        let func = parse_fn("async fn foo()");
         assert!(matches!(
-            classify_sig(&sig),
+            classify_cst_fn(&func),
             Classification::Instrumentable
         ));
 
-        let sig: syn::Signature = parse_quote! { fn foo<T: Clone>(x: T) -> T };
+        let func = parse_fn("fn foo<T: Clone>(x: T) -> T");
         assert!(matches!(
-            classify_sig(&sig),
+            classify_cst_fn(&func),
             Classification::Instrumentable
         ));
 
-        let sig: syn::Signature =
-            parse_quote! { fn foo() -> impl std::future::Future<Output = i32> };
+        let func = parse_fn("fn foo() -> impl std::future::Future<Output = i32>");
         assert!(matches!(
-            classify_sig(&sig),
+            classify_cst_fn(&func),
             Classification::Instrumentable
         ));
     }

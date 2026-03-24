@@ -57,36 +57,22 @@ pub struct FnEntry {
     pub alloc_count: u64,
     #[serde(default)]
     pub alloc_bytes: u64,
+    #[serde(default)]
+    pub free_count: u64,
+    #[serde(default)]
+    pub free_bytes: u64,
 }
 
-/// Per-frame data loaded from an NDJSON file.
-pub struct FrameData {
-    pub fn_names: Vec<String>,
-    pub frames: Vec<Vec<FrameFnEntry>>,
-}
-
-/// Accumulated per-function counters across all frames (used during NDJSON aggregation).
+/// Accumulated per-function counters (used during NDJSON aggregation).
 #[derive(Default, Clone, Copy)]
 pub(super) struct FnAgg {
     pub(super) calls: u64,
     pub(super) self_ns: u64,
     pub(super) alloc_count: u64,
     pub(super) alloc_bytes: u64,
+    pub(super) free_count: u64,
+    pub(super) free_bytes: u64,
     pub(super) cpu_self_ns: u64,
-}
-
-/// Per-function entry within a single frame.
-#[derive(Clone, Copy)]
-pub struct FrameFnEntry {
-    pub fn_id: usize,
-    pub tid: Option<usize>,
-    pub calls: u64,
-    pub self_ns: u64,
-    pub cpu_self_ns: Option<u64>,
-    pub alloc_count: u64,
-    pub alloc_bytes: u64,
-    pub free_count: u64,
-    pub free_bytes: u64,
 }
 
 /// NDJSON header/trailer line.
@@ -102,10 +88,6 @@ pub(super) struct NdjsonNameTable {
     /// Name table: string keys (name_id) mapped to function names.
     #[serde(default)]
     pub(super) names: std::collections::HashMap<String, String>,
-    /// Calibration bias in nanoseconds (not used by the reader, but present in the format).
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub(super) bias_ns: u64,
 }
 
 /// NDJSON measurement line -- one per completed function invocation.
@@ -130,25 +112,6 @@ pub(super) struct NdjsonMeasurement {
     pub(super) free_bytes: u64,
 }
 
-pub(super) fn format_ns(ns: u64) -> String {
-    let us = ns as f64 / 1_000.0;
-    if us < 1000.0 {
-        format!("{us:.1}us")
-    } else {
-        format!("{:.2}ms", us / 1_000.0)
-    }
-}
-
-pub(super) fn format_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes}B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1}KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
-    }
-}
-
 /// Format a SystemTime as a relative duration string ("N sec/min/hours/days ago").
 pub fn relative_time(t: std::time::SystemTime) -> String {
     let elapsed = t.elapsed().unwrap_or_default();
@@ -170,13 +133,10 @@ pub fn relative_time(t: std::time::SystemTime) -> String {
 
 // Re-exports so external code can use `crate::report::load_run` etc.
 pub use diff::{JsonDiffEntry, diff_runs, diff_runs_json};
-pub use format::{
-    JsonFnEntry, format_frames_json, format_frames_table, format_json, format_json_with_frames,
-    format_per_thread_json, format_per_thread_tables, format_per_thread_tables_from_frames,
-    format_table, format_table_with_frames,
-};
+pub use format::{JsonFnEntry, format_json, format_per_thread_tables, format_table};
 pub use load::{
     find_latest_run_file, find_latest_run_file_since, find_ndjson_by_run_id, load_latest_run,
-    load_latest_runs_per_thread, load_ndjson, load_run, load_run_by_id, load_two_latest_runs,
+    load_latest_runs_per_thread, load_ndjson, load_ndjson_per_thread, load_run, load_run_by_id,
+    load_two_latest_runs,
 };
 pub use tag::{load_tagged_run, resolve_tag, reverse_resolve_tag, save_tag};

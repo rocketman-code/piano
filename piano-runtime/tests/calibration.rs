@@ -136,7 +136,7 @@ fn bias_impact() {
     // Create parent Guard, create+drop 100 child Guards inside it, drop parent.
     // Drain buffer: 101 measurements (100 children pushed first, parent last).
     // Compute parent self_time = parent.wall_time - sum(child.wall_time).
-    // Then corrected self_time = self_time - 100 * guard_overhead.
+    // Self-time should be small relative to sum of children (measurement overhead only).
     let parent_child_results = std::thread::spawn(move || {
         const N_CHILDREN: usize = 100;
         let tid = AtomicU64::new(1);

@@ -31,7 +31,6 @@ pub struct CalibrationData {
     bias_ticks: u64,
     epoch_tsc: u64,
     cpu_bias_f64_bits: u64,
-    guard_overhead_f64_bits: u64,
 }
 
 impl CalibrationData {
@@ -47,7 +46,6 @@ impl CalibrationData {
             bias_ticks: 0,
             epoch_tsc: 0,
             cpu_bias_f64_bits: 0,
-            guard_overhead_f64_bits: 0,
         };
 
         // SAFETY: ONCE.call_once guarantees single initialization. After init,
@@ -65,7 +63,6 @@ impl CalibrationData {
                     bias_ticks,
                     epoch_tsc,
                     cpu_bias_f64_bits,
-                    guard_overhead_f64_bits: 0,
                 };
             });
             CACHED
@@ -80,7 +77,6 @@ impl CalibrationData {
         bias_ticks: u64,
         epoch_tsc: u64,
         cpu_bias_f64_bits: u64,
-        guard_overhead_f64_bits: u64,
     ) -> Self {
         CalibrationData {
             quotient,
@@ -88,7 +84,6 @@ impl CalibrationData {
             bias_ticks,
             epoch_tsc,
             cpu_bias_f64_bits,
-            guard_overhead_f64_bits,
         }
     }
 
@@ -121,12 +116,6 @@ impl CalibrationData {
         f64::from_bits(self.cpu_bias_f64_bits)
     }
 
-    /// Return the guard instrumentation overhead as f64 nanoseconds.
-    #[cfg(unix)]
-    #[inline(always)]
-    pub fn guard_overhead_f64(&self) -> f64 {
-        f64::from_bits(self.guard_overhead_f64_bits)
-    }
 }
 
 /// Read the hardware cycle counter. Returns raw ticks.
@@ -137,7 +126,7 @@ impl CalibrationData {
 pub fn read() -> u64 {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: _rdtsc is a stable intrinsic that reads the timestamp counter.
-    // No memory safety implications — returns a u64 counter value.
+    // No memory safety implications: returns a u64 counter value.
     unsafe {
         core::arch::x86_64::_rdtsc()
     }
@@ -187,14 +176,19 @@ fn compute_multiplier(remainder: u64, divisor: u64) -> u64 {
     }
 }
 
-/// Calibrate the tick-to-nanosecond ratio. Spins for ~2ms measuring
-/// TSC ticks against Instant::now() as reference clock.
+/// Calibrate the tick-to-nanosecond ratio. Spins for CALIBRATION_SPIN_MS
+/// measuring TSC ticks against Instant::now() as reference clock.
 ///
 /// Returns (quotient, multiplier, epoch_tsc).
 fn calibrate() -> (u64, u64, u64) {
+    // Spin duration for tick-to-ns ratio measurement. Longer = more accurate
+    // but slower startup. 2ms gives ~0.1% accuracy on modern hardware.
+    const CALIBRATION_SPIN_MS: u64 = 2;
+
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         // Fallback: read() already returns nanoseconds, so Q=1, M=0.
+        let _ = CALIBRATION_SPIN_MS;
         return (1, 0, 0);
     }
 
@@ -203,7 +197,7 @@ fn calibrate() -> (u64, u64, u64) {
         let wall_start = Instant::now();
         let tsc_start = read();
 
-        let target = std::time::Duration::from_millis(2);
+        let target = std::time::Duration::from_millis(CALIBRATION_SPIN_MS);
         while wall_start.elapsed() < target {}
 
         let tsc_end = read();
@@ -234,33 +228,20 @@ fn calibrate_bias() -> u64 {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        const N: usize = 10_000;
-        let mut samples = Vec::with_capacity(N);
-        for _ in 0..N {
+        const SAMPLES: usize = 10_000;
+        const TRIM_PCT: usize = 2; // discard top/bottom 2% as outliers
+        const TRIM_COUNT: usize = SAMPLES * TRIM_PCT / 100;
+
+        let mut deltas = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
             let start = read();
             compiler_fence(Ordering::SeqCst);
             let end = read();
-            samples.push(end.wrapping_sub(start));
+            deltas.push(end.wrapping_sub(start));
         }
-        samples.sort_unstable();
-        let trim = N / 50; // 2% trim
-        let trimmed = &samples[trim..N - trim];
+        deltas.sort_unstable();
+        let trimmed = &deltas[TRIM_COUNT..SAMPLES - TRIM_COUNT];
         let sum: u64 = trimmed.iter().sum();
         sum / trimmed.len() as u64
     }
-}
-
-/// Compute quotient and multiplier from a numer/denom ratio (test convenience).
-///
-/// Useful for constructing CalibrationData::new_test with a human-readable
-/// ratio like (3, 2) instead of computing fixed-point values manually.
-#[cfg(feature = "_test_internals")]
-pub fn ratio_to_qm(numer: u64, denom: u64) -> (u64, u64) {
-    if denom == 0 {
-        return (0, 0);
-    }
-    let q = numer / denom;
-    let r = numer % denom;
-    let m = compute_multiplier(r, denom);
-    (q, m)
 }

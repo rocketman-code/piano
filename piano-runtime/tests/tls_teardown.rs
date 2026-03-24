@@ -19,7 +19,6 @@ struct TlsTeardownResults {
     is_reentrant: bool,
     // ReentrancyGuard::enter() should be no-op (not panic)
     reentrancy_guard_safe: bool,
-    thread_id: u64,
 }
 
 impl Drop for TlsDestructorSentinel {
@@ -38,18 +37,10 @@ impl Drop for TlsDestructorSentinel {
         })
         .is_ok();
 
-        // current_thread_id: module is pub(crate), so we test it
-        // indirectly via guard's thread_id behavior. We test
-        // the documented fallback: returns 0 when TLS destroyed.
-        // Since thread_id is pub(crate), we can't call it directly.
-        // But we CAN verify the sentinel runs during teardown.
-        let thread_id = 0; // placeholder — see note below
-
         let _ = self.tx.send(TlsTeardownResults {
             snapshot,
             is_reentrant,
             reentrancy_guard_safe,
-            thread_id,
         });
     }
 }

@@ -73,3 +73,45 @@ fn error_counter_thread_safe() {
     }
     assert_eq!(sink.io_error_count(), 1000);
 }
+
+// Production write path increments io_errors on write failure.
+// Uses a read-only file so all write_* calls return Err, triggering
+// record_io_error. The RootCtx::new -> write_header path is sufficient
+// to prove the property, and Ctx::drop adds write_measurements +
+// write_trailer failures on top.
+#[test]
+fn write_path_increments_io_errors_on_failure() {
+    use piano_runtime::ctx::RootCtx;
+
+    // Spawn a thread for TLS isolation.
+    std::thread::spawn(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.piano");
+        // Create the file, then reopen read-only so writes fail.
+        std::fs::File::create(&path).unwrap();
+        let read_only = std::fs::File::open(&path).unwrap();
+        let sink = Arc::new(FileSink::new(read_only));
+        let sink_ref = Arc::clone(&sink);
+
+        {
+            // RootCtx::new calls write_header -> fails -> record_io_error (1st)
+            let root = RootCtx::new(Some(sink_ref), false, &[(1, "test::func")]);
+            let ctx = root.ctx();
+            // enter + drop guard pushes a measurement to the buffer
+            let (guard, _) = ctx.enter(1);
+            drop(guard);
+            drop(ctx);
+            // RootCtx::drop: write_measurements -> fails -> record_io_error (2nd)
+            // RootCtx::drop: write_trailer -> fails -> record_io_error (3rd)
+        }
+
+        // All three write sites checked their Result and incremented on Err.
+        assert!(
+            sink.io_error_count() >= 3,
+            "all write sites must increment io_errors on Err; got: {}",
+            sink.io_error_count()
+        );
+    })
+    .join()
+    .expect("test thread panicked");
+}

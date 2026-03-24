@@ -10,18 +10,18 @@
 //! are safe because each atexit registration is idempotent
 //! (drains once, subsequent drains find empty buffers).
 
-use piano_runtime::ctx::Ctx;
+use piano_runtime::ctx::RootCtx;
 use piano_runtime::file_sink::FileSink;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 
-/// SH4: Multiple Ctx::new calls (which call register()) are safe.
+/// SH4: Multiple RootCtx::new calls (which call register()) are safe.
 /// Each overwrites the previous state. atexit handlers drain
 /// once each; the first finds data, subsequent find empty.
 #[test]
 fn multiple_register_calls_safe() {
     // Create multiple root contexts in sequence.
-    // Each Ctx::new with a file_sink calls register().
+    // Each RootCtx::new with a file_sink calls register().
     // This must not panic or corrupt state.
 
     // Use None file_sink to avoid actual file I/O.
@@ -30,11 +30,11 @@ fn multiple_register_calls_safe() {
     // and then verify the pattern structurally.
     let names: &'static [(u32, &'static str)] = &[(0, "test")];
 
-    // Multiple root contexts with None sink — no register() called,
-    // but Ctx::new and Ctx::drop run safely.
+    // Multiple root contexts with None sink. No register() called,
+    // but RootCtx::new and RootCtx::drop run safely.
     for _ in 0..5 {
-        let ctx = Ctx::new(None, false, names);
-        drop(ctx);
+        let root = RootCtx::new(None, false, names);
+        drop(root);
     }
 
     // Verify no panic occurred. The register() path with file_sink
@@ -42,9 +42,9 @@ fn multiple_register_calls_safe() {
     // which create real file sinks and verify trailer output.
 }
 
-/// SH4: Multiple Ctx::new with file sinks.
+/// SH4: Multiple RootCtx::new with file sinks.
 /// Each creates a temp file, registers for atexit cleanup.
-/// Drop of root ctx writes trailer.
+/// Drop of RootCtx writes trailer.
 #[test]
 fn multiple_ctx_new_with_file_sinks() {
     let names: &'static [(u32, &'static str)] = &[(0, "test")];
@@ -55,8 +55,8 @@ fn multiple_ctx_new_with_file_sinks() {
         let path = std::env::temp_dir().join(format!("piano_sh4_test_{}.ndjson", i));
         let file = File::create(&path).unwrap();
         let file_sink = Some(Arc::new(FileSink::new(file)));
-        let ctx = Ctx::new(file_sink, false, names);
-        drop(ctx); // root drop writes trailer
+        let root = RootCtx::new(file_sink, false, names);
+        drop(root); // root drop writes trailer
         let _ = std::fs::remove_file(&path);
     }
     // No panic = SH4 proven
@@ -90,7 +90,7 @@ fn shutdown_healing_pattern_is_consistent() {
     })
     .join();
 
-    // Heal it — exact pattern used in shutdown.rs
+    // Heal it (exact pattern used in shutdown.rs)
     let val = m.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(*val, 42, "healed mutex should retain its value");
 }

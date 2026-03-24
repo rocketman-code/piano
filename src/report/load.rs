@@ -3,16 +3,15 @@ use std::path::{Path, PathBuf};
 
 use crate::error::Error;
 
-use super::{
-    NdjsonMeasurement, NdjsonNameTable, FnAgg, FnEntry, FrameData, FrameFnEntry, Run, RunCompleteness,
-    RunFormat,
-};
+use super::{NdjsonMeasurement, NdjsonNameTable, FnAgg, FnEntry, Run, RunCompleteness, RunFormat};
+
+const NS_PER_MS: f64 = 1_000_000.0;
 
 /// Read a profiling run from a JSON or NDJSON file on disk.
 pub fn load_run(path: &Path) -> Result<Run, Error> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if ext == "ndjson" {
-        let (run, _frame_data, _completeness) = load_ndjson(path)?;
+        let (run, _completeness) = load_ndjson(path)?;
         return Ok(run);
     }
     let contents = std::fs::read_to_string(path).map_err(|source| Error::RunReadError {
@@ -25,8 +24,8 @@ pub fn load_run(path: &Path) -> Result<Run, Error> {
     })
 }
 
-/// Load an NDJSON file, returning the aggregated Run, frame-level data, and
-/// whether the file was complete or recovered from a crash.
+/// Load an NDJSON file, returning the aggregated Run and whether the file
+/// was complete or recovered from a crash.
 ///
 /// NDJSON format:
 /// - Header: `{"type":"header","names":{"0":"fn_name",...},"bias_ns":N}`
@@ -44,158 +43,64 @@ pub fn load_run(path: &Path) -> Result<Run, Error> {
 /// Self-attribution is computed from the span tree: for each span, self values
 /// are the span's inclusive values minus the sum of its direct children's values.
 /// Aggregation groups self-attributed values by name_id.
-pub fn load_ndjson(path: &Path) -> Result<(Run, FrameData, RunCompleteness), Error> {
-    let contents = std::fs::read_to_string(path).map_err(|source| Error::RunReadError {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let all_lines: Vec<&str> = contents.lines().collect();
-
-    let header_line = all_lines.first().ok_or_else(|| Error::InvalidRunData {
-        path: path.to_path_buf(),
-        reason: "empty NDJSON file".into(),
-    })?;
-    let header: NdjsonNameTable =
-        serde_json::from_str(header_line).map_err(|e| Error::InvalidRunData {
-            path: path.to_path_buf(),
-            reason: format!("invalid NDJSON header: {e}"),
-        })?;
-    if header.kind != "header" {
-        return Err(Error::InvalidRunData {
-            path: path.to_path_buf(),
-            reason: format!("expected header line, got type={:?}", header.kind),
-        });
-    }
-
-    // Extract run_id and timestamp_ms from header line via raw JSON value,
-    // since NdjsonNameTable doesn't carry them (they're optional metadata fields).
-    let header_value: serde_json::Value =
-        serde_json::from_str(header_line).map_err(|e| Error::InvalidRunData {
-            path: path.to_path_buf(),
-            reason: format!("invalid NDJSON header: {e}"),
-        })?;
-    let run_id = header_value
-        .get("run_id")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let timestamp_ms = header_value
-        .get("timestamp_ms")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u128;
-
-    // Parse body lines: measurements and possibly a trailer.
-    let body = &all_lines[1..];
-    let mut measurements: Vec<NdjsonMeasurement> = Vec::new();
-    let mut trailer_names: Option<HashMap<String, String>> = None;
-    let mut completeness = RunCompleteness::Recovered;
-
-    for line in body {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        // Try to detect header/trailer lines (they have a "type" field).
-        // Measurements never have a "type" field.
-        if let Ok(name_table) = serde_json::from_str::<NdjsonNameTable>(line) {
-            if name_table.kind == "trailer" {
-                trailer_names = Some(name_table.names);
-                completeness = RunCompleteness::Complete;
-                continue;
-            }
-        }
-        // Try to parse as a measurement. Gracefully skip lines that fail
-        // JSON parsing -- a truncated last line (from SIGKILL mid-write)
-        // is common in crashed runs and should not abort the entire parse.
-        match serde_json::from_str::<NdjsonMeasurement>(line) {
-            Ok(m) => measurements.push(m),
-            Err(_) => continue,
-        }
-    }
-
-    // Resolve the name table: prefer trailer (authoritative), fall back to header.
-    let raw_names = if let Some(names) = trailer_names {
-        names
-    } else {
-        header.names
-    };
-
-    // Build ordered name table: sorted by name_id (numeric key).
-    let fn_names = build_name_table(&raw_names);
-
-    // Compute self-attributed values from span tree and aggregate by name_id.
-    let self_values = compute_self_attribution(&measurements);
-
-    // Determine if CPU time is present (any measurement has non-zero cpu_end_ns).
-    let has_cpu = measurements.iter().any(|m| m.cpu_end_ns > 0);
-
-    // Aggregate self-attributed values by name_id.
-    let mut fn_agg: HashMap<u32, FnAgg> = HashMap::new();
-    for sv in &self_values {
-        let agg = fn_agg.entry(sv.name_id).or_default();
-        agg.calls += 1;
-        agg.self_ns += sv.self_wall_ns;
-        agg.cpu_self_ns += sv.self_cpu_ns;
-        agg.alloc_count += sv.self_alloc_count;
-        agg.alloc_bytes += sv.self_alloc_bytes;
-    }
-
-    // Build FnEntry for every registered function, including zero-call ones.
-    let functions: Vec<FnEntry> = fn_names
-        .iter()
-        .enumerate()
-        .map(|(idx, name)| {
-            let name_id = idx as u32;
-            let agg = fn_agg.get(&name_id).copied().unwrap_or_default();
-            let self_ms = agg.self_ns as f64 / 1_000_000.0;
-            FnEntry {
-                name: name.clone(),
-                calls: agg.calls,
-                total_ms: None,
-                self_ms,
-                cpu_self_ms: if has_cpu {
-                    Some(agg.cpu_self_ns as f64 / 1_000_000.0)
-                } else {
-                    None
-                },
-                alloc_count: agg.alloc_count,
-                alloc_bytes: agg.alloc_bytes,
-            }
-        })
-        .collect();
-
-    // Build FrameData for format.rs compatibility.
-    // Each measurement becomes a single-entry "frame" with self-attributed values.
-    let frames: Vec<Vec<FrameFnEntry>> = self_values
-        .iter()
-        .map(|sv| {
-            vec![FrameFnEntry {
-                fn_id: sv.name_id as usize,
-                tid: Some(sv.thread_id as usize),
-                calls: 1,
-                self_ns: sv.self_wall_ns,
-                cpu_self_ns: if has_cpu {
-                    Some(sv.self_cpu_ns)
-                } else {
-                    None
-                },
-                alloc_count: sv.self_alloc_count,
-                alloc_bytes: sv.self_alloc_bytes,
-                free_count: sv.self_free_count,
-                free_bytes: sv.self_free_bytes,
-            }]
-        })
-        .collect();
+pub fn load_ndjson(path: &Path) -> Result<(Run, RunCompleteness), Error> {
+    let parsed = parse_ndjson(path)?;
+    let self_values = compute_self_attribution(&parsed.measurements);
+    let has_cpu = parsed.measurements.iter().any(|m| m.cpu_end_ns > 0);
+    let fn_agg = aggregate_self_values(&self_values);
+    let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu);
 
     let run = Run {
-        run_id,
-        timestamp_ms,
+        run_id: parsed.run_id,
+        timestamp_ms: parsed.timestamp_ms,
         functions,
         source_format: RunFormat::Ndjson,
     };
+    Ok((run, parsed.completeness))
+}
 
-    let frame_data = FrameData { fn_names, frames };
+/// Load an NDJSON file and split results by thread, returning one `Run` per
+/// thread (sorted by thread ID ascending). Returns `None` if the file has no
+/// thread data (all thread_ids are zero or identical).
+pub fn load_ndjson_per_thread(path: &Path) -> Result<Option<Vec<Run>>, Error> {
+    let parsed = parse_ndjson(path)?;
 
-    Ok((run, frame_data, completeness))
+    // Check if there are distinct thread IDs.
+    let mut thread_ids: Vec<u64> = parsed.measurements.iter().map(|m| m.thread_id).collect();
+    thread_ids.sort_unstable();
+    thread_ids.dedup();
+    if thread_ids.len() <= 1 {
+        return Ok(None);
+    }
+
+    let self_values = compute_self_attribution(&parsed.measurements);
+    let has_cpu = parsed.measurements.iter().any(|m| m.cpu_end_ns > 0);
+
+    // Group self-attributed values by thread_id.
+    let mut by_thread: HashMap<u64, Vec<&SpanSelfValues>> = HashMap::new();
+    for sv in &self_values {
+        by_thread.entry(sv.thread_id).or_default().push(sv);
+    }
+
+    let mut runs: Vec<(u64, Run)> = by_thread
+        .into_iter()
+        .map(|(tid, spans)| {
+            let fn_agg = aggregate_self_values(spans);
+            let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu);
+            (
+                tid,
+                Run {
+                    run_id: parsed.run_id.clone(),
+                    timestamp_ms: parsed.timestamp_ms,
+                    functions,
+                    source_format: RunFormat::Ndjson,
+                },
+            )
+        })
+        .collect();
+
+    runs.sort_by_key(|(tid, _)| *tid);
+    Ok(Some(runs.into_iter().map(|(_, run)| run).collect()))
 }
 
 /// Self-attributed values for a single span after subtracting children.
@@ -281,6 +186,148 @@ fn build_name_table(raw: &HashMap<String, String>) -> Vec<String> {
     names
 }
 
+/// Parsed NDJSON file contents. Single parse site so adding a field to the
+/// NDJSON format can't silently break one of the callers.
+struct ParsedNdjson {
+    run_id: Option<String>,
+    timestamp_ms: u128,
+    fn_names: Vec<String>,
+    measurements: Vec<NdjsonMeasurement>,
+    completeness: RunCompleteness,
+}
+
+/// Parse an NDJSON file into its component parts: header metadata, name table,
+/// measurements, and completeness status.
+fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
+    let contents = std::fs::read_to_string(path).map_err(|source| Error::RunReadError {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let all_lines: Vec<&str> = contents.lines().collect();
+
+    let header_line = all_lines.first().ok_or_else(|| Error::InvalidRunData {
+        path: path.to_path_buf(),
+        reason: "empty NDJSON file".into(),
+    })?;
+    let header: NdjsonNameTable =
+        serde_json::from_str(header_line).map_err(|e| Error::InvalidRunData {
+            path: path.to_path_buf(),
+            reason: format!("invalid NDJSON header: {e}"),
+        })?;
+    if header.kind != "header" {
+        return Err(Error::InvalidRunData {
+            path: path.to_path_buf(),
+            reason: format!("expected header line, got type={:?}", header.kind),
+        });
+    }
+
+    // Extract run_id and timestamp_ms from header line via raw JSON value,
+    // since NdjsonNameTable doesn't carry them (they're optional metadata fields).
+    let header_value: serde_json::Value =
+        serde_json::from_str(header_line).map_err(|e| Error::InvalidRunData {
+            path: path.to_path_buf(),
+            reason: format!("invalid NDJSON header: {e}"),
+        })?;
+    let run_id = header_value
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let timestamp_ms = header_value
+        .get("timestamp_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u128;
+
+    // Parse body lines: measurements and possibly a trailer.
+    let body = &all_lines[1..];
+    let mut measurements: Vec<NdjsonMeasurement> = Vec::new();
+    let mut trailer_names: Option<HashMap<String, String>> = None;
+    let mut completeness = RunCompleteness::Recovered;
+
+    for line in body {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Try to detect header/trailer lines (they have a "type" field).
+        // Measurements never have a "type" field.
+        if let Ok(name_table) = serde_json::from_str::<NdjsonNameTable>(line) {
+            if name_table.kind == "trailer" {
+                trailer_names = Some(name_table.names);
+                completeness = RunCompleteness::Complete;
+                continue;
+            }
+        }
+        // Gracefully skip lines that fail JSON parsing -- a truncated last
+        // line (from SIGKILL mid-write) is common and should not abort.
+        match serde_json::from_str::<NdjsonMeasurement>(line) {
+            Ok(m) => measurements.push(m),
+            Err(_) => continue,
+        }
+    }
+
+    // Resolve the name table: prefer trailer (authoritative), fall back to header.
+    let raw_names = trailer_names.unwrap_or(header.names);
+    let fn_names = build_name_table(&raw_names);
+
+    Ok(ParsedNdjson {
+        run_id,
+        timestamp_ms,
+        fn_names,
+        measurements,
+        completeness,
+    })
+}
+
+/// Aggregate self-attributed values into per-function stats.
+fn aggregate_self_values<'a>(
+    spans: impl IntoIterator<Item = &'a SpanSelfValues>,
+) -> HashMap<u32, FnAgg> {
+    let mut fn_agg: HashMap<u32, FnAgg> = HashMap::new();
+    for sv in spans {
+        let agg = fn_agg.entry(sv.name_id).or_default();
+        agg.calls += 1;
+        agg.self_ns += sv.self_wall_ns;
+        agg.cpu_self_ns += sv.self_cpu_ns;
+        agg.alloc_count += sv.self_alloc_count;
+        agg.alloc_bytes += sv.self_alloc_bytes;
+        agg.free_count += sv.self_free_count;
+        agg.free_bytes += sv.self_free_bytes;
+    }
+    fn_agg
+}
+
+/// Build FnEntry list from name table and aggregated stats. Single construction
+/// site so adding a field to FnEntry can't silently break one of the callers.
+fn build_fn_entries(
+    fn_names: &[String],
+    fn_agg: &HashMap<u32, FnAgg>,
+    has_cpu: bool,
+) -> Vec<FnEntry> {
+    fn_names
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            let name_id = idx as u32;
+            let agg = fn_agg.get(&name_id).copied().unwrap_or_default();
+            FnEntry {
+                name: name.clone(),
+                calls: agg.calls,
+                total_ms: None,
+                self_ms: agg.self_ns as f64 / NS_PER_MS,
+                cpu_self_ms: if has_cpu {
+                    Some(agg.cpu_self_ns as f64 / NS_PER_MS)
+                } else {
+                    None
+                },
+                alloc_count: agg.alloc_count,
+                alloc_bytes: agg.alloc_bytes,
+                free_count: agg.free_count,
+                free_bytes: agg.free_bytes,
+            }
+        })
+        .collect()
+}
+
 /// Collect all run files (.json and .ndjson) in the given directory, sorted by filename.
 fn collect_run_files(runs_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let entries = std::fs::read_dir(runs_dir).map_err(|source| Error::RunReadError {
@@ -360,6 +407,8 @@ fn merge_runs(runs: &[&Run]) -> Run {
                 cpu_self_ms: None,
                 alloc_count: 0,
                 alloc_bytes: 0,
+                free_count: 0,
+                free_bytes: 0,
             });
             entry.calls += f.calls;
             if let Some(t) = f.total_ms {
@@ -371,6 +420,8 @@ fn merge_runs(runs: &[&Run]) -> Run {
             }
             entry.alloc_count += f.alloc_count;
             entry.alloc_bytes += f.alloc_bytes;
+            entry.free_count += f.free_count;
+            entry.free_bytes += f.free_bytes;
         }
     }
 
@@ -956,7 +1007,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, frame_data, completeness) = load_ndjson(&path).unwrap();
+        let (run, completeness) = load_ndjson(&path).unwrap();
         assert_eq!(completeness, RunCompleteness::Complete);
         assert_eq!(run.run_id.as_deref(), Some("r1_complete"));
         assert_eq!(run.timestamp_ms, 3000);
@@ -965,8 +1016,6 @@ mod tests {
         assert_eq!(run.functions[0].calls, 1);
         assert_eq!(run.functions[1].name, "compute");
         assert_eq!(run.functions[1].calls, 1);
-        assert_eq!(frame_data.fn_names, vec!["setup", "compute"]);
-        assert_eq!(frame_data.frames.len(), 2);
         assert_eq!(run.source_format, RunFormat::Ndjson);
     }
 
@@ -988,12 +1037,11 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, frame_data, completeness) = load_ndjson(&path).unwrap();
+        let (run, completeness) = load_ndjson(&path).unwrap();
         assert_eq!(completeness, RunCompleteness::Recovered);
         assert_eq!(run.functions.len(), 2);
         assert_eq!(run.functions[0].name, "alpha");
         assert_eq!(run.functions[1].name, "beta");
-        assert_eq!(frame_data.frames.len(), 2);
         assert_eq!(run.functions[0].calls, 1);
         assert_eq!(run.functions[1].calls, 1);
     }
@@ -1007,13 +1055,11 @@ mod tests {
         let content = format!("{}\n", ndjson_header("r2_empty", 6000, &[]));
         fs::write(&path, content).unwrap();
 
-        let (run, frame_data, completeness) = load_ndjson(&path).unwrap();
+        let (run, completeness) = load_ndjson(&path).unwrap();
         assert_eq!(completeness, RunCompleteness::Recovered);
         assert_eq!(run.run_id.as_deref(), Some("r2_empty"));
         assert_eq!(run.timestamp_ms, 6000);
         assert!(run.functions.is_empty(), "header-only should have no functions");
-        assert!(frame_data.frames.is_empty(), "header-only should have no frames");
-        assert!(frame_data.fn_names.is_empty(), "header-only should have no fn_names");
     }
 
     #[test]
@@ -1032,10 +1078,10 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, frame_data, completeness) = load_ndjson(&path).unwrap();
+        let (run, completeness) = load_ndjson(&path).unwrap();
         assert_eq!(completeness, RunCompleteness::Recovered);
         // Only the two valid measurements should be parsed.
-        assert_eq!(frame_data.frames.len(), 2);
+        assert_eq!(run.functions.len(), 2);
         assert_eq!(run.functions[0].name, "alpha");
         assert_eq!(run.functions[1].name, "beta");
         assert_eq!(run.functions[0].calls, 1);
@@ -1058,7 +1104,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _, completeness) = load_ndjson(&path).unwrap();
+        let (run, completeness) = load_ndjson(&path).unwrap();
         assert_eq!(completeness, RunCompleteness::Complete);
         assert_eq!(run.functions[0].name, "trailer_name_0");
         assert_eq!(run.functions[1].name, "trailer_name_1");
@@ -1090,7 +1136,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path).unwrap();
 
         let parent = run.functions.iter().find(|f| f.name == "parent_fn").unwrap();
         let child1 = run.functions.iter().find(|f| f.name == "child1_fn").unwrap();
@@ -1116,7 +1162,7 @@ mod tests {
         // child1: leaf span, self = inclusive
         let child1_wall_ns: f64 = 3000.0; // 5000 - 2000
         assert!(
-            (child1.self_ms - child1_wall_ns / 1_000_000.0).abs() < 0.0001,
+            (child1.self_ms - child1_wall_ns / NS_PER_MS).abs() < 0.0001,
             "child1 self_ms should be ~0.003, got {}",
             child1.self_ms
         );
@@ -1125,7 +1171,7 @@ mod tests {
         // child2: leaf span, self = inclusive
         let child2_wall_ns: f64 = 4000.0; // 10000 - 6000
         assert!(
-            (child2.self_ms - child2_wall_ns / 1_000_000.0).abs() < 0.0001,
+            (child2.self_ms - child2_wall_ns / NS_PER_MS).abs() < 0.0001,
             "child2 self_ms should be ~0.004, got {}",
             child2.self_ms
         );
@@ -1147,7 +1193,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path).unwrap();
         let leaf = run.functions.iter().find(|f| f.name == "leaf_fn").unwrap();
 
         // wall = 6000 - 1000 = 5000 ns = 0.005 ms
@@ -1186,7 +1232,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path).unwrap();
         let repeated = run
             .functions
             .iter()
@@ -1219,7 +1265,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path).unwrap();
         assert_eq!(run.functions.len(), 2);
         let unused = run.functions.iter().find(|f| f.name == "unused").unwrap();
         assert_eq!(unused.calls, 0);
@@ -1242,7 +1288,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path).unwrap();
         for f in &run.functions {
             assert!(
                 f.total_ms.is_none(),
@@ -1254,30 +1300,6 @@ mod tests {
     }
 
     // --- Thread grouping (measurements carry thread_id for per-thread breakdown) ---
-
-    #[test]
-    fn r6_thread_id_preserved_in_frame_data() {
-        // Measurements from different threads should have correct tid in frame data.
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("threads.ndjson");
-        let names = &[(0, "work")];
-
-        let content = format!(
-            "{}\n{}\n{}\n{}\n",
-            ndjson_header("threads", 1000, names),
-            // thread 1
-            ndjson_measurement(1, 0, 0, 100, 600, 1, 0, 0, 0, 0),
-            // thread 2
-            ndjson_measurement(2, 0, 0, 200, 700, 2, 0, 0, 0, 0),
-            ndjson_trailer(names),
-        );
-        fs::write(&path, content).unwrap();
-
-        let (_, frame_data, _) = load_ndjson(&path).unwrap();
-        assert_eq!(frame_data.frames.len(), 2);
-        assert_eq!(frame_data.frames[0][0].tid, Some(1));
-        assert_eq!(frame_data.frames[1][0].tid, Some(2));
-    }
 
     #[test]
     fn r6_aggregation_merges_across_threads() {
@@ -1295,7 +1317,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path).unwrap();
         let work = run.functions.iter().find(|f| f.name == "work").unwrap();
         assert_eq!(work.calls, 2); // 1 from each thread
         // self_wall = 500 + 700 = 1200 ns = 0.0012 ms
@@ -1325,7 +1347,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, frame_data, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path).unwrap();
         let compute = run.functions.iter().find(|f| f.name == "compute").unwrap();
         assert!(compute.cpu_self_ms.is_some(), "should have cpu_self_ms");
         // cpu = 4500 - 500 = 4000 ns = 0.004 ms
@@ -1334,7 +1356,6 @@ mod tests {
             "expected ~0.004ms, got {}",
             compute.cpu_self_ms.unwrap()
         );
-        assert_eq!(frame_data.frames[0][0].cpu_self_ns, Some(4000));
     }
 
     #[test]
@@ -1353,13 +1374,12 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, frame_data, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path).unwrap();
         let work = run.functions.iter().find(|f| f.name == "work").unwrap();
         assert!(
             work.cpu_self_ms.is_none(),
             "should not have cpu_self_ms when no CPU time"
         );
-        assert_eq!(frame_data.frames[0][0].cpu_self_ns, None);
     }
 
     // --- Determinism ---
@@ -1381,8 +1401,8 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run1, _, _) = load_ndjson(&path).unwrap();
-        let (run2, _, _) = load_ndjson(&path).unwrap();
+        let (run1, _) = load_ndjson(&path).unwrap();
+        let (run2, _) = load_ndjson(&path).unwrap();
 
         for (f1, f2) in run1.functions.iter().zip(run2.functions.iter()) {
             assert_eq!(f1.name, f2.name);

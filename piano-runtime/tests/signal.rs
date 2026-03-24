@@ -4,7 +4,7 @@
 // Signal handler tests. Separate binary for process isolation --
 // signals are process-wide and cannot be scoped to a test.
 
-use piano_runtime::ctx::Ctx;
+use piano_runtime::ctx::RootCtx;
 use piano_runtime::file_sink::FileSink;
 use std::fs::{self, File};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,10 +52,10 @@ fn signal_handler_restores_previous() {
 
     let (fs, path) = test_file("restore");
 
-    // Ctx::new -> shutdown::register -> signal::register
+    // RootCtx::new -> shutdown::register -> signal::register
     // This installs piano's handler, saving user_handler as previous.
     {
-        let _ctx = Ctx::new(Some(fs), false, &[(1, "test::func")]);
+        let _root = RootCtx::new(Some(fs), false, &[(1, "test::func")]);
 
         // Raise SIGINT. Piano's handler runs:
         // 1. Sets AtomicBool flag

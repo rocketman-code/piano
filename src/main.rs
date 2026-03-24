@@ -584,7 +584,6 @@ fn build_project(
         None
     };
 
-    let instrument_macros = specs.is_empty();
     let src_rel = src_dir.strip_prefix(&pkg_root).unwrap_or(Path::new("src"));
 
     // Collect all QualifiedFunction entries with module prefixes applied,
@@ -602,7 +601,7 @@ fn build_project(
     }
     let display_names = piano::naming::disambiguate(&all_qualified);
 
-    let (mut global_name_ids, mut global_display_names, mut next_id) =
+    let (global_name_ids, global_display_names, _next_id) =
         assign_name_ids(&all_qualified, &display_names);
 
     // TODO(rewriter-rebuild): macro function name discovery will be
@@ -610,17 +609,6 @@ fn build_project(
 
     // Build set of all instrumentable function names across the entire workspace.
     // Uses all_functions (not just measured targets) so that non-measured functions
-    // become pass-through: they receive ctx parameter for context propagation
-    // but no guard (zero profiling overhead for pass-through functions).
-    let mut all_instrumentable: HashSet<String> = all_functions
-        .iter()
-        .flat_map(|t| t.functions.iter().map(|qf| qf.minimal.clone()))
-        .collect();
-    // Include macro-discovered names so call-site injection handles them.
-    for name in global_name_ids.keys() {
-        all_instrumentable.insert(name.clone());
-    }
-
     // Build a set of measured function names (from targets) for quick lookup.
     let measured_names: HashSet<String> = targets
         .iter()
@@ -653,13 +641,10 @@ fn build_project(
 
     // Compute source paths relative to workspace root (matches what wrapper receives).
     let mut targets_relative: HashMap<PathBuf, HashMap<String, u32>> = HashMap::new();
-    let mut module_prefixes_relative: HashMap<PathBuf, String> = HashMap::new();
 
     for af in &all_functions {
         let relative = af.file.strip_prefix(&src_dir).unwrap_or(&af.file);
         let prefix = module_prefix(relative);
-        // Build per-file measured map: only functions that are in the measured
-        // set (selected by selectors, minus --skip) get name_ids and guards.
         let measured: HashMap<String, u32> = af
             .functions
             .iter()
@@ -673,15 +658,13 @@ fn build_project(
             })
             .collect();
 
-        // Path relative to workspace root for the config
         let ws_relative = if let Some(ref sub) = member_subdir {
             PathBuf::from(sub).join(src_rel).join(relative)
         } else {
             PathBuf::from(src_rel).join(relative)
         };
 
-        targets_relative.insert(ws_relative.clone(), measured);
-        module_prefixes_relative.insert(ws_relative, prefix);
+        targets_relative.insert(ws_relative, measured);
     }
 
     // Entry point path relative to workspace root
@@ -719,18 +702,13 @@ fn build_project(
     let config = piano::wrapper::WrapperConfig {
         runtime_rlib: runtime.rlib_path,
         runtime_deps_dir: runtime.deps_dir,
-        instrument_macros,
         entry_point: piano::wrapper::EntryPointConfig {
             source_path: bin_entry_relative,
             name_table,
             runs_dir: runs_dir.clone(),
             cpu_time,
-            cli_override: output_dir.is_some(),
         },
         targets: targets_relative,
-        all_instrumentable,
-        module_prefixes: module_prefixes_relative,
-        macro_name_ids: global_name_ids,
     };
 
     let config_path = target_dir.join("config.json");
@@ -739,8 +717,6 @@ fn build_project(
     std::fs::write(&config_path, config_json)
         .map_err(io_context("write wrapper config", &config_path))?;
 
-    // Clean stale concurrency data from previous builds.
-    let _ = std::fs::remove_file(piano::wrapper::concurrency_path(&config_path));
 
     // Build with wrapper
     let pkg_arg = if member_subdir.is_some() {
@@ -756,15 +732,6 @@ fn build_project(
         &config_path,
     )?;
 
-    // Warn about concurrent functions when --cpu-time is not enabled.
-    if !cpu_time {
-        let concurrency = piano::wrapper::read_concurrency(&config_path);
-        for (func, _pattern) in &concurrency {
-            eprintln!(
-                "warning: {func} spawns parallel work -- add --cpu-time to see computation time"
-            );
-        }
-    }
 
     Ok(Some((binary, runs_dir, total_fns)))
 }
