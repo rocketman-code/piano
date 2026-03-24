@@ -33,7 +33,7 @@ fn build_lifecycle_prefix(runs_dir: &str, cpu_time: bool) -> String {
     s.push_str("\n                        format!(\"{}-{}-{}.ndjson\", __piano_ts, __piano_pid, __piano_suffix)");
     s.push_str("\n                    };");
     s.push_str("\n                    let __piano_path = __piano_dir.join(&__piano_name);");
-    s.push_str("\n                    match std::fs::File::create_new(&__piano_path) {");
+    s.push_str("\n                    match std::fs::OpenOptions::new().write(true).create_new(true).open(&__piano_path) {");
     s.push_str("\n                        Ok(f) => { __piano_file = Some(f); break; }");
     s.push_str("\n                        Err(_) => {}");
     s.push_str("\n                    }");

@@ -64,10 +64,10 @@ pub fn instrument_source(
             }
         }
 
-        let is_async = func.async_token().is_some() || returns_impl_future(&func);
+        let is_async_fn = func.async_token().is_some();
+        let is_impl_future = returns_impl_future(&func);
 
-        if is_async {
-            // Wrap body in enter_async(NAME_ID, async move { body })
+        if is_async_fn || is_impl_future {
             let close_brace = stmt_list.syntax().children_with_tokens()
                 .filter(|t| t.kind() == T!['}'])
                 .last()
@@ -78,7 +78,13 @@ pub fn instrument_source(
                 inject_offset,
                 format!("\npiano_runtime::enter_async({name_id}, async move {{"),
             );
-            injector.insert(close_offset, "})");
+            // async fn: .await the PianoFuture (body expects the return type, not PianoFuture)
+            // impl Future: return the PianoFuture directly (it IS the return value)
+            if is_async_fn {
+                injector.insert(close_offset, "}).await");
+            } else {
+                injector.insert(close_offset, "})");
+            }
         } else {
             // Sync: inject guard at body start
             injector.insert(
