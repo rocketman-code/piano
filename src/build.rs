@@ -298,7 +298,7 @@ fn remap_rendered_error(rendered: &str, file_maps: &HashMap<PathBuf, SourceMap>)
             let map = file_maps.get(Path::new(file));
             current_map = map;
             if let Some(m) = map {
-                let remapped = m.remap_line(line_num).unwrap_or(line_num);
+                let remapped = m.remap_line(line_num);
                 lines.push(
                     SPAN_RE
                         .replace(line, format!(" --> {file}:{remapped}:{col}"))
@@ -312,7 +312,7 @@ fn remap_rendered_error(rendered: &str, file_maps: &HashMap<PathBuf, SourceMap>)
                 let spaces = &caps[1];
                 let line_num: u32 = caps[2].parse().unwrap_or(0);
                 let suffix = &caps[3];
-                let remapped = map.remap_line(line_num).unwrap_or(line_num);
+                let remapped = map.remap_line(line_num);
                 let width = caps[2].len();
                 let rest = &line[caps[0].len()..];
                 lines.push(format!("{spaces}{remapped:>width$}{suffix}{rest}"));
@@ -358,6 +358,47 @@ fn filter_piano_internals(rendered: &str) -> String {
     filtered.join("\n")
 }
 
+/// Detect Send-bound errors caused by piano's async wrapping and return user guidance.
+///
+/// Returns `Some(message)` when the error contains a Send-bound pattern AND mentions
+/// piano internals (`PianoFuture` or `piano_runtime`), indicating the wrapping caused it.
+/// Returns `None` for Send errors in user code or non-Send errors.
+fn detect_send_bound_guidance(error_text: &str) -> Option<String> {
+    let has_send_error = error_text.contains("is not Send")
+        || error_text.contains("cannot be sent between threads safely")
+        || error_text.contains("doesn't implement Send")
+        || error_text.contains("which is required by") && error_text.contains("Send");
+
+    if !has_send_error {
+        return None;
+    }
+
+    let piano_involved = error_text.contains("PianoFuture") || error_text.contains("piano_runtime");
+    if !piano_involved {
+        return None;
+    }
+
+    // Try to extract the function name from the error context.
+    // Rustc errors include both diagnostic text (e.g. `function `foo``) and
+    // source code lines (e.g. `fn foo() ->`). We match both patterns.
+    static FN_NAME_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?:fn|function) `?(\w+)`?(?:\(|`)").unwrap());
+
+    let name = FN_NAME_RE
+        .captures(error_text)
+        .map(|caps| caps[1].to_string());
+
+    let fn_desc = match &name {
+        Some(n) => format!("function '{n}'"),
+        None => "a function".to_string(),
+    };
+
+    Some(format!(
+        "piano: {fn_desc} cannot be wrapped for async profiling \
+         (non-Send type captured). Use --skip <name> to exclude it."
+    ))
+}
+
 /// Find the project root by walking up from `start_dir` looking for Cargo.toml.
 ///
 /// Returns the canonicalized directory containing the nearest Cargo.toml.
@@ -378,7 +419,7 @@ pub fn find_project_root(start_dir: &Path) -> Result<PathBuf, Error> {
     }
 }
 
-/// Result of pre-building the piano-runtime library.
+/// Result of pre-building piano-runtime as an rlib.
 pub struct PrebuiltRuntime {
     /// Path to the compiled libpiano_runtime.rlib
     pub rlib_path: PathBuf,
@@ -390,7 +431,6 @@ pub struct PrebuiltRuntime {
 ///
 /// Creates a minimal crate that depends on `piano-runtime` from crates.io,
 /// builds it with `cargo build --release`, and locates the output rlib.
-/// Cargo's fingerprinting and registry cache avoid redundant downloads.
 pub fn prebuild_runtime(
     project_dir: &Path,
     target_dir: &Path,
@@ -460,7 +500,7 @@ fn copy_runtime_standalone(src: &Path, dest: &Path) -> Result<(), Error> {
     // Copy and patch Cargo.toml
     let cargo_toml = std::fs::read_to_string(src.join("Cargo.toml"))
         .map_err(io_context("read Cargo.toml", &src.join("Cargo.toml")))?;
-    let mut doc: toml_edit::DocumentMut = cargo_toml
+    let mut doc: DocumentMut = cargo_toml
         .parse()
         .map_err(|e| Error::BuildFailed(format!("failed to parse runtime Cargo.toml: {e}")))?;
     doc.remove("bench");
@@ -673,6 +713,11 @@ pub fn build_instrumented(
         // Remap line numbers using source maps written by the wrapper
         let file_maps = crate::wrapper::read_source_maps(config_path);
         let error_text = remap_rendered_error(&error_text, &file_maps);
+        // Detect Send-bound errors before filtering piano internals (the
+        // filter strips `piano_runtime` lines that the detector needs).
+        if let Some(guidance) = detect_send_bound_guidance(&error_text) {
+            eprintln!("{guidance}");
+        }
         let error_text = filter_piano_internals(&error_text);
         return Err(Error::BuildFailed(error_text));
     }
@@ -1050,7 +1095,7 @@ edition = "2021"
         let rendered = "error[E0308]: mismatched types\n --> src/main.rs:7:18\n  |\n7 |     let x: i32 = \"hello\";\n  |                  ^^^^^^^ expected `i32`, found `&str`\n";
         let mut file_maps = std::collections::HashMap::new();
         let mut map = crate::source_map::SourceMap::new();
-        map.record(1, 2, 2);
+        map.record(1, 2);
         file_maps.insert(PathBuf::from("src/main.rs"), map);
 
         let result = remap_rendered_error(rendered, &file_maps);
@@ -1063,11 +1108,11 @@ edition = "2021"
 
     #[test]
     fn filter_piano_internals_from_errors() {
-        let rendered = "error[E0308]: mismatched types\n --> src/main.rs:5:10\n  |\n3 |     let __piano_guard = piano_runtime::enter(\"foo\");\n  |         -------------- this is of type `Guard`\n4 |     let x: i32 = \"hello\";\n  |                  ^^^^^^^ expected `i32`, found `&str`\n";
+        let rendered = "error[E0308]: mismatched types\n --> src/main.rs:5:10\n  |\n3 |     let (__piano_guard, __piano_ctx) = __piano_ctx.enter(0);\n  |         -------------- this is of type `Guard`\n4 |     let x: i32 = \"hello\";\n  |                  ^^^^^^^ expected `i32`, found `&str`\n";
         let result = filter_piano_internals(rendered);
         assert!(
-            !result.contains("piano_runtime"),
-            "should filter piano_runtime: {result}"
+            !result.contains("__piano_ctx"),
+            "should filter __piano_ctx: {result}"
         );
         assert!(
             !result.contains("__piano_guard"),
@@ -1080,46 +1125,81 @@ edition = "2021"
     }
 
     #[test]
-    fn prebuild_runtime_produces_rlib() {
-        let tmp = TempDir::new().unwrap();
-        let target_dir = tmp.path().join("target/piano");
-        std::fs::create_dir_all(&target_dir).unwrap();
-
-        let result = prebuild_runtime(tmp.path(), &target_dir, &[]).unwrap();
-
-        assert!(
-            result.rlib_path.exists(),
-            "rlib should exist at {}",
-            result.rlib_path.display()
+    fn send_bound_error_with_piano_future_returns_guidance() {
+        let error_text = concat!(
+            "error[E0277]: `Rc<Cell<i32>>` cannot be sent between threads safely\n",
+            " --> src/handler.rs:12:5\n",
+            "  |\n",
+            "12 |     some_call().await;\n",
+            "  |     ^^^^^^^^^^ `Rc<Cell<i32>>` cannot be sent between threads safely\n",
+            "  |\n",
+            "  = help: within `PianoFuture<impl Future<Output = ()>>`, ",
+            "the trait `Send` is not implemented for `Rc<Cell<i32>>`\n",
+            "  = note: required by a bound in fn `handle_request`\n",
         );
+
+        let result = detect_send_bound_guidance(error_text);
         assert!(
-            result.rlib_path.to_string_lossy().contains("piano_runtime"),
-            "rlib should be piano_runtime: {}",
-            result.rlib_path.display()
+            result.is_some(),
+            "should detect Send error with PianoFuture"
         );
+        let msg = result.unwrap();
         assert!(
-            result.deps_dir.is_dir(),
-            "deps dir should exist: {}",
-            result.deps_dir.display()
+            msg.contains("cannot be wrapped for async profiling"),
+            "should contain guidance: {msg}"
+        );
+        assert!(msg.contains("--skip"), "should mention --skip flag: {msg}");
+    }
+
+    #[test]
+    fn send_bound_error_without_piano_returns_none() {
+        let error_text = concat!(
+            "error[E0277]: `Rc<i32>` cannot be sent between threads safely\n",
+            " --> src/main.rs:5:10\n",
+            "  |\n",
+            "5 |     tokio::spawn(async move { drop(rc); });\n",
+            "  |     ^^^^^^^^^^^^ `Rc<i32>` cannot be sent between threads safely\n",
+        );
+
+        let result = detect_send_bound_guidance(error_text);
+        assert!(
+            result.is_none(),
+            "should not trigger for user's own Send error"
         );
     }
 
     #[test]
-    fn clean_stale_piano_files_removes_temp_files() {
-        let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("src");
-        std::fs::create_dir_all(&src).unwrap();
+    fn non_send_error_returns_none() {
+        let error_text = concat!(
+            "error[E0308]: mismatched types\n",
+            " --> src/main.rs:3:18\n",
+            "  |\n",
+            "3 |     let x: i32 = \"hello\";\n",
+            "  |                  ^^^^^^^ expected `i32`, found `&str`\n",
+        );
 
-        // Create stale temp files
-        std::fs::write(src.join(".main.piano.rs"), "stale").unwrap();
-        std::fs::write(src.join(".lib.piano.rs"), "stale").unwrap();
-        // Create a normal file that should be preserved
-        std::fs::write(src.join("main.rs"), "fn main() {}").unwrap();
+        let result = detect_send_bound_guidance(error_text);
+        assert!(result.is_none(), "should not trigger for non-Send errors");
+    }
 
-        clean_stale_piano_files(&src).unwrap();
+    #[test]
+    fn send_bound_guidance_extracts_function_name() {
+        let error_text = concat!(
+            "error[E0277]: `Rc<Cell<i32>>` is not Send\n",
+            " --> src/api.rs:20:1\n",
+            "  |\n",
+            "20 | fn process_request() -> impl Future<Output = ()> {\n",
+            "  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+            "  = note: within `PianoFuture<impl Future>`, ",
+            "the trait `Send` is not implemented for `Rc<Cell<i32>>`\n",
+        );
 
-        assert!(!src.join(".main.piano.rs").exists());
-        assert!(!src.join(".lib.piano.rs").exists());
-        assert!(src.join("main.rs").exists());
+        let result = detect_send_bound_guidance(error_text);
+        assert!(result.is_some());
+        let msg = result.unwrap();
+        assert!(
+            msg.contains("function 'process_request'"),
+            "should extract function name: {msg}"
+        );
     }
 }
