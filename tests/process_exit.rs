@@ -122,23 +122,17 @@ fn process_exit_produces_valid_profiling_data() {
         "work() should have been called at least once"
     );
 
-    // In-flight function: main's guard never drops because process::exit(1)
-    // fires before main returns. The TlsFlushGuard should recover it.
+    // main() is the lifecycle boundary (creates root context) and is excluded
+    // from the name table. It does not appear in the output even though --fn main was passed.
     assert!(
-        stats.contains_key("main"),
-        "in-flight function 'main' should be recovered on process::exit, got: {stats:?}"
-    );
-    assert!(
-        stats["main"].calls >= 1,
-        "main() should have been called at least once"
+        !stats.contains_key("main"),
+        "main should NOT appear in output (lifecycle boundary, excluded from name table)"
     );
 }
 
-/// Streaming mode (PIANO_STREAM_FRAMES=1) exercises the atexit path through
-/// `stream_frame_to_writer` and `intern_name`, which use TLS (THREAD_INDEX,
-/// NAME_CACHE). When `process::exit()` destroys TLS before the atexit handler
-/// runs, these `.with()` calls would panic. The fix converts them to
-/// `.try_with()` with graceful fallback.
+/// The atexit path uses TLS (THREAD_INDEX, NAME_CACHE). When `process::exit()`
+/// destroys TLS before the atexit handler runs, `.with()` calls would panic.
+/// The fix converts them to `.try_with()` with graceful fallback.
 #[test]
 fn process_exit_streaming_no_tls_panic() {
     let tmp = tempfile::tempdir().unwrap();
