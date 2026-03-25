@@ -282,19 +282,27 @@ fn profile_ignore_exit_code_surfaces_no_data_written() {
         .expect("failed to run piano profile with --ignore-exit-code");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // With --ignore-exit-code, the user wants profiling results despite
-    // non-zero exit. NoRuns should NOT be suppressed -- it surfaces as
-    // NoDataWritten so they know something went wrong with data collection.
+    // The runtime always writes header + trailer via the shutdown handler,
+    // even when the program exits before calling any instrumented function.
+    // So an NDJSON file exists, but it contains zero measurements.
+    // The report should succeed but show no function data.
     assert!(
-        stderr.contains("profiling data was not written"),
-        "should show NoDataWritten error with --ignore-exit-code, got: {stderr}"
+        output.status.success(),
+        "piano profile with --ignore-exit-code should succeed, got:\nstderr: {stderr}\nstdout: {stdout}"
     );
 
     // The exit code warning should NOT appear (--ignore-exit-code suppresses it).
     assert!(
         !stderr.contains("exited with code"),
         "should NOT warn about exit code with --ignore-exit-code, got: {stderr}"
+    );
+
+    // The report should not contain work() data since it was never called.
+    assert!(
+        !stdout.contains("work"),
+        "report should NOT show work (never called), got: {stdout}"
     );
 }
 

@@ -1,91 +1,186 @@
 //! Shared NDJSON parsing utilities for integration tests.
 //!
-//! Parses the NDJSON v4 format written by piano-runtime: a header line,
-//! frame lines with per-function summaries, and a trailer line with
-//! the function names array.
+//! Parses the NDJSON format written by piano-runtime:
+//! - Header: `{"type":"header","names":{"0":"fn_name",...}}`
+//! - Measurement: `{"span_id":N,"parent_span_id":N,"name_id":N,...}`
+//! - Trailer: `{"type":"trailer","names":{"0":"fn_name",...}}`
+//!
+//! Self-attribution is computed from the span tree: for each span,
+//! self = inclusive - sum(direct children's inclusive).
 
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Per-function aggregated data from NDJSON frames.
+/// Per-function aggregated data from NDJSON spans.
 #[derive(Debug, Default)]
 pub struct FnStats {
     pub calls: u64,
     pub self_ns: u64,
+    pub alloc_count: u64,
+    pub alloc_bytes: u64,
 }
 
-/// Parse NDJSON content and aggregate per-function stats (calls + self_ns)
-/// across all frames.
+/// A single measurement span (one per completed function invocation).
+struct Measurement {
+    span_id: u64,
+    parent_span_id: u64,
+    name_id: u64,
+    start_ns: u64,
+    end_ns: u64,
+    alloc_count: u64,
+    alloc_bytes: u64,
+}
+
+/// Parse NDJSON content and aggregate per-function stats.
+///
+/// Parses the name table from header/trailer, parses measurement spans,
+/// computes self-attribution (inclusive - children), and aggregates by
+/// function name.
 ///
 /// Returns a map from function name to aggregated `FnStats`.
 pub fn aggregate_ndjson(content: &str) -> HashMap<String, FnStats> {
     let all_lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     assert!(
-        all_lines.len() >= 2,
-        "NDJSON should have at least header + trailer"
+        !all_lines.is_empty(),
+        "NDJSON should have at least a header line"
     );
 
-    // v4: function names are in the trailer (last line), not the header.
-    let trailer = *all_lines.last().unwrap();
-    let fn_names = parse_trailer_functions(trailer);
+    // Parse all lines: extract name table (prefer trailer over header)
+    // and collect measurements.
+    let mut header_names: Option<HashMap<String, String>> = None;
+    let mut trailer_names: Option<HashMap<String, String>> = None;
+    let mut measurements: Vec<Measurement> = Vec::new();
+    let mut pre_aggregated: HashMap<u64, FnStats> = HashMap::new();
 
-    let mut calls = vec![0u64; fn_names.len()];
-    let mut self_ns = vec![0u64; fn_names.len()];
+    for &line in &all_lines {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
 
-    // Frame lines are between header and trailer.
-    for &line in &all_lines[1..all_lines.len() - 1] {
-        if !line.contains("\"fns\"") {
-            continue;
-        }
-        let fns_start = line.find("\"fns\":[").unwrap() + "\"fns\":[".len();
-        let fns_end = line[fns_start..].rfind(']').unwrap();
-        let fns_str = &line[fns_start..fns_start + fns_end];
-        for entry in fns_str.split("},{") {
-            let entry = entry.trim_start_matches('{').trim_end_matches('}');
-            let id = extract_json_u64(entry, "\"id\":");
-            let c = extract_json_u64(entry, "\"calls\":");
-            let s = extract_json_u64(entry, "\"self_ns\":");
-            if let Some(id) = id {
-                let idx = id as usize;
-                if idx < calls.len() {
-                    calls[idx] += c.unwrap_or(0);
-                    self_ns[idx] += s.unwrap_or(0);
+        // Lines with a "type" field are header or trailer.
+        if let Some(kind) = v.get("type").and_then(|t| t.as_str()) {
+            if let Some(names_obj) = v.get("names").and_then(|n| n.as_object()) {
+                let names: HashMap<String, String> = names_obj
+                    .iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect();
+                match kind {
+                    "header" => header_names = Some(names),
+                    "trailer" => trailer_names = Some(names),
+                    _ => {}
                 }
             }
+            continue;
+        }
+
+        // Aggregated lines (default mode): have "calls" and "self_ns", no "span_id"
+        if let Some(calls) = v.get("calls").and_then(|c| c.as_u64()) {
+            let name_id = v.get("name_id").and_then(|n| n.as_u64()).unwrap_or(0);
+            let agg = pre_aggregated.entry(name_id).or_default();
+            agg.calls += calls;
+            agg.self_ns += v.get("self_ns").and_then(|n| n.as_u64()).unwrap_or(0);
+            agg.alloc_count += v.get("alloc_count").and_then(|n| n.as_u64()).unwrap_or(0);
+            agg.alloc_bytes += v.get("alloc_bytes").and_then(|n| n.as_u64()).unwrap_or(0);
+            continue;
+        }
+
+        // Raw span lines (--raw-spans mode): have "span_id"
+        if let Some(span_id) = v.get("span_id").and_then(|s| s.as_u64()) {
+            measurements.push(Measurement {
+                span_id,
+                parent_span_id: v
+                    .get("parent_span_id")
+                    .and_then(|s| s.as_u64())
+                    .unwrap_or(0),
+                name_id: v.get("name_id").and_then(|s| s.as_u64()).unwrap_or(0),
+                start_ns: v.get("start_ns").and_then(|s| s.as_u64()).unwrap_or(0),
+                end_ns: v.get("end_ns").and_then(|s| s.as_u64()).unwrap_or(0),
+                alloc_count: v.get("alloc_count").and_then(|s| s.as_u64()).unwrap_or(0),
+                alloc_bytes: v.get("alloc_bytes").and_then(|s| s.as_u64()).unwrap_or(0),
+            });
         }
     }
 
-    fn_names
-        .into_iter()
+    // Resolve name table: prefer trailer (authoritative), fall back to header.
+    let raw_names = trailer_names
+        .or(header_names)
+        .expect("NDJSON should have a header or trailer with names");
+
+    let fn_names = build_name_table(&raw_names);
+
+    // If we have pre-aggregated data (default mode), use it directly.
+    if !pre_aggregated.is_empty() {
+        return pre_aggregated
+            .into_iter()
+            .filter_map(|(id, stats)| {
+                let idx = id as usize;
+                fn_names.get(idx).map(|name| (name.clone(), stats))
+            })
+            .collect();
+    }
+
+    // Otherwise, compute self-attribution from span tree (raw-spans mode).
+    let span_index: HashMap<u64, usize> = measurements
+        .iter()
         .enumerate()
-        .map(|(i, name)| {
-            (
-                name,
-                FnStats {
-                    calls: calls[i],
-                    self_ns: self_ns[i],
-                },
-            )
+        .map(|(i, m)| (m.span_id, i))
+        .collect();
+
+    let mut children_sums: HashMap<u64, (u64, u64, u64)> = HashMap::new();
+    for m in &measurements {
+        if m.parent_span_id != 0 && span_index.contains_key(&m.parent_span_id) {
+            let entry = children_sums.entry(m.parent_span_id).or_default();
+            entry.0 += m.end_ns.saturating_sub(m.start_ns);
+            entry.1 += m.alloc_count;
+            entry.2 += m.alloc_bytes;
+        }
+    }
+
+    let mut stats_by_id: HashMap<u64, FnStats> = HashMap::new();
+    for m in &measurements {
+        let wall = m.end_ns.saturating_sub(m.start_ns);
+        let (child_wall, child_ac, child_ab) =
+            children_sums.get(&m.span_id).copied().unwrap_or_default();
+
+        let agg = stats_by_id.entry(m.name_id).or_default();
+        agg.calls += 1;
+        agg.self_ns += wall.saturating_sub(child_wall);
+        agg.alloc_count += m.alloc_count.saturating_sub(child_ac);
+        agg.alloc_bytes += m.alloc_bytes.saturating_sub(child_ab);
+    }
+
+    stats_by_id
+        .into_iter()
+        .filter_map(|(id, stats)| {
+            let idx = id as usize;
+            fn_names.get(idx).map(|name| (name.clone(), stats))
         })
         .collect()
 }
 
-/// Parse the "functions" array from an NDJSON v4 trailer line.
-fn parse_trailer_functions(trailer: &str) -> Vec<String> {
-    let fns_start = trailer
-        .find("\"functions\":[")
-        .expect("trailer should have functions array")
-        + "\"functions\":[".len();
-    let fns_end = trailer[fns_start..]
-        .find(']')
-        .expect("functions array should close");
-    let fns_str = &trailer[fns_start..fns_start + fns_end];
-    fns_str
-        .split(',')
-        .map(|s| s.trim().trim_matches('"').to_string())
-        .collect()
+/// Build an ordered name table from the raw string-keyed map.
+///
+/// Keys are numeric name_ids as strings (e.g., "0", "1", "2").
+/// Returns a Vec where index i holds the name for name_id i.
+fn build_name_table(raw: &HashMap<String, String>) -> Vec<String> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let mut pairs: Vec<(u64, String)> = raw
+        .iter()
+        .filter_map(|(k, v)| k.parse::<u64>().ok().map(|id| (id, v.clone())))
+        .collect();
+    pairs.sort_by_key(|(id, _)| *id);
+
+    let max_id = pairs.last().map(|(id, _)| *id).unwrap_or(0);
+    let mut names = vec![String::new(); (max_id + 1) as usize];
+    for (id, name) in pairs {
+        names[id as usize] = name;
+    }
+    names
 }
 
 /// Find the largest NDJSON file in a directory.

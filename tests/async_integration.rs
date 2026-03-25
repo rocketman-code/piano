@@ -43,8 +43,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
     // The program allocates in an async function with .await points.
     // Vec::with_capacity forces a real heap allocation.
     // Uses a sync wrapper that calls the async function via block_on,
-    // ensuring the depth-0 guard boundary flushes FRAME_BUFFER to FRAMES
-    // so NDJSON output is produced.
+    // ensuring the depth-0 guard boundary flushes the per-thread buffer
+    // to the file sink so NDJSON output is produced.
     fs::write(
         dir.join("src").join("main.rs"),
         r#"
@@ -138,8 +138,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
     // The program has a parent that uses select! over two children.
     // Each child sleeps for 50ms. The parent does no computation.
-    // With the old phantom-based system, select! cancellation could inflate
-    // the parent's self_ns. With PianoFuture, self_ns should be ~0.
+    // select! cancellation must not inflate the parent's self_ns.
+    // PianoFuture tracks per-poll wall time, so self_ns should be ~0.
     fs::write(
         dir.join("src").join("main.rs"),
         r#"use tokio::time::{sleep, Duration};
@@ -415,51 +415,20 @@ fn async_alloc_tracking_pipeline() {
     let run_file = common::largest_ndjson_file(&runs_dir);
     let content = fs::read_to_string(&run_file).unwrap();
 
-    // NDJSON v4 format:
-    //   Line 1 (header): {"format_version":4,"run_id":"...","timestamp_ms":...}
-    //   Lines 2..N (frames): {"frame":0,"fns":[{"id":0,"calls":1,"self_ns":...,"ac":N,"ab":N,...}]}
-    //   Last line (trailer): {"functions":["allocating_work","main"]}
-    // "ac" = alloc_count, "ab" = alloc_bytes. Functions referenced by index from trailer.
+    // NDJSON format:
+    //   Header: {"type":"header","names":{"0":"allocating_work",...}}
+    //   Measurement: {"span_id":N,"parent_span_id":N,"name_id":N,...,"alloc_count":N,"alloc_bytes":N}
+    //   Trailer: {"type":"trailer","names":{"0":"allocating_work",...}}
 
-    // v4: function names are in the trailer (last non-empty line), not the header.
-    let all_lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    let trailer_line = all_lines
-        .last()
-        .expect("should have at least header + trailer");
-    let trailer: serde_json::Value =
-        serde_json::from_str(trailer_line).expect("trailer should be valid JSON");
-    let fn_names = trailer
-        .get("functions")
-        .and_then(|f| f.as_array())
-        .expect("trailer should have functions array");
-    let alloc_work_id = fn_names
-        .iter()
-        .position(|n| n.as_str() == Some("allocating_work"))
-        .expect("allocating_work should be in functions list");
+    let stats = common::aggregate_ndjson(&content);
 
-    // Search frame lines (skip header and trailer) for an entry with that function id
-    // and non-zero "ac".
-    let frame_lines = &all_lines[1..all_lines.len() - 1];
-    let has_alloc_data = frame_lines.iter().any(|line| {
-        if let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) {
-            frame
-                .get("fns")
-                .and_then(|f| f.as_array())
-                .map(|fns| {
-                    fns.iter().any(|f| {
-                        f.get("id").and_then(|id| id.as_u64()) == Some(alloc_work_id as u64)
-                            && f.get("ac").and_then(|n| n.as_u64()).unwrap_or(0) > 0
-                    })
-                })
-                .unwrap_or(false)
-        } else {
-            false
-        }
-    });
+    let alloc_stats = stats
+        .get("allocating_work")
+        .expect("allocating_work should appear in output");
 
     assert!(
-        has_alloc_data,
-        "allocating_work should have non-zero alloc_count (ac) in NDJSON output.\nContent:\n{content}"
+        alloc_stats.alloc_count > 0,
+        "allocating_work should have non-zero alloc_count in NDJSON output.\nContent:\n{content}"
     );
 }
 
@@ -598,16 +567,20 @@ fn async_nested_select_self_time() {
         "output should contain child_a. Got:\n{content}"
     );
 
-    // All functions here only sleep (no CPU work). With the hybrid timing
-    // model, self_ns reflects active poll time, so sleeping functions have
-    // near-zero self_ns. The key invariant: self_ns is small (overhead
-    // only, not inflated by select! mechanics or child sleep time).
+    // parent_select does zero computation -- its body is just a select! macro.
+    // Its self_ns should be much smaller than child_a's self_ns (~50ms of sleep).
     let parent = stats.get("parent_select").unwrap();
+    let child = stats.get("child_a").unwrap();
     assert!(
-        parent.self_ns < 30_000_000,
-        "parent_select.self_ns ({}) should be small (< 30ms) -- \
-         sleep time should not inflate self_ns",
+        child.self_ns > 0,
+        "child_a should have non-zero self_ns (it sleeps 50ms)"
+    );
+    assert!(
+        parent.self_ns < child.self_ns,
+        "parent_select.self_ns ({}) must be < child_a.self_ns ({}) -- \
+         parent does no computation, select! overhead should be negligible",
         parent.self_ns,
+        child.self_ns,
     );
 }
 
@@ -755,7 +728,7 @@ fn async_tokio_pipeline() {
         "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
     );
 
-    // The old behavior was to skip async functions with a warning.
+    // Async functions must be instrumented, not skipped.
     // Verify no "skipped" + "async" message appears in stderr.
     let stderr_lower = stderr.to_lowercase();
     assert!(
@@ -877,19 +850,13 @@ fn impl_future_self_time_attribution() {
     let foo = stats.get("foo").unwrap();
     let bar = stats.get("bar").unwrap();
 
-    // foo sleeps 80ms (no CPU work). bar just awaits foo.
-    // With the hybrid timing model, self_ns = active poll time.
-    // Neither function does CPU work, so both have near-zero self_ns.
-    // The key invariant: neither self_ns is inflated by sleep time.
+    // foo does the work (80ms sleep x3 calls). bar does nothing.
+    // foo.self_ns must be greater than bar.self_ns.
     assert!(
-        foo.self_ns < 30_000_000,
-        "foo.self_ns ({}) should be small (< 30ms) -- \
-         sleep time should not inflate self_ns",
+        foo.self_ns > bar.self_ns,
+        "foo.self_ns ({}) must be > bar.self_ns ({}) -- \
+         foo does the 80ms sleep, bar just awaits foo",
         foo.self_ns,
-    );
-    assert!(
-        bar.self_ns < 30_000_000,
-        "bar.self_ns ({}) should be small (< 30ms)",
         bar.self_ns,
     );
 }
