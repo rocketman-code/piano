@@ -28,7 +28,7 @@ exclude_re = [
     # clock_gettime syscall and Once-guarded calibration.
     # Same reasoning as time.rs.
     "cpu_now_ns",
-    "cpu_clock.rs.+calibrate_bias",
+    "replace calibrate_bias",
 
     # --- session.rs: null pointer check ---
     # Deleting ! in is_null() returns Some for null pointers.
