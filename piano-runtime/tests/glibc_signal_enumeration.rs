@@ -6,7 +6,7 @@
 //!
 //! Requires: glibc development headers (glibc-devel / libc6-dev).
 
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 #[test]
 fn posix_signals_exhaustive() {
