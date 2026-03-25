@@ -10,7 +10,7 @@ fn get_returns_none_before_init() {
 #[test]
 fn init_returns_static_ref() {
     std::thread::spawn(|| {
-        let session = ProfileSession::init(None, false, &[], "test", 0);
+        let _session = ProfileSession::init(None, false, &[], "test", 0);
         // init returns a valid &'static reference
         assert!(ProfileSession::get().is_some());
     })
