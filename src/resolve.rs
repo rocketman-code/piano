@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use syn::visit::Visit;
+use ra_ap_syntax::ast::HasAttrs;
+use ra_ap_syntax::ast::HasModuleItem;
+use ra_ap_syntax::ast::HasName;
+use ra_ap_syntax::{AstNode, AstToken, Edition, SyntaxKind, ast};
 
 use crate::error::{Error, io_context};
 
@@ -23,9 +26,11 @@ pub struct ResolvedTarget {
 }
 
 /// Why a function was excluded from instrumentation.
+///
+/// Only structurally uninstrumentable signatures belong here.
+/// unsafe fn is NOT skipped -- it receives ctx and guard like any other function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    Unsafe,
     Const,
     ExternAbi,
 }
@@ -33,7 +38,6 @@ pub enum SkipReason {
 impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SkipReason::Unsafe => write!(f, "unsafe"),
             SkipReason::Const => write!(f, "const"),
             SkipReason::ExternAbi => write!(f, "extern"),
         }
@@ -42,7 +46,7 @@ impl std::fmt::Display for SkipReason {
 
 /// Whether a function signature is safe to instrument.
 ///
-/// Explicit enum — no implicit "everything else is fine" default.
+/// Explicit enum with no implicit "everything else is fine" default.
 /// Every code path through `classify()` returns a named variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Classification {
@@ -64,8 +68,14 @@ pub struct SkippedFunction {
 /// Result of target resolution: resolved targets plus any skipped functions.
 #[derive(Debug)]
 pub struct ResolveResult {
+    /// Functions selected for measurement (matched by selectors, or all when no selectors).
     pub targets: Vec<ResolvedTarget>,
+    /// Functions excluded from instrumentation (const fn, extern fn).
     pub skipped: Vec<SkippedFunction>,
+    /// ALL instrumentable functions across the source tree, regardless of selectors.
+    /// Used to build the pass-through set: functions that receive ctx but no guard.
+    /// When selectors are empty, this equals the union of all targets.
+    pub all_functions: Vec<ResolvedTarget>,
 }
 
 /// Resolve user-provided target specs against the source tree rooted at `src_dir`.
@@ -96,19 +106,28 @@ pub fn resolve_targets(
     // avoiding a redundant re-parse in build_suggestion_hint.
     let mut all_seen_names: Vec<String> = Vec::new();
 
+    // Always collect ALL instrumentable functions for pass-through support.
+    // When selectors are active, non-selected functions become pass-through:
+    // they receive ctx but no guard (zero profiling overhead for pass-through).
+    let mut all_functions: Vec<ResolvedTarget> = Vec::new();
+    let mut all_skipped: Vec<SkippedFunction> = Vec::new();
+    for file in &rs_files {
+        let source = std::fs::read_to_string(file).map_err(|source| Error::RunReadError {
+            path: file.clone(),
+            source,
+        })?;
+        let (all_fns, file_skipped) = extract_functions(&source, rel_path(file));
+        if !all_fns.is_empty() {
+            merge_into(&mut all_functions, file, all_fns);
+        }
+        all_skipped.extend(file_skipped);
+    }
+
     if specs.is_empty() {
         // No specs = instrument all functions in all files.
-        for file in &rs_files {
-            let source = std::fs::read_to_string(file).map_err(|source| Error::RunReadError {
-                path: file.clone(),
-                source,
-            })?;
-            let (all_fns, file_skipped) = extract_functions(&source, rel_path(file));
-            if !all_fns.is_empty() {
-                merge_into(&mut results, file, all_fns);
-            }
-            skipped.extend(file_skipped);
-        }
+        // Reuse the already-collected all_functions and all_skipped.
+        results = all_functions.clone();
+        skipped = all_skipped;
     } else {
         for spec in specs {
             match spec {
@@ -125,8 +144,8 @@ pub fn resolve_targets(
                         let matched: Vec<crate::naming::QualifiedFunction> = all_fns
                             .into_iter()
                             .filter(|qf| {
-                                // Match against the bare function name (after any Type:: prefix).
                                 let name = &qf.minimal;
+                                // Match against the bare function name (after any Type:: prefix).
                                 let bare = name.rsplit("::").next().unwrap_or(name);
                                 if exact {
                                     bare == pattern.as_str() || name == pattern.as_str()
@@ -247,9 +266,17 @@ pub fn resolve_targets(
     skipped.sort_by(|a, b| a.name.cmp(&b.name));
     skipped.dedup_by(|a, b| a.name == b.name);
 
+    // Sort all_functions the same way as results.
+    all_functions.sort_by(|a, b| a.file.cmp(&b.file));
+    for r in &mut all_functions {
+        r.functions.sort_by(|a, b| a.full.cmp(&b.full));
+        r.functions.dedup_by(|a, b| a.full == b.full);
+    }
+
     Ok(ResolveResult {
         targets: results,
         skipped,
+        all_functions,
     })
 }
 
@@ -303,14 +330,20 @@ pub(crate) fn extract_functions(
     source: &str,
     rel_path: PathBuf,
 ) -> (Vec<crate::naming::QualifiedFunction>, Vec<SkippedFunction>) {
-    let syntax = match syn::parse_file(source) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("warning: skipping {}: {e}", rel_path.display());
-            return (Vec::new(), Vec::new());
-        }
-    };
+    let parse = ast::SourceFile::parse(source, Edition::Edition2024);
 
+    // ra_ap_syntax does error recovery, so we always get a tree.
+    // If there are errors, warn but continue (like syn did -- we just get
+    // fewer functions from broken regions).
+    if !parse.errors().is_empty() {
+        eprintln!(
+            "warning: parse errors in {} ({} errors, continuing with recovered tree)",
+            rel_path.display(),
+            parse.errors().len()
+        );
+    }
+
+    let file = parse.tree();
     let mut collector = FnCollector {
         functions: Vec::new(),
         skipped: Vec::new(),
@@ -319,81 +352,162 @@ pub(crate) fn extract_functions(
         current_trait: None,
         scope: crate::naming::ScopeState::new(),
     };
-    collector.visit_file(&syntax);
+    collector.walk_source_file(&file);
+
+    // Discover functions generated by macro_rules! invocations.
+    // This replaces the old token-scan approach (visit_macro_rules) for
+    // metavar-named functions. Uses ra_ap_mbe to expand each invocation
+    // and parses the expansion to find fn items.
+    let (expansions, _defs, calls) =
+        crate::macro_expand::expand_fn_generating_macros(file.syntax());
+    for exp in &expansions {
+        let call = &calls[exp.call_idx];
+
+        // Determine impl context from the macro call's position in the CST.
+        let impl_prefix = macro_call_impl_context(file.syntax(), call.byte_start);
+
+        for fn_name in &exp.fn_names {
+            let qualified = if let Some(ref prefix) = impl_prefix {
+                format!("{prefix}::{fn_name}")
+            } else {
+                fn_name.clone()
+            };
+            let minimal = collector.scope.render_minimal(&qualified);
+            let medium = collector.scope.render_medium(&qualified);
+            let full = collector.scope.render_full(&qualified);
+            collector
+                .functions
+                .push(crate::naming::QualifiedFunction::new(
+                    &minimal, &medium, &full,
+                ));
+        }
+    }
+
     (collector.functions, collector.skipped)
 }
 
-/// Check whether an attribute list contains a specific simple attribute (e.g. `#[test]`).
-fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
-    attrs.iter().any(|a| a.path().is_ident(name))
+/// Determine if a macro call at `byte_offset` is inside an `impl` block.
+/// If so, returns the impl type name (e.g., "S" or "S<T>").
+fn macro_call_impl_context(root: &ra_ap_syntax::SyntaxNode, byte_offset: usize) -> Option<String> {
+    use ra_ap_syntax::TextSize;
+
+    // Find the deepest node covering this offset.
+    let offset = TextSize::from(byte_offset as u32);
+    let token = root.token_at_offset(offset).right_biased()?;
+
+    // Walk up ancestors looking for an IMPL node.
+    for ancestor in token.parent_ancestors() {
+        if ancestor.kind() == SyntaxKind::IMPL {
+            let imp = ast::Impl::cast(ancestor)?;
+            let self_ty = imp.self_ty()?;
+            let trait_ty = imp.trait_();
+            return Some(crate::naming::render_impl_name(&self_ty, trait_ty.as_ref()));
+        }
+    }
+    None
 }
 
-/// Check whether an attribute list contains `#[cfg(test)]`.
-fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        if !a.path().is_ident("cfg") {
-            return false;
-        }
-        a.parse_args::<syn::Ident>()
-            .map(|id| id == "test")
-            .unwrap_or(false)
+/// Check whether a CST node's attributes contain a specific simple attribute (e.g. `#[test]`).
+fn has_attr_cst(attrs: impl Iterator<Item = ast::Attr>, name: &str) -> bool {
+    attrs.into_iter().any(|a| {
+        // Simple path attribute: `#[test]` has a single path segment.
+        a.path()
+            .and_then(|p| p.segment())
+            .and_then(|seg| seg.name_ref())
+            .is_some_and(|n| n.text() == name)
     })
 }
 
-/// Classify whether a function signature is safe to instrument.
+/// Check whether a CST node's attributes contain `#[cfg(test)]`.
+fn has_cfg_test_cst(attrs: impl Iterator<Item = ast::Attr>) -> bool {
+    attrs.into_iter().any(|a| {
+        let path_is_cfg = a
+            .path()
+            .and_then(|p| p.segment())
+            .and_then(|seg| seg.name_ref())
+            .is_some_and(|n| n.text() == "cfg");
+        if !path_is_cfg {
+            return false;
+        }
+        // Check if the token tree content is just "test".
+        // The token tree text is "(test)" -- strip parens and check.
+        a.token_tree().is_some_and(|tt| {
+            let text = tt.syntax().text().to_string();
+            let inner = text.trim_start_matches('(').trim_end_matches(')').trim();
+            inner == "test"
+        })
+    })
+}
+
+/// Extract the ABI string from a CST `ast::Fn`, stripping surrounding quotes.
 ///
-/// Uses exhaustive destructuring of `syn::Signature` so that adding a new
-/// field to `Signature` (e.g., for `gen fn`) causes a compile error here,
-/// forcing an explicit decision about the new modifier's instrumentability.
+/// Returns `None` when there is no `extern` keyword (default Rust ABI).
+/// Returns `Some("")` for bare `extern fn` (no ABI string, defaults to C).
+/// Returns `Some("C")`, `Some("Rust")`, etc. for explicit ABI strings.
+fn extract_cst_abi(func: &ast::Fn) -> Option<String> {
+    let abi = func.abi()?;
+    match abi.abi_string() {
+        Some(abi_str) => {
+            // abi_string().text() returns the token including quotes, e.g. "\"Rust\"".
+            let raw = abi_str.text();
+            let unquoted = raw
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(raw);
+            Some(unquoted.to_string())
+        }
+        None => {
+            // bare `extern fn` (no ABI string) defaults to "C"
+            Some(String::new())
+        }
+    }
+}
+
+/// Classify whether a function is safe to instrument based on primitive properties.
 ///
-/// NEVER use `..` in this destructuring — it defeats the compile-time safety.
+/// Takes parser-agnostic bools and an optional ABI string so that both the
+/// resolver and the rewriter call the same implementation. One function, one proof.
 ///
-/// Checkpoint coverage for the "wrong function filtering" bug class:
-/// - CP1 (this function): signature modifiers via exhaustive destructuring
-/// - CP2: return type via `returns_future()` in the strategy layer (rewrite/mod.rs)
-/// - CP3: attributes via caller-level checks (#[test]) + structural coverage
-///   (all dangerous built-in attrs require unsafe/extern, caught here)
-/// - CP4: syntactic context via Visit method selection (FnCollector/InjectionCollector)
+/// `abi` semantics: `None` means no explicit ABI (default Rust ABI, instrumentable).
+/// `Some("Rust")` is also instrumentable. Any other value (including `Some("")`
+/// for bare `extern fn`) causes a skip.
+///
+/// Defense against the "wrong function filtering" bug class:
+/// - This function: signature modifiers via is_const, abi
+/// - Return type: `returns_future()` in the strategy layer (rewrite/mod.rs)
+/// - Attributes: caller-level checks (#[test]) + structural coverage
+/// - Syntactic context: item walking (FnCollector/InjectionCollector)
+///
+/// unsafe fn is NOT skipped -- it receives ctx parameter and guard like any
+/// other instrumentable function.
 ///
 /// Built-in attribute audit (Rust 1.88, 26 attrs on functions):
 ///   Safe: cfg, cfg_attr, ignore, should_panic, allow, expect, warn, deny,
 ///     forbid, deprecated, must_use, inline, cold, track_caller,
 ///     instruction_set, no_mangle, export_name, link_section, doc
 ///   Policy skip: test (handled by caller)
-///   Caught by signature: naked (unsafe+extern), target_feature (unsafe)
+///   Caught by signature: naked (extern), target_feature (safe to instrument)
 ///   Unreachable: proc_macro, proc_macro_derive, proc_macro_attribute,
 ///     panic_handler (no_std only)
-pub(crate) fn classify(sig: &syn::Signature) -> Classification {
-    let syn::Signature {
-        constness,
-        asyncness: _, // strategy concern, not filtering (PianoFuture wrapping)
-        unsafety,
-        abi,
-        fn_token: _,    // syntax token, irrelevant to instrumentability
-        ident: _,       // function name, irrelevant to instrumentability
-        generics: _,    // guard is monomorphic, works with any generics
-        paren_token: _, // syntax token, irrelevant to instrumentability
-        inputs: _,      // parameter types don't affect guard injection
-        variadic: _,    // only valid in extern fns, already caught by abi check
-        output: _,      // strategy concern (returns_future), not filtering
-    } = sig;
-
-    if unsafety.is_some() {
-        return Classification::Skip(SkipReason::Unsafe);
-    }
-    if constness.is_some() {
+pub(crate) fn classify(is_const: bool, abi: Option<&str>) -> Classification {
+    if is_const {
         return Classification::Skip(SkipReason::Const);
     }
-    if let Some(abi) = abi {
-        let is_rust_abi = abi.name.as_ref().is_some_and(|name| name.value() == "Rust");
-        if !is_rust_abi {
+    if let Some(abi_str) = abi {
+        if abi_str != "Rust" {
             return Classification::Skip(SkipReason::ExternAbi);
         }
     }
     Classification::Instrumentable
 }
 
-/// AST visitor that collects function names from a parsed Rust file.
+/// Classify a CST function node using primitive properties extracted from the CST.
+fn classify_cst_fn(func: &ast::Fn) -> Classification {
+    let cst_abi = extract_cst_abi(func);
+    classify(func.const_token().is_some(), cst_abi.as_deref())
+}
+
+/// CST-based collector that walks module items to extract function names.
 struct FnCollector {
     functions: Vec<crate::naming::QualifiedFunction>,
     skipped: Vec<SkippedFunction>,
@@ -407,133 +521,233 @@ struct FnCollector {
     scope: crate::naming::ScopeState,
 }
 
-impl<'ast> Visit<'ast> for FnCollector {
-    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if has_cfg_test(&node.attrs) {
+impl FnCollector {
+    fn walk_source_file(&mut self, file: &ast::SourceFile) {
+        for item in file.items() {
+            self.walk_item(&item);
+        }
+    }
+
+    fn walk_item(&mut self, item: &ast::Item) {
+        match item {
+            ast::Item::Module(module) => self.visit_module(module),
+            ast::Item::Fn(func) => self.visit_top_level_fn(func),
+            ast::Item::Impl(imp) => self.visit_impl(imp),
+            ast::Item::Trait(tr) => self.visit_trait(tr),
+            // MacroRules: fn discovery handled by macro_expand module
+            // after the tree walk (see extract_functions).
+            _ => {}
+        }
+    }
+
+    fn walk_item_list(&mut self, item_list: &ast::ItemList) {
+        for item in item_list.items() {
+            self.walk_item(&item);
+        }
+    }
+
+    fn visit_module(&mut self, module: &ast::Module) {
+        if has_cfg_test_cst(module.attrs()) {
             return; // skip entire #[cfg(test)] module
         }
-        self.scope.push_mod(&node.ident.to_string());
-        syn::visit::visit_item_mod(self, node);
+        let mod_name = module
+            .name()
+            .map(|n| n.text().to_string())
+            .unwrap_or_else(|| "_".to_string());
+        self.scope.push_mod(&mod_name);
+        if let Some(item_list) = module.item_list() {
+            self.walk_item_list(&item_list);
+        }
         self.scope.pop();
     }
 
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if !has_attr(&node.attrs, "test") {
-            let name = node.sig.ident.to_string();
-            let minimal = self.scope.render_minimal(&name);
-            match classify(&node.sig) {
-                Classification::Skip(reason) => {
-                    self.skipped.push(SkippedFunction {
-                        name: minimal,
-                        reason,
-                        path: self.path.clone(),
-                    });
-                }
-                Classification::Instrumentable => {
-                    let medium = self.scope.render_medium(&name);
-                    let full = self.scope.render_full(&name);
-                    self.functions.push(crate::naming::QualifiedFunction::new(
-                        &minimal, &medium, &full,
-                    ));
+    fn visit_top_level_fn(&mut self, func: &ast::Fn) {
+        if !has_attr_cst(func.attrs(), "test") {
+            let name = func
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_default();
+            self.record_function(func, &name);
+        }
+        // Push fn scope for nested items, then walk the body for nested fns.
+        let fn_name = func
+            .name()
+            .map(|n| n.text().to_string())
+            .unwrap_or_default();
+        self.scope.push_fn(&fn_name);
+        if let Some(body) = func.body() {
+            self.walk_fn_body(&body);
+        }
+        self.scope.pop();
+    }
+
+    fn visit_impl(&mut self, imp: &ast::Impl) {
+        let self_ty = imp.self_ty();
+        let trait_ty = imp.trait_();
+        let impl_name = crate::naming::render_impl_name(
+            self_ty.as_ref().expect("impl should have self type"),
+            trait_ty.as_ref(),
+        );
+        let prev = self.current_impl.replace(impl_name);
+        if let Some(assoc_list) = imp.assoc_item_list() {
+            for assoc in assoc_list.assoc_items() {
+                if let ast::AssocItem::Fn(func) = assoc {
+                    self.visit_impl_fn(&func);
                 }
             }
         }
-        // Push fn scope for nested items, then visit ONLY the block body.
-        // Using the free function skips our visit_block override, so the
-        // fn body itself doesn't get a block scope.
-        self.scope.push_fn(&node.sig.ident.to_string());
-        syn::visit::visit_block(self, &node.block);
-        self.scope.pop();
-    }
-
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        let impl_name = crate::naming::render_impl_name(
-            &node.self_ty,
-            node.trait_.as_ref().map(|(_, path, _)| path),
-        );
-        let prev = self.current_impl.replace(impl_name);
-        syn::visit::visit_item_impl(self, node);
         self.current_impl = prev;
     }
 
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if !has_attr(&node.attrs, "test") {
-            let method_name = node.sig.ident.to_string();
+    fn visit_impl_fn(&mut self, func: &ast::Fn) {
+        if !has_attr_cst(func.attrs(), "test") {
+            let method_name = func
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_default();
             let impl_qualified = if let Some(ref impl_name) = self.current_impl {
                 format!("{impl_name}::{method_name}")
             } else {
                 method_name
             };
-            let minimal = self.scope.render_minimal(&impl_qualified);
-            match classify(&node.sig) {
-                Classification::Skip(reason) => {
-                    self.skipped.push(SkippedFunction {
-                        name: minimal,
-                        reason,
-                        path: self.path.clone(),
-                    });
-                }
-                Classification::Instrumentable => {
-                    let medium = self.scope.render_medium(&impl_qualified);
-                    let full = self.scope.render_full(&impl_qualified);
-                    self.functions.push(crate::naming::QualifiedFunction::new(
-                        &minimal, &medium, &full,
-                    ));
-                }
-            }
+            self.record_function(func, &impl_qualified);
         }
         // Push fn scope for nested items.
-        self.scope.push_fn(&node.sig.ident.to_string());
-        syn::visit::visit_block(self, &node.block);
+        let fn_name = func
+            .name()
+            .map(|n| n.text().to_string())
+            .unwrap_or_default();
+        self.scope.push_fn(&fn_name);
+        if let Some(body) = func.body() {
+            self.walk_fn_body(&body);
+        }
         self.scope.pop();
     }
 
-    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
-        let trait_name = node.ident.to_string();
+    fn visit_trait(&mut self, tr: &ast::Trait) {
+        let trait_name = tr
+            .name()
+            .map(|n| n.text().to_string())
+            .unwrap_or_else(|| "_".to_string());
         let prev = self.current_trait.replace(trait_name);
-        syn::visit::visit_item_trait(self, node);
+        if let Some(assoc_list) = tr.assoc_item_list() {
+            for assoc in assoc_list.assoc_items() {
+                if let ast::AssocItem::Fn(func) = assoc {
+                    self.visit_trait_fn(&func);
+                }
+            }
+        }
         self.current_trait = prev;
     }
 
-    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-        if let Some(ref block) = node.default {
-            let method_name = node.sig.ident.to_string();
+    fn visit_trait_fn(&mut self, func: &ast::Fn) {
+        // Only collect trait fns with default bodies.
+        if func.body().is_some() {
+            let method_name = func
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_default();
             let trait_qualified = if let Some(ref trait_name) = self.current_trait {
                 format!("{trait_name}::{method_name}")
             } else {
                 method_name
             };
-            let minimal = self.scope.render_minimal(&trait_qualified);
-            match classify(&node.sig) {
-                Classification::Skip(reason) => {
-                    self.skipped.push(SkippedFunction {
-                        name: minimal,
-                        reason,
-                        path: self.path.clone(),
-                    });
-                }
-                Classification::Instrumentable => {
-                    let medium = self.scope.render_medium(&trait_qualified);
-                    let full = self.scope.render_full(&trait_qualified);
-                    self.functions.push(crate::naming::QualifiedFunction::new(
-                        &minimal, &medium, &full,
-                    ));
-                }
+            self.record_function(func, &trait_qualified);
+            // Push fn scope for nested items in the default body.
+            let fn_name = func
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_default();
+            self.scope.push_fn(&fn_name);
+            if let Some(body) = func.body() {
+                self.walk_fn_body(&body);
             }
-            // Push fn scope for nested items.
-            self.scope.push_fn(&node.sig.ident.to_string());
-            syn::visit::visit_block(self, block);
             self.scope.pop();
-        } else {
-            syn::visit::visit_trait_item_fn(self, node);
         }
     }
 
-    fn visit_block(&mut self, node: &'ast syn::Block) {
-        self.scope.push_block();
-        syn::visit::visit_block(self, node);
-        self.scope.pop();
+    /// Walk descendants of a function body to find nested items
+    /// (inner fns, impls, traits, modules defined inside function bodies).
+    fn walk_fn_body(&mut self, body: &ast::BlockExpr) {
+        // Walk direct statement-level items in the block.
+        // We need to handle nested items like:
+        //   fn outer() {
+        //     struct S;
+        //     impl S { fn m() {} }
+        //     fn inner() {}
+        //   }
+        // Use descendants to find nested items at any depth within the block.
+        for node in body.syntax().descendants() {
+            if node.kind() == SyntaxKind::FN {
+                // Skip the function itself (body's parent fn is already handled).
+                if node.text_range() == body.syntax().text_range() {
+                    continue;
+                }
+                if let Some(inner_fn) = ast::Fn::cast(node.clone()) {
+                    // Only process if the parent is NOT another FN we already handle
+                    // via recursive visit. Check if this fn is a direct item
+                    // (not inside another nested fn's body that would be visited
+                    // by its own walk_fn_body call).
+                    // The ancestor walking approach: find the enclosing context.
+                    let context = find_ancestor_impl_context(&node);
+                    self.visit_nested_fn(&inner_fn, context.as_deref());
+                }
+            }
+        }
     }
+
+    /// Process a nested function found inside another function's body.
+    fn visit_nested_fn(&mut self, func: &ast::Fn, impl_context: Option<&str>) {
+        if !has_attr_cst(func.attrs(), "test") {
+            let name = func
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_default();
+            let fn_qualified = match impl_context {
+                Some(prefix) => format!("{prefix}::{name}"),
+                None => name,
+            };
+            self.record_function(func, &fn_qualified);
+        }
+    }
+
+    /// Classify a function and record it as instrumentable or skipped.
+    /// Single site for classification -> push, so adding a Classification
+    /// variant or SkippedFunction field can't silently break one of the callers.
+    fn record_function(&mut self, func: &ast::Fn, qualified: &str) {
+        let minimal = self.scope.render_minimal(qualified);
+        match classify_cst_fn(func) {
+            Classification::Skip(reason) => {
+                self.skipped.push(SkippedFunction {
+                    name: minimal,
+                    reason,
+                    path: self.path.clone(),
+                });
+            }
+            Classification::Instrumentable => {
+                let medium = self.scope.render_medium(qualified);
+                let full = self.scope.render_full(qualified);
+                self.functions.push(crate::naming::QualifiedFunction::new(
+                    &minimal, &medium, &full,
+                ));
+            }
+        }
+    }
+}
+
+/// Walk up the syntax tree from a FN node to find the nearest enclosing `impl`
+/// block and extract its qualified type name (e.g. "Local" or "<Local as Trait>").
+fn find_ancestor_impl_context(fn_node: &ra_ap_syntax::SyntaxNode) -> Option<String> {
+    let mut current = fn_node.parent();
+    while let Some(node) = current {
+        if let Some(imp) = ast::Impl::cast(node.clone()) {
+            let self_ty = imp.self_ty()?;
+            let trait_ty = imp.trait_();
+            return Some(crate::naming::render_impl_name(&self_ty, trait_ty.as_ref()));
+        }
+        current = node.parent();
+    }
+    None
 }
 
 /// Levenshtein edit distance between two strings.
@@ -823,7 +1037,7 @@ mod tests {
             "error should mention the pattern: {err}"
         );
         assert!(
-            err.contains("Found 11 functions"),
+            err.contains("Found 14 functions"),
             "error should show function count: {err}"
         );
         assert!(
@@ -944,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_skips_const_unsafe_extern_functions() {
+    fn resolve_skips_const_and_extern_functions() {
         let tmp = TempDir::new().unwrap();
         create_test_project(tmp.path());
 
@@ -964,22 +1178,24 @@ mod tests {
             "should include Widget::valid_method"
         );
 
-        // Should skip const/unsafe/extern
+        // unsafe fn IS instrumentable -- guard is pure safe code
+        assert!(all_fns.contains(&"dangerous"), "should include unsafe fn");
+        assert!(
+            all_fns.contains(&"Widget::raw_ptr"),
+            "should include unsafe impl method"
+        );
+
+        // Should skip const/extern
         assert!(!all_fns.contains(&"fixed_size"), "should skip const fn");
-        assert!(!all_fns.contains(&"dangerous"), "should skip unsafe fn");
         assert!(!all_fns.contains(&"ffi_callback"), "should skip extern fn");
         assert!(
             !all_fns.contains(&"Widget::none"),
             "should skip const impl method"
         );
-        assert!(
-            !all_fns.contains(&"Widget::raw_ptr"),
-            "should skip unsafe impl method"
-        );
     }
 
     #[test]
-    fn resolve_skips_trait_methods_with_unsafe_qualifier() {
+    fn resolve_instruments_unsafe_trait_default_methods() {
         let tmp = TempDir::new().unwrap();
         create_test_project(tmp.path());
 
@@ -992,16 +1208,16 @@ mod tests {
             .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
             .collect();
 
-        // Trait default methods that are instrumentable should be included
+        // Trait default methods should be included
         assert!(
             all_fns.contains(&"Processor::default_method"),
-            "should include instrumentable trait default method"
+            "should include safe trait default method"
         );
 
-        // Unsafe trait default methods should be skipped
+        // unsafe trait default methods ARE instrumentable -- guard is pure safe code
         assert!(
-            !all_fns.contains(&"Processor::unsafe_default"),
-            "should skip unsafe trait default method"
+            all_fns.contains(&"Processor::unsafe_default"),
+            "should include unsafe trait default method"
         );
 
         // Trait methods without default bodies should not appear at all
@@ -1014,11 +1230,11 @@ mod tests {
             "should not include trait method without default body"
         );
 
-        // Verify unsafe_default appears in skipped list
+        // unsafe_default should NOT be in the skipped list
         let skipped_names: Vec<&str> = result.skipped.iter().map(|s| s.name.as_str()).collect();
         assert!(
-            skipped_names.contains(&"Processor::unsafe_default"),
-            "unsafe trait default method should appear in skipped list"
+            !skipped_names.contains(&"Processor::unsafe_default"),
+            "unsafe trait default method should not be skipped"
         );
     }
 
@@ -1196,25 +1412,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_skipped_filtered_by_fn_pattern() {
+    fn resolve_finds_unsafe_fn_by_pattern() {
         let tmp = TempDir::new().unwrap();
         create_test_project(tmp.path());
 
-        // "dangerous" matches the unsafe fn "dangerous" but not "fixed_size" or "ffi_callback".
-        // Since all matched functions are skipped (none instrumentable), resolve_targets
-        // returns an error with skip information in the hint.
+        // "dangerous" matches the unsafe fn "dangerous" -- unsafe fn is instrumentable.
         let specs = [TargetSpec::Fn("dangerous".into())];
-        let result = resolve_targets(&tmp.path().join("src"), &specs, false);
+        let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
-        assert!(result.is_err(), "should error when all matches are skipped");
-        let err = result.unwrap_err().to_string();
+        let all_fns: Vec<&str> = result
+            .targets
+            .iter()
+            .flat_map(|r| r.functions.iter().map(|qf| qf.minimal.as_str()))
+            .collect();
         assert!(
-            err.contains("no functions matched"),
-            "error should say no functions matched: {err}"
-        );
-        assert!(
-            err.contains("1 matched function(s) were skipped (unsafe)"),
-            "error should mention skipped unsafe function: {err}"
+            all_fns.contains(&"dangerous"),
+            "should find and instrument unsafe fn 'dangerous': {all_fns:?}"
         );
     }
 
@@ -1237,10 +1450,6 @@ mod tests {
             "should report const fn as skipped: {skipped_names:?}"
         );
         assert!(
-            skipped_names.contains(&("dangerous", &SkipReason::Unsafe)),
-            "should report unsafe fn as skipped: {skipped_names:?}"
-        );
-        assert!(
             skipped_names.contains(&("ffi_callback", &SkipReason::ExternAbi)),
             "should report extern fn as skipped: {skipped_names:?}"
         );
@@ -1248,9 +1457,17 @@ mod tests {
             skipped_names.contains(&("Widget::none", &SkipReason::Const)),
             "should report const impl method as skipped: {skipped_names:?}"
         );
+
+        // unsafe fns should NOT be in the skipped list -- guard is pure safe code
         assert!(
-            skipped_names.contains(&("Widget::raw_ptr", &SkipReason::Unsafe)),
-            "should report unsafe impl method as skipped: {skipped_names:?}"
+            !skipped_names.iter().any(|(name, _)| *name == "dangerous"),
+            "unsafe fn should not be skipped: {skipped_names:?}"
+        );
+        assert!(
+            !skipped_names
+                .iter()
+                .any(|(name, _)| *name == "Widget::raw_ptr"),
+            "unsafe impl method should not be skipped: {skipped_names:?}"
         );
 
         // All skipped functions from this file should have the correct relative path.
@@ -1270,6 +1487,9 @@ mod tests {
             .collect();
         assert!(all_fns.contains(&"normal_fn"));
         assert!(all_fns.contains(&"Widget::valid_method"));
+        // unsafe fns should be in the instrumented list
+        assert!(all_fns.contains(&"dangerous"));
+        assert!(all_fns.contains(&"Widget::raw_ptr"));
     }
 
     #[test]
@@ -1406,134 +1626,232 @@ fn main() {}
 
     #[test]
     fn classify_returns_explicit_classification() {
-        use syn::parse_quote;
-
         // Normal fn -> Instrumentable
-        let sig: syn::Signature = parse_quote! { fn foo() };
-        assert!(matches!(classify(&sig), Classification::Instrumentable));
+        assert!(matches!(
+            classify(false, None),
+            Classification::Instrumentable
+        ));
 
         // const fn -> Skip(Const)
-        let sig: syn::Signature = parse_quote! { const fn foo() };
         assert!(matches!(
-            classify(&sig),
+            classify(true, None),
             Classification::Skip(SkipReason::Const)
         ));
 
-        // unsafe fn -> Skip(Unsafe)
-        let sig: syn::Signature = parse_quote! { unsafe fn foo() };
-        assert!(matches!(
-            classify(&sig),
-            Classification::Skip(SkipReason::Unsafe)
-        ));
-
         // extern "C" fn -> Skip(ExternAbi)
-        let sig: syn::Signature = parse_quote! { extern "C" fn foo() };
         assert!(matches!(
-            classify(&sig),
+            classify(false, Some("C")),
             Classification::Skip(SkipReason::ExternAbi)
         ));
 
-        // extern fn (bare extern = C ABI) -> Skip(ExternAbi)
-        let sig: syn::Signature = parse_quote! { extern fn foo() };
+        // extern fn (bare extern = empty ABI) -> Skip(ExternAbi)
         assert!(matches!(
-            classify(&sig),
+            classify(false, Some("")),
             Classification::Skip(SkipReason::ExternAbi)
         ));
 
         // extern "Rust" fn -> Instrumentable (explicit Rust ABI is fine)
-        let sig: syn::Signature = parse_quote! { extern "Rust" fn foo() };
-        assert!(matches!(classify(&sig), Classification::Instrumentable));
+        assert!(matches!(
+            classify(false, Some("Rust")),
+            Classification::Instrumentable
+        ));
 
         // async fn -> Instrumentable (async affects strategy, not filtering)
-        let sig: syn::Signature = parse_quote! { async fn foo() };
-        assert!(matches!(classify(&sig), Classification::Instrumentable));
-
-        // fn with generics -> Instrumentable
-        let sig: syn::Signature = parse_quote! { fn foo<T: Clone>(x: T) -> T };
-        assert!(matches!(classify(&sig), Classification::Instrumentable));
-
-        // fn returning impl Future -> Instrumentable (strategy concern, not filter)
-        let sig: syn::Signature =
-            parse_quote! { fn foo() -> impl std::future::Future<Output = i32> };
-        assert!(matches!(classify(&sig), Classification::Instrumentable));
+        // (asyncness is not a classify parameter -- it is a strategy concern)
+        assert!(matches!(
+            classify(false, None),
+            Classification::Instrumentable
+        ));
     }
 
     #[test]
-    fn inline_mod_qualifies_fn_names() {
-        let source = r#"
-mod inner {
-    fn foo() {}
+    fn classify_cst_fn_delegates_to_classify() {
+        /// Parse a function signature string into a CST `ast::Fn` node.
+        fn parse_fn(sig: &str) -> ast::Fn {
+            let source = format!("{sig} {{}}");
+            let parse = ast::SourceFile::parse(&source, Edition::Edition2024);
+            let file = parse.tree();
+            file.syntax()
+                .descendants()
+                .find_map(ast::Fn::cast)
+                .expect("should parse fn")
+        }
 
-    struct Bar;
-    impl Bar {
-        fn baz(&self) {}
+        // Verify classify_cst_fn extracts properties from CST ast::Fn
+        // and delegates to the unified classify().
+        let func = parse_fn("fn foo()");
+        assert!(matches!(
+            classify_cst_fn(&func),
+            Classification::Instrumentable
+        ));
+
+        let func = parse_fn("const fn foo()");
+        assert!(matches!(
+            classify_cst_fn(&func),
+            Classification::Skip(SkipReason::Const)
+        ));
+
+        // unsafe fn -> Instrumentable (guard is pure safe code)
+        let func = parse_fn("unsafe fn foo()");
+        assert!(matches!(
+            classify_cst_fn(&func),
+            Classification::Instrumentable
+        ));
+
+        let func = parse_fn("extern \"C\" fn foo()");
+        assert!(matches!(
+            classify_cst_fn(&func),
+            Classification::Skip(SkipReason::ExternAbi)
+        ));
+
+        let func = parse_fn("extern fn foo()");
+        assert!(matches!(
+            classify_cst_fn(&func),
+            Classification::Skip(SkipReason::ExternAbi)
+        ));
+
+        let func = parse_fn("extern \"Rust\" fn foo()");
+        assert!(matches!(
+            classify_cst_fn(&func),
+            Classification::Instrumentable
+        ));
+
+        let func = parse_fn("async fn foo()");
+        assert!(matches!(
+            classify_cst_fn(&func),
+            Classification::Instrumentable
+        ));
+
+        let func = parse_fn("fn foo<T: Clone>(x: T) -> T");
+        assert!(matches!(
+            classify_cst_fn(&func),
+            Classification::Instrumentable
+        ));
+
+        let func = parse_fn("fn foo() -> impl std::future::Future<Output = i32>");
+        assert!(matches!(
+            classify_cst_fn(&func),
+            Classification::Instrumentable
+        ));
     }
-}
 
-fn top_level() {}
-"#;
-        let (fns, _skipped) = extract_functions(source, PathBuf::from("src/lib.rs"));
-        let names: Vec<&str> = fns.iter().map(|qf| qf.minimal.as_str()).collect();
-        assert!(
-            names.contains(&"inner::foo"),
-            "inline mod should qualify fn name. Got: {names:?}",
-        );
-        assert!(
-            names.contains(&"inner::Bar::baz"),
-            "inline mod should qualify impl method. Got: {names:?}",
-        );
-        assert!(
-            names.contains(&"top_level"),
-            "top-level fn should be unqualified. Got: {names:?}",
-        );
-    }
+    // --- Pass-through / all_functions tests ---
 
+    /// resolve_targets with selectors returns all_functions containing every
+    /// instrumentable function, while targets contains only the selected subset.
     #[test]
-    fn fn_local_types_get_different_full_names() {
-        let source = r#"
-fn outer_a() {
-    struct S;
-    impl S { fn method(&self) {} }
-}
-fn outer_b() {
-    struct S;
-    impl S { fn method(&self) {} }
-}
-"#;
-        let (fns, _skipped) = extract_functions(source, PathBuf::from("src/lib.rs"));
-        let minimal_names: Vec<&str> = fns.iter().map(|qf| qf.minimal.as_str()).collect();
-        let full_names: Vec<&str> = fns.iter().map(|qf| qf.full.as_str()).collect();
+    fn all_functions_includes_unselected() {
+        let dir = TempDir::new().unwrap();
+        create_test_project(dir.path());
+        let src = dir.path().join("src");
 
-        // Both produce "S::method" at the minimal level (identical).
-        let sm_count = minimal_names.iter().filter(|n| **n == "S::method").count();
-        assert_eq!(
-            sm_count, 2,
-            "should find two S::method at minimal level: {minimal_names:?}"
-        );
+        // Use --fn to select only "walk" (in walker.rs).
+        let specs = vec![TargetSpec::Fn("walk".to_string())];
+        let result = resolve_targets(&src, &specs, false).unwrap();
 
-        // But they must have different full names (fn scope distinguishes them).
-        let sm_fulls: Vec<&&str> = full_names
+        // targets should contain only matched functions.
+        let measured_names: Vec<&str> = result
+            .targets
             .iter()
-            .filter(|n| n.contains("S::method"))
+            .flat_map(|t| t.functions.iter().map(|qf| qf.minimal.as_str()))
+            .collect();
+        assert!(
+            measured_names.iter().all(|n| n.contains("walk")),
+            "targets should only contain walk-matching functions. Got: {measured_names:?}"
+        );
+
+        // all_functions should contain functions from all files, not just matched ones.
+        let all_names: Vec<&str> = result
+            .all_functions
+            .iter()
+            .flat_map(|t| t.functions.iter().map(|qf| qf.minimal.as_str()))
+            .collect();
+        assert!(
+            all_names.len() >= measured_names.len(),
+            "all_functions should be >= targets. all={}, targets={}",
+            all_names.len(),
+            measured_names.len()
+        );
+
+        // all_functions should include functions not in targets.
+        let has_non_walk = all_names.iter().any(|n| !n.contains("walk"));
+        assert!(
+            has_non_walk,
+            "all_functions should include non-walk functions for pass-through. Got: {all_names:?}"
+        );
+    }
+
+    /// When specs are empty (default), all_functions equals targets.
+    #[test]
+    fn all_functions_equals_targets_when_no_specs() {
+        let dir = TempDir::new().unwrap();
+        create_test_project(dir.path());
+        let src = dir.path().join("src");
+
+        let specs: Vec<TargetSpec> = Vec::new();
+        let result = resolve_targets(&src, &specs, false).unwrap();
+
+        let target_names: std::collections::BTreeSet<String> = result
+            .targets
+            .iter()
+            .flat_map(|t| t.functions.iter().map(|qf| qf.minimal.clone()))
+            .collect();
+        let all_names: std::collections::BTreeSet<String> = result
+            .all_functions
+            .iter()
+            .flat_map(|t| t.functions.iter().map(|qf| qf.minimal.clone()))
             .collect();
         assert_eq!(
-            sm_fulls.len(),
-            2,
-            "should find two S::method at full level: {full_names:?}"
+            target_names, all_names,
+            "when no selectors, all_functions should equal targets"
         );
-        assert_ne!(
-            sm_fulls[0], sm_fulls[1],
-            "full names must differ: {full_names:?}"
-        );
+    }
+
+    #[test]
+    fn macro_in_impl_naming_diagnostic() {
+        // Observe what names resolve produces for macro-generated methods.
+        let source = r#"
+macro_rules! add_method {
+    ($name:ident) => {
+        fn $name(&self) -> u32 { 42 }
+    };
+}
+struct S;
+impl S {
+    add_method!(get_value);
+    fn regular_method(&self) -> u32 { 99 }
+}
+fn main() {}
+"#;
+        let (functions, _) = extract_functions(source, PathBuf::from("test.rs"));
+        for f in &functions {
+            eprintln!(
+                "  minimal={:?}  medium={:?}  full={:?}",
+                f.minimal, f.medium, f.full
+            );
+        }
+
+        let macro_fn = functions.iter().find(|f| f.minimal.contains("get_value"));
+        let regular_fn = functions
+            .iter()
+            .find(|f| f.minimal.contains("regular_method"));
+
         assert!(
-            sm_fulls[0].contains("outer_a"),
-            "first should contain outer_a: {}",
-            sm_fulls[0]
+            macro_fn.is_some(),
+            "macro-generated method should be discovered"
         );
-        assert!(
-            sm_fulls[1].contains("outer_b"),
-            "second should contain outer_b: {}",
-            sm_fulls[1]
+        assert!(regular_fn.is_some(), "regular method should be discovered");
+
+        // Both should have the same S:: prefix
+        assert_eq!(
+            macro_fn.unwrap().minimal,
+            "S::get_value",
+            "macro-generated method should be impl-qualified"
+        );
+        assert_eq!(
+            regular_fn.unwrap().minimal,
+            "S::regular_method",
+            "regular method should be impl-qualified"
         );
     }
 }
