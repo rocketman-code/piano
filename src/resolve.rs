@@ -361,13 +361,23 @@ pub(crate) fn extract_functions(
     // This replaces the old token-scan approach (visit_macro_rules) for
     // metavar-named functions. Uses ra_ap_mbe to expand each invocation
     // and parses the expansion to find fn items.
-    let (expansions, _defs, _calls) =
+    let (expansions, _defs, calls) =
         crate::macro_expand::expand_fn_generating_macros(file.syntax());
     for exp in &expansions {
+        let call = &calls[exp.call_idx];
+
+        // Determine impl context from the macro call's position in the CST.
+        let impl_prefix = macro_call_impl_context(file.syntax(), call.byte_start);
+
         for fn_name in &exp.fn_names {
-            let minimal = collector.scope.render_minimal(fn_name);
-            let medium = collector.scope.render_medium(fn_name);
-            let full = collector.scope.render_full(fn_name);
+            let qualified = if let Some(ref prefix) = impl_prefix {
+                format!("{prefix}::{fn_name}")
+            } else {
+                fn_name.clone()
+            };
+            let minimal = collector.scope.render_minimal(&qualified);
+            let medium = collector.scope.render_medium(&qualified);
+            let full = collector.scope.render_full(&qualified);
             collector.functions.push(crate::naming::QualifiedFunction::new(
                 &minimal, &medium, &full,
             ));
@@ -375,6 +385,30 @@ pub(crate) fn extract_functions(
     }
 
     (collector.functions, collector.skipped)
+}
+
+/// Determine if a macro call at `byte_offset` is inside an `impl` block.
+/// If so, returns the impl type name (e.g., "S" or "S<T>").
+fn macro_call_impl_context(
+    root: &ra_ap_syntax::SyntaxNode,
+    byte_offset: usize,
+) -> Option<String> {
+    use ra_ap_syntax::TextSize;
+
+    // Find the deepest node covering this offset.
+    let offset = TextSize::from(byte_offset as u32);
+    let token = root.token_at_offset(offset).right_biased()?;
+
+    // Walk up ancestors looking for an IMPL node.
+    for ancestor in token.parent_ancestors() {
+        if ancestor.kind() == SyntaxKind::IMPL {
+            let imp = ast::Impl::cast(ancestor)?;
+            let self_ty = imp.self_ty()?;
+            let trait_ty = imp.trait_();
+            return Some(crate::naming::render_impl_name(&self_ty, trait_ty.as_ref()));
+        }
+    }
+    None
 }
 
 /// Check whether a CST node's attributes contain a specific simple attribute (e.g. `#[test]`).
@@ -1762,6 +1796,50 @@ fn main() {}
         assert_eq!(
             target_names, all_names,
             "when no selectors, all_functions should equal targets"
+        );
+    }
+
+    #[test]
+    fn macro_in_impl_naming_diagnostic() {
+        // Observe what names resolve produces for macro-generated methods.
+        let source = r#"
+macro_rules! add_method {
+    ($name:ident) => {
+        fn $name(&self) -> u32 { 42 }
+    };
+}
+struct S;
+impl S {
+    add_method!(get_value);
+    fn regular_method(&self) -> u32 { 99 }
+}
+fn main() {}
+"#;
+        let (functions, _) = extract_functions(source, PathBuf::from("test.rs"));
+        for f in &functions {
+            eprintln!("  minimal={:?}  medium={:?}  full={:?}", f.minimal, f.medium, f.full);
+        }
+
+        let macro_fn = functions.iter().find(|f| f.minimal.contains("get_value"));
+        let regular_fn = functions.iter().find(|f| f.minimal.contains("regular_method"));
+
+        assert!(
+            macro_fn.is_some(),
+            "macro-generated method should be discovered"
+        );
+        assert!(
+            regular_fn.is_some(),
+            "regular method should be discovered"
+        );
+
+        // Both should have the same S:: prefix
+        assert_eq!(
+            macro_fn.unwrap().minimal, "S::get_value",
+            "macro-generated method should be impl-qualified"
+        );
+        assert_eq!(
+            regular_fn.unwrap().minimal, "S::regular_method",
+            "regular method should be impl-qualified"
         );
     }
 }

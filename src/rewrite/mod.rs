@@ -390,13 +390,17 @@ fn expand_and_replace_macros(
 
 /// Inject guards into expanded macro text. Parses the expansion, finds fn
 /// items, and inserts guards for functions that are in the measured map.
+/// Inject guards into expanded macro text. Uses the same guard logic as
+/// the main instrument_source loop: sync enter(), async enter_async(),
+/// impl-Future wrapping. Skips const fn and non-Rust ABI.
 fn inject_guards_into_expansion(
     expanded: &str,
     measured: &HashMap<String, u32>,
 ) -> String {
     let parse = SourceFile::parse(expanded, ra_ap_syntax::Edition::Edition2021);
 
-    // Collect guard insertions: (byte_offset, guard_text)
+    // Collect insertions: (byte_offset, text, is_close_brace_insert)
+    // We use a Vec of insertions applied in reverse order.
     let mut insertions: Vec<(usize, String)> = Vec::new();
 
     for node in parse.tree().syntax().descendants() {
@@ -410,15 +414,46 @@ fn inject_guards_into_expansion(
         // Skip const fn
         if func.const_token().is_some() { continue }
 
+        // Skip non-Rust ABI
+        if let Some(abi) = func.abi() {
+            if let Some(token) = abi.string_token() {
+                if token.text() != "\"Rust\"" { continue }
+            }
+        }
+
         let Some(stmt_list) = body.stmt_list() else { continue };
         let Some(open_brace) = stmt_list.syntax().children_with_tokens()
             .find(|t| t.kind() == T!['{']) else { continue };
-
         let offset: usize = open_brace.text_range().end().into();
-        insertions.push((
-            offset,
-            format!("\nlet __piano_guard = piano_runtime::enter({name_id});"),
-        ));
+
+        let is_async_fn = func.async_token().is_some();
+        let is_impl_future = returns_impl_future(&func);
+
+        if is_async_fn || is_impl_future {
+            let Some(close_brace) = stmt_list.syntax().children_with_tokens()
+                .filter(|t| t.kind() == T!['}'])
+                .last() else { continue };
+            let close_offset: usize = close_brace.text_range().start().into();
+
+            if is_async_fn {
+                insertions.push((
+                    offset,
+                    format!("\npiano_runtime::enter_async({name_id}, async move {{"),
+                ));
+                insertions.push((close_offset, "}).await".to_string()));
+            } else {
+                insertions.push((
+                    offset,
+                    format!("\npiano_runtime::enter_async({name_id},"),
+                ));
+                insertions.push((close_offset, ")".to_string()));
+            }
+        } else {
+            insertions.push((
+                offset,
+                format!("\nlet __piano_guard = piano_runtime::enter({name_id});"),
+            ));
+        }
     }
 
     // Apply in reverse order to preserve offsets.
