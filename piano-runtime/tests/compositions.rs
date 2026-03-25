@@ -182,3 +182,47 @@ fn piano_future_thread_migration() {
     handle_a.join().expect("thread A panicked");
     handle_b.join().expect("thread B panicked");
 }
+
+#[test]
+fn nested_guards_compute_correct_self_time() {
+    std::thread::spawn(|| {
+        ProfileSession::init(None, false, &[], "test", 0);
+
+        // outer calls inner. inner takes ~1ms. outer's self-time should
+        // exclude inner's time (children TLS accumulator).
+        {
+            let _outer = enter(0);
+            {
+                let _inner = enter(1);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        let agg = drain_thread_agg();
+        let outer = agg.iter().find(|a| a.name_id == 0).unwrap();
+        let inner = agg.iter().find(|a| a.name_id == 1).unwrap();
+
+        // inner's self_ns should be close to 1ms (the sleep).
+        // outer's self_ns should be much less than inner's (just overhead).
+        assert!(
+            inner.self_ns > 500_000,
+            "inner should have at least 0.5ms self-time, got {}ns",
+            inner.self_ns
+        );
+        assert!(
+            outer.self_ns < inner.self_ns,
+            "outer self-time ({}) must be less than inner ({})",
+            outer.self_ns,
+            inner.self_ns
+        );
+        // outer's inclusive_ns should be >= inner's (it contains inner)
+        assert!(
+            outer.inclusive_ns >= inner.inclusive_ns,
+            "outer inclusive ({}) must be >= inner inclusive ({})",
+            outer.inclusive_ns,
+            inner.inclusive_ns
+        );
+    })
+    .join()
+    .unwrap();
+}

@@ -238,3 +238,27 @@ fn guard_never_panics() {
     .join()
     .expect("guard without cpu_time panicked");
 }
+
+#[test]
+fn alloc_accumulates_across_calls() {
+    std::thread::spawn(|| {
+        ProfileSession::init(None, false, &[], "test", 0);
+
+        {
+            let _g = enter(0);
+            record_alloc(100);
+        }
+        {
+            let _g = enter(0);
+            record_alloc(200);
+        }
+
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 1, "same name_id should merge");
+        assert_eq!(agg[0].calls, 2);
+        assert_eq!(agg[0].alloc_count, 2);
+        assert_eq!(agg[0].alloc_bytes, 300);
+    })
+    .join()
+    .unwrap();
+}
