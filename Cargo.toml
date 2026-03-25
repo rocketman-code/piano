@@ -23,6 +23,11 @@ anstyle = "1"
 anstream = "0.6"
 regex = "1"
 ra_ap_syntax = "=0.0.270"
+ra_ap_mbe = "=0.0.270"
+ra_ap_span = "=0.0.270"
+ra_ap_tt = "=0.0.270"
+ra_ap_parser = "=0.0.270"
+ra_ap_syntax-bridge = "=0.0.270"
 
 [[bin]]
 name = "piano"
