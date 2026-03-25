@@ -41,6 +41,9 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install glibc headers (signal enumeration test)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libc6-dev
       - run: cargo install cargo-show-asm --locked
       - run: cargo test --workspace
 
@@ -52,6 +55,7 @@ jobs:
         with:
           toolchain: "1.88.0"
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get install -y libc6-dev
       - name: Install Rust 1.59 for runtime MSRV test
         run: rustup toolchain install 1.59.0 --profile minimal
       - run: cargo install cargo-show-asm --locked
@@ -66,6 +70,7 @@ jobs:
           toolchain: stable
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get install -y libc6-dev
       - run: cargo install cargo-show-asm --locked
       - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
@@ -111,7 +116,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-asm and cargo-mutants
+      - run: sudo apt-get install -y libc6-dev
+      - name: Install cargo-show-asm and cargo-mutants
         run: |
           cargo install cargo-show-asm --locked
           cargo install cargo-mutants --locked
