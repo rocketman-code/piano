@@ -104,7 +104,7 @@ extern "C" fn atexit_handler() {
             file_sink.record_io_error();
         }
     }
-    if crate::output::write_trailer(&mut *file, names, calibration.bias_ns()).is_err() {
+    if crate::output::write_trailer(&mut *file, names, calibration.bias_ns(), calibration.cpu_bias_ns()).is_err() {
         file_sink.record_io_error();
     }
     if std::io::Write::flush(&mut *file).is_err() {
@@ -126,11 +126,11 @@ extern "C" fn atexit_handler() {
 
 #[cfg(unix)]
 mod signal {
-    use crate::aggregator::{AggRegistry, FnAgg};
+    use crate::aggregator::AggRegistry;
     use crate::file_sink::FileSink;
     use crate::output::{serialize_aggregate_to_stack, serialize_trailer};
     use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, Once};
+    use std::sync::{Arc, Once};
 
     const SIGINT: std::os::raw::c_int = 2;
     const SIGTERM: std::os::raw::c_int = 15;
@@ -238,7 +238,7 @@ mod signal {
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             let calibration = crate::time::CalibrationData::calibrate();
-            let trailer_bytes = serialize_trailer(names, calibration.bias_ns());
+            let trailer_bytes = serialize_trailer(names, calibration.bias_ns(), calibration.cpu_bias_ns());
             let trailer = Box::new(SignalTrailer { bytes: trailer_bytes });
             TRAILER.store(Box::into_raw(trailer) as usize, Ordering::Relaxed);
 

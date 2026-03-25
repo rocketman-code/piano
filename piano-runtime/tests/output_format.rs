@@ -7,7 +7,7 @@ use piano_runtime::output::{write_header, write_trailer, write_aggregates, seria
 #[test]
 fn header_contains_type_and_names() {
     let mut buf = Vec::new();
-    write_header(&mut buf, &[(0, "work"), (1, "helper")], 8).unwrap();
+    write_header(&mut buf, &[(0, "work"), (1, "helper")], 8, 0).unwrap();
     let line = String::from_utf8(buf).unwrap();
 
     assert!(line.starts_with('{'), "header must start with {{");
@@ -21,9 +21,9 @@ fn header_contains_type_and_names() {
 #[test]
 fn trailer_matches_header_structure() {
     let mut hdr = Vec::new();
-    write_header(&mut hdr, &[(0, "a"), (1, "b")], 5).unwrap();
+    write_header(&mut hdr, &[(0, "a"), (1, "b")], 5, 0).unwrap();
     let mut trl = Vec::new();
-    write_trailer(&mut trl, &[(0, "a"), (1, "b")], 5).unwrap();
+    write_trailer(&mut trl, &[(0, "a"), (1, "b")], 5, 0).unwrap();
 
     let h = String::from_utf8(hdr).unwrap();
     let t = String::from_utf8(trl).unwrap();

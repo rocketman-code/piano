@@ -24,8 +24,6 @@ use std::sync::{Arc, Mutex};
 pub struct ProfileSession {
     pub(crate) calibration: CalibrationData,
     pub(crate) cpu_time_enabled: bool,
-    pub(crate) file_sink: Option<Arc<FileSink>>,
-    pub(crate) names: &'static [(u32, &'static str)],
     pub(crate) agg_registry: Arc<AggRegistry>,
 }
 
@@ -52,7 +50,7 @@ impl ProfileSession {
 
         if let Some(ref fs) = file_sink {
             let mut file = fs.lock();
-            if write_header(&mut *file, names, calibration.bias_ns()).is_err() {
+            if write_header(&mut *file, names, calibration.bias_ns(), calibration.cpu_bias_ns()).is_err() {
                 fs.record_io_error();
             }
             if std::io::Write::flush(&mut *file).is_err() {
@@ -66,8 +64,6 @@ impl ProfileSession {
         let session = Box::new(Self {
             calibration,
             cpu_time_enabled,
-            file_sink,
-            names,
             agg_registry,
         });
 

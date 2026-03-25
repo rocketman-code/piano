@@ -667,8 +667,8 @@ mod tests {
         fs::write(dir.path().join("1000.ndjson"), ndjson_a).unwrap();
         fs::write(dir.path().join("2000.ndjson"), ndjson_b).unwrap();
 
-        let (run_a, _) = load_ndjson(&dir.path().join("1000.ndjson")).unwrap();
-        let (run_b, _) = load_ndjson(&dir.path().join("2000.ndjson")).unwrap();
+        let (run_a, _) = load_ndjson(&dir.path().join("1000.ndjson"), false).unwrap();
+        let (run_b, _) = load_ndjson(&dir.path().join("2000.ndjson"), false).unwrap();
 
         // Both runs should have total_ms == None
         assert!(run_a.functions[0].total_ms.is_none());

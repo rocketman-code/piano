@@ -30,7 +30,7 @@ pub struct CalibrationData {
     multiplier: u64,
     bias_ticks: u64,
     epoch_tsc: u64,
-    cpu_bias_f64_bits: u64,
+    cpu_bias_ns: u64,
 }
 
 impl CalibrationData {
@@ -45,7 +45,7 @@ impl CalibrationData {
             multiplier: 0,
             bias_ticks: 0,
             epoch_tsc: 0,
-            cpu_bias_f64_bits: 0,
+            cpu_bias_ns: 0,
         };
 
         // SAFETY: ONCE.call_once guarantees single initialization. After init,
@@ -56,13 +56,14 @@ impl CalibrationData {
                 let (quotient, multiplier, epoch_tsc) = calibrate();
                 let bias_ticks = calibrate_bias();
                 let cpu_bias_f64_bits = crate::cpu_clock::calibrate_bias();
+                let cpu_bias_ns = f64::from_bits(cpu_bias_f64_bits).round() as u64;
 
                 CACHED = CalibrationData {
                     quotient,
                     multiplier,
                     bias_ticks,
                     epoch_tsc,
-                    cpu_bias_f64_bits,
+                    cpu_bias_ns,
                 };
             });
             CACHED
@@ -76,14 +77,13 @@ impl CalibrationData {
         multiplier: u64,
         bias_ticks: u64,
         epoch_tsc: u64,
-        cpu_bias_f64_bits: u64,
     ) -> Self {
         CalibrationData {
             quotient,
             multiplier,
             bias_ticks,
             epoch_tsc,
-            cpu_bias_f64_bits,
+            cpu_bias_ns: 0,
         }
     }
 
@@ -109,13 +109,11 @@ impl CalibrationData {
         self.ticks_to_ns(self.bias_ticks)
     }
 
-    /// Return the calibrated CPU-time bias as f64 nanoseconds.
-    #[cfg(unix)]
+    /// Return the calibrated CPU-time measurement bias in nanoseconds.
     #[inline(always)]
-    pub fn cpu_bias_f64(&self) -> f64 {
-        f64::from_bits(self.cpu_bias_f64_bits)
+    pub fn cpu_bias_ns(&self) -> u64 {
+        self.cpu_bias_ns
     }
-
 }
 
 /// Read the hardware cycle counter. Returns raw ticks.

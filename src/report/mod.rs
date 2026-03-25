@@ -68,6 +68,7 @@ pub struct FnEntry {
 pub(super) struct FnAgg {
     pub(super) calls: u64,
     pub(super) self_ns: u64,
+    pub(super) inclusive_ns: u64,
     pub(super) alloc_count: u64,
     pub(super) alloc_bytes: u64,
     pub(super) free_count: u64,

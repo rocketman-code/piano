@@ -180,6 +180,10 @@ enum Commands {
         #[arg(long)]
         threads: bool,
 
+        /// Show measured times without subtracting profiling overhead.
+        #[arg(long)]
+        uncorrected: bool,
+
         /// Directory for profiling output files.
         /// Overrides PIANO_RUNS_DIR env var and the default (target/piano/runs/).
         #[arg(long, value_name = "DIR")]
@@ -324,10 +328,11 @@ fn run(cli: Cli) -> Result<(), Error> {
             top,
             json,
             threads,
+            uncorrected,
             output_dir,
         } => {
             let (show_all, limit) = resolve_display_limit(all, top);
-            cmd_report(run, show_all, limit, json, threads, &project_root, output_dir)
+            cmd_report(run, show_all, limit, json, threads, uncorrected, &project_root, output_dir)
         }
         Commands::Diff {
             a,
@@ -1123,7 +1128,7 @@ fn cmd_profile(
     }
 
     eprintln!("--- profiling report ---");
-    let report_result = match cmd_report(None, show_all, limit, json, threads, project_root, None) {
+    let report_result = match cmd_report(None, show_all, limit, json, threads, false, project_root, None) {
         Ok(()) => Ok(()),
         Err(Error::NoRuns)
             if !outcome.status.success() && !ignore_exit_code && !intentional_stop =>
@@ -1166,6 +1171,7 @@ fn cmd_report(
     limit: Option<usize>,
     json: bool,
     threads: bool,
+    uncorrected: bool,
     project_root: &Option<PathBuf>,
     output_dir: Option<PathBuf>,
 ) -> Result<(), Error> {
@@ -1214,7 +1220,7 @@ fn cmd_report(
         && path.extension().and_then(|e| e.to_str()) == Some("ndjson")
     {
         if threads {
-            let thread_runs = load_ndjson_per_thread(path)?;
+            let thread_runs = load_ndjson_per_thread(path, uncorrected)?;
             match thread_runs {
                 Some(runs) => {
                     if json {
@@ -1248,7 +1254,7 @@ fn cmd_report(
                         "warning: --threads requires per-thread data; this file predates thread tracking"
                     );
                     eprintln!("warning: showing aggregated view instead");
-                    let (run, _completeness) = load_ndjson(path)?;
+                    let (run, _completeness) = load_ndjson(path, uncorrected)?;
                     if json {
                         println!("{}", format_json(&run, show_all, limit));
                     } else {
@@ -1257,7 +1263,7 @@ fn cmd_report(
                 }
             }
         } else {
-            let (run, _completeness) = load_ndjson(path)?;
+            let (run, _completeness) = load_ndjson(path, uncorrected)?;
             if json {
                 println!("{}", format_json(&run, show_all, limit));
             } else {

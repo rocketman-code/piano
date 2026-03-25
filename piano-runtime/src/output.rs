@@ -14,20 +14,20 @@
 use std::io::{self, Write};
 
 /// Write the name table as a header line.
-pub fn write_header(w: &mut impl Write, names: &[(u32, &str)], bias_ns: u64) -> io::Result<()> {
-    write_name_table(w, "header", names, bias_ns)
+pub fn write_header(w: &mut impl Write, names: &[(u32, &str)], bias_ns: u64, cpu_bias_ns: u64) -> io::Result<()> {
+    write_name_table(w, "header", names, bias_ns, cpu_bias_ns)
 }
 
 /// Write the name table as a trailer line.
-pub fn write_trailer(w: &mut impl Write, names: &[(u32, &str)], bias_ns: u64) -> io::Result<()> {
-    write_name_table(w, "trailer", names, bias_ns)
+pub fn write_trailer(w: &mut impl Write, names: &[(u32, &str)], bias_ns: u64, cpu_bias_ns: u64) -> io::Result<()> {
+    write_name_table(w, "trailer", names, bias_ns, cpu_bias_ns)
 }
 
 /// Serialize the trailer to a byte vector for signal-safe writing.
-pub fn serialize_trailer(names: &[(u32, &str)], bias_ns: u64) -> Vec<u8> {
+pub fn serialize_trailer(names: &[(u32, &str)], bias_ns: u64, cpu_bias_ns: u64) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(b'\n');
-    let _ = write_trailer(&mut buf, names, bias_ns);
+    let _ = write_trailer(&mut buf, names, bias_ns, cpu_bias_ns);
     buf
 }
 
@@ -113,8 +113,8 @@ pub fn serialize_aggregate_to_stack(buf: &mut [u8; 512], a: &crate::aggregator::
     pos
 }
 
-fn write_name_table(w: &mut impl Write, kind: &str, names: &[(u32, &str)], bias_ns: u64) -> io::Result<()> {
-    write!(w, "{{\"type\":\"{kind}\",\"bias_ns\":{bias_ns},\"names\":{{")?;
+fn write_name_table(w: &mut impl Write, kind: &str, names: &[(u32, &str)], bias_ns: u64, cpu_bias_ns: u64) -> io::Result<()> {
+    write!(w, "{{\"type\":\"{kind}\",\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{")?;
     for (i, (id, name)) in names.iter().enumerate() {
         if i > 0 {
             write!(w, ",")?;

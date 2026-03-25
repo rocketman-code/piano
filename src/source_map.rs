@@ -97,13 +97,6 @@ enum Entry {
 }
 
 impl Entry {
-    fn start(&self) -> usize {
-        match self {
-            Entry::Insert(offset, _) => *offset,
-            Entry::Replace(start, _, _) => *start,
-        }
-    }
-
     fn sort_key(&self) -> (usize, u8) {
         // Insert before Replace at the same position
         match self {

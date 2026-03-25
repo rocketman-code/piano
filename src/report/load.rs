@@ -11,7 +11,7 @@ const NS_PER_MS: f64 = 1_000_000.0;
 pub fn load_run(path: &Path) -> Result<Run, Error> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if ext == "ndjson" {
-        let (run, _completeness) = load_ndjson(path)?;
+        let (run, _completeness) = load_ndjson(path, false)?;
         return Ok(run);
     }
     let contents = std::fs::read_to_string(path).map_err(|source| Error::RunReadError {
@@ -43,8 +43,10 @@ pub fn load_run(path: &Path) -> Result<Run, Error> {
 /// Self-attribution is computed from the span tree: for each span, self values
 /// are the span's inclusive values minus the sum of its direct children's values.
 /// Aggregation groups self-attributed values by name_id.
-pub fn load_ndjson(path: &Path) -> Result<(Run, RunCompleteness), Error> {
+pub fn load_ndjson(path: &Path, uncorrected: bool) -> Result<(Run, RunCompleteness), Error> {
     let parsed = parse_ndjson(path)?;
+    let bias_ns = if uncorrected { 0 } else { parsed.bias_ns };
+    let cpu_bias_ns = if uncorrected { 0 } else { parsed.cpu_bias_ns };
 
     let (fn_agg, has_cpu) = if !parsed.aggregates.is_empty() {
         // Aggregated format: self-time pre-computed by runtime
@@ -54,6 +56,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, RunCompleteness), Error> {
             let entry = agg.entry(a.name_id).or_default();
             entry.calls += a.calls;
             entry.self_ns += a.self_ns;
+            entry.inclusive_ns += a.inclusive_ns;
             entry.alloc_count += a.alloc_count;
             entry.alloc_bytes += a.alloc_bytes;
             entry.free_count += a.free_count;
@@ -71,7 +74,7 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, RunCompleteness), Error> {
         (aggregate_self_values(&self_values), has_cpu)
     };
 
-    let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu);
+    let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
 
     let run = Run {
         run_id: parsed.run_id,
@@ -85,8 +88,10 @@ pub fn load_ndjson(path: &Path) -> Result<(Run, RunCompleteness), Error> {
 /// Load an NDJSON file and split results by thread, returning one `Run` per
 /// thread (sorted by thread ID ascending). Returns `None` if the file has no
 /// thread data (all thread_ids are zero or identical).
-pub fn load_ndjson_per_thread(path: &Path) -> Result<Option<Vec<Run>>, Error> {
+pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<Vec<Run>>, Error> {
     let parsed = parse_ndjson(path)?;
+    let bias_ns = if uncorrected { 0 } else { parsed.bias_ns };
+    let cpu_bias_ns = if uncorrected { 0 } else { parsed.cpu_bias_ns };
 
     // Aggregated format: group by thread field
     if !parsed.aggregates.is_empty() {
@@ -105,13 +110,14 @@ pub fn load_ndjson_per_thread(path: &Path) -> Result<Option<Vec<Run>>, Error> {
                 let entry = fn_agg.entry(a.name_id).or_default();
                 entry.calls += a.calls;
                 entry.self_ns += a.self_ns;
+                entry.inclusive_ns += a.inclusive_ns;
                 entry.alloc_count += a.alloc_count;
                 entry.alloc_bytes += a.alloc_bytes;
                 entry.free_count += a.free_count;
                 entry.free_bytes += a.free_bytes;
                 entry.cpu_self_ns += a.cpu_self_ns;
             }
-            let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu);
+            let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
             runs.push((tid, Run {
                 run_id: parsed.run_id.clone(),
                 timestamp_ms: parsed.timestamp_ms,
@@ -144,7 +150,7 @@ pub fn load_ndjson_per_thread(path: &Path) -> Result<Option<Vec<Run>>, Error> {
         .into_iter()
         .map(|(tid, spans)| {
             let fn_agg = aggregate_self_values(spans);
-            let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu);
+            let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
             (
                 tid,
                 Run {
@@ -253,6 +259,8 @@ struct ParsedNdjson {
     measurements: Vec<NdjsonMeasurement>,
     aggregates: Vec<NdjsonAggregate>,
     completeness: RunCompleteness,
+    bias_ns: u64,
+    cpu_bias_ns: u64,
 }
 
 /// Parse an NDJSON file into its component parts: header metadata, name table,
@@ -295,6 +303,14 @@ fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
         .get("timestamp_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u128;
+    let bias_ns = header_value
+        .get("bias_ns")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cpu_bias_ns = header_value
+        .get("cpu_bias_ns")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     // Parse body lines: aggregates, raw measurements, and trailer.
     let body = &all_lines[1..];
@@ -338,6 +354,8 @@ fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
         measurements,
         aggregates,
         completeness,
+        bias_ns,
+        cpu_bias_ns,
     })
 }
 
@@ -361,10 +379,17 @@ fn aggregate_self_values<'a>(
 
 /// Build FnEntry list from name table and aggregated stats. Single construction
 /// site so adding a field to FnEntry can't silently break one of the callers.
+///
+/// Applies aggregate bias correction: subtracts (bias_ns * calls) from each
+/// function's self_ns and cpu_self_ns. This removes the systematic measurement
+/// overhead (cost of TSC reads and clock_gettime calls per invocation).
+/// Correction is aggregate, not per-call, to avoid clipping individual samples.
 fn build_fn_entries(
     fn_names: &[String],
     fn_agg: &HashMap<u32, FnAgg>,
     has_cpu: bool,
+    bias_ns: u64,
+    cpu_bias_ns: u64,
 ) -> Vec<FnEntry> {
     fn_names
         .iter()
@@ -372,13 +397,20 @@ fn build_fn_entries(
         .map(|(idx, name)| {
             let name_id = idx as u32;
             let agg = fn_agg.get(&name_id).copied().unwrap_or_default();
+            let corrected_self_ns = agg.self_ns.saturating_sub(bias_ns * agg.calls);
+            let corrected_inclusive_ns = agg.inclusive_ns.saturating_sub(bias_ns * agg.calls);
+            let corrected_cpu_self_ns = agg.cpu_self_ns.saturating_sub(cpu_bias_ns * agg.calls);
             FnEntry {
                 name: name.clone(),
                 calls: agg.calls,
-                total_ms: None,
-                self_ms: agg.self_ns as f64 / NS_PER_MS,
+                total_ms: if agg.inclusive_ns > 0 {
+                    Some(corrected_inclusive_ns as f64 / NS_PER_MS)
+                } else {
+                    None
+                },
+                self_ms: corrected_self_ns as f64 / NS_PER_MS,
                 cpu_self_ms: if has_cpu {
-                    Some(agg.cpu_self_ns as f64 / NS_PER_MS)
+                    Some(corrected_cpu_self_ns as f64 / NS_PER_MS)
                 } else {
                     None
                 },
@@ -1070,7 +1102,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, completeness) = load_ndjson(&path).unwrap();
+        let (run, completeness) = load_ndjson(&path, false).unwrap();
         assert_eq!(completeness, RunCompleteness::Complete);
         assert_eq!(run.run_id.as_deref(), Some("r1_complete"));
         assert_eq!(run.timestamp_ms, 3000);
@@ -1100,7 +1132,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, completeness) = load_ndjson(&path).unwrap();
+        let (run, completeness) = load_ndjson(&path, false).unwrap();
         assert_eq!(completeness, RunCompleteness::Recovered);
         assert_eq!(run.functions.len(), 2);
         assert_eq!(run.functions[0].name, "alpha");
@@ -1118,7 +1150,7 @@ mod tests {
         let content = format!("{}\n", ndjson_header("r2_empty", 6000, &[]));
         fs::write(&path, content).unwrap();
 
-        let (run, completeness) = load_ndjson(&path).unwrap();
+        let (run, completeness) = load_ndjson(&path, false).unwrap();
         assert_eq!(completeness, RunCompleteness::Recovered);
         assert_eq!(run.run_id.as_deref(), Some("r2_empty"));
         assert_eq!(run.timestamp_ms, 6000);
@@ -1141,7 +1173,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, completeness) = load_ndjson(&path).unwrap();
+        let (run, completeness) = load_ndjson(&path, false).unwrap();
         assert_eq!(completeness, RunCompleteness::Recovered);
         // Only the two valid measurements should be parsed.
         assert_eq!(run.functions.len(), 2);
@@ -1167,7 +1199,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, completeness) = load_ndjson(&path).unwrap();
+        let (run, completeness) = load_ndjson(&path, false).unwrap();
         assert_eq!(completeness, RunCompleteness::Complete);
         assert_eq!(run.functions[0].name, "trailer_name_0");
         assert_eq!(run.functions[1].name, "trailer_name_1");
@@ -1199,7 +1231,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path, false).unwrap();
 
         let parent = run.functions.iter().find(|f| f.name == "parent_fn").unwrap();
         let child1 = run.functions.iter().find(|f| f.name == "child1_fn").unwrap();
@@ -1256,7 +1288,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path, false).unwrap();
         let leaf = run.functions.iter().find(|f| f.name == "leaf_fn").unwrap();
 
         // wall = 6000 - 1000 = 5000 ns = 0.005 ms
@@ -1295,7 +1327,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path, false).unwrap();
         let repeated = run
             .functions
             .iter()
@@ -1328,7 +1360,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path, false).unwrap();
         assert_eq!(run.functions.len(), 2);
         let unused = run.functions.iter().find(|f| f.name == "unused").unwrap();
         assert_eq!(unused.calls, 0);
@@ -1351,7 +1383,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path, false).unwrap();
         for f in &run.functions {
             assert!(
                 f.total_ms.is_none(),
@@ -1380,7 +1412,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path, false).unwrap();
         let work = run.functions.iter().find(|f| f.name == "work").unwrap();
         assert_eq!(work.calls, 2); // 1 from each thread
         // self_wall = 500 + 700 = 1200 ns = 0.0012 ms
@@ -1410,7 +1442,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path, false).unwrap();
         let compute = run.functions.iter().find(|f| f.name == "compute").unwrap();
         assert!(compute.cpu_self_ms.is_some(), "should have cpu_self_ms");
         // cpu = 4500 - 500 = 4000 ns = 0.004 ms
@@ -1437,7 +1469,7 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run, _) = load_ndjson(&path).unwrap();
+        let (run, _) = load_ndjson(&path, false).unwrap();
         let work = run.functions.iter().find(|f| f.name == "work").unwrap();
         assert!(
             work.cpu_self_ms.is_none(),
@@ -1464,8 +1496,8 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let (run1, _) = load_ndjson(&path).unwrap();
-        let (run2, _) = load_ndjson(&path).unwrap();
+        let (run1, _) = load_ndjson(&path, false).unwrap();
+        let (run2, _) = load_ndjson(&path, false).unwrap();
 
         for (f1, f2) in run1.functions.iter().zip(run2.functions.iter()) {
             assert_eq!(f1.name, f2.name);
