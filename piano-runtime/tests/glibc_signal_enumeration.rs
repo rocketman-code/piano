@@ -198,9 +198,7 @@ fn posix_signals_exhaustive() {
                 return content;
             }
         }
-        panic!(
-            "{name} not found in any of {include_dirs:?} (is libc6-dev installed?)"
-        );
+        panic!("{name} not found in any of {include_dirs:?} (is libc6-dev installed?)");
     };
     let header = find_header("signum-generic.h");
     let arch_header = find_header("signum-arch.h");
