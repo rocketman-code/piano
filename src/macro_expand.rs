@@ -347,4 +347,90 @@ mod tests {
         assert_eq!(exps.len(), 1, "single invocation should produce one expansion");
         assert_eq!(exps[0].fn_names, vec!["a", "b", "c"]);
     }
+
+    /// Enumeration test pinned to ra_ap_mbe's parser.rs source.
+    ///
+    /// Reads the actual `eat_fragment_kind` match arms from the ra_ap_mbe
+    /// crate's source to verify piano handles every fragment specifier that
+    /// the expander supports. If ra_ap_mbe adds a new specifier (or we
+    /// upgrade versions), this test fails and forces a classification decision.
+    ///
+    /// Same pattern as piano-runtime's glibc signal enumeration test.
+    #[test]
+    fn fragment_specifiers_exhaustive() {
+        // Find ra_ap_mbe source via cargo metadata (robust across machines).
+        let output = std::process::Command::new("cargo")
+            .args(["metadata", "--format-version", "1"])
+            .output()
+            .expect("cargo metadata failed");
+        let meta: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("cargo metadata output is not valid JSON");
+
+        let mbe_manifest = meta["packages"]
+            .as_array()
+            .expect("packages is not an array")
+            .iter()
+            .find(|pkg| pkg["name"] == "ra_ap_mbe")
+            .expect("ra_ap_mbe not found in cargo metadata")["manifest_path"]
+            .as_str()
+            .expect("manifest_path is not a string")
+            .to_string();
+
+        let parser_path = std::path::Path::new(&mbe_manifest)
+            .parent()
+            .unwrap()
+            .join("src/parser.rs");
+        let source = std::fs::read_to_string(&parser_path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read ra_ap_mbe parser.rs at {}: {e}",
+                parser_path.display()
+            )
+        });
+
+        // Extract fragment specifier strings from eat_fragment_kind match arms.
+        // Lines look like: "path" => MetaVarKind::Path,
+        //              or: "pat" => {
+        let mut found: Vec<String> = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if !(trimmed.contains("=> MetaVarKind") || trimmed.ends_with("=> {")) {
+                continue;
+            }
+            if let Some(start) = trimmed.find('"') {
+                if let Some(end) = trimmed[start + 1..].find('"') {
+                    found.push(trimmed[start + 1..start + 1 + end].to_string());
+                }
+            }
+        }
+        found.sort();
+
+        // Pinned set: every macro_rules! fragment specifier in Rust.
+        // Source: Rust Reference, Macros By Example, and ra_ap_mbe 0.0.270.
+        let expected = vec![
+            "block",
+            "expr",
+            "expr_2021",
+            "ident",
+            "item",
+            "lifetime",
+            "literal",
+            "meta",
+            "pat",
+            "pat_param",
+            "path",
+            "stmt",
+            "tt",
+            "ty",
+            "vis",
+        ];
+
+        assert_eq!(
+            found, expected,
+            "ra_ap_mbe fragment specifier set has changed.\n\
+             Found in source: {found:?}\n\
+             Expected (pinned): {expected:?}\n\
+             If a specifier was added, update this test and verify \
+             piano's expansion handles it correctly."
+        );
+    }
 }
