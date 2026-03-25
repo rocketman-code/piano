@@ -132,3 +132,106 @@ fn stack_serializer_matches_write_aggregates() {
         "stack serializer and write_aggregates must produce identical output"
     );
 }
+
+/// NDJSON format contract: every field the CLI reads must be present in
+/// the runtime's output. If the runtime drops a field, this test fails.
+///
+/// This is the structural guarantee that prevents the run_id bug from
+/// recurring. The writer (piano-runtime) and reader (piano CLI) can't
+/// share a type (different crate, zero-dep constraint). This test pins
+/// the contract mechanically instead.
+///
+/// Pinned to: src/report/mod.rs (NdjsonNameTable, NdjsonAggregate)
+///            src/report/load.rs (header_value.get("run_id"), etc.)
+#[test]
+fn ndjson_format_contract_header() {
+    let mut buf = Vec::new();
+    write_header(
+        &mut buf,
+        &[(0, "work"), (1, "helper")],
+        8, 3, "abc_1000", 1700000000000,
+    ).unwrap();
+    let line = String::from_utf8(buf).unwrap();
+
+    // Every field the CLI reads from the header via serde_json::Value::get
+    let required_fields = [
+        ("type", "\"type\":\"header\""),
+        ("run_id", "\"run_id\":\"abc_1000\""),
+        ("timestamp_ms", "\"timestamp_ms\":1700000000000"),
+        ("bias_ns", "\"bias_ns\":8"),
+        ("cpu_bias_ns", "\"cpu_bias_ns\":3"),
+        ("names", "\"names\":{"),
+    ];
+
+    for (field, pattern) in &required_fields {
+        assert!(
+            line.contains(pattern),
+            "header missing required field '{field}'. \
+             CLI reads this field in load.rs. \
+             Header line: {line}"
+        );
+    }
+}
+
+#[test]
+fn ndjson_format_contract_trailer() {
+    let mut buf = Vec::new();
+    write_trailer(
+        &mut buf,
+        &[(0, "work")],
+        8, 3,
+    ).unwrap();
+    let line = String::from_utf8(buf).unwrap();
+
+    let required_fields = [
+        ("type", "\"type\":\"trailer\""),
+        ("bias_ns", "\"bias_ns\":8"),
+        ("cpu_bias_ns", "\"cpu_bias_ns\":3"),
+        ("names", "\"names\":{"),
+    ];
+
+    for (field, pattern) in &required_fields {
+        assert!(
+            line.contains(pattern),
+            "trailer missing required field '{field}'. \
+             CLI reads this field via NdjsonNameTable deserialization. \
+             Trailer line: {line}"
+        );
+    }
+}
+
+#[test]
+fn ndjson_format_contract_aggregate() {
+    let agg = FnAgg {
+        name_id: 5, calls: 100, self_ns: 5000,
+        inclusive_ns: 8000, cpu_self_ns: 3000,
+        alloc_count: 10, alloc_bytes: 1024,
+        free_count: 5, free_bytes: 512,
+    };
+    let mut buf = Vec::new();
+    write_aggregates(&mut buf, &[vec![agg]]).unwrap();
+    let line = String::from_utf8(buf).unwrap();
+
+    // Every field the CLI reads via NdjsonAggregate deserialization
+    let required_fields = [
+        ("thread", "\"thread\":"),
+        ("name_id", "\"name_id\":5"),
+        ("calls", "\"calls\":100"),
+        ("self_ns", "\"self_ns\":5000"),
+        ("inclusive_ns", "\"inclusive_ns\":8000"),
+        ("cpu_self_ns", "\"cpu_self_ns\":3000"),
+        ("alloc_count", "\"alloc_count\":10"),
+        ("alloc_bytes", "\"alloc_bytes\":1024"),
+        ("free_count", "\"free_count\":5"),
+        ("free_bytes", "\"free_bytes\":512"),
+    ];
+
+    for (field, pattern) in &required_fields {
+        assert!(
+            line.contains(pattern),
+            "aggregate missing required field '{field}'. \
+             CLI reads this field via NdjsonAggregate deserialization. \
+             Aggregate line: {line}"
+        );
+    }
+}
