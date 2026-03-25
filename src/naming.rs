@@ -1,54 +1,52 @@
-use quote::quote;
+use ra_ap_syntax::AstNode;
+use ra_ap_syntax::ast;
 
-/// Render a `syn::Type` to a human-readable string.
+/// Render a CST type node to a human-readable string.
 ///
-/// Exhaustive match over all `syn::Type` variants -- no wildcards.
-/// If syn adds a new variant, this code will not compile.
-/// Replaces both `type_name_from_type` (resolve.rs) and `type_ident` (shutdown.rs).
-pub fn render_type(ty: &syn::Type) -> String {
-    match ty {
-        syn::Type::Array(t) => quote!(#t).to_string(),
-        syn::Type::BareFn(t) => quote!(#t).to_string(),
-        syn::Type::Group(t) => {
-            // Invisible delimiter (proc-macro artifact, never from source parsing).
-            render_type(&t.elem)
-        }
-        syn::Type::ImplTrait(t) => quote!(#t).to_string(),
-        syn::Type::Infer(_) => "_".to_string(),
-        syn::Type::Macro(t) => quote!(#t).to_string(),
-        syn::Type::Never(_) => "!".to_string(),
-        syn::Type::Paren(t) => quote!(#t).to_string(),
-        syn::Type::Path(t) => quote!(#t).to_string(),
-        syn::Type::Ptr(t) => quote!(#t).to_string(),
-        syn::Type::Reference(t) => quote!(#t).to_string(),
-        syn::Type::Slice(t) => quote!(#t).to_string(),
-        syn::Type::TraitObject(t) => quote!(#t).to_string(),
-        syn::Type::Tuple(t) => quote!(#t).to_string(),
-        syn::Type::Verbatim(t) => t.to_string(),
-        // syn::Type is #[non_exhaustive]. Safe fallback for future variants.
-        _ => quote!(#ty).to_string(),
-    }
+/// Uses the exact source text from the CST node, which preserves the
+/// original formatting (generics, references, etc.). Matches
+/// `type_ident_cst` in rewrite/mod.rs, ensuring FnCollector and
+/// InjectionCollector agree on qualified names.
+pub fn render_type(ty: &ast::Type) -> String {
+    ty.syntax().text().to_string()
 }
 
 /// Build the impl context string for a function inside an impl block.
 ///
-/// - Inherent impl: returns rendered self_ty (e.g. `"Wrapper < u32 >"`)
+/// - Inherent impl: returns rendered self_ty (e.g. `"Wrapper<u32>"`)
 /// - Trait impl: returns `"<{self_ty} as {trait_name}>"` (e.g. `"<Foo as Display>"`)
 ///
 /// Uses last segment of trait path only. Within a module, same ident = same trait
 /// (Rust prevents conflicting imports). Cross-module disambiguation comes from
 /// the module prefix.
-pub fn render_impl_name(self_ty: &syn::Type, trait_: Option<&syn::Path>) -> String {
+///
+/// For trait_ty: pass the trait type from `ast::Impl::trait_()`.
+pub fn render_impl_name(self_ty: &ast::Type, trait_ty: Option<&ast::Type>) -> String {
     let type_str = render_type(self_ty);
-    if let Some(trait_path) = trait_ {
-        if let Some(seg) = trait_path.segments.last() {
-            format!("<{type_str} as {}>", seg.ident)
-        } else {
-            type_str
-        }
+    if let Some(trait_type) = trait_ty {
+        let trait_name = trait_last_segment(trait_type);
+        format!("<{type_str} as {trait_name}>")
     } else {
         type_str
     }
+}
+
+/// Extract the last segment name from a trait type in a CST.
+///
+/// For `fmt::Display`, returns `"Display"`. For `MyTrait`, returns `"MyTrait"`.
+/// Uses the last segment of the trait path only.
+pub(crate) fn trait_last_segment(ty: &ast::Type) -> String {
+    if let ast::Type::PathType(path_type) = ty {
+        if let Some(path) = path_type.path() {
+            // ra_ap_syntax: `.segment()` returns the last segment directly.
+            if let Some(seg) = path.segment() {
+                if let Some(name_ref) = seg.name_ref() {
+                    return name_ref.text().to_string();
+                }
+            }
+        }
+    }
+    ty.syntax().text().to_string()
 }
 
 /// A single entry in the scope chain from file root to a function definition.
@@ -223,82 +221,115 @@ fn find_duplicates(names: &[String]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ra_ap_syntax::Edition;
+
+    /// Parse a type string into a CST `ast::Type` by embedding it in a
+    /// dummy function return type and extracting the type node.
+    fn parse_type(s: &str) -> ast::Type {
+        let source = format!("fn __dummy() -> {s} {{}}");
+        let parse = ast::SourceFile::parse(&source, Edition::Edition2024);
+        let file = parse.tree();
+        let func = file
+            .syntax()
+            .descendants()
+            .find_map(ast::Fn::cast)
+            .expect("should parse dummy fn");
+        func.ret_type()
+            .expect("should have return type")
+            .ty()
+            .expect("should have type")
+    }
+
+    /// Parse an impl block and extract the self_ty and optional trait type.
+    fn parse_impl(source: &str) -> (ast::Type, Option<ast::Type>) {
+        let full = format!("{source} {{}}");
+        let parse = ast::SourceFile::parse(&full, Edition::Edition2024);
+        let file = parse.tree();
+        let imp = file
+            .syntax()
+            .descendants()
+            .find_map(ast::Impl::cast)
+            .expect("should parse impl");
+        let self_ty = imp.self_ty().expect("should have self type");
+        let trait_ty = imp.trait_();
+        (self_ty, trait_ty)
+    }
 
     #[test]
     fn render_type_path_simple() {
-        let ty: syn::Type = syn::parse_str("Foo").unwrap();
+        let ty = parse_type("Foo");
         assert_eq!(render_type(&ty), "Foo");
     }
 
     #[test]
     fn render_type_path_with_generics() {
-        let ty: syn::Type = syn::parse_str("Wrapper<u32>").unwrap();
+        let ty = parse_type("Wrapper<u32>");
         assert!(
             render_type(&ty).contains("u32"),
             "generics must be preserved"
         );
-        let ty2: syn::Type = syn::parse_str("Wrapper<String>").unwrap();
+        let ty2 = parse_type("Wrapper<String>");
         assert_ne!(render_type(&ty), render_type(&ty2));
     }
 
     #[test]
     fn render_type_reference() {
-        let ty: syn::Type = syn::parse_str("&Foo").unwrap();
+        let ty = parse_type("&Foo");
         assert!(render_type(&ty).contains("&"));
         assert!(render_type(&ty).contains("Foo"));
     }
 
     #[test]
     fn render_type_mut_reference() {
-        let ty: syn::Type = syn::parse_str("&mut Foo").unwrap();
+        let ty = parse_type("&mut Foo");
         let r = render_type(&ty);
         assert!(r.contains("mut"), "must distinguish &mut from &");
     }
 
     #[test]
     fn render_type_tuple() {
-        let ty: syn::Type = syn::parse_str("(i32, i64)").unwrap();
+        let ty = parse_type("(i32, i64)");
         let r = render_type(&ty);
         assert!(r.contains("i32") && r.contains("i64"));
     }
 
     #[test]
     fn render_type_slice() {
-        let ty: syn::Type = syn::parse_str("[u8]").unwrap();
+        let ty = parse_type("[u8]");
         assert!(render_type(&ty).contains("u8"));
     }
 
     #[test]
     fn render_type_array() {
-        let ty: syn::Type = syn::parse_str("[u8; 4]").unwrap();
+        let ty = parse_type("[u8; 4]");
         let r = render_type(&ty);
         assert!(r.contains("u8") && r.contains("4"));
     }
 
     #[test]
     fn render_type_ptr() {
-        let ty: syn::Type = syn::parse_str("*const u8").unwrap();
+        let ty = parse_type("*const u8");
         assert!(render_type(&ty).contains("const"));
     }
 
     #[test]
     fn render_type_bare_fn() {
-        let ty: syn::Type = syn::parse_str("fn(u32) -> bool").unwrap();
+        let ty = parse_type("fn(u32) -> bool");
         let r = render_type(&ty);
         assert!(r.contains("fn") && r.contains("bool"));
     }
 
     #[test]
     fn render_type_never() {
-        let ty: syn::Type = syn::parse_str("!").unwrap();
+        let ty = parse_type("!");
         assert_eq!(render_type(&ty), "!");
     }
 
     #[test]
     fn render_type_paren() {
-        let ty: syn::Type = syn::parse_str("(Foo)").unwrap();
+        let ty = parse_type("(Foo)");
         let r = render_type(&ty);
-        let tuple: syn::Type = syn::parse_str("(Foo,)").unwrap();
+        let tuple = parse_type("(Foo,)");
         assert_ne!(r, render_type(&tuple));
     }
 
@@ -322,7 +353,7 @@ mod tests {
         ];
         let mut seen = std::collections::HashSet::new();
         for src in &sources {
-            let ty: syn::Type = syn::parse_str(src).unwrap();
+            let ty = parse_type(src);
             let rendered = render_type(&ty);
             assert!(
                 seen.insert(rendered.clone()),
@@ -333,29 +364,30 @@ mod tests {
 
     #[test]
     fn render_impl_name_inherent() {
-        let ty: syn::Type = syn::parse_str("Walker").unwrap();
-        assert_eq!(render_impl_name(&ty, None), "Walker");
+        let (self_ty, _) = parse_impl("impl Walker");
+        assert_eq!(render_impl_name(&self_ty, None), "Walker");
     }
 
     #[test]
     fn render_impl_name_with_generics() {
-        let ty: syn::Type = syn::parse_str("Wrapper<u32>").unwrap();
-        let name = render_impl_name(&ty, None);
+        let (self_ty, _) = parse_impl("impl Wrapper<u32>");
+        let name = render_impl_name(&self_ty, None);
         assert!(name.contains("u32"), "generics preserved: {name}");
     }
 
     #[test]
     fn render_impl_name_trait_impl() {
-        let ty: syn::Type = syn::parse_str("Foo").unwrap();
-        let trait_path: syn::Path = syn::parse_str("Display").unwrap();
-        assert_eq!(render_impl_name(&ty, Some(&trait_path)), "<Foo as Display>");
+        let (self_ty, trait_ty) = parse_impl("impl Display for Foo");
+        assert_eq!(
+            render_impl_name(&self_ty, trait_ty.as_ref()),
+            "<Foo as Display>"
+        );
     }
 
     #[test]
     fn render_impl_name_trait_impl_reference_type() {
-        let ty: syn::Type = syn::parse_str("&Foo").unwrap();
-        let trait_path: syn::Path = syn::parse_str("MyTrait").unwrap();
-        let name = render_impl_name(&ty, Some(&trait_path));
+        let (self_ty, trait_ty) = parse_impl("impl MyTrait for &Foo");
+        let name = render_impl_name(&self_ty, trait_ty.as_ref());
         assert!(name.contains("&"), "reference preserved: {name}");
         assert!(name.contains("Foo"), "type preserved: {name}");
         assert!(name.contains("MyTrait"), "trait preserved: {name}");
@@ -444,147 +476,20 @@ mod tests {
         assert!(!result[0].contains("host::Unique"));
     }
 
-    // --- Cross-path agreement tests ---
-    //
-    // Verify that FnCollector (resolve.rs) and InjectionCollector (rewrite/mod.rs)
-    // agree on function names: every function FnCollector discovers must be found
-    // by InjectionCollector when given the corresponding target map.
-
-    /// Helper: run the full pipeline (extract -> disambiguate -> instrument) on a
-    /// source snippet and return (display_names, instrumented_source).
-    fn run_pipeline(source: &str, module_prefix: &str) -> (Vec<String>, String) {
-        use std::path::PathBuf;
-
-        let rel_path = if module_prefix.is_empty() {
-            PathBuf::from("src/lib.rs")
-        } else {
-            // Convert "db::query" prefix into a plausible relative path.
-            let parts: Vec<&str> = module_prefix.split("::").collect();
-            let mut p = PathBuf::from("src");
-            for part in &parts[..parts.len() - 1] {
-                p.push(part);
-            }
-            p.push(format!("{}.rs", parts.last().unwrap()));
-            p
-        };
-        let (functions, _skipped) = crate::resolve::extract_functions(source, rel_path.clone());
-
-        // Apply module prefix (same as main.rs does).
-        let prefix = crate::resolve::module_prefix(&rel_path);
-        let qualified: Vec<QualifiedFunction> = functions
-            .iter()
-            .map(|qf| {
-                QualifiedFunction::new(
-                    &crate::resolve::qualify(&prefix, &qf.minimal),
-                    &crate::resolve::qualify(&prefix, &qf.medium),
-                    &crate::resolve::qualify(&prefix, &qf.full),
-                )
-            })
-            .collect();
-
-        let display_names = disambiguate(&qualified);
-
-        // Build target map: full_name -> display_name (same as main.rs).
-        let target_map: std::collections::HashMap<String, String> = qualified
-            .iter()
-            .zip(display_names.iter())
-            .map(|(qf, d)| (qf.full.clone(), d.clone()))
-            .collect();
-
-        let result = crate::rewrite::instrument_source(source, &target_map, false, &prefix)
-            .expect("instrument_source should succeed");
-
-        (display_names, result.source)
-    }
-
-    #[test]
-    fn cross_path_agreement_basic() {
-        let cases: Vec<(&str, &str, &str)> = vec![
-            ("fn walk() { let _ = 1; }", "", "bare function"),
-            (
-                "struct W; impl W { fn walk(&self) { let _ = 1; } }",
-                "",
-                "inherent impl",
-            ),
-            (
-                "struct W<T>(T); impl W<u32> { fn go(&self) { let _ = 1; } }",
-                "",
-                "generic impl",
-            ),
-            (
-                "trait D { fn draw(&self) { let _ = 1; } }",
-                "",
-                "trait default method",
-            ),
-            (
-                "mod inner { pub fn foo() { let _ = 1; } }",
-                "",
-                "inline mod",
-            ),
-            (
-                "struct W; impl W { fn walk(&self) { let _ = 1; } }",
-                "db::query",
-                "with file prefix",
-            ),
-        ];
-        for (source, prefix, desc) in &cases {
-            let (display_names, instrumented) = run_pipeline(source, prefix);
-            assert!(
-                !display_names.is_empty(),
-                "{desc}: expected at least one function"
-            );
-            for name in &display_names {
-                let guard = format!("piano_runtime::enter(\"{name}\")");
-                assert!(
-                    instrumented.contains(&guard),
-                    "{desc}: guard not found for '{name}' in:\n{instrumented}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn cross_path_agreement_trait_impl() {
-        // Trait impl: impl D for Foo { fn draw() }
-        let source = r#"
-            trait D { fn draw(&self); }
-            struct Foo;
-            impl D for Foo { fn draw(&self) { let _ = 1; } }
-        "#;
-        let (display_names, instrumented) = run_pipeline(source, "");
-        // Only the impl method has a body (trait method is signature-only).
-        assert_eq!(display_names.len(), 1, "expected one function");
-        let guard = format!("piano_runtime::enter(\"{}\")", display_names[0]);
-        assert!(
-            instrumented.contains(&guard),
-            "guard not found in:\n{instrumented}"
-        );
-        // The display name should contain both the type and trait info.
-        assert!(
-            display_names[0].contains("Foo"),
-            "expected Foo in display name: {}",
-            display_names[0]
-        );
-    }
+    // Cross-path agreement tests removed: the old InjectionCollector (rewrite/mod.rs)
+    // is deleted. The new guard-only rewriter will need its own agreement tests.
+    // TODO(rewriter-rebuild): re-add cross-path agreement tests for the new rewriter.
 
     // --- Collision regression tests ---
-    //
-    // Each test covers a specific collision scenario (E1-E7 from the naming
-    // design, H1-H2 from hidden collisions). These serve as regression tests:
-    // if the naming system is changed, any regression that reintroduces a known
-    // collision class will break one of these.
 
-    /// E3: generic type parameters must produce distinct names.
     #[test]
     fn collision_regression_generic_types() {
-        // Two impl blocks on the same generic type with different type args.
-        let ty_u32: syn::Type = syn::parse_str("W<u32>").unwrap();
-        let ty_string: syn::Type = syn::parse_str("W<String>").unwrap();
+        let (ty_u32, _) = parse_impl("impl W<u32>");
+        let (ty_string, _) = parse_impl("impl W<String>");
         let name_u32 = render_impl_name(&ty_u32, None);
         let name_string = render_impl_name(&ty_string, None);
         assert_ne!(name_u32, name_string, "generic args must distinguish impls");
 
-        // Full pipeline: two methods with same name in different generic impls.
         let entries = vec![
             QualifiedFunction::new(
                 &format!("{name_u32}::go"),
@@ -603,19 +508,17 @@ mod tests {
         assert!(display[1].contains("String"), "got: {}", display[1]);
     }
 
-    /// E1: non-Path self types (references, tuples, etc.) must be preserved.
     #[test]
     fn collision_regression_non_path_type() {
-        let ty: syn::Type = syn::parse_str("&Foo").unwrap();
-        let trait_path: syn::Path = syn::parse_str("MyTrait").unwrap();
-        let name = render_impl_name(&ty, Some(&trait_path));
+        let (self_ty, trait_ty) = parse_impl("impl MyTrait for &Foo");
+        let name = render_impl_name(&self_ty, trait_ty.as_ref());
         assert!(
             name.contains("&") && name.contains("Foo") && name.contains("MyTrait"),
             "expected & + Foo + MyTrait in: {name}"
         );
     }
 
-    /// H1: fn-local types in different functions must disambiguate.
+    /// Fn-local types in different functions must disambiguate.
     #[test]
     fn collision_regression_fn_local_types() {
         // fn outer_a() { struct S; impl S { fn m() {} } }
@@ -630,7 +533,7 @@ mod tests {
         assert!(display[1].contains("outer_b"), "got: {}", display[1]);
     }
 
-    /// H2: sibling blocks in same function must disambiguate via block index.
+    /// Sibling blocks in same function must disambiguate via block index.
     #[test]
     fn collision_regression_sibling_blocks() {
         // Two blocks in same fn with same type name.
@@ -644,7 +547,7 @@ mod tests {
         assert!(display[1].contains("{1}"), "got: {}", display[1]);
     }
 
-    /// E2: inline mod vs top-level must produce different names.
+    /// Inline mod vs top-level must produce different names.
     #[test]
     fn collision_regression_inline_mod() {
         let entries = vec![
@@ -657,7 +560,7 @@ mod tests {
         assert_eq!(display[1], "inner::foo");
     }
 
-    /// T6: when there is no collision, the minimal name is used (no fn scope
+    /// When there is no collision, the minimal name is used (no fn scope
     /// or block index clutter).
     #[test]
     fn no_unnecessary_disambiguation() {
