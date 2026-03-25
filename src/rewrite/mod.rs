@@ -127,8 +127,8 @@ pub fn instrument_source(
         }
     }
 
-    // --- Macro guards: token-tree walk ---
-    instrument_macro_fns(&file, measured, &mut injector);
+    // --- Macro expansion: replace fn-generating invocations ---
+    expand_and_replace_macros(file.syntax(), measured, &mut injector);
 
     let (source, source_map) = injector.apply(source);
     Ok(InstrumentResult { source, source_map })
@@ -365,97 +365,69 @@ fn build_lifecycle_prefix(runs_dir: &str, cpu_time: bool) -> String {
 // Macro guards: token-tree walk
 // ---------------------------------------------------------------------------
 
-/// Walk macro_rules! bodies and inject guards into literal fn items.
-fn instrument_macro_fns(
-    file: &SourceFile,
+/// Expand fn-generating macro_rules! invocations and replace them with
+/// instrumented expansions. Expression-position macros are skipped
+/// (safety fence: no fn items in expansion).
+fn expand_and_replace_macros(
+    root: &ra_ap_syntax::SyntaxNode,
     measured: &HashMap<String, u32>,
     injector: &mut StringInjector,
 ) {
-    for node in file.syntax().descendants() {
-        if node.kind() != SyntaxKind::MACRO_RULES {
-            continue;
-        }
+    use crate::macro_expand;
 
-        let tokens: Vec<_> = node
-            .descendants_with_tokens()
-            .filter_map(|e| e.into_token())
-            .collect();
+    let (expansions, _defs, calls) = macro_expand::expand_fn_generating_macros(root);
 
-        let mut i = 0;
-        while i < tokens.len() {
-            if tokens[i].kind() != SyntaxKind::FN_KW {
-                i += 1;
-                continue;
-            }
+    for exp in &expansions {
+        let call = &calls[exp.call_idx];
 
-            // Skip const fn
-            if i > 0 && tokens[i - 1].kind() == SyntaxKind::CONST_KW {
-                i += 1;
-                continue;
-            }
-            if i >= 2
-                && tokens[i - 1].kind() == SyntaxKind::WHITESPACE
-                && tokens[i - 2].kind() == SyntaxKind::CONST_KW
-            {
-                i += 1;
-                continue;
-            }
+        // Inject guards into the expanded text for measured functions.
+        let instrumented = inject_guards_into_expansion(&exp.expanded_text, measured);
 
-            // Find next IDENT (function name), skipping whitespace
-            let mut j = i + 1;
-            while j < tokens.len() && tokens[j].kind() == SyntaxKind::WHITESPACE {
-                j += 1;
-            }
-            if j >= tokens.len() || tokens[j].kind() != SyntaxKind::IDENT {
-                i += 1;
-                continue;
-            }
-
-            let fn_name = tokens[j].text().to_string();
-            let Some(&name_id) = measured.get(&fn_name) else {
-                i = j + 1;
-                continue;
-            };
-
-            // Find L_PAREN (start of params)
-            let mut k = j + 1;
-            while k < tokens.len() && tokens[k].kind() != SyntaxKind::L_PAREN {
-                k += 1;
-            }
-
-            // Track paren depth to skip past the parameter list
-            let mut depth = 0i32;
-            while k < tokens.len() {
-                match tokens[k].kind() {
-                    SyntaxKind::L_PAREN => depth += 1,
-                    SyntaxKind::R_PAREN => {
-                        depth -= 1;
-                        if depth == 0 {
-                            k += 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                k += 1;
-            }
-
-            // Find next L_CURLY (body start) after params
-            while k < tokens.len() && tokens[k].kind() != SyntaxKind::L_CURLY {
-                k += 1;
-            }
-
-            if k < tokens.len() {
-                let brace_offset: usize = tokens[k].text_range().end().into();
-                injector.insert(
-                    brace_offset,
-                    format!("\nlet __piano_guard = piano_runtime::enter({name_id});"),
-                );
-            }
-
-            i = k + 1;
-        }
+        // Replace the MACRO_CALL byte range with the instrumented expansion.
+        injector.replace(call.byte_start, call.byte_end, instrumented);
     }
+}
+
+/// Inject guards into expanded macro text. Parses the expansion, finds fn
+/// items, and inserts guards for functions that are in the measured map.
+fn inject_guards_into_expansion(
+    expanded: &str,
+    measured: &HashMap<String, u32>,
+) -> String {
+    let parse = SourceFile::parse(expanded, ra_ap_syntax::Edition::Edition2021);
+
+    // Collect guard insertions: (byte_offset, guard_text)
+    let mut insertions: Vec<(usize, String)> = Vec::new();
+
+    for node in parse.tree().syntax().descendants() {
+        let Some(func) = ast::Fn::cast(node) else { continue };
+        let Some(body) = func.body() else { continue };
+        let Some(name) = func.name() else { continue };
+        let fn_name = name.text().to_string();
+
+        let Some(&name_id) = measured.get(&fn_name) else { continue };
+
+        // Skip const fn
+        if func.const_token().is_some() { continue }
+
+        let Some(stmt_list) = body.stmt_list() else { continue };
+        let Some(open_brace) = stmt_list.syntax().children_with_tokens()
+            .find(|t| t.kind() == T!['{']) else { continue };
+
+        let offset: usize = open_brace.text_range().end().into();
+        insertions.push((
+            offset,
+            format!("\nlet __piano_guard = piano_runtime::enter({name_id});"),
+        ));
+    }
+
+    // Apply in reverse order to preserve offsets.
+    insertions.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut result = expanded.to_string();
+    for (offset, text) in &insertions {
+        result.insert_str(*offset, text);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -750,6 +722,7 @@ impl T for S { fn trait_impl(&self) { let _ = 1; } fn trait_abstract(&self) { le
 extern "C" { fn foreign(x: i32) -> i32; }
 fn outer() { fn nested() { let _ = 1; } }
 macro_rules! m { () => { fn macro_fn() { let _ = 1; } }; }
+m!();
 "#;
 
         let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
