@@ -10,7 +10,7 @@ use std::process::Command;
 /// Create a workspace project with the binary in a member crate and no
 /// root-level `src/` directory.
 fn create_workspace_project(root: &Path) {
-    // Workspace root Cargo.toml — no [package], just [workspace].
+    // Workspace root Cargo.toml: no [package], just [workspace].
     fs::create_dir_all(root).unwrap();
     fs::write(
         root.join("Cargo.toml"),
