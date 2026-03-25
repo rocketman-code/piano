@@ -20,15 +20,15 @@ async fn main() {
 `piano` reports:
 
 ```
-Function                                       Self    Calls   Allocs  Alloc Bytes
-----------------------------------------------------------------------------------
-fetch_all                                   341.21ms        1      840       62.5KB
-analyze                                     141.13ms        1      329       24.1KB
-load_config                                  12.44ms        1       52        4.1KB
-write_output                                  3.02ms        1       12        1.2KB
+Function                                       Self    Calls   Allocs  Alloc Bytes    Frees   Free Bytes
+--------------------------------------------------------------------------------------------------------
+fetch_all                                   341.21ms        1      840       62.5KB      780       58.1KB
+analyze                                     141.13ms        1      329       24.1KB      310       22.8KB
+load_config                                  12.44ms        1       52        4.1KB       48        3.9KB
+write_output                                  3.02ms        1       12        1.2KB        8        0.9KB
 ```
 
-Self-time is time spent in the function itself, excluding called functions. `fetch_all` took 341ms of its own work. The `.await` points and thread migrations are tracked automatically. Programs using threads (rayon, std::thread) and async runtimes (tokio, async-std) work automatically.
+Self-time is time spent in the function itself, excluding called functions. `fetch_all` took 341ms of its own work. Alloc and free columns track heap operations per function. Free columns appear when the program frees memory during profiling. The `.await` points and thread migrations are tracked automatically. Programs using threads (rayon, std::thread) and async runtimes (tokio, async-std) work automatically.
 
 Output shows the top 10 functions by self-time. Use `--all` to see every instrumented function, or `--top N` to adjust the limit.
 
