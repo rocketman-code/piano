@@ -13,7 +13,11 @@ fn create_mini_project(dir: &Path) {
         "[package]\nname = \"mini\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     )
     .unwrap();
-    fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(
+        dir.join("src/main.rs"),
+        "fn main() { work(); }\nfn work() { let _ = 42; }\n",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -77,9 +81,10 @@ fn build_auto_detects_project_from_subdirectory() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let runtime_path = manifest_dir.join("piano-runtime");
 
-    // Run piano build from src/ subdirectory, without --project
+    // Run piano build from src/ subdirectory, without --project.
+    // main() is excluded from the name table (lifecycle boundary), so target work() instead.
     let output = Command::new(piano_bin)
-        .args(["build", "--fn", "main", "--runtime-path"])
+        .args(["build", "--fn", "work", "--runtime-path"])
         .arg(&runtime_path)
         .current_dir(project.join("src"))
         .output()
@@ -105,9 +110,10 @@ fn report_works_from_subdirectory() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let runtime_path = manifest_dir.join("piano-runtime");
 
-    // Build and run to generate profiling data
+    // Build and run to generate profiling data.
+    // main() is excluded from the name table (lifecycle boundary), so instrument work() instead.
     let output = Command::new(piano_bin)
-        .args(["profile", "--fn", "main", "--project"])
+        .args(["profile", "--fn", "work", "--project"])
         .arg(&project)
         .arg("--runtime-path")
         .arg(&runtime_path)
@@ -135,8 +141,8 @@ fn report_works_from_subdirectory() {
         "piano report from subdirectory failed:\nstderr: {stderr}\nstdout: {stdout}"
     );
     assert!(
-        stdout.contains("main"),
-        "report should show 'main' function, got: {stdout}"
+        stdout.contains("work"),
+        "report should show 'work' function, got: {stdout}"
     );
 }
 

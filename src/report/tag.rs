@@ -313,4 +313,55 @@ mod tests {
         let t = SystemTime::now() - Duration::from_secs(86400);
         assert_eq!(relative_time(t), "1 day ago");
     }
+
+    // --- C2: Tag/diff round-trip through NDJSON aggregate format ---
+    //
+    // The chain save_tag -> resolve_tag -> load_run_by_id -> load_ndjson -> Run
+    // must work when the run file is NDJSON with aggregate lines.
+    // Existing tests only cover legacy JSON.
+
+    #[test]
+    fn tag_round_trip_ndjson_aggregate() {
+        let dir = TempDir::new().unwrap();
+        let tags_dir = dir.path().join("tags");
+        let runs_dir = dir.path().join("runs");
+        fs::create_dir_all(&tags_dir).unwrap();
+        fs::create_dir_all(&runs_dir).unwrap();
+
+        // Write an NDJSON file with aggregate lines (new format)
+        let ndjson = concat!(
+            "{\"type\":\"header\",\"run_id\":\"agg_7000\",\"timestamp_ms\":7000,",
+            "\"bias_ns\":0,\"cpu_bias_ns\":0,\"names\":{\"0\":\"process\",\"1\":\"parse\"}}\n",
+            "{\"thread\":0,\"name_id\":0,\"calls\":100,\"self_ns\":50000,",
+            "\"inclusive_ns\":80000,\"cpu_self_ns\":30000,",
+            "\"alloc_count\":10,\"alloc_bytes\":1024,\"free_count\":5,\"free_bytes\":512}\n",
+            "{\"thread\":0,\"name_id\":1,\"calls\":200,\"self_ns\":30000,",
+            "\"inclusive_ns\":30000,\"cpu_self_ns\":20000,",
+            "\"alloc_count\":0,\"alloc_bytes\":0,\"free_count\":0,\"free_bytes\":0}\n",
+            "{\"type\":\"trailer\",\"bias_ns\":0,\"cpu_bias_ns\":0,",
+            "\"names\":{\"0\":\"process\",\"1\":\"parse\"}}\n",
+        );
+        fs::write(runs_dir.join("7000-1234.ndjson"), ndjson).unwrap();
+
+        // Tag it
+        save_tag(&tags_dir, "baseline", "agg_7000").unwrap();
+
+        // Load via tag
+        let run = load_tagged_run(&tags_dir, &runs_dir, "baseline").unwrap();
+
+        assert_eq!(run.functions.len(), 2);
+
+        let process = run.functions.iter().find(|f| f.name == "process").unwrap();
+        assert_eq!(process.calls, 100);
+        assert!(process.self_ms > 0.0, "self_ms should be positive");
+        assert!(process.cpu_self_ms.is_some(), "should have CPU time");
+        assert_eq!(process.alloc_count, 10);
+        assert_eq!(process.alloc_bytes, 1024);
+        assert_eq!(process.free_count, 5);
+        assert_eq!(process.free_bytes, 512);
+
+        let parse = run.functions.iter().find(|f| f.name == "parse").unwrap();
+        assert_eq!(parse.calls, 200);
+        assert_eq!(parse.alloc_count, 0);
+    }
 }
