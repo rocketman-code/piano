@@ -1,6 +1,4 @@
 //! Test that macro_rules! definitions with fn items get instrumented correctly.
-//! Covers the full pipeline (build + run + verify NDJSON output) and a
-//! unit-level syntax validation test.
 
 mod common;
 
@@ -28,9 +26,9 @@ path = "src/main.rs"
 
     fs::write(
         dir.join("src").join("main.rs"),
-        r#"macro_rules! make_handler {
-    ($name:ident) => {
-        fn $name() -> u64 {
+        r#"macro_rules! setup_compute {
+    () => {
+        fn compute() -> u64 {
             let mut sum = 0u64;
             for i in 0..100 {
                 sum += i;
@@ -40,15 +38,15 @@ path = "src/main.rs"
     };
 }
 
-macro_rules! make_pair {
-    ($a:ident, $b:ident) => {
-        fn $a() -> u64 { 42 }
-        fn $b() -> u64 { 99 }
+macro_rules! setup_pair {
+    () => {
+        fn alpha() -> u64 { 42 }
+        fn beta() -> u64 { 99 }
     };
 }
 
-make_handler!(compute);
-make_pair!(alpha, beta);
+setup_compute!();
+setup_pair!();
 
 fn main() {
     let a = compute();
@@ -72,7 +70,6 @@ fn macro_generated_fns_appear_in_output() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let runtime_path = manifest_dir.join("piano-runtime");
 
-    // Build with no target filter -- activates instrument_macros = true.
     let output = Command::new(piano_bin)
         .args(["build", "--project"])
         .arg(&project_dir)
@@ -89,13 +86,9 @@ fn macro_generated_fns_appear_in_output() {
         "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
     );
 
-    // Run the instrumented binary.
-    let runs_dir = tmp.path().join("runs");
-    fs::create_dir_all(&runs_dir).unwrap();
-
+    let runs_dir = project_dir.join("target/piano/runs");
     let binary_path = stdout.trim();
     let run_output = Command::new(binary_path)
-        .env("PIANO_RUNS_DIR", &runs_dir)
         .output()
         .expect("failed to run instrumented binary");
 
@@ -105,42 +98,27 @@ fn macro_generated_fns_appear_in_output() {
         String::from_utf8_lossy(&run_output.stderr)
     );
 
-    // Program correctness: compute() = 4950, alpha() = 42, beta() = 99.
     let program_stdout = String::from_utf8_lossy(&run_output.stdout);
     assert!(
         program_stdout.contains("results: 4950 42 99"),
         "program should produce correct output, got: {program_stdout}"
     );
 
-    // Verify run file contains the macro-generated function names.
     let run_file = common::largest_ndjson_file(&runs_dir);
     let content = fs::read_to_string(&run_file).unwrap();
 
-    // Metavar-generated functions should appear by their expanded names.
-    assert!(
-        content.contains("\"compute\""),
-        "output should contain macro-generated function 'compute'"
-    );
-    assert!(
-        content.contains("\"alpha\""),
-        "output should contain macro-generated function 'alpha'"
-    );
-    assert!(
-        content.contains("\"beta\""),
-        "output should contain macro-generated function 'beta'"
-    );
-
-    // main should also be instrumented (no target filter = instrument all).
-    assert!(content.contains("\"main\""), "output should contain 'main'");
+    assert!(content.contains("\"compute\""), "should contain 'compute'");
+    assert!(content.contains("\"alpha\""), "should contain 'alpha'");
+    assert!(content.contains("\"beta\""), "should contain 'beta'");
+    assert!(!content.contains("\"main\""), "should NOT contain 'main'");
 }
 
 #[test]
 fn instrumented_macro_output_is_valid_syntax() {
-    // Use instrument_source directly and verify the output parses as valid Rust.
     let source = r#"
-macro_rules! make_handler {
-    ($name:ident) => {
-        fn $name() -> u64 {
+macro_rules! setup {
+    () => {
+        fn initialize() -> u64 {
             let mut sum = 0u64;
             for i in 0..100 {
                 sum += i;
@@ -150,73 +128,149 @@ macro_rules! make_handler {
     };
 }
 
-macro_rules! make_pair {
-    ($a:ident, $b:ident) => {
-        fn $a() -> u64 { 42 }
-        fn $b() -> u64 { 99 }
-    };
-}
-
-make_handler!(compute);
-make_pair!(alpha, beta);
+setup!();
 
 fn main() {
-    let a = compute();
-    let b = alpha();
-    let c = beta();
-    println!("results: {a} {b} {c}");
+    let a = initialize();
+    println!("result: {a}");
 }
 "#;
 
-    let targets: HashMap<String, String> = HashMap::new();
-    let result = piano::rewrite::instrument_source(source, &targets, true, "")
+    let measured: HashMap<String, u32> =
+        [("initialize".into(), 0), ("main".into(), 1)].into_iter().collect();
+    let result = piano::rewrite::instrument_source(source, &measured, None)
         .expect("instrument_source should succeed");
 
-    // The instrumented source must parse as valid Rust.
-    let parsed: Result<syn::File, _> = syn::parse_str(&result.source);
+    let re_parse = ra_ap_syntax::SourceFile::parse(
+        &result.source, ra_ap_syntax::Edition::Edition2024,
+    );
+    let errors: Vec<_> = re_parse.errors().to_vec();
     assert!(
-        parsed.is_ok(),
-        "instrumented macro output should be valid Rust syntax. Error: {:?}\nSource:\n{}",
-        parsed.err(),
-        result.source
+        errors.is_empty(),
+        "instrumented output should be valid Rust. Errors: {:?}\nSource:\n{}",
+        errors, result.source
     );
 
-    // Verify the guards were actually injected.
     assert!(
-        result.source.contains("piano_runtime :: enter"),
-        "instrumented source should contain piano_runtime::enter guards.\nSource:\n{}",
-        result.source
+        result.source.contains("piano_runtime::enter(0)"),
+        "should contain guard for initialize. Got:\n{}", result.source
     );
 }
 
 #[test]
-fn macro_literal_fn_gets_registered() {
+fn macro_literal_fn_gets_guard() {
     let source = r#"
 macro_rules! setup {
     () => {
         fn initialize() {
-            start();
+            let _ = 1;
         }
     };
 }
 setup!();
 fn main() {}
 "#;
-    let targets: HashMap<String, String> = HashMap::new();
-    let result = piano::rewrite::instrument_source(source, &targets, true, "")
+    let measured: HashMap<String, u32> = [("initialize".into(), 0)].into_iter().collect();
+    let result = piano::rewrite::instrument_source(source, &measured, None)
         .expect("instrument_source should succeed");
 
     assert!(
-        result.macro_fn_names.contains(&"initialize".to_string()),
-        "literal fn name should be collected. Got: {:?}",
-        result.macro_fn_names,
+        result.source.contains("piano_runtime::enter(0)"),
+        "literal fn in macro should get a guard. Got:\n{}", result.source
+    );
+}
+
+#[test]
+fn metavar_fn_appears_in_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("metavar-fns");
+    fs::create_dir_all(project_dir.join("src")).unwrap();
+
+    fs::write(
+        project_dir.join("Cargo.toml"),
+        r#"[package]
+name = "metavar-fns"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "metavar-fns"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        project_dir.join("src").join("main.rs"),
+        r#"macro_rules! make_fn {
+    ($name:ident) => {
+        fn $name() -> u64 {
+            let mut sum = 0u64;
+            for i in 0..100 { sum += i; }
+            sum
+        }
+    };
+}
+
+make_fn!(dynamic_compute);
+
+fn main() {
+    let a = dynamic_compute();
+    println!("result: {a}");
+}
+"#,
+    )
+    .unwrap();
+
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
     );
 
-    let (registered_source, _map) =
-        piano::rewrite::inject_registrations(&result.source, &result.macro_fn_names)
-            .expect("inject_registrations should succeed");
+    let runs_dir = project_dir.join("target/piano/runs");
+    let binary_path = stdout.trim();
+    let run_output = Command::new(binary_path)
+        .output()
+        .expect("failed to run instrumented binary");
+
     assert!(
-        registered_source.contains(r#"piano_runtime::register("initialize")"#),
-        "literal macro fn should get register() call. Got:\n{registered_source}"
+        run_output.status.success(),
+        "instrumented binary failed:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let program_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        program_stdout.contains("result: 4950"),
+        "program should produce correct output, got: {program_stdout}"
+    );
+
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+
+    assert!(
+        content.contains("\"dynamic_compute\""),
+        "metavar-expanded fn should appear in NDJSON output with correct name"
+    );
+    assert!(
+        !content.contains("\"main\""),
+        "main should NOT appear in output"
     );
 }

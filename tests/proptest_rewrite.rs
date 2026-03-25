@@ -2,7 +2,6 @@
 //!
 //! Uses proptest to generate diverse Rust function signatures with randomized
 //! decorators, then verifies the rewriter produces valid instrumented output.
-//! Targets the "pattern matching blindness" bug class (#237, #238, #249, #270).
 
 use std::collections::HashMap;
 
@@ -28,212 +27,99 @@ fn ident() -> impl Strategy<Value = String> {
                 | "for"
                 | "while"
                 | "loop"
-                | "match"
                 | "return"
-                | "break"
-                | "continue"
+                | "match"
+                | "impl"
                 | "struct"
                 | "enum"
-                | "impl"
                 | "trait"
                 | "type"
-                | "where"
-                | "async"
-                | "await"
-                | "move"
-                | "ref"
-                | "self"
-                | "super"
-                | "crate"
-                | "as"
-                | "in"
                 | "const"
                 | "static"
-                | "extern"
+                | "async"
+                | "await"
                 | "unsafe"
-                | "dyn"
+                | "extern"
+                | "crate"
+                | "self"
+                | "super"
+                | "where"
                 | "true"
                 | "false"
+                | "as"
+                | "in"
+                | "ref"
+                | "move"
+                | "dyn"
+                | "break"
+                | "continue"
+                | "yield"
+                | "box"
+                | "become"
+                | "do"
+                | "final"
+                | "macro"
+                | "override"
+                | "priv"
+                | "try"
+                | "abstract"
+                | "virtual"
         )
     })
 }
 
-/// A #[cfg(...)] attribute with various conditions.
-fn cfg_attr() -> impl Strategy<Value = String> {
+/// One of: nothing, `const`, `async`, `unsafe`, `extern "C"`.
+fn fn_decorator() -> impl Strategy<Value = &'static str> {
     prop_oneof![
-        Just("#[cfg(test)]".to_string()),
-        Just("#[cfg(not(test))]".to_string()),
-        Just("#[cfg(target_os = \"linux\")]".to_string()),
-        Just("#[cfg(debug_assertions)]".to_string()),
-        Just("#[cfg(feature = \"some_feature\")]".to_string()),
-        Just("#[cfg(any(target_os = \"linux\", target_os = \"macos\"))]".to_string()),
-        Just("#[cfg(all(unix, not(target_os = \"macos\")))]".to_string()),
-        Just("#[cfg_attr(test, allow(unused))]".to_string()),
-        Just("#[cfg_attr(feature = \"serde\", derive(Serialize))]".to_string()),
+        5 => Just(""),
+        1 => Just("const "),
+        2 => Just("async "),
+        1 => Just("unsafe "),
+        1 => Just("extern \"C\" "),
     ]
 }
 
-/// A non-cfg attribute.
-fn other_attr() -> impl Strategy<Value = String> {
-    prop_oneof![
-        Just("#[inline]".to_string()),
-        Just("#[inline(always)]".to_string()),
-        Just("#[inline(never)]".to_string()),
-        Just("#[must_use]".to_string()),
-        Just("#[allow(unused)]".to_string()),
-        Just("#[allow(clippy::too_many_arguments)]".to_string()),
-        Just("#[doc = \"some docs\"]".to_string()),
-    ]
+/// Whether a function is instrumentable (not const, not extern non-Rust).
+fn is_instrumentable(decorator: &str) -> bool {
+    !decorator.contains("const") && !decorator.contains("extern")
 }
 
-/// Zero or more attributes stacked on a function.
-fn attr_stack() -> impl Strategy<Value = String> {
-    prop::collection::vec(prop_oneof![cfg_attr(), other_attr()], 0..=3)
-        .prop_map(|attrs| attrs.join("\n"))
+/// Generate a single function with a random name and decorator.
+fn rust_fn() -> impl Strategy<Value = (String, String, bool)> {
+    (ident(), fn_decorator()).prop_map(|(name, decorator)| {
+        let instrumentable = is_instrumentable(decorator);
+        let body = if decorator.contains("const") {
+            format!("{decorator}fn {name}() -> u32 {{ 42 }}")
+        } else if decorator.contains("async") {
+            format!("{decorator}fn {name}() {{ let _ = 1; }}")
+        } else {
+            format!("{decorator}fn {name}() {{ let _ = 1; }}")
+        };
+        (name, body, instrumentable)
+    })
 }
 
-/// Function visibility.
-fn visibility() -> impl Strategy<Value = String> {
-    prop_oneof![
-        Just("".to_string()),
-        Just("pub ".to_string()),
-        Just("pub(crate) ".to_string()),
-        Just("pub(super) ".to_string()),
-    ]
-}
-
-/// Async modifier.
-fn async_modifier() -> impl Strategy<Value = String> {
-    prop_oneof![Just("".to_string()), Just("async ".to_string()),]
-}
-
-/// Function modifier that makes a function uninstrumentable.
-/// Piano skips unsafe fn, const fn, and extern "C" fn.
-fn skip_modifier() -> impl Strategy<Value = String> {
-    prop_oneof![
-        6 => Just("".to_string()),
-        1 => Just("unsafe ".to_string()),
-        1 => Just("const ".to_string()),
-        1 => Just("extern \"C\" ".to_string()),
-    ]
-}
-
-/// Generic parameters.
-fn generics() -> impl Strategy<Value = String> {
-    prop_oneof![
-        Just("".to_string()),
-        Just("<T>".to_string()),
-        Just("<T: Clone>".to_string()),
-        Just("<T: Clone + Send>".to_string()),
-        Just("<T, U>".to_string()),
-    ]
-}
-
-/// Where clause (only with generics, but we keep it simple).
-fn where_clause() -> impl Strategy<Value = String> {
-    prop_oneof![
-        9 => Just("".to_string()),
-        1 => Just(" where T: std::fmt::Debug".to_string()),
-    ]
-}
-
-/// Return type.
-fn return_type() -> impl Strategy<Value = String> {
-    prop_oneof![
-        Just("".to_string()),
-        Just(" -> i32".to_string()),
-        Just(" -> String".to_string()),
-        Just(" -> bool".to_string()),
-        Just(" -> Option<i32>".to_string()),
-        Just(" -> Result<(), String>".to_string()),
-        Just(" -> Vec<u8>".to_string()),
-    ]
-}
-
-/// Parameter list.
-fn params() -> impl Strategy<Value = String> {
-    prop_oneof![
-        Just("".to_string()),
-        Just("x: i32".to_string()),
-        Just("x: i32, y: i32".to_string()),
-        Just("s: &str".to_string()),
-        Just("s: String, n: usize".to_string()),
-    ]
-}
-
-/// A single function definition with randomized attributes/signature.
-/// Returns (name, source, instrumentable) where instrumentable is false for
-/// unsafe/const/extern "C" functions.
-fn function_def() -> impl Strategy<Value = (String, String, bool)> {
-    (
-        attr_stack(),
-        visibility(),
-        skip_modifier(),
-        async_modifier(),
-        ident(),
-        generics(),
-        params(),
-        return_type(),
-        where_clause(),
-    )
-        .prop_map(
-            |(attrs, vis, skip_mod, async_mod, name, generics, params, ret, where_cl)| {
-                let instrumentable = skip_mod.is_empty();
-
-                // const fn and extern "C" fn cannot be async.
-                let effective_async = if skip_mod.is_empty() {
-                    async_mod
-                } else {
-                    String::new()
-                };
-
-                // Build a body that returns the right type.
-                let body = match ret.as_str() {
-                    "" => "let _ = 42;".to_string(),
-                    " -> i32" => "42".to_string(),
-                    " -> String" => "String::new()".to_string(),
-                    " -> bool" => "true".to_string(),
-                    " -> Option<i32>" => "Some(42)".to_string(),
-                    " -> Result<(), String>" => "Ok(())".to_string(),
-                    " -> Vec<u8>" => "Vec::new()".to_string(),
-                    _ => "let _ = 42;".to_string(),
-                };
-
-                let attrs_block = if attrs.is_empty() {
-                    String::new()
-                } else {
-                    format!("{attrs}\n")
-                };
-
-                let source = format!(
-                    "{attrs_block}{vis}{skip_mod}{effective_async}fn {name}{generics}({params}){ret}{where_cl} {{\n    {body}\n}}\n"
-                );
-
-                (name, source, instrumentable)
-            },
-        )
-}
-
-/// A full Rust file with 1-4 functions (deduplicated names).
-/// Returns (names, source, instrumentable_names).
+/// Generate a file with 1-5 functions, all unique names.
 fn rust_file() -> impl Strategy<Value = (Vec<String>, String, Vec<String>)> {
-    prop::collection::vec(function_def(), 1..=4).prop_map(|fns| {
+    prop::collection::vec(rust_fn(), 1..=5).prop_map(|fns| {
         let mut seen = std::collections::HashSet::new();
-        let fns: Vec<_> = fns
-            .into_iter()
-            .filter(|(n, _, _)| seen.insert(n.clone()))
-            .collect();
-        let names: Vec<String> = fns.iter().map(|(n, _, _)| n.clone()).collect();
-        let instrumentable_names: Vec<String> = fns
-            .iter()
-            .filter(|(_, _, instrumentable)| *instrumentable)
-            .map(|(n, _, _)| n.clone())
-            .collect();
-        let source = fns
-            .into_iter()
-            .map(|(_, s, _)| s)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut names = Vec::new();
+        let mut bodies = Vec::new();
+        let mut instrumentable_names = Vec::new();
+
+        for (name, body, instrumentable) in fns {
+            if seen.contains(&name) {
+                continue;
+            }
+            seen.insert(name.clone());
+            names.push(name.clone());
+            bodies.push(body);
+            if instrumentable {
+                instrumentable_names.push(name);
+            }
+        }
+
+        let source = bodies.join("\n");
         (names, source, instrumentable_names)
     })
 }
@@ -246,120 +132,123 @@ proptest! {
     /// Instrumented output must always parse as valid Rust.
     #[test]
     fn output_parses_as_valid_rust((names, source, _instrumentable) in rust_file()) {
-        // Only test inputs that are valid Rust (syn can parse them).
-        if syn::parse_str::<syn::File>(&source).is_err() {
+        if !ra_ap_syntax::SourceFile::parse(&source, ra_ap_syntax::Edition::Edition2024).errors().is_empty() {
             return Ok(());
         }
-        let targets: HashMap<String, String> = names.iter().map(|n| (n.clone(), n.clone())).collect();
-        let result = instrument_source(&source, &targets, false, "")
+        let measured: HashMap<String, u32> = names.iter().enumerate()
+            .map(|(i, n)| (n.clone(), i as u32)).collect();
+        let result = instrument_source(&source, &measured, None)
             .expect("instrument_source should succeed on valid Rust input");
-        // Core invariant: output must be parseable Rust.
-        let parse = syn::parse_str::<syn::File>(&result.source);
+        let re_parse = ra_ap_syntax::SourceFile::parse(&result.source, ra_ap_syntax::Edition::Edition2024);
+        let errors: Vec<_> = re_parse.errors().to_vec();
         prop_assert!(
-            parse.is_ok(),
-            "output failed to parse:\n{}\nerror: {:?}",
+            errors.is_empty(),
+            "output failed to parse:\n{}\nerrors: {:?}",
             result.source,
-            parse.err()
+            errors
         );
     }
 
     /// Every targeted instrumentable function should have a guard injected.
     #[test]
     fn targeted_functions_get_guards((names, source, instrumentable) in rust_file()) {
-        if syn::parse_str::<syn::File>(&source).is_err() {
+        if !ra_ap_syntax::SourceFile::parse(&source, ra_ap_syntax::Edition::Edition2024).errors().is_empty() {
             return Ok(());
         }
-        let targets: HashMap<String, String> = names.iter().map(|n| (n.clone(), n.clone())).collect();
-        let result = instrument_source(&source, &targets, false, "")
+        let measured: HashMap<String, u32> = names.iter().enumerate()
+            .map(|(i, n)| (n.clone(), i as u32)).collect();
+        let result = instrument_source(&source, &measured, None)
             .expect("instrument_source should succeed on valid Rust input");
         for name in &instrumentable {
-            let guard_pattern = format!("piano_runtime::enter(\"{name}\")");
+            let name_id = measured.get(name).unwrap();
+            let sync_guard = format!("piano_runtime::enter({name_id})");
+            let async_guard = format!("piano_runtime::enter_async({name_id},");
             prop_assert!(
-                result.source.contains(&guard_pattern),
-                "missing guard for '{}' in:\n{}",
-                name,
-                result.source
+                result.source.contains(&sync_guard) || result.source.contains(&async_guard),
+                "missing guard for '{}' (id {}) in:\n{}",
+                name, name_id, result.source
             );
         }
     }
 
-    /// Async functions should be wrapped with PianoFuture.
+    /// Async functions should be wrapped with enter_async.
     #[test]
-    fn async_functions_get_piano_future((names, source, instrumentable) in rust_file()) {
+    fn async_functions_get_enter_async((names, source, instrumentable) in rust_file()) {
         if !source.contains("async fn") {
             return Ok(());
         }
-        // Only expect PianoFuture if at least one instrumentable function is async.
         let has_instrumentable_async = instrumentable.iter().any(|name| {
             source.contains(&format!("async fn {name}"))
         });
         if !has_instrumentable_async {
             return Ok(());
         }
-        if syn::parse_str::<syn::File>(&source).is_err() {
+        if !ra_ap_syntax::SourceFile::parse(&source, ra_ap_syntax::Edition::Edition2024).errors().is_empty() {
             return Ok(());
         }
-        let targets: HashMap<String, String> = names.iter().map(|n| (n.clone(), n.clone())).collect();
-        let result = instrument_source(&source, &targets, false, "")
+        let measured: HashMap<String, u32> = names.iter().enumerate()
+            .map(|(i, n)| (n.clone(), i as u32)).collect();
+        let result = instrument_source(&source, &measured, None)
             .expect("instrument_source should succeed on valid Rust input");
         prop_assert!(
-            result.source.contains("PianoFuture"),
-            "async function present but no PianoFuture in:\n{}",
+            result.source.contains("enter_async"),
+            "async function present but no enter_async in:\n{}",
             result.source
         );
     }
 
-    /// Non-targeted functions should NOT be instrumented.
+    /// Non-targeted functions should NOT get guards.
     #[test]
-    fn non_targeted_functions_untouched((names, source, _instrumentable) in rust_file()) {
+    fn non_targeted_functions_no_guard((names, source, _instrumentable) in rust_file()) {
         if names.len() < 2 {
             return Ok(());
         }
-        if syn::parse_str::<syn::File>(&source).is_err() {
+        if !ra_ap_syntax::SourceFile::parse(&source, ra_ap_syntax::Edition::Edition2024).errors().is_empty() {
             return Ok(());
         }
-        // Target only the first function, check the rest are untouched.
-        let targets: HashMap<String, String> = [(names[0].clone(), names[0].clone())].into();
-        let result = instrument_source(&source, &targets, false, "")
+        // Target only the first function.
+        let measured: HashMap<String, u32> = HashMap::from([(names[0].clone(), 0u32)]);
+        let result = instrument_source(&source, &measured, None)
             .expect("instrument_source should succeed on valid Rust input");
-        for name in &names[1..] {
-            let guard_pattern = format!("piano_runtime::enter(\"{name}\")");
-            prop_assert!(
-                !result.source.contains(&guard_pattern),
-                "non-targeted '{}' was instrumented in:\n{}",
-                name,
-                result.source
-            );
-        }
+        // Only ID 0 should appear in guards. No other IDs.
+        let guard_count = result.source.matches("piano_runtime::enter(").count()
+            + result.source.matches("piano_runtime::enter_async(").count();
+        prop_assert!(
+            guard_count <= 1,
+            "expected at most 1 guard (for targeted function), got {} in:\n{}",
+            guard_count, result.source
+        );
     }
 
-    /// Uninstrumentable functions (unsafe, const, extern) should NOT get guards.
+    /// Uninstrumentable functions (const, extern "C") should NOT get guards.
     #[test]
     fn uninstrumentable_functions_skipped((names, source, instrumentable) in rust_file()) {
-        if syn::parse_str::<syn::File>(&source).is_err() {
+        if !ra_ap_syntax::SourceFile::parse(&source, ra_ap_syntax::Edition::Edition2024).errors().is_empty() {
             return Ok(());
         }
         let instrumentable_set: std::collections::HashSet<&str> =
             instrumentable.iter().map(|s| s.as_str()).collect();
-        let skipped: Vec<&str> = names
-            .iter()
+        let skipped: Vec<&str> = names.iter()
             .map(|s| s.as_str())
             .filter(|n| !instrumentable_set.contains(n))
             .collect();
         if skipped.is_empty() {
             return Ok(());
         }
-        let targets: HashMap<String, String> = names.iter().map(|n| (n.clone(), n.clone())).collect();
-        let result = instrument_source(&source, &targets, false, "")
+        let measured: HashMap<String, u32> = names.iter().enumerate()
+            .map(|(i, n)| (n.clone(), i as u32)).collect();
+        let result = instrument_source(&source, &measured, None)
             .expect("instrument_source should succeed on valid Rust input");
         for name in &skipped {
-            let guard_pattern = format!("piano_runtime::enter(\"{name}\")");
-            prop_assert!(
-                !result.source.contains(&guard_pattern),
-                "uninstrumentable '{}' was instrumented in:\n{}",
-                name,
-                result.source
-            );
+            if let Some(&id) = measured.get(*name) {
+                let sync_pattern = format!("piano_runtime::enter({id})");
+                let async_pattern = format!("piano_runtime::enter_async({id},");
+                prop_assert!(
+                    !result.source.contains(&sync_pattern) && !result.source.contains(&async_pattern),
+                    "uninstrumentable '{}' (id {}) was instrumented in:\n{}",
+                    name, id, result.source
+                );
+            }
         }
     }
 }

@@ -25,7 +25,7 @@ fn has_toolchain(version: &str) -> bool {
 fn create_rayon_alloc_project(dir: &Path) {
     fs::create_dir_all(dir.join("src")).unwrap();
 
-    // Pin Rust 1.91.0 — this version has the strict TLS destructor check
+    // Pin Rust 1.91.0. This version has the strict TLS destructor check
     // that aborts if the global allocator uses TLS with destructors.
     fs::write(
         dir.join("rust-toolchain.toml"),
@@ -148,12 +148,11 @@ fn compute(x: u64) -> u64 {
 /// PianoAllocator in a multi-threaded program.
 ///
 /// The allocator must not crash when threads that performed allocations exit.
-/// Previously, `track_alloc` accessed `STACK` (RefCell<Vec>) which has a
-/// destructor -- forbidden for global allocators on Rust < 1.93.1.
+/// Global allocator TLS with destructors is forbidden on Rust < 1.93.1.
 ///
-/// This test pins Rust 1.91.0 (via rust-toolchain.toml in the test project)
+/// Pins Rust 1.91.0 (via rust-toolchain.toml in the test project)
 /// because 1.93.1 relaxed the TLS restriction and silently masks the bug.
-/// It also uses rayon (common real-world pattern) to exercise thread pool
+/// Uses rayon (common real-world pattern) to exercise thread pool
 /// allocation paths.
 #[test]
 fn rayon_program_with_alloc_tracking_does_not_crash_on_older_rust() {
@@ -192,7 +191,7 @@ fn rayon_program_with_alloc_tracking_does_not_crash_on_older_rust() {
         "built binary should exist at: {binary_path}"
     );
 
-    // Run the instrumented binary — should NOT crash.
+    // Run the instrumented binary. Should NOT crash.
     let runs_dir = tmp.path().join("runs");
     fs::create_dir_all(&runs_dir).unwrap();
 
@@ -236,9 +235,9 @@ fn cross_thread_captures_all_calls() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let runtime_path = manifest_dir.join("piano-runtime");
 
-    // Run piano build on the fixture — instrument both compute and main.
+    // Run piano build on the fixture -- instrument compute (main excluded: lifecycle boundary).
     let piano_build = Command::new(piano_bin)
-        .args(["build", "--fn", "compute", "--fn", "main", "--project"])
+        .args(["build", "--fn", "compute", "--project"])
         .arg(&project_dir)
         .arg("--runtime-path")
         .arg(&runtime_path)
@@ -289,17 +288,10 @@ fn cross_thread_captures_all_calls() {
         "compute should be called 200 times (100 par_iter + 100 thread::scope), got {compute_calls}"
     );
 
-    // Cross-thread wall-time non-propagation: main's self_ns must NOT be
-    // reduced by child-thread compute time. Since compute runs on worker
-    // threads (not as a same-thread child of main), main's self_ns equals
-    // its full wall time. If this invariant were broken, main's self_ns
-    // would be near zero.
-    let main_self_ns = stats.get("main").map(|s| s.self_ns).unwrap_or(0);
-    let compute_self_ns = stats.get("compute").map(|s| s.self_ns).unwrap_or(0);
+    // main() is excluded from the name table -- it is the lifecycle boundary
+    // that creates the root context, not a profiled function.
     assert!(
-        main_self_ns > compute_self_ns / 64,
-        "main self_ns ({main_self_ns}) should be substantial relative to compute \
-         self_ns ({compute_self_ns}) — cross-thread wall time must not be subtracted \
-         from parent self-time"
+        !stats.contains_key("main"),
+        "main should NOT appear in stats (lifecycle boundary, excluded from name table)"
     );
 }

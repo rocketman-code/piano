@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 996b402c5450a62e0d87de168babb8c5719e9a1d03497d0fab648542ea617374 # shrinks to (names, source, instrumentable) = (["a0"], "unsafe fn a0() {\n    let _ = 42;\n}\n", [])

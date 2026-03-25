@@ -5,12 +5,8 @@ pub enum Error {
     #[error("no functions matched {specs}{hint}")]
     NoTargetsFound { specs: String, hint: String },
 
-    #[error("failed to parse {}: {source}", path.display())]
-    ParseError {
-        path: PathBuf,
-        #[source]
-        source: syn::Error,
-    },
+    #[error("failed to parse {}: {message}", path.display())]
+    ParseError { path: PathBuf, message: String },
 
     #[error("build failed: {0}")]
     BuildFailed(String),

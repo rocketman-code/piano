@@ -1,37 +1,7 @@
 # cargo-mutants configuration
 # https://mutants.rs/config.html
 
-# TlsFlushGuard::drop is only exercised during TLS destruction via
-# process::exit(). Tested by tests/process_exit.rs at the workspace level,
-# but cargo-mutants scopes to --package piano-runtime where no test can
-# trigger TLS destruction without killing the test runner.
 exclude_re = [
-    "<impl Drop for TlsFlushGuard>::drop",
-    # Signal/atexit: process-level infrastructure requiring real signals or
-    # process::exit to exercise. Tested indirectly via integration tests.
-    "signal_impl::",
-    "atexit_impl::",
-    # init() orchestrates signal/atexit registration -- same constraint.
-    "replace init with \\(\\)",
-    # | and ^ are equivalent when operand bit ranges are disjoint by
-    # construction (name_id in bits 16-31, depth in bits 0-15).
-    "replace \\| with \\^ in pack_name_depth",
-    # SpanContext::finalize is backed up by Drop (which calls apply_children
-    # when !finalized). Replacing finalize with () is semantically equivalent.
-    "replace SpanContext::finalize with \\(\\)",
-    # SpanContext::drop is redundant when finalize() was called (which it is
-    # in all test paths). The Drop exists for safety, not primary logic.
-    "SpanContext>::drop",
-    # SpanContext::apply_children and AdoptGuard cpu-time propagation use
-    # timing ratios that are too coarse for mutation testing (tightening
-    # thresholds causes CI flakiness). Tested via cpu_time_propagated_across_
-    # threads_via_adopt with wide margins.
-    "SpanContext::apply_children",
-    "replace \\+= with \\*= in <impl Drop for AdoptGuard>::drop",
-    # AdoptGuard depth-0 flush is backed up by TlsFlushGuard (drains
-    # FRAME_BUFFER on thread exit). Both paths tested; mutating one still
-    # passes because the other catches the data.
-    "replace == with != in <impl Drop for AdoptGuard>::drop",
     # calibrate/store_ratio remainder: replacing % with + adds an extra
     # `denom * 2^64 / denom = 2^64` to the fixed-point intermediate, which
     # wraps to zero on the `as u64` cast. Mathematically equivalent.
@@ -40,36 +10,4 @@ exclude_re = [
     # calibrate_bias trim: N/50 vs N%50 yields nearly identical means on
     # well-behaved data (2% trim vs 0% trim). Unkillable by test.
     "replace / with % in calibrate_bias",
-    # drop_cold flush optimization: remaining_all_base / is_frame_boundary
-    # control WHEN flush_records_buf() fires, not WHETHER data is flushed.
-    # Records always reach RECORDS via collect() or TlsFlushGuard. Mutations
-    # change timing but not correctness.
-    "replace == with != in drop_cold",
-    "replace \\|\\| with && in drop_cold",
-    # calibrate_guard_cost line 188: f64 modulo produces the fractional-part
-    # remainder, which lands in [0, N) -- often a plausible guard_cost value.
-    "replace / with % in calibrate_guard_cost$",
-    # calibrate_guard_cost line 189: guard_cost ± bias produces values in the
-    # same plausible range (~10-55ns). Unkillable without tight timing bounds
-    # that would cause CI flakiness.
-    "replace - with \\+ in calibrate_guard_cost$",
-    "replace - with / in calibrate_guard_cost$",
-    # calibrate_guard_cost line 194: during calibration only __piano_cal__
-    # entries exist in RECORDS_BUF, so != vs == doesn't change the retained set.
-    "replace != with == in calibrate_guard_cost$",
-    # Frame-buffer bias correction (drop_cold line 833): same formula as
-    # aggregate-path correction (tested). Streaming output not observable from
-    # unit tests -- requires NDJSON integration tests.
-    "replace - with .+ in drop_cold",
-    "replace \\* with .+ in drop_cold",
-    # open_stream_file name_count > 0: NAME_TABLE_LEN is append-only (never
-    # resets), so it is always > 0 after any intern_name call. Since all tests
-    # intern names, > 0 vs >= 0 (always true for usize) is indistinguishable.
-    "replace > with >= in open_stream_file$",
-    # drop_cold line 834 / aggregate line 994: `> 0.0` vs `>= 0.0` -- when
-    # corrected == 0.0, both paths produce 0 (0.0 as u64 == 0, 0.0/1M == 0.0).
-    # False positive. The > vs == and > vs < on line 834 are also streaming-
-    # path only.
-    "replace > with .+ in drop_cold",
-    "replace > with >= in aggregate",
 ]
