@@ -1,4 +1,6 @@
 // ASM verification tests for measurement window claims (TM6, TM7, TM8).
+// x86_64 only: assembly patterns are architecture-specific.
+#![cfg(target_arch = "x86_64")]
 //
 // These tests extract assembly from codegen_inspect.rs example functions
 // using cargo-show-asm and verify structural properties of the generated
