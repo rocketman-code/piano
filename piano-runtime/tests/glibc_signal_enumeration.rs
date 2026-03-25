@@ -183,11 +183,27 @@ fn posix_signals_exhaustive() {
         }, // C: bad syscall
     ];
 
-    // Verify the signal constants match the system headers
-    let header = std::fs::read_to_string("/usr/include/bits/signum-generic.h")
-        .expect("glibc signal header not found (is build-essential installed?)");
-    let arch_header = std::fs::read_to_string("/usr/include/bits/signum-arch.h")
-        .expect("glibc arch signal header not found");
+    // Verify the signal constants match the system headers.
+    // On multiarch systems (Ubuntu 24.04+), headers live under the
+    // architecture-specific include path.
+    let include_dirs = [
+        "/usr/include/bits",
+        "/usr/include/x86_64-linux-gnu/bits",
+        "/usr/include/aarch64-linux-gnu/bits",
+    ];
+    let find_header = |name: &str| -> String {
+        for dir in &include_dirs {
+            let path = format!("{dir}/{name}");
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                return content;
+            }
+        }
+        panic!(
+            "{name} not found in any of {include_dirs:?} (is libc6-dev installed?)"
+        );
+    };
+    let header = find_header("signum-generic.h");
+    let arch_header = find_header("signum-arch.h");
     let all_headers = format!("{header}\n{arch_header}");
 
     for sig in &signals {
