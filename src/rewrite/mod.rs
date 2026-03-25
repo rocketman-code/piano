@@ -814,4 +814,78 @@ m!();
             "macro_rules fn should be instrumented"
         );
     }
+
+    #[test]
+    fn macro_metavar_fn_gets_guard() {
+        let source = r#"
+macro_rules! make_fn { ($name:ident) => { fn $name() { let _ = 1; } }; }
+make_fn!(dynamic_fn);
+fn main() {}
+"#;
+        let measured: HashMap<String, u32> = [("dynamic_fn".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None)
+            .expect("instrument_source should succeed");
+
+        assert!(
+            result.source.contains("piano_runtime::enter(0)"),
+            "metavar-expanded fn should get a guard. Got:\n{}", result.source
+        );
+    }
+
+    #[test]
+    fn macro_unmeasured_fn_not_guarded() {
+        let source = r#"
+macro_rules! make_fn { ($name:ident) => { fn $name() { let _ = 1; } }; }
+make_fn!(unlisted_fn);
+fn main() {}
+"#;
+        // unlisted_fn is NOT in the measured map.
+        let measured: HashMap<String, u32> = HashMap::new();
+        let result = instrument_source(source, &measured, None)
+            .expect("instrument_source should succeed");
+
+        assert!(
+            !result.source.contains("piano_runtime::enter"),
+            "unmeasured macro fn should not get a guard. Got:\n{}", result.source
+        );
+    }
+
+    #[test]
+    fn macro_const_fn_not_guarded() {
+        let source = r#"
+macro_rules! make_const { () => { const fn fixed() -> u32 { 42 } }; }
+make_const!();
+fn main() {}
+"#;
+        let measured: HashMap<String, u32> = [("fixed".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None)
+            .expect("instrument_source should succeed");
+
+        assert!(
+            !result.source.contains("piano_runtime::enter"),
+            "const fn from macro should be skipped. Got:\n{}", result.source
+        );
+    }
+
+    #[test]
+    fn macro_mixed_measured_unmeasured() {
+        let source = r#"
+macro_rules! pair { () => { fn tracked() { let _ = 1; } fn untracked() { let _ = 2; } }; }
+pair!();
+fn main() {}
+"#;
+        // Only "tracked" is in the measured map.
+        let measured: HashMap<String, u32> = [("tracked".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None)
+            .expect("instrument_source should succeed");
+
+        assert!(
+            result.source.contains("piano_runtime::enter(0)"),
+            "measured fn should get a guard. Got:\n{}", result.source
+        );
+        assert_eq!(
+            result.source.matches("piano_runtime::enter").count(), 1,
+            "only the measured fn should get a guard, not both. Got:\n{}", result.source
+        );
+    }
 }

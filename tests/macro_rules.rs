@@ -179,3 +179,98 @@ fn main() {}
         "literal fn in macro should get a guard. Got:\n{}", result.source
     );
 }
+
+#[test]
+fn metavar_fn_appears_in_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("metavar-fns");
+    fs::create_dir_all(project_dir.join("src")).unwrap();
+
+    fs::write(
+        project_dir.join("Cargo.toml"),
+        r#"[package]
+name = "metavar-fns"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "metavar-fns"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        project_dir.join("src").join("main.rs"),
+        r#"macro_rules! make_fn {
+    ($name:ident) => {
+        fn $name() -> u64 {
+            let mut sum = 0u64;
+            for i in 0..100 { sum += i; }
+            sum
+        }
+    };
+}
+
+make_fn!(dynamic_compute);
+
+fn main() {
+    let a = dynamic_compute();
+    println!("result: {a}");
+}
+"#,
+    )
+    .unwrap();
+
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let runs_dir = project_dir.join("target/piano/runs");
+    let binary_path = stdout.trim();
+    let run_output = Command::new(binary_path)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run_output.status.success(),
+        "instrumented binary failed:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let program_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        program_stdout.contains("result: 4950"),
+        "program should produce correct output, got: {program_stdout}"
+    );
+
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+
+    assert!(
+        content.contains("\"dynamic_compute\""),
+        "metavar-expanded fn should appear in NDJSON output with correct name"
+    );
+    assert!(
+        !content.contains("\"main\""),
+        "main should NOT appear in output"
+    );
+}

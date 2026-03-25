@@ -285,4 +285,66 @@ mod tests {
         assert_eq!(exps.len(), 1);
         assert_eq!(exps[0].fn_names, vec!["get_value"]);
     }
+
+    #[test]
+    fn external_macro_call_skipped() {
+        let (exps, _) = parse_and_expand(r#"
+            fn main() { println!("hello"); }
+        "#);
+        assert!(exps.is_empty(), "external macro call with no local def should produce no expansions");
+    }
+
+    #[test]
+    fn expand_failure_silently_skipped() {
+        // Macro expects one ident arg, but invocation provides two -- expansion should
+        // fail silently (no panic), and the call is skipped.
+        let (exps, _) = parse_and_expand(r#"
+            macro_rules! make_fn { ($name:ident) => { fn $name() {} }; }
+            make_fn!(a, b);
+        "#);
+        assert!(exps.is_empty(), "failed expansion should be silently skipped");
+    }
+
+    #[test]
+    fn empty_source_produces_no_expansions() {
+        let (exps, calls) = parse_and_expand("fn main() { let x = 1; }");
+        assert!(exps.is_empty(), "source with no macros should produce no expansions");
+        assert!(calls.is_empty(), "source with no macros should produce no calls");
+    }
+
+    #[test]
+    fn defs_without_calls_produce_no_expansions() {
+        let (exps, _) = parse_and_expand(r#"
+            macro_rules! unused { () => { fn ghost() {} }; }
+            fn main() {}
+        "#);
+        assert!(exps.is_empty(), "defined but never invoked macro should produce no expansions");
+    }
+
+    #[test]
+    fn multiple_rules_macro() {
+        let (exps, _) = parse_and_expand(r#"
+            macro_rules! make {
+                (fast $name:ident) => { fn $name() { let _ = "fast"; } };
+                (slow $name:ident) => { fn $name() { let _ = "slow"; } };
+            }
+            make!(fast speedy);
+            make!(slow turtle);
+        "#);
+        assert_eq!(exps.len(), 2, "both invocations should expand");
+        assert_eq!(exps[0].fn_names, vec!["speedy"]);
+        assert_eq!(exps[1].fn_names, vec!["turtle"]);
+    }
+
+    #[test]
+    fn repetition_pattern_expands() {
+        let (exps, _) = parse_and_expand(r#"
+            macro_rules! make_fns {
+                ($($name:ident),*) => { $(fn $name() { let _ = 1; })* };
+            }
+            make_fns!(a, b, c);
+        "#);
+        assert_eq!(exps.len(), 1, "single invocation should produce one expansion");
+        assert_eq!(exps[0].fn_names, vec!["a", "b", "c"]);
+    }
 }
