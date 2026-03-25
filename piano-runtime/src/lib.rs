@@ -2,50 +2,64 @@
 #![allow(renamed_and_removed_lints)]
 #![allow(clippy::missing_const_for_thread_local)]
 
-mod alloc;
-pub(crate) mod channel;
-mod collector;
-mod cpu_clock;
-mod piano_future;
 #[cfg(feature = "_test_internals")]
 #[doc(hidden)]
-pub mod tsc;
+pub mod cpu_clock;
 #[cfg(not(feature = "_test_internals"))]
-mod tsc;
+mod cpu_clock;
 
-// User-facing API: visible in docs
+pub(crate) mod children;
+
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
+pub mod aggregator;
+#[cfg(not(feature = "_test_internals"))]
+pub(crate) mod aggregator;
+
+#[doc(hidden)]
+pub mod session;
+
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
+pub mod time;
+#[cfg(not(feature = "_test_internals"))]
+mod time;
+
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
+pub mod guard;
+#[cfg(not(feature = "_test_internals"))]
+mod guard;
+
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
+pub mod output;
+#[cfg(not(feature = "_test_internals"))]
+mod output;
+
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
+pub mod shutdown;
+#[cfg(not(feature = "_test_internals"))]
+mod shutdown;
+
+// Rewriter-referenced modules
+#[doc(hidden)]
+pub mod file_sink;
+
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
+pub mod alloc;
+#[cfg(not(feature = "_test_internals"))]
+mod alloc;
+
+#[cfg(feature = "_test_internals")]
+#[doc(hidden)]
+pub mod piano_future;
+#[cfg(not(feature = "_test_internals"))]
+mod piano_future;
+
+// Public API for rewriter-generated code
 pub use alloc::PianoAllocator;
-pub use collector::{
-    collect, collect_all, collect_frames, enter, FrameFnSummary, FunctionRecord, Guard,
-    InvocationRecord,
-};
-
-// Injection-only API: public for rewriter-generated code, hidden from docs
-#[cfg(feature = "channels-crossbeam")]
-#[doc(hidden)]
-pub use channel::crossbeam::{
-    wrap_bounded as wrap_crossbeam_bounded, wrap_unbounded as wrap_crossbeam_unbounded,
-    ProxyReceiver as CrossbeamProxyReceiver, ProxySender as CrossbeamProxySender,
-};
-#[doc(hidden)]
-pub use channel::{
-    collect_channel_stats, register_channel, ChannelKind, ChannelSnapshot, ChannelStats,
-};
-#[doc(hidden)]
-pub use collector::{
-    adopt, flush, fork, init, register, reset, set_runs_dir, shutdown, shutdown_to, AdoptGuard,
-    SpanContext,
-};
-#[doc(hidden)]
-pub use piano_future::PianoFuture;
-
-#[cfg(test)]
-pub use collector::clear_runs_dir;
-#[cfg(any(test, feature = "_test_internals"))]
-pub use collector::collect_invocations;
-
-#[cfg(all(feature = "_test_internals", feature = "cpu-time"))]
-#[doc(hidden)]
-pub use cpu_clock::{
-    load_cpu_bias_ns, load_guard_overhead_ns, store_cpu_bias_ns, store_guard_overhead_ns,
-};
+pub use guard::enter;
+pub use piano_future::{enter_async, PianoFuture};
