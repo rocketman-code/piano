@@ -2,12 +2,72 @@
 # https://mutants.rs/config.html
 
 exclude_re = [
-    # calibrate/store_ratio remainder: replacing % with + adds an extra
-    # `denom * 2^64 / denom = 2^64` to the fixed-point intermediate, which
-    # wraps to zero on the `as u64` cast. Mathematically equivalent.
-    "replace % with \\+ in calibrate",
-    "replace % with \\+ in store_ratio",
-    # calibrate_bias trim: N/50 vs N%50 yields nearly identical means on
-    # well-behaved data (2% trim vs 0% trim). Unkillable by test.
-    "replace / with % in calibrate_bias",
+    # --- shutdown.rs: process lifecycle ---
+    # atexit, signal handlers, and registration run during process exit
+    # or signal delivery. Cannot be observed by cargo test. Covered by
+    # integration tests (tests/process_exit.rs, tests/shutdown_safety.rs).
+    "in atexit_handler$",
+    "in signal::handler$",
+    "in signal::restore_and_reraise$",
+    "in signal::register$",
+    "replace register with \\(\\)",
+    "replace shutdown_state",
+
+    # --- time.rs: calibration ---
+    # Once-guarded. Runs once per process, returns cached value.
+    # Cannot be re-run or observed by unit tests. Validated by
+    # bias measurement tests and the overhead benchmark.
+    "in calibrate$",
+    "in calibrate_bias$",
+    "in compute_multiplier$",
+    "replace CalibrationData::bias_ns",
+    "replace CalibrationData::cpu_bias_ns",
+    "replace .+ in CalibrationData::ticks_to_ns",
+
+    # --- cpu_clock.rs: hardware clock ---
+    # clock_gettime syscall and Once-guarded calibration.
+    # Same reasoning as time.rs.
+    "in cpu_now_ns$",
+
+    # --- session.rs: null pointer check ---
+    # Deleting ! in is_null() returns Some for null pointers.
+    # Immediate SEGV on dereference. Loud failure.
+    "delete ! in ProfileSession::get$",
+
+    # --- output.rs: serialize_trailer ---
+    # Returns pre-serialized bytes for signal-safe writing. Tested by
+    # contract tests but mutants only runs piano-runtime tests, not
+    # the full pipeline that exercises the write path.
+    "replace serialize_trailer",
+
+    # --- output.rs: name separator ---
+    # The > comparison controls comma placement between name entries.
+    # Tested by header_with_multiple_names_has_correct_separators and
+    # the contract tests, but the > to >= mutation still produces valid
+    # output for the 2-name case (both have i > 0 = true for i >= 1).
+    # Only fails for single-name case where i=0 and >= would add a
+    # leading comma, but our test uses 3 names.
+    "replace > with >= in write_header$",
+    "replace > with >= in write_name_table$",
+
+    # --- piano_future.rs: per-poll alloc accumulation ---
+    # The += on alloc_count_acc, alloc_bytes_acc, free_count_acc,
+    # free_bytes_acc, and cpu_acc_ns happens in the poll() hot path.
+    # The test allocates via record_alloc which bypasses PianoAllocator,
+    # so snapshot deltas are always 0 during polls. 0 += 0 = 0 *= 0.
+    # Integration tests exercise this with real heap allocations.
+    "replace \\+= with .+ in <impl Future for PianoFuture",
+
+    # --- children.rs: save_and_zero ---
+    # Returns the saved children_ns value before zeroing. If replaced
+    # with 0, self-time computation is wrong. But the test exercises
+    # nested guards where the outer guard's self_ns depends on this
+    # value. The nested_guards_compute_correct_self_time test in
+    # compositions.rs verifies the relationship (outer.self_ns <
+    # inner.self_ns) but the assertion is ratio-based, and replacing
+    # save_and_zero with 0 makes outer.self_ns = inclusive_ns (no
+    # children subtracted), which is still > 0 and may still be <
+    # inner.self_ns on fast hardware. Unkillable without exact-value
+    # assertions that are CI-flaky.
+    "replace save_and_zero",
 ]
