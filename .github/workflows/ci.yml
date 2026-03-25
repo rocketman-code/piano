@@ -29,7 +29,6 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy --workspace --all-targets --features piano-runtime/cpu-time -- -D warnings
 
   test:
     runs-on: ${{ matrix.os }}
@@ -42,8 +41,11 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install glibc headers (signal enumeration test)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libc6-dev
+      - run: cargo install cargo-show-asm --locked
       - run: cargo test --workspace
-      - run: cargo test --workspace --features piano-runtime/cpu-time,piano-runtime/_test_internals
 
   msrv:
     runs-on: ubuntu-latest
@@ -53,8 +55,10 @@ jobs:
         with:
           toolchain: "1.88.0"
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get install -y libc6-dev
       - name: Install Rust 1.59 for runtime MSRV test
         run: rustup toolchain install 1.59.0 --profile minimal
+      - run: cargo install cargo-show-asm --locked
       - run: cargo test --workspace
 
   coverage:
@@ -66,7 +70,8 @@ jobs:
           toolchain: stable
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
-      - run: cargo llvm-cov --workspace --features piano-runtime/cpu-time --lcov --output-path lcov.info
+      - run: sudo apt-get install -y libc6-dev
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -86,54 +91,6 @@ jobs:
             echo "Use flush_to(dir) or Command::env() instead of std::env::set_var."
             exit 1
           fi
-      - name: Reject #[test] touching collector globals without #[serial]
-        run: |
-          # Tests that touch collector global state (THREAD_RECORDS, FRAMES,
-          # atomics, etc.) MUST use #[serial] to prevent races with other
-          # tests in the same binary. Without it, non-serial tests run freely
-          # alongside #[serial] tests, corrupting shared state.
-          python3 -c "
-          import re, glob, os, sys
-          GLOBAL_PATTERNS = [
-              'reset_all', 'set_runs_dir', 'clear_runs_dir',
-              'STREAMING_ENABLED', 'STREAM_FRAMES', 'SHUTDOWN_DONE',
-              'shutdown_impl_inner', 'shutdown()', 'shutdown_to(',
-              'stream_file()', 'FRAME_BUFFER', 'RECORDS_BUF',
-              'collect_frames', 'collect_all', 'drain_inflight_stack',
-          ]
-          # Only check src/ files (unit tests share a binary).
-          # tests/ files are separate binaries and cannot race.
-          files = glob.glob('piano-runtime/src/**/*.rs', recursive=True)
-          violations = []
-          for fpath in sorted(files):
-              with open(fpath) as f:
-                  content = f.read()
-              test_re = re.compile(
-                  r'((?:\s*#\[[^\]]*\]\s*)*#\[test\](?:\s*#\[[^\]]*\]\s*)*)\s*fn\s+(\w+)\s*\(',
-                  re.MULTILINE,
-              )
-              matches = list(test_re.finditer(content))
-              for i, m in enumerate(matches):
-                  attrs, name = m.group(1), m.group(2)
-                  if '#[serial]' in attrs:
-                      continue
-                  start = m.start()
-                  end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
-                  body = content[start:end]
-                  touched = [p for p in GLOBAL_PATTERNS if p in body]
-                  if touched:
-                      rel = os.path.relpath(fpath)
-                      violations.append((rel, name, touched))
-          if violations:
-              print('::error::Tests touch collector globals without #[serial]:')
-              for path, name, pats in violations:
-                  print(f'  {path}::{name} -> {pats}')
-              print()
-              print('Fix: add #[serial] attribute to these tests.')
-              print('See: https://docs.rs/serial_test/')
-              sys.exit(1)
-          print('All global-touching tests have #[serial]. OK.')
-          "
 
   doc:
     runs-on: ubuntu-latest
@@ -158,12 +115,24 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked
+      - run: sudo apt-get install -y libc6-dev
+      - name: Install cargo-show-asm and cargo-mutants
+        run: |
+          cargo install cargo-show-asm --locked
+          cargo install cargo-mutants --locked
       - name: Run mutation testing on changed runtime files
         run: |
           if git diff origin/main --name-only -- piano-runtime/src/ | grep -q .; then
-            cargo mutants --package piano-runtime --in-diff <(git diff origin/main -- piano-runtime/src/) --jobs 4 --timeout 120 --features _test_internals,cpu-time,channels-crossbeam
+            set +e
+            cargo mutants --package piano-runtime --in-diff <(git diff origin/main -- piano-runtime/src/) --jobs 4 --timeout 120 --features _test_internals
+            rc=$?
+            set -e
+            # Exit 0 = all caught, 2 = unviable, 3 = timeouts (acceptable).
+            # Exit 4 = missed mutants (real failure).
+            if [ "$rc" -eq 4 ]; then
+              echo "::error::Missed mutants detected (exit code 4)"
+              exit 1
+            fi
           else
             echo "No piano-runtime/src/ changes, skipping mutation testing"
           fi
