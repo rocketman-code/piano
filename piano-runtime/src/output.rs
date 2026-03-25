@@ -14,9 +14,22 @@
 use std::io::{self, Write};
 
 /// Write the name table as a header line, including run metadata.
-pub fn write_header(w: &mut impl Write, names: &[(u32, &str)], bias_ns: u64, cpu_bias_ns: u64, run_id: &str, timestamp_ms: u128) -> io::Result<()> {
-    write!(w, "{{\"type\":\"header\",\"run_id\":\"{run_id}\",\"timestamp_ms\":{timestamp_ms},")?;
-    write!(w, "\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{")?;
+pub fn write_header(
+    w: &mut impl Write,
+    names: &[(u32, &str)],
+    bias_ns: u64,
+    cpu_bias_ns: u64,
+    run_id: &str,
+    timestamp_ms: u128,
+) -> io::Result<()> {
+    write!(
+        w,
+        "{{\"type\":\"header\",\"run_id\":\"{run_id}\",\"timestamp_ms\":{timestamp_ms},"
+    )?;
+    write!(
+        w,
+        "\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{"
+    )?;
     for (i, (id, name)) in names.iter().enumerate() {
         if i > 0 {
             write!(w, ",")?;
@@ -29,7 +42,12 @@ pub fn write_header(w: &mut impl Write, names: &[(u32, &str)], bias_ns: u64, cpu
 }
 
 /// Write the name table as a trailer line.
-pub fn write_trailer(w: &mut impl Write, names: &[(u32, &str)], bias_ns: u64, cpu_bias_ns: u64) -> io::Result<()> {
+pub fn write_trailer(
+    w: &mut impl Write,
+    names: &[(u32, &str)],
+    bias_ns: u64,
+    cpu_bias_ns: u64,
+) -> io::Result<()> {
     write_name_table(w, "trailer", names, bias_ns, cpu_bias_ns)
 }
 
@@ -44,7 +62,10 @@ pub fn serialize_trailer(names: &[(u32, &str)], bias_ns: u64, cpu_bias_ns: u64) 
 /// Write aggregated per-function summaries as NDJSON lines.
 /// Each inner Vec is one thread's data. Thread index is assigned
 /// from position in the outer slice.
-pub fn write_aggregates(w: &mut impl Write, per_thread: &[Vec<crate::aggregator::FnAgg>]) -> io::Result<()> {
+pub fn write_aggregates(
+    w: &mut impl Write,
+    per_thread: &[Vec<crate::aggregator::FnAgg>],
+) -> io::Result<()> {
     for (thread_idx, thread_agg) in per_thread.iter().enumerate() {
         for a in thread_agg {
             writeln!(
@@ -93,7 +114,11 @@ fn itoa(mut n: u64, buf: &mut [u8]) -> usize {
 
 /// Serialize a FnAgg as NDJSON into a stack-allocated buffer.
 /// No allocation, no format!(). Signal-safe.
-pub fn serialize_aggregate_to_stack(buf: &mut [u8; 512], a: &crate::aggregator::FnAgg, thread_idx: u64) -> usize {
+pub fn serialize_aggregate_to_stack(
+    buf: &mut [u8; 512],
+    a: &crate::aggregator::FnAgg,
+    thread_idx: u64,
+) -> usize {
     let mut pos = 0;
     macro_rules! put {
         ($bytes:expr) => {
@@ -108,23 +133,42 @@ pub fn serialize_aggregate_to_stack(buf: &mut [u8; 512], a: &crate::aggregator::
         };
     }
 
-    put!(b"{\"thread\":");        put_u64!(thread_idx);
-    put!(b",\"name_id\":");       put_u64!(a.name_id as u64);
-    put!(b",\"calls\":");         put_u64!(a.calls);
-    put!(b",\"self_ns\":");       put_u64!(a.self_ns);
-    put!(b",\"inclusive_ns\":");  put_u64!(a.inclusive_ns);
-    put!(b",\"cpu_self_ns\":");   put_u64!(a.cpu_self_ns);
-    put!(b",\"alloc_count\":");   put_u64!(a.alloc_count);
-    put!(b",\"alloc_bytes\":");   put_u64!(a.alloc_bytes);
-    put!(b",\"free_count\":");    put_u64!(a.free_count);
-    put!(b",\"free_bytes\":");    put_u64!(a.free_bytes);
+    put!(b"{\"thread\":");
+    put_u64!(thread_idx);
+    put!(b",\"name_id\":");
+    put_u64!(a.name_id as u64);
+    put!(b",\"calls\":");
+    put_u64!(a.calls);
+    put!(b",\"self_ns\":");
+    put_u64!(a.self_ns);
+    put!(b",\"inclusive_ns\":");
+    put_u64!(a.inclusive_ns);
+    put!(b",\"cpu_self_ns\":");
+    put_u64!(a.cpu_self_ns);
+    put!(b",\"alloc_count\":");
+    put_u64!(a.alloc_count);
+    put!(b",\"alloc_bytes\":");
+    put_u64!(a.alloc_bytes);
+    put!(b",\"free_count\":");
+    put_u64!(a.free_count);
+    put!(b",\"free_bytes\":");
+    put_u64!(a.free_bytes);
     put!(b"}\n");
 
     pos
 }
 
-fn write_name_table(w: &mut impl Write, kind: &str, names: &[(u32, &str)], bias_ns: u64, cpu_bias_ns: u64) -> io::Result<()> {
-    write!(w, "{{\"type\":\"{kind}\",\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{")?;
+fn write_name_table(
+    w: &mut impl Write,
+    kind: &str,
+    names: &[(u32, &str)],
+    bias_ns: u64,
+    cpu_bias_ns: u64,
+) -> io::Result<()> {
+    write!(
+        w,
+        "{{\"type\":\"{kind}\",\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{"
+    )?;
     for (i, (id, name)) in names.iter().enumerate() {
         if i > 0 {
             write!(w, ",")?;

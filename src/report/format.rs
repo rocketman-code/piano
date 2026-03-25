@@ -47,10 +47,16 @@ pub fn format_table(run: &Run, show_all: bool, limit: Option<usize>) -> String {
     }
     header.push_str(&format!(" {:>CALLS_W$}", "Calls"));
     if has_alloc {
-        header.push_str(&format!(" {:>COUNT_W$} {:>BYTES_W$}", "Allocs", "Alloc Bytes"));
+        header.push_str(&format!(
+            " {:>COUNT_W$} {:>BYTES_W$}",
+            "Allocs", "Alloc Bytes"
+        ));
     }
     if has_free {
-        header.push_str(&format!(" {:>COUNT_W$} {:>BYTES_W$}", "Frees", "Free Bytes"));
+        header.push_str(&format!(
+            " {:>COUNT_W$} {:>BYTES_W$}",
+            "Frees", "Free Bytes"
+        ));
     }
     let width = header.len();
     out.push_str(&format!("{HEADER}{header}{HEADER:#}\n"));
@@ -1044,5 +1050,4 @@ mod tests {
         assert_eq!(entries[0].free_count, 38);
         assert_eq!(entries[0].free_bytes, 900);
     }
-
 }

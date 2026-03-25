@@ -89,7 +89,11 @@ impl Guard {
         let _reentrancy = ReentrancyGuard::enter();
         let saved_children_ns = children::save_and_zero();
         let snap = snapshot_alloc_counters();
-        let cpu_start_ns = if session.cpu_time_enabled { cpu_now_ns() } else { 0 };
+        let cpu_start_ns = if session.cpu_time_enabled {
+            cpu_now_ns()
+        } else {
+            0
+        };
         drop(_reentrancy);
 
         Self {
@@ -126,7 +130,11 @@ impl Drop for Guard {
             None => return,
         };
         let _reentrancy = ReentrancyGuard::enter();
-        let cpu_end_ns = if self.cpu_time_enabled { cpu_now_ns() } else { 0 };
+        let cpu_end_ns = if self.cpu_time_enabled {
+            cpu_now_ns()
+        } else {
+            0
+        };
         let snap_end = snapshot_alloc_counters();
 
         let start_ns = session.calibration.now_ns(self.start_ns);

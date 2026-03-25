@@ -1,6 +1,4 @@
-use piano_runtime::alloc::{
-    is_reentrant, record_alloc, snapshot_alloc_counters, ReentrancyGuard,
-};
+use piano_runtime::alloc::{is_reentrant, record_alloc, snapshot_alloc_counters, ReentrancyGuard};
 
 // All tests run in spawned threads for TLS isolation.
 // All assertions use deltas, never absolute values.
@@ -13,8 +11,16 @@ fn record_alloc_increments_counters() {
         record_alloc(100);
         record_alloc(200);
         let after = snapshot_alloc_counters();
-        assert_eq!(after.alloc_count - before.alloc_count, 2, "should record 2 allocs");
-        assert_eq!(after.alloc_bytes - before.alloc_bytes, 300, "should record 300 bytes");
+        assert_eq!(
+            after.alloc_count - before.alloc_count,
+            2,
+            "should record 2 allocs"
+        );
+        assert_eq!(
+            after.alloc_bytes - before.alloc_bytes,
+            300,
+            "should record 300 bytes"
+        );
     })
     .join()
     .expect("test thread panicked");
@@ -30,8 +36,16 @@ fn reentrancy_guard_excludes_allocs() {
             record_alloc(999);
         } // guard dropped, reentrancy exits
         let after = snapshot_alloc_counters();
-        assert_eq!(after.alloc_count - before.alloc_count, 0, "guarded allocs should not count");
-        assert_eq!(after.alloc_bytes - before.alloc_bytes, 0, "guarded bytes should not count");
+        assert_eq!(
+            after.alloc_count - before.alloc_count,
+            0,
+            "guarded allocs should not count"
+        );
+        assert_eq!(
+            after.alloc_bytes - before.alloc_bytes,
+            0,
+            "guarded bytes should not count"
+        );
     })
     .join()
     .expect("test thread panicked");
@@ -53,7 +67,8 @@ fn nested_reentrancy() {
         } // outer dropped (counter=0)
         let after = snapshot_alloc_counters();
         assert_eq!(
-            after.alloc_count - before.alloc_count, 0,
+            after.alloc_count - before.alloc_count,
+            0,
             "all allocs inside nested guards should be excluded"
         );
     })
@@ -85,15 +100,19 @@ fn cross_thread_isolation() {
         record_alloc(100);
 
         // Spawned child should have independent counters
-        let child_snap = std::thread::spawn(|| {
-            snapshot_alloc_counters()
-        })
-        .join()
-        .expect("child panicked");
+        let child_snap = std::thread::spawn(|| snapshot_alloc_counters())
+            .join()
+            .expect("child panicked");
 
         // Fresh thread TLS starts at 0 -- property of new threads
-        assert_eq!(child_snap.alloc_count, 0, "child should have independent alloc count");
-        assert_eq!(child_snap.alloc_bytes, 0, "child should have independent alloc bytes");
+        assert_eq!(
+            child_snap.alloc_count, 0,
+            "child should have independent alloc count"
+        );
+        assert_eq!(
+            child_snap.alloc_bytes, 0,
+            "child should have independent alloc bytes"
+        );
     })
     .join()
     .expect("test thread panicked");

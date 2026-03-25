@@ -1,6 +1,4 @@
-use piano_runtime::alloc::{
-    PianoAllocator, snapshot_alloc_counters, ReentrancyGuard,
-};
+use piano_runtime::alloc::{snapshot_alloc_counters, PianoAllocator, ReentrancyGuard};
 use std::alloc::System;
 
 #[global_allocator]
@@ -18,8 +16,14 @@ fn alloc_is_counted() {
         let v = std::hint::black_box(v);
 
         let after = snapshot_alloc_counters();
-        assert!(after.alloc_count - before.alloc_count >= 1, "expected at least 1 alloc event");
-        assert!(after.alloc_bytes - before.alloc_bytes >= 1024, "expected at least 1024 bytes");
+        assert!(
+            after.alloc_count - before.alloc_count >= 1,
+            "expected at least 1 alloc event"
+        );
+        assert!(
+            after.alloc_bytes - before.alloc_bytes >= 1024,
+            "expected at least 1024 bytes"
+        );
 
         drop(v);
     })
@@ -38,7 +42,11 @@ fn dealloc_does_not_count() {
         let after = snapshot_alloc_counters();
 
         // Delta-based: no alloc events from dealloc
-        assert_eq!(after.alloc_count - before.alloc_count, 0, "dealloc should not increment count");
+        assert_eq!(
+            after.alloc_count - before.alloc_count,
+            0,
+            "dealloc should not increment count"
+        );
     })
     .join()
     .expect("test thread panicked");
@@ -80,8 +88,16 @@ fn reentrancy_excludes_profiler_allocs() {
         }
 
         let after = snapshot_alloc_counters();
-        assert_eq!(after.alloc_count - before.alloc_count, 0, "guarded allocs should not count");
-        assert_eq!(after.alloc_bytes - before.alloc_bytes, 0, "guarded bytes should not count");
+        assert_eq!(
+            after.alloc_count - before.alloc_count,
+            0,
+            "guarded allocs should not count"
+        );
+        assert_eq!(
+            after.alloc_bytes - before.alloc_bytes,
+            0,
+            "guarded bytes should not count"
+        );
     })
     .join()
     .expect("test thread panicked");

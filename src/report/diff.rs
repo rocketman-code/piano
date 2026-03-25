@@ -82,7 +82,13 @@ fn prepare_diff<'a>(a: &'a Run, b: &'a Run, show_all: bool, limit: Option<usize>
         names.truncate(n);
     }
 
-    DiffSetup { a_map, b_map, names, total_count, after_filter_count }
+    DiffSetup {
+        a_map,
+        b_map,
+        names,
+        total_count,
+        after_filter_count,
+    }
 }
 
 /// Serialize a diff between two runs as a JSON array.
@@ -92,7 +98,12 @@ fn prepare_diff<'a>(a: &'a Run, b: &'a Run, show_all: bool, limit: Option<usize>
 /// When `show_all` is false, entries where both runs have zero calls are hidden.
 /// When `limit` is `Some(n)`, only the top `n` entries (by absolute delta) are included.
 pub fn diff_runs_json(a: &Run, b: &Run, show_all: bool, limit: Option<usize>) -> String {
-    let DiffSetup { a_map, b_map, names, .. } = prepare_diff(a, b, show_all, limit);
+    let DiffSetup {
+        a_map,
+        b_map,
+        names,
+        ..
+    } = prepare_diff(a, b, show_all, limit);
 
     let json_entries: Vec<JsonDiffEntry> = names
         .iter()
@@ -147,8 +158,13 @@ pub fn diff_runs(
         eprintln!("warning: comparing runs with different source formats (JSON vs NDJSON)");
     }
 
-    let DiffSetup { a_map, b_map, names, total_count, after_filter_count } =
-        prepare_diff(a, b, show_all, limit);
+    let DiffSetup {
+        a_map,
+        b_map,
+        names,
+        total_count,
+        after_filter_count,
+    } = prepare_diff(a, b, show_all, limit);
 
     // Check if either run has alloc data or CPU data.
     let has_allocs = a.functions.iter().any(|f| f.alloc_count > 0)
@@ -655,14 +671,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // NDJSON format: header with names, single root measurement, trailer
         let ndjson_a = concat!(
-            r#"{"type":"header","run_id":"diff_a","timestamp_ms":1000,"bias_ns":0,"names":{"0":"work"}}"#, "\n",
-            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":5000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#, "\n",
-            r#"{"type":"trailer","bias_ns":0,"names":{"0":"work"}}"#, "\n",
+            r#"{"type":"header","run_id":"diff_a","timestamp_ms":1000,"bias_ns":0,"names":{"0":"work"}}"#,
+            "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":5000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"type":"trailer","bias_ns":0,"names":{"0":"work"}}"#,
+            "\n",
         );
         let ndjson_b = concat!(
-            r#"{"type":"header","run_id":"diff_b","timestamp_ms":2000,"bias_ns":0,"names":{"0":"work"}}"#, "\n",
-            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":8000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#, "\n",
-            r#"{"type":"trailer","bias_ns":0,"names":{"0":"work"}}"#, "\n",
+            r#"{"type":"header","run_id":"diff_b","timestamp_ms":2000,"bias_ns":0,"names":{"0":"work"}}"#,
+            "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":8000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"type":"trailer","bias_ns":0,"names":{"0":"work"}}"#,
+            "\n",
         );
         fs::write(dir.path().join("1000.ndjson"), ndjson_a).unwrap();
         fs::write(dir.path().join("2000.ndjson"), ndjson_b).unwrap();
@@ -797,17 +819,25 @@ mod tests {
 
         // Run A: "compute" called twice, self_ns sums to 5ms.
         let ndjson_a = concat!(
-            r#"{"type":"header","run_id":"aaa_1000","timestamp_ms":1000,"bias_ns":0,"names":{"0":"compute"}}"#, "\n",
-            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":2000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#, "\n",
-            r#"{"span_id":2,"parent_span_id":0,"name_id":0,"start_ns":3000000,"end_ns":6000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#, "\n",
-            r#"{"type":"trailer","bias_ns":0,"names":{"0":"compute"}}"#, "\n",
+            r#"{"type":"header","run_id":"aaa_1000","timestamp_ms":1000,"bias_ns":0,"names":{"0":"compute"}}"#,
+            "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":2000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"span_id":2,"parent_span_id":0,"name_id":0,"start_ns":3000000,"end_ns":6000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"type":"trailer","bias_ns":0,"names":{"0":"compute"}}"#,
+            "\n",
         );
         // Run B: "compute" called twice, self_ns sums to 8ms.
         let ndjson_b = concat!(
-            r#"{"type":"header","run_id":"bbb_2000","timestamp_ms":2000,"bias_ns":0,"names":{"0":"compute"}}"#, "\n",
-            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":4000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#, "\n",
-            r#"{"span_id":2,"parent_span_id":0,"name_id":0,"start_ns":5000000,"end_ns":9000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#, "\n",
-            r#"{"type":"trailer","bias_ns":0,"names":{"0":"compute"}}"#, "\n",
+            r#"{"type":"header","run_id":"bbb_2000","timestamp_ms":2000,"bias_ns":0,"names":{"0":"compute"}}"#,
+            "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":4000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"span_id":2,"parent_span_id":0,"name_id":0,"start_ns":5000000,"end_ns":9000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"type":"trailer","bias_ns":0,"names":{"0":"compute"}}"#,
+            "\n",
         );
         fs::write(runs_dir.join("1000.ndjson"), ndjson_a).unwrap();
         fs::write(runs_dir.join("2000.ndjson"), ndjson_b).unwrap();
@@ -826,10 +856,7 @@ mod tests {
             .iter()
             .find(|f| f.name == "compute")
             .unwrap();
-        assert_eq!(
-            compute_a.calls, 2,
-            "run A should have 2 calls from 2 spans"
-        );
+        assert_eq!(compute_a.calls, 2, "run A should have 2 calls from 2 spans");
         assert!(
             (compute_a.self_ms - 5.0).abs() < 0.01,
             "run A self_ms should be ~5.0ms (from NDJSON), got {}",
@@ -841,10 +868,7 @@ mod tests {
             .iter()
             .find(|f| f.name == "compute")
             .unwrap();
-        assert_eq!(
-            compute_b.calls, 2,
-            "run B should have 2 calls from 2 spans"
-        );
+        assert_eq!(compute_b.calls, 2, "run B should have 2 calls from 2 spans");
         assert!(
             (compute_b.self_ms - 8.0).abs() < 0.01,
             "run B self_ms should be ~8.0ms (from NDJSON), got {}",

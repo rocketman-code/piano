@@ -44,7 +44,9 @@ thread_local! {
 
 /// Snapshot the current thread's allocation counters.
 pub fn snapshot_alloc_counters() -> AllocSnapshot {
-    ALLOC_COUNTERS.try_with(|c| c.get()).unwrap_or(AllocSnapshot::ZERO)
+    ALLOC_COUNTERS
+        .try_with(|c| c.get())
+        .unwrap_or(AllocSnapshot::ZERO)
 }
 
 /// Record an allocation on the current thread.

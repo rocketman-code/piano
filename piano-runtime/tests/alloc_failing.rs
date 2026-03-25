@@ -36,8 +36,16 @@ fn failed_alloc_not_counted() {
         let ptr = unsafe { allocator.alloc(layout) };
         assert!(ptr.is_null());
         let after = snapshot_alloc_counters();
-        assert_eq!(after.alloc_count - before.alloc_count, 0, "failed alloc should not be counted");
-        assert_eq!(after.alloc_bytes - before.alloc_bytes, 0, "failed alloc bytes should be zero");
+        assert_eq!(
+            after.alloc_count - before.alloc_count,
+            0,
+            "failed alloc should not be counted"
+        );
+        assert_eq!(
+            after.alloc_bytes - before.alloc_bytes,
+            0,
+            "failed alloc bytes should be zero"
+        );
     })
     .join()
     .expect("test thread panicked");
@@ -53,8 +61,16 @@ fn failed_alloc_zeroed_not_counted() {
         let ptr = unsafe { allocator.alloc_zeroed(layout) };
         assert!(ptr.is_null());
         let after = snapshot_alloc_counters();
-        assert_eq!(after.alloc_count - before.alloc_count, 0, "failed alloc_zeroed should not be counted");
-        assert_eq!(after.alloc_bytes - before.alloc_bytes, 0, "failed alloc_zeroed bytes should be zero");
+        assert_eq!(
+            after.alloc_count - before.alloc_count,
+            0,
+            "failed alloc_zeroed should not be counted"
+        );
+        assert_eq!(
+            after.alloc_bytes - before.alloc_bytes,
+            0,
+            "failed alloc_zeroed bytes should be zero"
+        );
     })
     .join()
     .expect("test thread panicked");
@@ -70,7 +86,11 @@ fn failed_realloc_not_counted() {
         let ptr = unsafe { allocator.realloc(std::ptr::null_mut(), layout, 128) };
         assert!(ptr.is_null());
         let after = snapshot_alloc_counters();
-        assert_eq!(after.alloc_count - before.alloc_count, 0, "failed realloc should not be counted");
+        assert_eq!(
+            after.alloc_count - before.alloc_count,
+            0,
+            "failed realloc should not be counted"
+        );
     })
     .join()
     .expect("test thread panicked");

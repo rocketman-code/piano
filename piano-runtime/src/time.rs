@@ -72,12 +72,7 @@ impl CalibrationData {
 
     /// Construct with explicit values (for integration tests).
     #[cfg(feature = "_test_internals")]
-    pub fn new_test(
-        quotient: u64,
-        multiplier: u64,
-        bias_ticks: u64,
-        epoch_tsc: u64,
-    ) -> Self {
+    pub fn new_test(quotient: u64, multiplier: u64, bias_ticks: u64, epoch_tsc: u64) -> Self {
         CalibrationData {
             quotient,
             multiplier,

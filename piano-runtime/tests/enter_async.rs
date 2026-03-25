@@ -27,7 +27,9 @@ fn async_enter_inactive_is_transparent() {
         let fut = enter_async(0, async { 42 });
         let result = block_on(fut);
         assert_eq!(result, 42);
-    }).join().unwrap();
+    })
+    .join()
+    .unwrap();
 }
 
 #[test]
@@ -40,7 +42,9 @@ fn async_enter_emits_aggregate_on_completion() {
         assert_eq!(agg.len(), 1);
         assert_eq!(agg[0].calls, 1);
         assert_eq!(agg[0].name_id, 0);
-    }).join().unwrap();
+    })
+    .join()
+    .unwrap();
 }
 
 #[test]
@@ -66,17 +70,23 @@ fn async_enter_emits_on_drop_if_cancelled() {
         }
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 1, "cancelled future must emit aggregate");
-    }).join().unwrap();
+    })
+    .join()
+    .unwrap();
 }
 
 #[test]
 fn never_polled_future_emits_nothing() {
     std::thread::spawn(|| {
         ProfileSession::init(None, false, &[], "test", 0);
-        { let _fut = enter_async(0, async { 42 }); }
+        {
+            let _fut = enter_async(0, async { 42 });
+        }
         let agg = drain_thread_agg();
         assert!(agg.is_empty(), "never-polled future must emit nothing");
-    }).join().unwrap();
+    })
+    .join()
+    .unwrap();
 }
 
 #[test]
@@ -98,7 +108,9 @@ fn wall_time_starts_on_first_poll_not_construction() {
             "self_ns ({} ns) should be < 1ms; wall time must start at first poll, not construction",
             agg[0].self_ns
         );
-    }).join().unwrap();
+    })
+    .join()
+    .unwrap();
 }
 
 #[test]
@@ -109,8 +121,10 @@ fn panicking_inner_future_emits_aggregate() {
         struct PanickingFuture;
         impl std::future::Future for PanickingFuture {
             type Output = ();
-            fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>)
-                -> std::task::Poll<()> {
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
                 panic!("intentional panic in poll");
             }
         }
@@ -135,8 +149,14 @@ fn panicking_inner_future_emits_aggregate() {
 
         drop(pf);
         let agg = drain_thread_agg();
-        assert_eq!(agg.len(), 1, "panicking future must emit aggregate via Drop");
-    }).join().unwrap();
+        assert_eq!(
+            agg.len(),
+            1,
+            "panicking future must emit aggregate via Drop"
+        );
+    })
+    .join()
+    .unwrap();
 }
 
 #[test]
@@ -151,8 +171,10 @@ fn multi_poll_alloc_accumulation() {
         }
         impl std::future::Future for AllocPerPoll {
             type Output = ();
-            fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>)
-                -> std::task::Poll<()> {
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
                 let this = self.get_mut();
                 if this.polled {
                     record_alloc(200);
@@ -189,9 +211,17 @@ fn multi_poll_alloc_accumulation() {
         drop(pf);
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 1);
-        assert_eq!(agg[0].alloc_count, 2, "allocs from both polls must accumulate");
-        assert_eq!(agg[0].alloc_bytes, 300, "bytes from both polls must accumulate");
-    }).join().unwrap();
+        assert_eq!(
+            agg[0].alloc_count, 2,
+            "allocs from both polls must accumulate"
+        );
+        assert_eq!(
+            agg[0].alloc_bytes, 300,
+            "bytes from both polls must accumulate"
+        );
+    })
+    .join()
+    .unwrap();
 }
 
 #[test]
@@ -204,5 +234,7 @@ fn async_closure_no_capture() {
         });
         assert_eq!(handle.join().unwrap(), 42);
         drain_thread_agg();
-    }).join().unwrap();
+    })
+    .join()
+    .unwrap();
 }

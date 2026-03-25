@@ -136,24 +136,26 @@ fn main() {
 }
 "#;
 
-    let measured: HashMap<String, u32> =
-        [("initialize".into(), 0), ("main".into(), 1)].into_iter().collect();
+    let measured: HashMap<String, u32> = [("initialize".into(), 0), ("main".into(), 1)]
+        .into_iter()
+        .collect();
     let result = piano::rewrite::instrument_source(source, &measured, None)
         .expect("instrument_source should succeed");
 
-    let re_parse = ra_ap_syntax::SourceFile::parse(
-        &result.source, ra_ap_syntax::Edition::Edition2024,
-    );
+    let re_parse =
+        ra_ap_syntax::SourceFile::parse(&result.source, ra_ap_syntax::Edition::Edition2024);
     let errors: Vec<_> = re_parse.errors().to_vec();
     assert!(
         errors.is_empty(),
         "instrumented output should be valid Rust. Errors: {:?}\nSource:\n{}",
-        errors, result.source
+        errors,
+        result.source
     );
 
     assert!(
         result.source.contains("piano_runtime::enter(0)"),
-        "should contain guard for initialize. Got:\n{}", result.source
+        "should contain guard for initialize. Got:\n{}",
+        result.source
     );
 }
 
@@ -176,7 +178,8 @@ fn main() {}
 
     assert!(
         result.source.contains("piano_runtime::enter(0)"),
-        "literal fn in macro should get a guard. Got:\n{}", result.source
+        "literal fn in macro should get a guard. Got:\n{}",
+        result.source
     );
 }
 

@@ -367,15 +367,13 @@ fn detect_send_bound_guidance(error_text: &str) -> Option<String> {
     let has_send_error = error_text.contains("is not Send")
         || error_text.contains("cannot be sent between threads safely")
         || error_text.contains("doesn't implement Send")
-        || error_text.contains("which is required by")
-            && error_text.contains("Send");
+        || error_text.contains("which is required by") && error_text.contains("Send");
 
     if !has_send_error {
         return None;
     }
 
-    let piano_involved =
-        error_text.contains("PianoFuture") || error_text.contains("piano_runtime");
+    let piano_involved = error_text.contains("PianoFuture") || error_text.contains("piano_runtime");
     if !piano_involved {
         return None;
     }
@@ -383,9 +381,8 @@ fn detect_send_bound_guidance(error_text: &str) -> Option<String> {
     // Try to extract the function name from the error context.
     // Rustc errors include both diagnostic text (e.g. `function `foo``) and
     // source code lines (e.g. `fn foo() ->`). We match both patterns.
-    static FN_NAME_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?:fn|function) `?(\w+)`?(?:\(|`)").unwrap()
-    });
+    static FN_NAME_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?:fn|function) `?(\w+)`?(?:\(|`)").unwrap());
 
     let name = FN_NAME_RE
         .captures(error_text)
@@ -1142,16 +1139,16 @@ edition = "2021"
         );
 
         let result = detect_send_bound_guidance(error_text);
-        assert!(result.is_some(), "should detect Send error with PianoFuture");
+        assert!(
+            result.is_some(),
+            "should detect Send error with PianoFuture"
+        );
         let msg = result.unwrap();
         assert!(
             msg.contains("cannot be wrapped for async profiling"),
             "should contain guidance: {msg}"
         );
-        assert!(
-            msg.contains("--skip"),
-            "should mention --skip flag: {msg}"
-        );
+        assert!(msg.contains("--skip"), "should mention --skip flag: {msg}");
     }
 
     #[test]
@@ -1182,10 +1179,7 @@ edition = "2021"
         );
 
         let result = detect_send_bound_guidance(error_text);
-        assert!(
-            result.is_none(),
-            "should not trigger for non-Send errors"
-        );
+        assert!(result.is_none(), "should not trigger for non-Send errors");
     }
 
     #[test]

@@ -244,8 +244,7 @@ fn metrology_fence_detection() {
 //     and TSC read, proving the tool detects violations.
 
 /// The symbol name for Guard's drop_in_place.
-const GUARD_DROP_SYMBOL: &str =
-    "core::ptr::drop_in_place<piano_runtime::guard::Guard>";
+const GUARD_DROP_SYMBOL: &str = "core::ptr::drop_in_place<piano_runtime::guard::Guard>";
 
 #[test]
 fn tm6_stamp_fence_then_tsc() {
@@ -405,9 +404,9 @@ fn tm7_enter_stamp_split() {
     let asm = extract_asm("tm7_positive");
     let lines = instruction_lines(&asm);
 
-    let has_create_call = lines.iter().any(|l| {
-        l.contains(GUARD_CREATE_CALL) && (l.contains("call") || l.contains("bl"))
-    });
+    let has_create_call = lines
+        .iter()
+        .any(|l| l.contains(GUARD_CREATE_CALL) && (l.contains("call") || l.contains("bl")));
     let has_inline_tsc = count_pattern(&lines, TSC_PATTERN) >= 1;
 
     assert!(
@@ -425,9 +424,9 @@ fn tm7_enter_stamp_split() {
     let asm = extract_asm("tm7_negative");
     let lines = instruction_lines(&asm);
 
-    let has_create_call = lines.iter().any(|l| {
-        l.contains(GUARD_CREATE_CALL) && (l.contains("call") || l.contains("bl"))
-    });
+    let has_create_call = lines
+        .iter()
+        .any(|l| l.contains(GUARD_CREATE_CALL) && (l.contains("call") || l.contains("bl")));
     let has_inline_tsc = count_pattern(&lines, TSC_PATTERN) >= 1;
 
     assert!(
@@ -531,10 +530,7 @@ fn tm8_piano_future_poll_cpu_ordering() {
     let fences = find_indices(&lines, FENCE_PATTERN);
     let cpu_calls = find_indices(&lines, CPU_NOW_CALL);
 
-    assert!(
-        !fences.is_empty(),
-        "tm8_negative: must contain a fence"
-    );
+    assert!(!fences.is_empty(), "tm8_negative: must contain a fence");
     assert!(
         !cpu_calls.is_empty(),
         "tm8_negative: must contain cpu_now_ns calls"

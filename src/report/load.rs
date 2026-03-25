@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use crate::error::Error;
 
-use super::{NdjsonAggregate, NdjsonMeasurement, NdjsonNameTable, FnAgg, FnEntry, Run, RunCompleteness, RunFormat};
+use super::{
+    FnAgg, FnEntry, NdjsonAggregate, NdjsonMeasurement, NdjsonNameTable, Run, RunCompleteness,
+    RunFormat,
+};
 
 const NS_PER_MS: f64 = 1_000_000.0;
 
@@ -117,13 +120,17 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
                 entry.free_bytes += a.free_bytes;
                 entry.cpu_self_ns += a.cpu_self_ns;
             }
-            let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
-            runs.push((tid, Run {
-                run_id: parsed.run_id.clone(),
-                timestamp_ms: parsed.timestamp_ms,
-                functions,
-                source_format: RunFormat::Ndjson,
-            }));
+            let functions =
+                build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
+            runs.push((
+                tid,
+                Run {
+                    run_id: parsed.run_id.clone(),
+                    timestamp_ms: parsed.timestamp_ms,
+                    functions,
+                    source_format: RunFormat::Ndjson,
+                },
+            ));
         }
         runs.sort_by_key(|(tid, _)| *tid);
         return Ok(Some(runs.into_iter().map(|(_, run)| run).collect()));
@@ -150,7 +157,8 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
         .into_iter()
         .map(|(tid, spans)| {
             let fn_agg = aggregate_self_values(spans);
-            let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
+            let functions =
+                build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
             (
                 tid,
                 Run {
@@ -729,8 +737,16 @@ mod tests {
                 "\"alloc_count\":{},\"alloc_bytes\":{},",
                 "\"free_count\":0,\"free_bytes\":0}}"
             ),
-            span_id, parent_span_id, name_id, start_ns, end_ns, thread_id,
-            cpu_start_ns, cpu_end_ns, alloc_count, alloc_bytes,
+            span_id,
+            parent_span_id,
+            name_id,
+            start_ns,
+            end_ns,
+            thread_id,
+            cpu_start_ns,
+            cpu_end_ns,
+            alloc_count,
+            alloc_bytes,
         )
     }
 
@@ -754,8 +770,16 @@ mod tests {
                 "\"alloc_count\":{},\"alloc_bytes\":{},",
                 "\"free_count\":{},\"free_bytes\":{}}}"
             ),
-            thread, name_id, calls, self_ns, inclusive_ns, cpu_self_ns,
-            alloc_count, alloc_bytes, free_count, free_bytes,
+            thread,
+            name_id,
+            calls,
+            self_ns,
+            inclusive_ns,
+            cpu_self_ns,
+            alloc_count,
+            alloc_bytes,
+            free_count,
+            free_bytes,
         )
     }
 
@@ -1068,7 +1092,11 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(files.len(), 2, "expected 2 files after dedup, got {files:?}");
+        assert_eq!(
+            files.len(),
+            2,
+            "expected 2 files after dedup, got {files:?}"
+        );
         assert!(stems_and_exts.contains(&("5000".into(), "ndjson".into())));
         assert!(!stems_and_exts.contains(&("5000".into(), "json".into())));
         assert!(stems_and_exts.contains(&("6000".into(), "json".into())));
@@ -1179,7 +1207,10 @@ mod tests {
         assert_eq!(completeness, RunCompleteness::Recovered);
         assert_eq!(run.run_id.as_deref(), Some("r2_empty"));
         assert_eq!(run.timestamp_ms, 6000);
-        assert!(run.functions.is_empty(), "header-only should have no functions");
+        assert!(
+            run.functions.is_empty(),
+            "header-only should have no functions"
+        );
     }
 
     #[test]
@@ -1258,9 +1289,21 @@ mod tests {
 
         let (run, _) = load_ndjson(&path, false).unwrap();
 
-        let parent = run.functions.iter().find(|f| f.name == "parent_fn").unwrap();
-        let child1 = run.functions.iter().find(|f| f.name == "child1_fn").unwrap();
-        let child2 = run.functions.iter().find(|f| f.name == "child2_fn").unwrap();
+        let parent = run
+            .functions
+            .iter()
+            .find(|f| f.name == "parent_fn")
+            .unwrap();
+        let child1 = run
+            .functions
+            .iter()
+            .find(|f| f.name == "child1_fn")
+            .unwrap();
+        let child2 = run
+            .functions
+            .iter()
+            .find(|f| f.name == "child2_fn")
+            .unwrap();
 
         // parent self_wall = 10000 - 3000 - 4000 = 3000 ns = 0.003 ms
         assert!(
@@ -1622,22 +1665,46 @@ mod tests {
             assert_eq!(s.calls, a.calls, "calls mismatch for {}", s.name);
             assert!(
                 (s.self_ms - a.self_ms).abs() < 1e-9,
-                "self_ms mismatch for {}: span={} agg={}", s.name, s.self_ms, a.self_ms,
+                "self_ms mismatch for {}: span={} agg={}",
+                s.name,
+                s.self_ms,
+                a.self_ms,
             );
             assert_eq!(
-                s.cpu_self_ms.is_some(), a.cpu_self_ms.is_some(),
-                "cpu_self_ms presence mismatch for {}", s.name,
+                s.cpu_self_ms.is_some(),
+                a.cpu_self_ms.is_some(),
+                "cpu_self_ms presence mismatch for {}",
+                s.name,
             );
             if let (Some(sc), Some(ac)) = (s.cpu_self_ms, a.cpu_self_ms) {
                 assert!(
                     (sc - ac).abs() < 1e-9,
-                    "cpu_self_ms mismatch for {}: span={} agg={}", s.name, sc, ac,
+                    "cpu_self_ms mismatch for {}: span={} agg={}",
+                    s.name,
+                    sc,
+                    ac,
                 );
             }
-            assert_eq!(s.alloc_count, a.alloc_count, "alloc_count mismatch for {}", s.name);
-            assert_eq!(s.alloc_bytes, a.alloc_bytes, "alloc_bytes mismatch for {}", s.name);
-            assert_eq!(s.free_count, a.free_count, "free_count mismatch for {}", s.name);
-            assert_eq!(s.free_bytes, a.free_bytes, "free_bytes mismatch for {}", s.name);
+            assert_eq!(
+                s.alloc_count, a.alloc_count,
+                "alloc_count mismatch for {}",
+                s.name
+            );
+            assert_eq!(
+                s.alloc_bytes, a.alloc_bytes,
+                "alloc_bytes mismatch for {}",
+                s.name
+            );
+            assert_eq!(
+                s.free_count, a.free_count,
+                "free_count mismatch for {}",
+                s.name
+            );
+            assert_eq!(
+                s.free_bytes, a.free_bytes,
+                "free_bytes mismatch for {}",
+                s.name
+            );
         }
     }
 
@@ -1689,10 +1756,21 @@ mod tests {
             assert_eq!(s.calls, a.calls, "calls mismatch for {}", s.name);
             assert!(
                 (s.self_ms - a.self_ms).abs() < 1e-9,
-                "self_ms mismatch for {}: span={} agg={}", s.name, s.self_ms, a.self_ms,
+                "self_ms mismatch for {}: span={} agg={}",
+                s.name,
+                s.self_ms,
+                a.self_ms,
             );
-            assert_eq!(s.alloc_count, a.alloc_count, "alloc_count mismatch for {}", s.name);
-            assert_eq!(s.alloc_bytes, a.alloc_bytes, "alloc_bytes mismatch for {}", s.name);
+            assert_eq!(
+                s.alloc_count, a.alloc_count,
+                "alloc_count mismatch for {}",
+                s.name
+            );
+            assert_eq!(
+                s.alloc_bytes, a.alloc_bytes,
+                "alloc_bytes mismatch for {}",
+                s.name
+            );
         }
     }
 }
