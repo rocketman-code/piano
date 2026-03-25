@@ -52,7 +52,7 @@ fn signal_handler_restores_previous() {
 
     // ProfileSession::init -> shutdown::register -> signal::register
     // Installs piano's handler, saving user_handler as previous.
-    ProfileSession::init(Some(fs), false, &[(1, "test::func")]);
+    ProfileSession::init(Some(fs), false, &[(1, "test::func")], "test", 0);
 
     // Raise SIGINT. Piano's handler:
     // 1. Drains buffers (best-effort)

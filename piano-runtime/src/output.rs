@@ -13,9 +13,19 @@
 
 use std::io::{self, Write};
 
-/// Write the name table as a header line.
-pub fn write_header(w: &mut impl Write, names: &[(u32, &str)], bias_ns: u64, cpu_bias_ns: u64) -> io::Result<()> {
-    write_name_table(w, "header", names, bias_ns, cpu_bias_ns)
+/// Write the name table as a header line, including run metadata.
+pub fn write_header(w: &mut impl Write, names: &[(u32, &str)], bias_ns: u64, cpu_bias_ns: u64, run_id: &str, timestamp_ms: u128) -> io::Result<()> {
+    write!(w, "{{\"type\":\"header\",\"run_id\":\"{run_id}\",\"timestamp_ms\":{timestamp_ms},")?;
+    write!(w, "\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{")?;
+    for (i, (id, name)) in names.iter().enumerate() {
+        if i > 0 {
+            write!(w, ",")?;
+        }
+        write!(w, "\"{id}\":\"",)?;
+        write_json_escaped(w, name)?;
+        write!(w, "\"")?;
+    }
+    writeln!(w, "}}}}")
 }
 
 /// Write the name table as a trailer line.

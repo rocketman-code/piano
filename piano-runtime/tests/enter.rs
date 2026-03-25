@@ -12,7 +12,7 @@ fn enter_inactive_is_noop() {
 #[test]
 fn enter_produces_aggregate() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         { let _g = enter(0); }
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 1);
@@ -23,7 +23,7 @@ fn enter_produces_aggregate() {
 #[test]
 fn nested_enter_computes_self_time() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         {
             let _g1 = enter(0);
             { let _g2 = enter(1); }
@@ -36,7 +36,7 @@ fn nested_enter_computes_self_time() {
 #[test]
 fn closure_works_without_capture() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         let handle = std::thread::spawn(|| {
             let _g = enter(0);
         });
@@ -48,7 +48,7 @@ fn closure_works_without_capture() {
 #[test]
 fn spawn_inside_map_works() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         let handles: Vec<_> = (0..4).map(|_| {
             std::thread::spawn(|| {
                 let _g = enter(0);

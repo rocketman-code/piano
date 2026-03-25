@@ -33,7 +33,7 @@ fn async_enter_inactive_is_transparent() {
 #[test]
 fn async_enter_emits_aggregate_on_completion() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         let fut = enter_async(0, async { 42 });
         let _ = block_on(fut);
         let agg = drain_thread_agg();
@@ -46,7 +46,7 @@ fn async_enter_emits_aggregate_on_completion() {
 #[test]
 fn async_enter_emits_on_drop_if_cancelled() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         {
             let mut fut = enter_async(0, async {
                 std::future::pending::<()>().await;
@@ -72,7 +72,7 @@ fn async_enter_emits_on_drop_if_cancelled() {
 #[test]
 fn never_polled_future_emits_nothing() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         { let _fut = enter_async(0, async { 42 }); }
         let agg = drain_thread_agg();
         assert!(agg.is_empty(), "never-polled future must emit nothing");
@@ -82,7 +82,7 @@ fn never_polled_future_emits_nothing() {
 #[test]
 fn wall_time_starts_on_first_poll_not_construction() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
 
         let fut = enter_async(0, async { 42 });
         // 10ms gap between construction and polling
@@ -104,7 +104,7 @@ fn wall_time_starts_on_first_poll_not_construction() {
 #[test]
 fn panicking_inner_future_emits_aggregate() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
 
         struct PanickingFuture;
         impl std::future::Future for PanickingFuture {
@@ -144,7 +144,7 @@ fn multi_poll_alloc_accumulation() {
     std::thread::spawn(|| {
         use piano_runtime::alloc::record_alloc;
 
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
 
         struct AllocPerPoll {
             polled: bool,
@@ -197,7 +197,7 @@ fn multi_poll_alloc_accumulation() {
 #[test]
 fn async_closure_no_capture() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         let handle = std::thread::spawn(|| {
             let fut = enter_async(0, async { 42 });
             block_on(fut)
