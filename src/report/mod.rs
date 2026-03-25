@@ -16,6 +16,20 @@ pub enum RunFormat {
     Ndjson,
 }
 
+/// Whether an NDJSON run file was fully written or recovered from a crash.
+///
+/// Complete files have a trailer with the authoritative name table.
+/// Recovered files are missing the trailer (process was killed before shutdown)
+/// so the header name table is used instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunCompleteness {
+    /// File has header + measurements + trailer. Name table from trailer.
+    Complete,
+    /// File has header + measurements but no trailer (crashed/killed run).
+    /// Name table from header.
+    Recovered,
+}
+
 /// A single profiling run loaded from a JSON file written by piano-runtime.
 #[derive(Debug, serde::Deserialize)]
 pub struct Run {
@@ -43,102 +57,84 @@ pub struct FnEntry {
     pub alloc_count: u64,
     #[serde(default)]
     pub alloc_bytes: u64,
+    #[serde(default)]
+    pub free_count: u64,
+    #[serde(default)]
+    pub free_bytes: u64,
 }
 
-/// Per-frame data loaded from an NDJSON file.
-pub struct FrameData {
-    pub fn_names: Vec<String>,
-    pub frames: Vec<Vec<FrameFnEntry>>,
-}
-
-/// Accumulated per-function counters across all frames (used during NDJSON aggregation).
+/// Accumulated per-function counters (used during NDJSON aggregation).
 #[derive(Default, Clone, Copy)]
 pub(super) struct FnAgg {
     pub(super) calls: u64,
     pub(super) self_ns: u64,
+    pub(super) inclusive_ns: u64,
     pub(super) alloc_count: u64,
     pub(super) alloc_bytes: u64,
+    pub(super) free_count: u64,
+    pub(super) free_bytes: u64,
     pub(super) cpu_self_ns: u64,
 }
 
-/// Per-function entry within a single frame.
-#[derive(Clone, Copy)]
-pub struct FrameFnEntry {
-    pub fn_id: usize,
-    pub tid: Option<usize>,
-    pub calls: u64,
-    pub self_ns: u64,
-    pub cpu_self_ns: Option<u64>,
-    pub alloc_count: u64,
-    pub alloc_bytes: u64,
-    pub free_count: u64,
-    pub free_bytes: u64,
+/// NDJSON header/trailer line.
+///
+/// Both header and trailer share the same structure: a "type" field
+/// ("header" or "trailer") and a "names" map of name_id -> function name.
+/// The header is written eagerly at startup; the trailer confirms clean shutdown.
+#[derive(serde::Deserialize)]
+pub(super) struct NdjsonNameTable {
+    /// "header" or "trailer".
+    #[serde(rename = "type")]
+    pub(super) kind: String,
+    /// Name table: string keys (name_id) mapped to function names.
+    #[serde(default)]
+    pub(super) names: std::collections::HashMap<String, String>,
 }
 
-/// NDJSON header line.
+/// NDJSON measurement line -- one per completed function invocation.
+/// Used by --raw-spans mode.
 #[derive(serde::Deserialize)]
-pub(super) struct NdjsonHeader {
-    #[serde(rename = "format_version")]
-    pub(super) _format_version: u32,
-    pub(super) run_id: Option<String>,
-    pub(super) timestamp_ms: u128,
+pub(super) struct NdjsonMeasurement {
+    pub(super) span_id: u64,
+    pub(super) parent_span_id: u64,
+    pub(super) name_id: u32,
+    pub(super) start_ns: u64,
+    pub(super) end_ns: u64,
     #[serde(default)]
-    pub(super) functions: Vec<String>,
+    pub(super) thread_id: u64,
     #[serde(default)]
-    pub(super) has_cpu_time: bool,
+    pub(super) cpu_start_ns: u64,
+    #[serde(default)]
+    pub(super) cpu_end_ns: u64,
+    pub(super) alloc_count: u64,
+    pub(super) alloc_bytes: u64,
+    #[serde(default)]
+    pub(super) free_count: u64,
+    #[serde(default)]
+    pub(super) free_bytes: u64,
 }
 
-/// NDJSON frame line.
+/// NDJSON aggregate line -- one per function (default mode).
+/// Self-time is pre-computed by the runtime.
 #[derive(serde::Deserialize)]
-pub(super) struct NdjsonFrame {
-    #[serde(rename = "frame")]
-    pub(super) _frame: usize,
+pub(super) struct NdjsonAggregate {
     #[serde(default)]
-    pub(super) tid: Option<usize>,
-    pub(super) fns: Vec<NdjsonFnEntry>,
-}
-
-/// Per-function entry within an NDJSON frame line.
-#[derive(serde::Deserialize)]
-pub(super) struct NdjsonFnEntry {
-    pub(super) id: usize,
+    pub(super) thread: u64,
+    pub(super) name_id: u32,
     pub(super) calls: u64,
     pub(super) self_ns: u64,
     #[serde(default)]
-    pub(super) csn: Option<u64>,
+    pub(super) inclusive_ns: u64,
     #[serde(default)]
-    pub(super) ac: u64,
+    pub(super) cpu_self_ns: u64,
     #[serde(default)]
-    pub(super) ab: u64,
+    pub(super) alloc_count: u64,
     #[serde(default)]
-    pub(super) fc: u64,
+    pub(super) alloc_bytes: u64,
     #[serde(default)]
-    pub(super) fb: u64,
-}
-
-/// NDJSON v4 trailer line (written at shutdown with the function name table).
-#[derive(serde::Deserialize)]
-pub(super) struct NdjsonTrailer {
-    pub(super) functions: Vec<String>,
-}
-
-pub(super) fn format_ns(ns: u64) -> String {
-    let us = ns as f64 / 1_000.0;
-    if us < 1000.0 {
-        format!("{us:.1}us")
-    } else {
-        format!("{:.2}ms", us / 1_000.0)
-    }
-}
-
-pub(super) fn format_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes}B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1}KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
-    }
+    pub(super) free_count: u64,
+    #[serde(default)]
+    pub(super) free_bytes: u64,
 }
 
 /// Format a SystemTime as a relative duration string ("N sec/min/hours/days ago").
@@ -162,13 +158,10 @@ pub fn relative_time(t: std::time::SystemTime) -> String {
 
 // Re-exports so external code can use `crate::report::load_run` etc.
 pub use diff::{JsonDiffEntry, diff_runs, diff_runs_json};
-pub use format::{
-    JsonFnEntry, format_frames_json, format_frames_table, format_json, format_json_with_frames,
-    format_per_thread_json, format_per_thread_tables, format_per_thread_tables_from_frames,
-    format_table, format_table_with_frames,
-};
+pub use format::{JsonFnEntry, format_json, format_per_thread_tables, format_table};
 pub use load::{
     find_latest_run_file, find_latest_run_file_since, find_ndjson_by_run_id, load_latest_run,
-    load_latest_runs_per_thread, load_ndjson, load_run, load_run_by_id, load_two_latest_runs,
+    load_latest_runs_per_thread, load_ndjson, load_ndjson_per_thread, load_run, load_run_by_id,
+    load_two_latest_runs,
 };
 pub use tag::{load_tagged_run, resolve_tag, reverse_resolve_tag, save_tag};

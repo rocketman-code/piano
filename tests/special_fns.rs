@@ -1,6 +1,7 @@
-//! Test that const, unsafe, and extern fn are skipped during instrumentation.
-//! The instrumented project should build and run successfully, with only
-//! normal functions appearing in the output.
+//! Test that const and extern fn are skipped during instrumentation.
+//! unsafe fn IS instrumentable (guard code is pure safe Rust).
+//! The instrumented project should build and run successfully, with normal
+//! and unsafe functions appearing in the output.
 
 mod common;
 
@@ -104,7 +105,7 @@ fn special_fns_are_skipped_during_instrumentation() {
         "program should produce correct output, got: {program_stdout}"
     );
 
-    // Verify run file contains normal_work but NOT const/unsafe/extern fns.
+    // Verify run file contains normal_work and unsafe fn, but NOT const/extern fns.
     let run_file = common::largest_ndjson_file(&runs_dir);
     let content = fs::read_to_string(&run_file).unwrap();
     assert!(
@@ -112,12 +113,12 @@ fn special_fns_are_skipped_during_instrumentation() {
         "output should contain normal_work"
     );
     assert!(
-        !content.contains("\"fixed_size\""),
-        "output should NOT contain const fn fixed_size"
+        content.contains("\"dangerous\""),
+        "output should contain unsafe fn dangerous (guard is safe code)"
     );
     assert!(
-        !content.contains("\"dangerous\""),
-        "output should NOT contain unsafe fn dangerous"
+        !content.contains("\"fixed_size\""),
+        "output should NOT contain const fn fixed_size"
     );
     assert!(
         !content.contains("\"ffi_callback\""),
@@ -152,11 +153,7 @@ fn list_skipped_shows_excluded_functions() {
         "piano build --list-skipped failed:\nstderr: {stderr}\nstdout: {stdout}"
     );
 
-    // Should list all skipped functions with file paths and reasons.
-    assert!(
-        stdout.contains("src/main.rs: dangerous (unsafe)"),
-        "should list unsafe fn with path: {stdout}"
-    );
+    // Should list const and extern fns as skipped (unsafe fn is instrumentable).
     assert!(
         stdout.contains("src/main.rs: fixed_size (const)"),
         "should list const fn with path: {stdout}"
@@ -166,10 +163,14 @@ fn list_skipped_shows_excluded_functions() {
         "should list extern fn with path: {stdout}"
     );
 
-    // Should NOT list normal functions.
+    // Should NOT list normal or unsafe functions (both are instrumentable).
     assert!(
         !stdout.contains("normal_work"),
         "should not list normal fn: {stdout}"
+    );
+    assert!(
+        !stdout.contains("dangerous"),
+        "should not list unsafe fn (it is instrumentable): {stdout}"
     );
     assert!(!stdout.contains("main ("), "should not list main: {stdout}");
 }
@@ -185,10 +186,11 @@ fn build_warns_about_skipped_functions() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let runtime_path = manifest_dir.join("piano-runtime");
 
-    // Use a broad --fn pattern that matches both normal and skipped functions.
-    // The warning should only fire when specs are explicit, not in instrument-everything mode.
+    // Use a broad --fn pattern that matches both instrumentable and skipped functions.
+    // "i" matches: fixed_size (const, skipped), ffi_callback (extern, skipped),
+    // and dangerous (unsafe, instrumentable). The warning should fire for the skipped ones.
     let output = Command::new(piano_bin)
-        .args(["build", "--fn", "o", "--project"])
+        .args(["build", "--fn", "i", "--project"])
         .arg(&project_dir)
         .arg("--runtime-path")
         .arg(&runtime_path)
@@ -330,10 +332,10 @@ fn no_targets_found_error_prints_once() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let runtime_path = manifest_dir.join("piano-runtime");
 
-    // --fn dangerous matches only the unsafe fn, which gets skipped.
+    // --fn fixed_size matches only the const fn, which gets skipped.
     // The error should appear exactly once (no duplicate warning).
     let output = Command::new(piano_bin)
-        .args(["build", "--fn", "dangerous", "--project"])
+        .args(["build", "--fn", "fixed_size", "--project"])
         .arg(&project_dir)
         .arg("--runtime-path")
         .arg(&runtime_path)
