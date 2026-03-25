@@ -3,7 +3,7 @@ members = ["piano-runtime"]
 
 [package]
 name = "piano"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Automatic instrumentation-based profiler for Rust. Measures self-time, call counts, and heap allocations per function."
