@@ -123,7 +123,16 @@ jobs:
       - name: Run mutation testing on changed runtime files
         run: |
           if git diff origin/main --name-only -- piano-runtime/src/ | grep -q .; then
+            set +e
             cargo mutants --package piano-runtime --in-diff <(git diff origin/main -- piano-runtime/src/) --jobs 4 --timeout 120 --features _test_internals
+            rc=$?
+            set -e
+            # Exit 0 = all caught, 2 = unviable, 3 = timeouts (acceptable).
+            # Exit 4 = missed mutants (real failure).
+            if [ "$rc" -eq 4 ]; then
+              echo "::error::Missed mutants detected (exit code 4)"
+              exit 1
+            fi
           else
             echo "No piano-runtime/src/ changes, skipping mutation testing"
           fi
