@@ -311,7 +311,14 @@ fn json_escaping_handles_special_characters() {
     let mut buf = Vec::new();
     write_header(
         &mut buf,
-        &[(0, "has\"quote"), (1, "has\\slash"), (2, "has\nnewline")],
+        &[
+            (0, "has\"quote"),
+            (1, "has\\slash"),
+            (2, "has\nnewline"),
+            (3, "has\rcarriage"),
+            (4, "has\ttab"),
+            (5, "has\x01control"),
+        ],
         0,
         0,
         "test",
@@ -334,5 +341,20 @@ fn json_escaping_handles_special_characters() {
     assert!(
         line.contains("has\\nnewline"),
         "newlines must be escaped. Got: {line}"
+    );
+    // Carriage returns must be escaped as \r
+    assert!(
+        line.contains("has\\rcarriage"),
+        "carriage returns must be escaped. Got: {line}"
+    );
+    // Tabs must be escaped as \t
+    assert!(
+        line.contains("has\\ttab"),
+        "tabs must be escaped. Got: {line}"
+    );
+    // Control chars must be escaped as \uXXXX
+    assert!(
+        line.contains("has\\u0001control"),
+        "control chars must be escaped. Got: {line}"
     );
 }
