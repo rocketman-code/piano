@@ -100,7 +100,7 @@ fn cross_thread_isolation() {
         record_alloc(100);
 
         // Spawned child should have independent counters
-        let child_snap = std::thread::spawn(|| snapshot_alloc_counters())
+        let child_snap = std::thread::spawn(snapshot_alloc_counters)
             .join()
             .expect("child panicked");
 

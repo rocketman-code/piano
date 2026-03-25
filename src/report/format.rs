@@ -70,7 +70,7 @@ pub fn format_table(run: &Run, show_all: bool, limit: Option<usize>) -> String {
                 Some(v) => format!("{v:.TIME_DECIMALS$}ms"),
                 None => "-".to_string(),
             };
-            line.push_str(&format!(" {:>TIME_W$}", cpu_val));
+            line.push_str(&format!(" {cpu_val:>TIME_W$}"));
         }
         line.push_str(&format!(" {:>CALLS_W$}", entry.calls));
         if has_alloc {

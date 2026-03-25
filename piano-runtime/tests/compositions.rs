@@ -18,11 +18,9 @@ fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
     let waker = unsafe { Waker::from_raw(raw) };
     let mut cx = Context::from_waker(&waker);
     let mut f = unsafe { std::pin::Pin::new_unchecked(&mut f) };
-    loop {
-        match f.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => panic!("test future returned Pending"),
-        }
+    match f.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!("test future returned Pending"),
     }
 }
 

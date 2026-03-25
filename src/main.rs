@@ -1191,6 +1191,7 @@ fn cmd_profile(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_report(
     run_path: Option<PathBuf>,
     show_all: bool,

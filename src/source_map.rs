@@ -133,7 +133,7 @@ impl StringInjector {
     /// Entries are applied in offset order. Each byte of the original
     /// source is copied at most once.
     pub fn apply(mut self, source: &str) -> (String, SourceMap) {
-        self.entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        self.entries.sort_by_key(|a| a.sort_key());
 
         let mut result = String::with_capacity(source.len() * 2);
         let mut map = SourceMap::new();

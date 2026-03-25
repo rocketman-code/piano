@@ -28,7 +28,7 @@ fn read_rust_source(relative: &str) -> String {
 fn extract_trait_methods(source: &str, trait_name: &str) -> Vec<String> {
     let trait_start = source
         .find(&format!("pub unsafe trait {trait_name}"))
-        .expect(&format!("{trait_name} trait not found"));
+        .unwrap_or_else(|| panic!("{trait_name} trait not found"));
     let trait_block = &source[trait_start..];
 
     // Find matching closing brace (simple brace counting)

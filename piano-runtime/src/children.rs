@@ -1,6 +1,6 @@
 //! Per-thread children-time accumulator.
 //!
-//! A single Cell<u64> in TLS holds the accumulated inclusive time of
+//! A single `Cell<u64>` in TLS holds the accumulated inclusive time of
 //! all children that have completed within the current Guard's scope.
 //! Guard saves the previous value on creation (resetting to 0) and
 //! restores it on drop (adding its own inclusive time to the parent's
@@ -16,7 +16,7 @@
 //! - Managed exclusively by Guard and PianoFuture.
 //! - Save/restore is RAII: every save has a corresponding restore on drop.
 //! - Returns 0 when TLS is destroyed (thread teardown).
-//! - Cell<u64> has no destructor (no TLS destruction ordering issues).
+//! - `Cell<u64>` has no destructor (no TLS destruction ordering issues).
 
 use std::cell::Cell;
 

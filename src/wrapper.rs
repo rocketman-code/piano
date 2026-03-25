@@ -239,7 +239,7 @@ fn rewrite_and_compile(
             None
         };
         let result = instrument_source(&file_source, target_measured, ep)
-            .map_err(|e| Error::BuildFailed(format!("rewrite failed for {}: {e}", file_path)))?;
+            .map_err(|e| Error::BuildFailed(format!("rewrite failed for {file_path}: {e}")))?;
 
         all_source_maps.push((file_path, result.source_map));
         instrumented_files.push((target_path.clone(), result.source));

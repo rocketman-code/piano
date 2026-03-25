@@ -1,6 +1,6 @@
 //! Output destination with I/O error counting.
 //!
-//! FileSink wraps a Mutex<BufWriter<File>> and an AtomicU64 error counter.
+//! FileSink wraps a `Mutex<BufWriter<File>>` and an AtomicU64 error counter.
 //! All write sites check their Result and increment the counter on failure.
 //!
 //! Invariants:
