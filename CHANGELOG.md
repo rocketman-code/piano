@@ -21,7 +21,7 @@ inside `macro_rules!` now just work.
 
 ### Changed
 
-- Per-call instrumentation overhead reduced from ~52ns to ~15ns on x86-64 (3.4x improvement)
+- Per-call instrumentation overhead reduced from ~70ns to ~29ns on x86-64 (2.4x improvement, measured on AMD Ryzen 7 3700X at 4.2 GHz)
 - Profiling output uses in-flight aggregation: one NDJSON line per function instead of one per call, reducing I/O from hundreds of megabytes to hundreds of bytes (#528)
 - Rewriter rebuilt as single-pass injection using ra_ap_syntax (rust-analyzer's parser), replacing the multi-pass syn/quote pipeline (#539)
 - `macro_rules!` instrumentation uses ra_ap_mbe (rust-analyzer's macro expander) instead of token scanning, handling all 15 fragment specifiers including `$name:ident`, `$body:expr`, and repetitions (#543)
