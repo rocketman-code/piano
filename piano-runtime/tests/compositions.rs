@@ -31,7 +31,7 @@ fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
 #[test]
 fn nested_piano_futures_self_time() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
 
         block_on(async {
             let outer_fut = enter_async(0, async {
@@ -67,7 +67,7 @@ fn nested_piano_futures_self_time() {
 #[test]
 fn guard_inside_piano_future_alloc_deltas_compose() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
 
         block_on(async {
             let fut = enter_async(0, async {
@@ -142,7 +142,7 @@ fn piano_future_thread_migration() {
     >(1);
 
     let handle_a = std::thread::spawn(move || {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
 
         let pf = enter_async(0, FlagFuture { ready: flag2 });
         let mut boxed = Box::pin(pf);

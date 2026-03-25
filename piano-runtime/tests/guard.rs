@@ -12,7 +12,7 @@ static ALLOC: PianoAllocator<System> = PianoAllocator::new(System);
 #[test]
 fn guard_produces_aggregate_on_drop() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         { let _g = enter(42); }
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 1);
@@ -24,7 +24,7 @@ fn guard_produces_aggregate_on_drop() {
 #[test]
 fn guard_captures_wall_time() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         { let _g = enter(0); std::hint::black_box(vec![0u8; 1024]); }
         let agg = drain_thread_agg();
         assert!(agg[0].self_ns > 0, "self_ns must be nonzero");
@@ -35,7 +35,7 @@ fn guard_captures_wall_time() {
 #[test]
 fn guard_captures_alloc_deltas() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         { let _g = enter(0); record_alloc(100); record_alloc(200); }
         let agg = drain_thread_agg();
         assert_eq!(agg[0].alloc_count, 2);
@@ -46,7 +46,7 @@ fn guard_captures_alloc_deltas() {
 #[test]
 fn guard_excludes_own_bookkeeping_allocs() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         { let _g = enter(0); }
         let agg = drain_thread_agg();
         assert_eq!(agg[0].alloc_count, 0);
@@ -57,7 +57,7 @@ fn guard_excludes_own_bookkeeping_allocs() {
 #[test]
 fn multiple_calls_accumulate() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         for _ in 0..10 { let _g = enter(0); }
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 1);
@@ -68,7 +68,7 @@ fn multiple_calls_accumulate() {
 #[test]
 fn different_functions_get_separate_entries() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         { let _g = enter(0); }
         { let _g = enter(1); }
         { let _g = enter(0); }
@@ -84,7 +84,7 @@ fn different_functions_get_separate_entries() {
 #[test]
 fn nested_guards_compute_self_time() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         {
             let _outer = enter(0);
             std::hint::black_box(vec![0u8; 64]); // outer's own work
@@ -111,7 +111,7 @@ fn nested_guards_compute_self_time() {
 #[test]
 fn alloc_deltas_scoped_to_guard_lifetime() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         record_alloc(999); // before guard
         { let _g = enter(0); record_alloc(50); record_alloc(75); }
         record_alloc(888); // after guard
@@ -124,7 +124,7 @@ fn alloc_deltas_scoped_to_guard_lifetime() {
 #[test]
 fn guard_captures_free_deltas() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         {
             let _g = enter(0);
             let v: Vec<u8> = Vec::with_capacity(100);
@@ -141,7 +141,7 @@ fn guard_captures_free_deltas() {
 #[test]
 fn guard_captures_cpu_time_when_enabled() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, true, &[]);
+        ProfileSession::init(None, true, &[], "test", 0);
         {
             let _g = enter(0);
             let mut sum: u64 = 0;
@@ -156,7 +156,7 @@ fn guard_captures_cpu_time_when_enabled() {
 #[test]
 fn guard_cpu_time_zero_when_disabled() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         { let _g = enter(0); }
         let agg = drain_thread_agg();
         assert_eq!(agg[0].cpu_self_ns, 0);
@@ -166,13 +166,13 @@ fn guard_cpu_time_zero_when_disabled() {
 #[test]
 fn guard_never_panics() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, true, &[]);
+        ProfileSession::init(None, true, &[], "test", 0);
         { let _g = enter(0); }
         drain_thread_agg();
     }).join().expect("guard with cpu_time panicked");
 
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[]);
+        ProfileSession::init(None, false, &[], "test", 0);
         { let _g = enter(0); }
         drain_thread_agg();
     }).join().expect("guard without cpu_time panicked");

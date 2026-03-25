@@ -44,13 +44,15 @@ impl ProfileSession {
         file_sink: Option<Arc<FileSink>>,
         cpu_time_enabled: bool,
         names: &'static [(u32, &'static str)],
+        run_id: &str,
+        timestamp_ms: u128,
     ) -> &'static Self {
         let calibration = CalibrationData::calibrate();
         let agg_registry: Arc<AggRegistry> = Arc::new(Mutex::new(Vec::new()));
 
         if let Some(ref fs) = file_sink {
             let mut file = fs.lock();
-            if write_header(&mut *file, names, calibration.bias_ns(), calibration.cpu_bias_ns()).is_err() {
+            if write_header(&mut *file, names, calibration.bias_ns(), calibration.cpu_bias_ns(), run_id, timestamp_ms).is_err() {
                 fs.record_io_error();
             }
             if std::io::Write::flush(&mut *file).is_err() {

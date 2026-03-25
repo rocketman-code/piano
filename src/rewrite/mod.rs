@@ -320,14 +320,14 @@ const FILE_COLLISION_RETRIES: u32 = 4;
 fn build_lifecycle_prefix(runs_dir: &str, cpu_time: bool) -> String {
     let mut s = String::new();
     s.push_str("\n    use std::io::Write as _;");
+    s.push_str("\n    let __piano_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();");
+    s.push_str("\n    let __piano_pid = std::process::id();");
     s.push_str("\n    let __piano_sink = {");
     s.push_str(&format!(
         "\n        let __piano_dir = std::path::PathBuf::from(std::env::var(\"PIANO_RUNS_DIR\").unwrap_or_else(|_| \"{runs_dir}\".into()));"
     ));
     s.push_str("\n        match std::fs::create_dir_all(&__piano_dir) {");
     s.push_str("\n            Ok(()) => {");
-    s.push_str("\n                let __piano_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();");
-    s.push_str("\n                let __piano_pid = std::process::id();");
     s.push_str("\n                let mut __piano_file = None;");
     s.push_str("\n                let mut __piano_warned = false;");
     s.push_str(&format!(
@@ -355,8 +355,9 @@ fn build_lifecycle_prefix(runs_dir: &str, cpu_time: bool) -> String {
     s.push_str("\n            }");
     s.push_str("\n        }");
     s.push_str("\n    };");
+    s.push_str("\n    let __piano_run_id = format!(\"{}-{}\", __piano_ts, __piano_pid);");
     s.push_str(&format!(
-        "\n    piano_runtime::session::ProfileSession::init(__piano_sink, {cpu_time}, &PIANO_NAMES);"
+        "\n    piano_runtime::session::ProfileSession::init(__piano_sink, {cpu_time}, &PIANO_NAMES, &__piano_run_id, __piano_ts);"
     ));
     s
 }

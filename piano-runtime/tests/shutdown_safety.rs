@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 fn multiple_register_calls_safe() {
     std::thread::spawn(|| {
         for _ in 0..5 {
-            ProfileSession::init(None, false, &[(0, "test")]);
+            ProfileSession::init(None, false, &[(0, "test")], "test", 0);
         }
     })
     .join()
@@ -36,7 +36,7 @@ fn multiple_init_with_file_sinks() {
             ));
             let file = File::create(&path).unwrap();
             let file_sink = Some(Arc::new(FileSink::new(file)));
-            ProfileSession::init(file_sink, false, &[(0, "test")]);
+            ProfileSession::init(file_sink, false, &[(0, "test")], "test", 0);
             let _ = std::fs::remove_file(&path);
         }
     })

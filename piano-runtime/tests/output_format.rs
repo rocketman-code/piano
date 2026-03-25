@@ -7,7 +7,7 @@ use piano_runtime::output::{write_header, write_trailer, write_aggregates, seria
 #[test]
 fn header_contains_type_and_names() {
     let mut buf = Vec::new();
-    write_header(&mut buf, &[(0, "work"), (1, "helper")], 8, 0).unwrap();
+    write_header(&mut buf, &[(0, "work"), (1, "helper")], 8, 0, "test", 0).unwrap();
     let line = String::from_utf8(buf).unwrap();
 
     assert!(line.starts_with('{'), "header must start with {{");
@@ -19,18 +19,25 @@ fn header_contains_type_and_names() {
 }
 
 #[test]
-fn trailer_matches_header_structure() {
+fn trailer_shares_core_fields_with_header() {
     let mut hdr = Vec::new();
-    write_header(&mut hdr, &[(0, "a"), (1, "b")], 5, 0).unwrap();
+    write_header(&mut hdr, &[(0, "a"), (1, "b")], 5, 0, "test", 0).unwrap();
     let mut trl = Vec::new();
     write_trailer(&mut trl, &[(0, "a"), (1, "b")], 5, 0).unwrap();
 
     let h = String::from_utf8(hdr).unwrap();
     let t = String::from_utf8(trl).unwrap();
 
-    // Identical except for type field
-    let normalized = h.replace("\"type\":\"header\"", "\"type\":\"trailer\"");
-    assert_eq!(normalized.trim(), t.trim());
+    // Both contain type, bias_ns, cpu_bias_ns, and names
+    assert!(t.contains("\"type\":\"trailer\""));
+    assert!(t.contains("\"bias_ns\":5"));
+    assert!(t.contains("\"cpu_bias_ns\":0"));
+    assert!(t.contains("\"0\":\"a\""));
+    assert!(t.contains("\"1\":\"b\""));
+
+    // Header has run metadata that trailer does not
+    assert!(h.contains("\"run_id\":\"test\""));
+    assert!(h.contains("\"timestamp_ms\":0"));
 }
 
 #[test]

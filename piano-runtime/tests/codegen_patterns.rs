@@ -61,7 +61,7 @@ fn with_inner_attr(x: i32) -> i32 {
 #[test]
 fn sync_guard_injection_compiles_and_runs() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, PIANO_NAMES);
+        ProfileSession::init(None, false, PIANO_NAMES, "test", 0);
         let result = measured_sync(10);
         assert_eq!(result, 11);
         drain_thread_agg();
@@ -73,7 +73,7 @@ fn sync_guard_injection_compiles_and_runs() {
 #[test]
 fn async_whole_body_wrapping_compiles_and_runs() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, PIANO_NAMES);
+        ProfileSession::init(None, false, PIANO_NAMES, "test", 0);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -88,7 +88,7 @@ fn async_whole_body_wrapping_compiles_and_runs() {
 #[test]
 fn inner_function_instrumented() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, PIANO_NAMES);
+        ProfileSession::init(None, false, PIANO_NAMES, "test", 0);
         let result = outer_with_inner(4);
         assert_eq!(result, 12);
         drain_thread_agg();
@@ -100,7 +100,7 @@ fn inner_function_instrumented() {
 #[test]
 fn closure_not_instrumented() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, PIANO_NAMES);
+        ProfileSession::init(None, false, PIANO_NAMES, "test", 0);
         let result = with_closure(&[1, 2, 3]);
         assert_eq!(result, vec![2, 3, 4]);
         drain_thread_agg();
@@ -113,7 +113,7 @@ fn closure_not_instrumented() {
 fn unsafe_fn_instrumented() {
     std::thread::spawn(|| {
         let val: i32 = 99;
-        ProfileSession::init(None, false, PIANO_NAMES);
+        ProfileSession::init(None, false, PIANO_NAMES, "test", 0);
         let result = unsafe { unsafe_measured(&val) };
         assert_eq!(result, 99);
         drain_thread_agg();
@@ -125,7 +125,7 @@ fn unsafe_fn_instrumented() {
 #[test]
 fn inner_attrs_before_guard() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, PIANO_NAMES);
+        ProfileSession::init(None, false, PIANO_NAMES, "test", 0);
         let result = with_inner_attr(5);
         assert_eq!(result, 5);
         drain_thread_agg();
@@ -154,7 +154,7 @@ fn allocator_wrapping_const() {
 #[test]
 fn nested_guards_compute_correct_self_time() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, PIANO_NAMES);
+        ProfileSession::init(None, false, PIANO_NAMES, "test", 0);
 
         {
             let _g1 = piano_runtime::enter(0);
@@ -190,7 +190,7 @@ fn nested_guards_compute_correct_self_time() {
 #[test]
 fn siblings_both_aggregated() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, PIANO_NAMES);
+        ProfileSession::init(None, false, PIANO_NAMES, "test", 0);
 
         {
             let _g1 = piano_runtime::enter(0);
@@ -211,7 +211,7 @@ fn siblings_both_aggregated() {
 #[test]
 fn async_preamble_has_nonzero_self_time() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, PIANO_NAMES);
+        ProfileSession::init(None, false, PIANO_NAMES, "test", 0);
 
         use std::future::Future;
         use std::task::{Context, RawWaker, RawWakerVTable, Waker};
@@ -250,7 +250,7 @@ fn async_preamble_has_nonzero_self_time() {
 #[test]
 fn spawn_no_capture_required() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, PIANO_NAMES);
+        ProfileSession::init(None, false, PIANO_NAMES, "test", 0);
 
         let handles: Vec<_> = (0..4)
             .map(|_| {
