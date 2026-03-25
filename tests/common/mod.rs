@@ -79,7 +79,9 @@ pub fn aggregate_ndjson(content: &str) -> HashMap<String, FnStats> {
         // Aggregated lines (default mode): have "calls" and "self_ns", no "span_id"
         if let Some(calls) = v.get("calls").and_then(|c| c.as_u64()) {
             let name_id = v.get("name_id").and_then(|n| n.as_u64()).unwrap_or(0);
-            let agg = pre_aggregated.entry(name_id).or_insert_with(FnStats::default);
+            let agg = pre_aggregated
+                .entry(name_id)
+                .or_insert_with(FnStats::default);
             agg.calls += calls;
             agg.self_ns += v.get("self_ns").and_then(|n| n.as_u64()).unwrap_or(0);
             agg.alloc_count += v.get("alloc_count").and_then(|n| n.as_u64()).unwrap_or(0);
@@ -98,14 +100,8 @@ pub fn aggregate_ndjson(content: &str) -> HashMap<String, FnStats> {
                 name_id: v.get("name_id").and_then(|s| s.as_u64()).unwrap_or(0),
                 start_ns: v.get("start_ns").and_then(|s| s.as_u64()).unwrap_or(0),
                 end_ns: v.get("end_ns").and_then(|s| s.as_u64()).unwrap_or(0),
-                alloc_count: v
-                    .get("alloc_count")
-                    .and_then(|s| s.as_u64())
-                    .unwrap_or(0),
-                alloc_bytes: v
-                    .get("alloc_bytes")
-                    .and_then(|s| s.as_u64())
-                    .unwrap_or(0),
+                alloc_count: v.get("alloc_count").and_then(|s| s.as_u64()).unwrap_or(0),
+                alloc_bytes: v.get("alloc_bytes").and_then(|s| s.as_u64()).unwrap_or(0),
             });
         }
     }

@@ -26,7 +26,8 @@ fn read_rust_source(relative: &str) -> String {
 
 /// Extract `unsafe fn NAME` declarations from a trait body.
 fn extract_trait_methods(source: &str, trait_name: &str) -> Vec<String> {
-    let trait_start = source.find(&format!("pub unsafe trait {trait_name}"))
+    let trait_start = source
+        .find(&format!("pub unsafe trait {trait_name}"))
         .expect(&format!("{trait_name} trait not found"));
     let trait_block = &source[trait_start..];
 
@@ -34,12 +35,21 @@ fn extract_trait_methods(source: &str, trait_name: &str) -> Vec<String> {
     let mut depth = 0;
     let mut end = 0;
     for (i, ch) in trait_block.char_indices() {
-        if ch == '{' { depth += 1; }
-        if ch == '}' { depth -= 1; if depth == 0 { end = i; break; } }
+        if ch == '{' {
+            depth += 1;
+        }
+        if ch == '}' {
+            depth -= 1;
+            if depth == 0 {
+                end = i;
+                break;
+            }
+        }
     }
     let trait_body = &trait_block[..end];
 
-    trait_body.lines()
+    trait_body
+        .lines()
         .filter_map(|line| {
             let trimmed = line.trim();
             if trimmed.starts_with("unsafe fn ") {
@@ -66,7 +76,8 @@ fn process_termination_modes_exhaustive() {
     let source = read_rust_source("library/std/src/process.rs");
 
     // Extract public termination functions from std::process
-    let termination_fns: Vec<&str> = source.lines()
+    let termination_fns: Vec<&str> = source
+        .lines()
         .filter_map(|line| {
             let trimmed = line.trim();
             if trimmed == "pub fn exit(code: i32) -> ! {" {
@@ -80,7 +91,8 @@ fn process_termination_modes_exhaustive() {
         .collect();
 
     assert_eq!(
-        termination_fns, vec!["exit", "abort"],
+        termination_fns,
+        vec!["exit", "abort"],
         "std::process termination functions have changed.\n\
          Found: {termination_fns:?}"
     );
@@ -107,17 +119,21 @@ fn process_termination_modes_exhaustive() {
 fn fn_contexts_exhaustive() {
     let source = read_rust_source("compiler/rustc_parse/src/parser/item.rs");
 
-    let enum_start = source.find("pub(crate) enum FnContext")
+    let enum_start = source
+        .find("pub(crate) enum FnContext")
         .expect("FnContext enum not found in rustc_parse");
     let enum_block = &source[enum_start..];
     let enum_end = enum_block.find('}').unwrap();
     let enum_body = &enum_block[..enum_end];
 
-    let variants: Vec<&str> = enum_body.lines()
+    let variants: Vec<&str> = enum_body
+        .lines()
         .filter_map(|line| {
             let trimmed = line.trim();
-            if trimmed.starts_with("///") || trimmed.starts_with("//")
-                || trimmed.is_empty() || trimmed.contains("enum")
+            if trimmed.starts_with("///")
+                || trimmed.starts_with("//")
+                || trimmed.is_empty()
+                || trimmed.contains("enum")
                 || trimmed.starts_with('{')
             {
                 return None;
@@ -172,23 +188,30 @@ fn poll_variants_exhaustive() {
     let source = read_rust_source("library/core/src/task/poll.rs");
 
     // Extract Poll enum variants
-    let enum_start = source.find("pub enum Poll<T>")
+    let enum_start = source
+        .find("pub enum Poll<T>")
         .expect("Poll enum not found");
     let enum_block = &source[enum_start..];
     let enum_end = enum_block.find('}').unwrap();
     let enum_body = &enum_block[..enum_end];
 
-    let variants: Vec<&str> = enum_body.lines()
+    let variants: Vec<&str> = enum_body
+        .lines()
         .filter_map(|line| {
             let trimmed = line.trim();
-            if trimmed.starts_with("///") || trimmed.starts_with("//")
-                || trimmed.is_empty() || trimmed.contains("enum")
-                || trimmed.starts_with('{') || trimmed.starts_with('#')
+            if trimmed.starts_with("///")
+                || trimmed.starts_with("//")
+                || trimmed.is_empty()
+                || trimmed.contains("enum")
+                || trimmed.starts_with('{')
+                || trimmed.starts_with('#')
             {
                 return None;
             }
             let name = trimmed.split('(').next()?.split(',').next()?.trim();
-            if name.is_empty() { return None; }
+            if name.is_empty() {
+                return None;
+            }
             Some(name)
         })
         .collect();
@@ -219,18 +242,28 @@ fn future_trait_methods_exhaustive() {
     let source = read_rust_source("library/core/src/future/future.rs");
 
     // Count fn declarations in the Future trait
-    let trait_start = source.find("pub trait Future")
+    let trait_start = source
+        .find("pub trait Future")
         .expect("Future trait not found");
     let trait_block = &source[trait_start..];
     let mut depth = 0;
     let mut end = 0;
     for (i, ch) in trait_block.char_indices() {
-        if ch == '{' { depth += 1; }
-        if ch == '}' { depth -= 1; if depth == 0 { end = i; break; } }
+        if ch == '{' {
+            depth += 1;
+        }
+        if ch == '}' {
+            depth -= 1;
+            if depth == 0 {
+                end = i;
+                break;
+            }
+        }
     }
     let trait_body = &trait_block[..end];
 
-    let methods: Vec<&str> = trait_body.lines()
+    let methods: Vec<&str> = trait_body
+        .lines()
         .filter_map(|line| {
             let trimmed = line.trim();
             if trimmed.starts_with("fn ") {
@@ -242,9 +275,9 @@ fn future_trait_methods_exhaustive() {
         .collect();
 
     assert_eq!(
-        methods, vec!["poll"],
+        methods,
+        vec!["poll"],
         "Future trait has new methods. Update PianoFuture.\n\
          Found: {methods:?}"
     );
 }
-

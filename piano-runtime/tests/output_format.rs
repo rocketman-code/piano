@@ -2,7 +2,9 @@
 //! contain expected fields.
 
 use piano_runtime::aggregator::FnAgg;
-use piano_runtime::output::{write_header, write_trailer, write_aggregates, serialize_aggregate_to_stack};
+use piano_runtime::output::{
+    serialize_aggregate_to_stack, write_aggregates, write_header, write_trailer,
+};
 
 #[test]
 fn header_contains_type_and_names() {
@@ -42,14 +44,17 @@ fn trailer_shares_core_fields_with_header() {
 
 #[test]
 fn aggregate_lines_contain_all_fields() {
-    let aggs = vec![vec![
-        FnAgg {
-            name_id: 0, calls: 100, self_ns: 5000,
-            inclusive_ns: 8000, cpu_self_ns: 3000,
-            alloc_count: 10, alloc_bytes: 1024,
-            free_count: 5, free_bytes: 512,
-        },
-    ]];
+    let aggs = vec![vec![FnAgg {
+        name_id: 0,
+        calls: 100,
+        self_ns: 5000,
+        inclusive_ns: 8000,
+        cpu_self_ns: 3000,
+        alloc_count: 10,
+        alloc_bytes: 1024,
+        free_count: 5,
+        free_bytes: 512,
+    }]];
 
     let mut buf = Vec::new();
     write_aggregates(&mut buf, &aggs).unwrap();
@@ -73,10 +78,28 @@ fn aggregate_lines_contain_all_fields() {
 #[test]
 fn multi_thread_aggregates_have_distinct_thread_indices() {
     let aggs = vec![
-        vec![FnAgg { name_id: 0, calls: 1, self_ns: 100, inclusive_ns: 100,
-            cpu_self_ns: 0, alloc_count: 0, alloc_bytes: 0, free_count: 0, free_bytes: 0 }],
-        vec![FnAgg { name_id: 0, calls: 1, self_ns: 200, inclusive_ns: 200,
-            cpu_self_ns: 0, alloc_count: 0, alloc_bytes: 0, free_count: 0, free_bytes: 0 }],
+        vec![FnAgg {
+            name_id: 0,
+            calls: 1,
+            self_ns: 100,
+            inclusive_ns: 100,
+            cpu_self_ns: 0,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
+        }],
+        vec![FnAgg {
+            name_id: 0,
+            calls: 1,
+            self_ns: 200,
+            inclusive_ns: 200,
+            cpu_self_ns: 0,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            free_count: 0,
+            free_bytes: 0,
+        }],
     ];
 
     let mut buf = Vec::new();
@@ -92,10 +115,15 @@ fn multi_thread_aggregates_have_distinct_thread_indices() {
 #[test]
 fn stack_serializer_produces_valid_ndjson() {
     let agg = FnAgg {
-        name_id: 3, calls: 42, self_ns: 999,
-        inclusive_ns: 1500, cpu_self_ns: 200,
-        alloc_count: 7, alloc_bytes: 256,
-        free_count: 2, free_bytes: 64,
+        name_id: 3,
+        calls: 42,
+        self_ns: 999,
+        inclusive_ns: 1500,
+        cpu_self_ns: 200,
+        alloc_count: 7,
+        alloc_bytes: 256,
+        free_count: 2,
+        free_bytes: 64,
     };
 
     let mut stack_buf = [0u8; 512];
@@ -113,10 +141,15 @@ fn stack_serializer_produces_valid_ndjson() {
 #[test]
 fn stack_serializer_matches_write_aggregates() {
     let agg = FnAgg {
-        name_id: 3, calls: 42, self_ns: 999,
-        inclusive_ns: 1500, cpu_self_ns: 200,
-        alloc_count: 7, alloc_bytes: 256,
-        free_count: 2, free_bytes: 64,
+        name_id: 3,
+        calls: 42,
+        self_ns: 999,
+        inclusive_ns: 1500,
+        cpu_self_ns: 200,
+        alloc_count: 7,
+        alloc_bytes: 256,
+        free_count: 2,
+        free_bytes: 64,
     };
 
     let mut formatted_buf = Vec::new();
@@ -128,7 +161,8 @@ fn stack_serializer_matches_write_aggregates() {
     let stack = std::str::from_utf8(&stack_buf[..len]).unwrap();
 
     assert_eq!(
-        formatted.trim(), stack.trim(),
+        formatted.trim(),
+        stack.trim(),
         "stack serializer and write_aggregates must produce identical output"
     );
 }
@@ -149,8 +183,12 @@ fn ndjson_format_contract_header() {
     write_header(
         &mut buf,
         &[(0, "work"), (1, "helper")],
-        8, 3, "abc_1000", 1700000000000,
-    ).unwrap();
+        8,
+        3,
+        "abc_1000",
+        1700000000000,
+    )
+    .unwrap();
     let line = String::from_utf8(buf).unwrap();
 
     // Every field the CLI reads from the header via serde_json::Value::get
@@ -176,11 +214,7 @@ fn ndjson_format_contract_header() {
 #[test]
 fn ndjson_format_contract_trailer() {
     let mut buf = Vec::new();
-    write_trailer(
-        &mut buf,
-        &[(0, "work")],
-        8, 3,
-    ).unwrap();
+    write_trailer(&mut buf, &[(0, "work")], 8, 3).unwrap();
     let line = String::from_utf8(buf).unwrap();
 
     let required_fields = [
@@ -203,10 +237,15 @@ fn ndjson_format_contract_trailer() {
 #[test]
 fn ndjson_format_contract_aggregate() {
     let agg = FnAgg {
-        name_id: 5, calls: 100, self_ns: 5000,
-        inclusive_ns: 8000, cpu_self_ns: 3000,
-        alloc_count: 10, alloc_bytes: 1024,
-        free_count: 5, free_bytes: 512,
+        name_id: 5,
+        calls: 100,
+        self_ns: 5000,
+        inclusive_ns: 8000,
+        cpu_self_ns: 3000,
+        alloc_count: 10,
+        alloc_bytes: 1024,
+        free_count: 5,
+        free_bytes: 512,
     };
     let mut buf = Vec::new();
     write_aggregates(&mut buf, &[vec![agg]]).unwrap();

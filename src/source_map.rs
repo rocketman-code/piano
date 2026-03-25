@@ -16,7 +16,9 @@ pub struct SourceMap {
 
 impl SourceMap {
     pub fn new() -> Self {
-        Self { injections: Vec::new() }
+        Self {
+            injections: Vec::new(),
+        }
     }
 
     /// Record an injection at `original_line` that added `newlines` lines.
@@ -154,10 +156,8 @@ impl StringInjector {
             result.push_str(&source[cursor..start]);
 
             // Compute line-number effects
-            let deleted_newlines = source[start..end]
-                .bytes()
-                .filter(|&b| b == b'\n')
-                .count() as u32;
+            let deleted_newlines =
+                source[start..end].bytes().filter(|&b| b == b'\n').count() as u32;
             let added_newlines = text.bytes().filter(|&b| b == b'\n').count() as u32;
             let net = added_newlines.saturating_sub(deleted_newlines);
 
@@ -378,7 +378,11 @@ mod tests {
         let mut inj = StringInjector::new();
         // Replace allocator (bytes 0..37)
         let alloc_end = source.find(";\n").unwrap() + 2;
-        inj.replace(0, alloc_end, "#[global_allocator]\nstatic A: P<M> = P::new(M);\n");
+        inj.replace(
+            0,
+            alloc_end,
+            "#[global_allocator]\nstatic A: P<M> = P::new(M);\n",
+        );
         // Insert guard after work()'s opening brace
         let brace = source.find("{\n    1").unwrap();
         inj.insert(brace + 1, "\nlet _g = enter(0);");

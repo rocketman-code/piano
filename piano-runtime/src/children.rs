@@ -28,9 +28,7 @@ thread_local! {
 /// Returns 0 if TLS is destroyed.
 #[inline(always)]
 pub fn current_children_ns() -> u64 {
-    CHILDREN_NS
-        .try_with(|c| c.get())
-        .unwrap_or(0)
+    CHILDREN_NS.try_with(|c| c.get()).unwrap_or(0)
 }
 
 /// Save the current children-time accumulator and reset to 0.

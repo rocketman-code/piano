@@ -46,7 +46,9 @@ fn no_test_backdoors_in_source() {
                     violations.push(format!(
                         "{}:{}: test-only mutation function '{}' -- \
                          use delta-based tests instead",
-                        rel.display(), n, fn_name,
+                        rel.display(),
+                        n,
+                        fn_name,
                     ));
                 }
             }
@@ -58,7 +60,10 @@ fn no_test_backdoors_in_source() {
                         violations.push(format!(
                             "{}:{}: stale function reference '{}' in comment \
                              -- was renamed to '{}'",
-                            rel.display(), n, old, new,
+                            rel.display(),
+                            n,
+                            old,
+                            new,
                         ));
                     }
                 }
@@ -80,7 +85,8 @@ fn no_test_backdoors_in_source() {
                         violations.push(format!(
                             "{}:{}: #[doc(hidden)] pub fn -- no backdoor \
                              exports for test convenience",
-                            rel.display(), n,
+                            rel.display(),
+                            n,
                         ));
                     }
                 }
@@ -91,7 +97,8 @@ fn no_test_backdoors_in_source() {
                 violations.push(format!(
                     "{}:{}: #[cfg(test)] in production source -- tests \
                      belong in tests/, not in src/",
-                    rel.display(), n,
+                    rel.display(),
+                    n,
                 ));
             }
 
@@ -115,7 +122,8 @@ fn no_test_backdoors_in_source() {
                     violations.push(format!(
                         "{}:{}: unsafe block without // SAFETY: comment -- \
                          document why the invariants are upheld",
-                        rel.display(), n,
+                        rel.display(),
+                        n,
                     ));
                 }
             }
@@ -199,7 +207,8 @@ fn no_test_backdoors_in_source() {
                      this is a composition bomb. Clone copies state that Drop \
                      acts on, causing duplicate side effects. Split into \
                      separate types (owner with Drop, handle with Clone).",
-                    rel.display(), ty,
+                    rel.display(),
+                    ty,
                 ));
             }
         }
@@ -210,7 +219,11 @@ fn no_test_backdoors_in_source() {
         let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         // buffer_global.rs tests drain_all_buffers itself.
         // shutdown.rs uses drain_all_buffers in the deadlock composition proof.
-        if filename == "buffer_global.rs" || filename == "shutdown.rs" || filename == "compositions.rs" || filename == "no_test_backdoors.rs" {
+        if filename == "buffer_global.rs"
+            || filename == "shutdown.rs"
+            || filename == "compositions.rs"
+            || filename == "no_test_backdoors.rs"
+        {
             return;
         }
         for (line_num, line) in contents.lines().enumerate() {
@@ -237,10 +250,7 @@ fn no_test_backdoors_in_source() {
     }
 }
 
-fn visit_rs_files(
-    dir: &std::path::Path,
-    cb: &mut dyn FnMut(&std::path::Path, &str),
-) {
+fn visit_rs_files(dir: &std::path::Path, cb: &mut dyn FnMut(&std::path::Path, &str)) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,

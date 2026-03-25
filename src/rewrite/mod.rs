@@ -9,8 +9,8 @@
 
 use std::collections::HashMap;
 
-use ra_ap_syntax::{AstNode, SourceFile, SyntaxKind, ast, T};
 use ra_ap_syntax::ast::{HasAttrs, HasName};
+use ra_ap_syntax::{AstNode, SourceFile, SyntaxKind, T, ast};
 
 use crate::source_map::{SourceMap, StringInjector};
 
@@ -64,7 +64,9 @@ pub fn instrument_source(
 
     // --- Guards + shutdown: walk all descendants ---
     for node in file.syntax().descendants() {
-        let Some(func) = ast::Fn::cast(node) else { continue };
+        let Some(func) = ast::Fn::cast(node) else {
+            continue;
+        };
         let Some(body) = func.body() else { continue };
         let Some(name) = func.name() else { continue };
         let fn_name = name.text().to_string();
@@ -72,27 +74,38 @@ pub fn instrument_source(
         // Shutdown: inject lifecycle into fn main()
         if fn_name == "main" {
             if let Some(ep) = entry_point {
-                let stmt_list = body.stmt_list()
+                let stmt_list = body
+                    .stmt_list()
                     .ok_or_else(|| "no stmt_list for fn main".to_string())?;
                 let inject_offset = brace_offset_after_inner_attrs(&stmt_list)?;
-                injector.insert(inject_offset, build_lifecycle_prefix(ep.runs_dir, ep.cpu_time));
+                injector.insert(
+                    inject_offset,
+                    build_lifecycle_prefix(ep.runs_dir, ep.cpu_time),
+                );
             }
             continue; // main is excluded from the name table
         }
 
         // Guard: only for measured functions
-        let Some(&name_id) = measured.get(&fn_name) else { continue };
+        let Some(&name_id) = measured.get(&fn_name) else {
+            continue;
+        };
 
         // Skip const fn and non-Rust ABI
-        if func.const_token().is_some() { continue }
+        if func.const_token().is_some() {
+            continue;
+        }
         if let Some(abi) = func.abi() {
             if let Some(token) = abi.string_token() {
                 let abi_str = token.text();
-                if abi_str != "\"Rust\"" { continue }
+                if abi_str != "\"Rust\"" {
+                    continue;
+                }
             }
         }
 
-        let stmt_list = body.stmt_list()
+        let stmt_list = body
+            .stmt_list()
             .ok_or_else(|| format!("no stmt_list for fn {fn_name}"))?;
         let inject_offset = brace_offset_after_inner_attrs(&stmt_list)?;
 
@@ -100,7 +113,9 @@ pub fn instrument_source(
         let is_impl_future = returns_impl_future(&func);
 
         if is_async_fn || is_impl_future {
-            let close_brace = stmt_list.syntax().children_with_tokens()
+            let close_brace = stmt_list
+                .syntax()
+                .children_with_tokens()
                 .filter(|t| t.kind() == T!['}'])
                 .last()
                 .ok_or_else(|| format!("no closing brace for fn {fn_name}"))?;
@@ -152,7 +167,9 @@ fn file_level_inner_attr_end(file: &SourceFile) -> usize {
 /// Find the injection offset inside a statement list: after the opening
 /// brace and any inner attributes.
 fn brace_offset_after_inner_attrs(stmt_list: &ast::StmtList) -> Result<usize, String> {
-    let open_brace = stmt_list.syntax().children_with_tokens()
+    let open_brace = stmt_list
+        .syntax()
+        .children_with_tokens()
         .find(|t| t.kind() == T!['{'])
         .ok_or_else(|| "no opening brace".to_string())?;
     let mut offset: usize = open_brace.text_range().end().into();
@@ -170,7 +187,9 @@ fn brace_offset_after_inner_attrs(stmt_list: &ast::StmtList) -> Result<usize, St
 
 /// Check if a function's return type contains `impl Future`.
 fn returns_impl_future(func: &ast::Fn) -> bool {
-    let Some(ret) = func.ret_type() else { return false };
+    let Some(ret) = func.ret_type() else {
+        return false;
+    };
     let ret_text = ret.syntax().text().to_string();
     ret_text.contains("impl") && ret_text.contains("Future")
 }
@@ -195,11 +214,14 @@ fn inject_allocator(
     match alloc_info {
         None => {
             // Case 1: no allocator. Inject PianoAllocator<System>.
-            injector.insert(0, concat!(
-                "#[global_allocator]\n",
-                "static __PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>\n",
-                "    = piano_runtime::PianoAllocator::new(std::alloc::System);\n",
-            ));
+            injector.insert(
+                0,
+                concat!(
+                    "#[global_allocator]\n",
+                    "static __PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>\n",
+                    "    = piano_runtime::PianoAllocator::new(std::alloc::System);\n",
+                ),
+            );
         }
         Some(info) => {
             let replacement = if let Some(ref cfg) = info.cfg_attr {
@@ -248,7 +270,9 @@ struct AllocatorInfo {
 /// Find a static item with #[global_allocator] using CST, extract its components.
 fn find_global_allocator(file: &SourceFile, source: &str) -> Option<AllocatorInfo> {
     for node in file.syntax().descendants() {
-        let Some(static_item) = ast::Static::cast(node) else { continue };
+        let Some(static_item) = ast::Static::cast(node) else {
+            continue;
+        };
 
         // Check for #[global_allocator] attribute
         let has_global_alloc = static_item.attrs().any(|attr| {
@@ -302,7 +326,10 @@ fn find_global_allocator(file: &SourceFile, source: &str) -> Option<AllocatorInf
 
 /// Negate a #[cfg(...)] attribute to #[cfg(not(...))].
 fn negate_cfg(cfg: &str) -> String {
-    if let Some(inner) = cfg.strip_prefix("#[cfg(").and_then(|s| s.strip_suffix(")]")) {
+    if let Some(inner) = cfg
+        .strip_prefix("#[cfg(")
+        .and_then(|s| s.strip_suffix(")]"))
+    {
         format!("#[cfg(not({inner}))]")
     } else {
         // Can't negate complex cfg_attr, fall back to not(any())
@@ -394,10 +421,7 @@ fn expand_and_replace_macros(
 /// Inject guards into expanded macro text. Uses the same guard logic as
 /// the main instrument_source loop: sync enter(), async enter_async(),
 /// impl-Future wrapping. Skips const fn and non-Rust ABI.
-fn inject_guards_into_expansion(
-    expanded: &str,
-    measured: &HashMap<String, u32>,
-) -> String {
+fn inject_guards_into_expansion(expanded: &str, measured: &HashMap<String, u32>) -> String {
     let parse = SourceFile::parse(expanded, ra_ap_syntax::Edition::Edition2021);
 
     // Collect insertions: (byte_offset, text, is_close_brace_insert)
@@ -405,35 +429,55 @@ fn inject_guards_into_expansion(
     let mut insertions: Vec<(usize, String)> = Vec::new();
 
     for node in parse.tree().syntax().descendants() {
-        let Some(func) = ast::Fn::cast(node) else { continue };
+        let Some(func) = ast::Fn::cast(node) else {
+            continue;
+        };
         let Some(body) = func.body() else { continue };
         let Some(name) = func.name() else { continue };
         let fn_name = name.text().to_string();
 
-        let Some(&name_id) = measured.get(&fn_name) else { continue };
+        let Some(&name_id) = measured.get(&fn_name) else {
+            continue;
+        };
 
         // Skip const fn
-        if func.const_token().is_some() { continue }
+        if func.const_token().is_some() {
+            continue;
+        }
 
         // Skip non-Rust ABI
         if let Some(abi) = func.abi() {
             if let Some(token) = abi.string_token() {
-                if token.text() != "\"Rust\"" { continue }
+                if token.text() != "\"Rust\"" {
+                    continue;
+                }
             }
         }
 
-        let Some(stmt_list) = body.stmt_list() else { continue };
-        let Some(open_brace) = stmt_list.syntax().children_with_tokens()
-            .find(|t| t.kind() == T!['{']) else { continue };
+        let Some(stmt_list) = body.stmt_list() else {
+            continue;
+        };
+        let Some(open_brace) = stmt_list
+            .syntax()
+            .children_with_tokens()
+            .find(|t| t.kind() == T!['{'])
+        else {
+            continue;
+        };
         let offset: usize = open_brace.text_range().end().into();
 
         let is_async_fn = func.async_token().is_some();
         let is_impl_future = returns_impl_future(&func);
 
         if is_async_fn || is_impl_future {
-            let Some(close_brace) = stmt_list.syntax().children_with_tokens()
+            let Some(close_brace) = stmt_list
+                .syntax()
+                .children_with_tokens()
                 .filter(|t| t.kind() == T!['}'])
-                .last() else { continue };
+                .last()
+            else {
+                continue;
+            };
             let close_offset: usize = close_brace.text_range().start().into();
 
             if is_async_fn {
@@ -443,10 +487,7 @@ fn inject_guards_into_expansion(
                 ));
                 insertions.push((close_offset, "}).await".to_string()));
             } else {
-                insertions.push((
-                    offset,
-                    format!("\npiano_runtime::enter_async({name_id},"),
-                ));
+                insertions.push((offset, format!("\npiano_runtime::enter_async({name_id},")));
                 insertions.push((close_offset, ")".to_string()));
             }
         } else {
@@ -475,7 +516,9 @@ mod tests {
         let source = "fn work() {\n    let x = 1;\n}\n";
         let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
         let file = parse.tree();
-        let funcs: Vec<_> = file.syntax().descendants()
+        let funcs: Vec<_> = file
+            .syntax()
+            .descendants()
             .filter_map(ast::Fn::cast)
             .collect();
         assert_eq!(funcs.len(), 1);
@@ -488,11 +531,12 @@ mod tests {
         let source = "fn work() {\n    let x = 1;\n}\n";
         let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
         let file = parse.tree();
-        let func = file.syntax().descendants()
-            .find_map(ast::Fn::cast).unwrap();
+        let func = file.syntax().descendants().find_map(ast::Fn::cast).unwrap();
         let body = func.body().unwrap();
         let stmt_list = body.stmt_list().unwrap();
-        let brace = stmt_list.syntax().children_with_tokens()
+        let brace = stmt_list
+            .syntax()
+            .children_with_tokens()
             .find(|t| t.kind() == T!['{'])
             .unwrap();
         let offset: usize = brace.text_range().end().into();
@@ -572,8 +616,9 @@ mod tests {
     #[test]
     fn no_call_site_injection() {
         let source = "fn caller() {\n    work();\n}\nfn work() {\n    let x = 1;\n}\n";
-        let measured: HashMap<String, u32> =
-            [("caller".into(), 0), ("work".into(), 1)].into_iter().collect();
+        let measured: HashMap<String, u32> = [("caller".into(), 0), ("work".into(), 1)]
+            .into_iter()
+            .collect();
         let result = instrument_source(source, &measured, None).unwrap();
         assert!(result.source.contains("    work();"), "call site unchanged");
         assert!(!result.source.contains(".clone()"));
@@ -595,7 +640,10 @@ mod tests {
         let measured: HashMap<String, u32> = [("method".into(), 0)].into_iter().collect();
         let result = instrument_source(source, &measured, None).unwrap();
         assert!(result.source.contains("piano_runtime::enter(0)"));
-        assert!(result.source.contains("fn method(&self)"), "signature unchanged");
+        assert!(
+            result.source.contains("fn method(&self)"),
+            "signature unchanged"
+        );
     }
 
     #[test]
@@ -611,7 +659,10 @@ mod tests {
         let source = "trait T {\n    fn abstract_method(&self);\n}\n";
         let measured: HashMap<String, u32> = [("abstract_method".into(), 0)].into_iter().collect();
         let result = instrument_source(source, &measured, None).unwrap();
-        assert!(!result.source.contains("piano_runtime::enter"), "no body = no guard");
+        assert!(
+            !result.source.contains("piano_runtime::enter"),
+            "no body = no guard"
+        );
     }
 
     #[test]
@@ -619,14 +670,18 @@ mod tests {
         let source = "extern {\n    fn c_function(x: i32) -> i32;\n}\n";
         let measured: HashMap<String, u32> = [("c_function".into(), 0)].into_iter().collect();
         let result = instrument_source(source, &measured, None).unwrap();
-        assert!(!result.source.contains("piano_runtime::enter"), "foreign fn has no body");
+        assert!(
+            !result.source.contains("piano_runtime::enter"),
+            "foreign fn has no body"
+        );
     }
 
     #[test]
     fn instruments_nested_function() {
         let source = "fn outer() {\n    fn inner() {\n        let x = 1;\n    }\n    inner();\n}\n";
-        let measured: HashMap<String, u32> =
-            [("outer".into(), 0), ("inner".into(), 1)].into_iter().collect();
+        let measured: HashMap<String, u32> = [("outer".into(), 0), ("inner".into(), 1)]
+            .into_iter()
+            .collect();
         let result = instrument_source(source, &measured, None).unwrap();
         assert!(result.source.contains("enter(0)"), "outer gets guard");
         assert!(result.source.contains("enter(1)"), "inner gets guard");
@@ -637,16 +692,26 @@ mod tests {
         let source = "async fn fetch() {\n    let x = 1;\n}\n";
         let measured: HashMap<String, u32> = [("fetch".into(), 0)].into_iter().collect();
         let result = instrument_source(source, &measured, None).unwrap();
-        assert!(result.source.contains("enter_async(0"), "async fn must use enter_async");
-        assert!(!result.source.contains("piano_runtime::enter(0)"), "must NOT use sync enter");
+        assert!(
+            result.source.contains("enter_async(0"),
+            "async fn must use enter_async"
+        );
+        assert!(
+            !result.source.contains("piano_runtime::enter(0)"),
+            "must NOT use sync enter"
+        );
     }
 
     #[test]
     fn impl_future_uses_enter_async() {
-        let source = "fn fetch() -> impl std::future::Future<Output = i32> {\n    async { 42 }\n}\n";
+        let source =
+            "fn fetch() -> impl std::future::Future<Output = i32> {\n    async { 42 }\n}\n";
         let measured: HashMap<String, u32> = [("fetch".into(), 0)].into_iter().collect();
         let result = instrument_source(source, &measured, None).unwrap();
-        assert!(result.source.contains("enter_async(0"), "impl Future must use enter_async");
+        assert!(
+            result.source.contains("enter_async(0"),
+            "impl Future must use enter_async"
+        );
     }
 
     #[test]
@@ -671,8 +736,14 @@ mod tests {
         let source = "async fn fetch() {\n    let x = do_work();\n    x + 1\n}\n";
         let measured: HashMap<String, u32> = [("fetch".into(), 0)].into_iter().collect();
         let result = instrument_source(source, &measured, None).unwrap();
-        assert!(result.source.contains("do_work()"), "original body preserved");
-        assert!(result.source.contains("async move {"), "body wrapped in async move");
+        assert!(
+            result.source.contains("do_work()"),
+            "original body preserved"
+        );
+        assert!(
+            result.source.contains("async move {"),
+            "body wrapped in async move"
+        );
     }
 
     // === Entry point injection tests ===
@@ -689,20 +760,33 @@ mod tests {
         let result = instrument_source(source, &measured, Some(&ep)).unwrap();
 
         // Guard in work()
-        assert!(result.source.contains("piano_runtime::enter(0)"), "work gets guard");
+        assert!(
+            result.source.contains("piano_runtime::enter(0)"),
+            "work gets guard"
+        );
         // Name table
         assert!(result.source.contains("PIANO_NAMES"), "name table injected");
-        assert!(result.source.contains("(0, \"work\")"), "name table has work");
+        assert!(
+            result.source.contains("(0, \"work\")"),
+            "name table has work"
+        );
         // Allocator (case 1: absent)
-        assert!(result.source.contains("PianoAllocator<std::alloc::System>"), "allocator injected");
+        assert!(
+            result.source.contains("PianoAllocator<std::alloc::System>"),
+            "allocator injected"
+        );
         // Lifecycle in main
-        assert!(result.source.contains("ProfileSession::init"), "lifecycle in main");
+        assert!(
+            result.source.contains("ProfileSession::init"),
+            "lifecycle in main"
+        );
         // Valid syntax
         let re_parse = SourceFile::parse(&result.source, ra_ap_syntax::Edition::Edition2021);
         assert!(
             re_parse.errors().is_empty(),
             "output must be valid Rust. Errors: {:?}\nSource:\n{}",
-            re_parse.errors(), result.source
+            re_parse.errors(),
+            result.source
         );
     }
 
@@ -717,10 +801,22 @@ mod tests {
         };
         let result = instrument_source(source, &measured, Some(&ep)).unwrap();
 
-        assert!(result.source.contains("PianoAllocator<MyAlloc>"), "allocator wrapped");
-        assert!(result.source.contains("PianoAllocator::new(MyAlloc)"), "init wrapped");
-        assert!(result.source.contains("piano_runtime::enter(0)"), "work gets guard");
-        assert!(result.source.contains("ProfileSession::init"), "lifecycle in main");
+        assert!(
+            result.source.contains("PianoAllocator<MyAlloc>"),
+            "allocator wrapped"
+        );
+        assert!(
+            result.source.contains("PianoAllocator::new(MyAlloc)"),
+            "init wrapped"
+        );
+        assert!(
+            result.source.contains("piano_runtime::enter(0)"),
+            "work gets guard"
+        );
+        assert!(
+            result.source.contains("ProfileSession::init"),
+            "lifecycle in main"
+        );
     }
 
     #[test]
@@ -779,7 +875,9 @@ m!();
             SyntaxKind::ASSOC_ITEM_LIST,
             SyntaxKind::EXTERN_ITEM_LIST,
             SyntaxKind::STMT_LIST,
-        ].into_iter().collect();
+        ]
+        .into_iter()
+        .collect();
 
         assert_eq!(
             parent_kinds, expected,
@@ -797,12 +895,16 @@ m!();
             ("nested".into(), 6),
             ("outer".into(), 7),
             ("macro_fn".into(), 8),
-        ].into_iter().collect();
+        ]
+        .into_iter()
+        .collect();
 
         let result = instrument_source(source, &measured, None).unwrap();
 
         for (name, id) in &measured {
-            if name == "foreign" { continue; }
+            if name == "foreign" {
+                continue;
+            }
             let pattern = format!("piano_runtime::enter({id})");
             assert!(
                 result.source.contains(&pattern),
@@ -824,12 +926,13 @@ make_fn!(dynamic_fn);
 fn main() {}
 "#;
         let measured: HashMap<String, u32> = [("dynamic_fn".into(), 0)].into_iter().collect();
-        let result = instrument_source(source, &measured, None)
-            .expect("instrument_source should succeed");
+        let result =
+            instrument_source(source, &measured, None).expect("instrument_source should succeed");
 
         assert!(
             result.source.contains("piano_runtime::enter(0)"),
-            "metavar-expanded fn should get a guard. Got:\n{}", result.source
+            "metavar-expanded fn should get a guard. Got:\n{}",
+            result.source
         );
     }
 
@@ -842,12 +945,13 @@ fn main() {}
 "#;
         // unlisted_fn is NOT in the measured map.
         let measured: HashMap<String, u32> = HashMap::new();
-        let result = instrument_source(source, &measured, None)
-            .expect("instrument_source should succeed");
+        let result =
+            instrument_source(source, &measured, None).expect("instrument_source should succeed");
 
         assert!(
             !result.source.contains("piano_runtime::enter"),
-            "unmeasured macro fn should not get a guard. Got:\n{}", result.source
+            "unmeasured macro fn should not get a guard. Got:\n{}",
+            result.source
         );
     }
 
@@ -859,12 +963,13 @@ make_const!();
 fn main() {}
 "#;
         let measured: HashMap<String, u32> = [("fixed".into(), 0)].into_iter().collect();
-        let result = instrument_source(source, &measured, None)
-            .expect("instrument_source should succeed");
+        let result =
+            instrument_source(source, &measured, None).expect("instrument_source should succeed");
 
         assert!(
             !result.source.contains("piano_runtime::enter"),
-            "const fn from macro should be skipped. Got:\n{}", result.source
+            "const fn from macro should be skipped. Got:\n{}",
+            result.source
         );
     }
 
@@ -877,16 +982,19 @@ fn main() {}
 "#;
         // Only "tracked" is in the measured map.
         let measured: HashMap<String, u32> = [("tracked".into(), 0)].into_iter().collect();
-        let result = instrument_source(source, &measured, None)
-            .expect("instrument_source should succeed");
+        let result =
+            instrument_source(source, &measured, None).expect("instrument_source should succeed");
 
         assert!(
             result.source.contains("piano_runtime::enter(0)"),
-            "measured fn should get a guard. Got:\n{}", result.source
+            "measured fn should get a guard. Got:\n{}",
+            result.source
         );
         assert_eq!(
-            result.source.matches("piano_runtime::enter").count(), 1,
-            "only the measured fn should get a guard, not both. Got:\n{}", result.source
+            result.source.matches("piano_runtime::enter").count(),
+            1,
+            "only the measured fn should get a guard, not both. Got:\n{}",
+            result.source
         );
     }
 }

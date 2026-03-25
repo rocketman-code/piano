@@ -1,5 +1,5 @@
-use ra_ap_syntax::ast;
 use ra_ap_syntax::AstNode;
+use ra_ap_syntax::ast;
 
 /// Render a CST type node to a human-readable string.
 ///
@@ -229,7 +229,9 @@ mod tests {
         let source = format!("fn __dummy() -> {s} {{}}");
         let parse = ast::SourceFile::parse(&source, Edition::Edition2024);
         let file = parse.tree();
-        let func = file.syntax().descendants()
+        let func = file
+            .syntax()
+            .descendants()
             .find_map(ast::Fn::cast)
             .expect("should parse dummy fn");
         func.ret_type()
@@ -243,7 +245,9 @@ mod tests {
         let full = format!("{source} {{}}");
         let parse = ast::SourceFile::parse(&full, Edition::Edition2024);
         let file = parse.tree();
-        let imp = file.syntax().descendants()
+        let imp = file
+            .syntax()
+            .descendants()
             .find_map(ast::Impl::cast)
             .expect("should parse impl");
         let self_ty = imp.self_ty().expect("should have self type");
@@ -374,7 +378,10 @@ mod tests {
     #[test]
     fn render_impl_name_trait_impl() {
         let (self_ty, trait_ty) = parse_impl("impl Display for Foo");
-        assert_eq!(render_impl_name(&self_ty, trait_ty.as_ref()), "<Foo as Display>");
+        assert_eq!(
+            render_impl_name(&self_ty, trait_ty.as_ref()),
+            "<Foo as Display>"
+        );
     }
 
     #[test]

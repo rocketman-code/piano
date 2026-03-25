@@ -56,7 +56,8 @@ fn nested_piano_futures_self_time() {
         assert!(
             outer.self_ns < outer.inclusive_ns,
             "outer self ({}) must be < inclusive ({})",
-            outer.self_ns, outer.inclusive_ns
+            outer.self_ns,
+            outer.inclusive_ns
         );
     })
     .join()
@@ -102,8 +103,7 @@ fn make_waker() -> std::task::Waker {
     fn clone_fn(p: *const ()) -> RawWaker {
         RawWaker::new(p, &VTABLE)
     }
-    static VTABLE: RawWakerVTable =
-        RawWakerVTable::new(clone_fn, no_op, no_op, no_op);
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, no_op, no_op, no_op);
     unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }
 

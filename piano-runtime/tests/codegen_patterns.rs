@@ -23,10 +23,7 @@ fn measured_sync(x: i32) -> i32 {
 }
 
 async fn measured_async(x: i32) -> i32 {
-    piano_runtime::enter_async(1, async move {
-        x * 2
-    })
-    .await
+    piano_runtime::enter_async(1, async move { x * 2 }).await
 }
 
 fn outer_with_inner(x: i32) -> i32 {
@@ -194,8 +191,12 @@ fn siblings_both_aggregated() {
 
         {
             let _g1 = piano_runtime::enter(0);
-            { let _g2 = piano_runtime::enter(1); }
-            { let _g3 = piano_runtime::enter(2); }
+            {
+                let _g2 = piano_runtime::enter(1);
+            }
+            {
+                let _g3 = piano_runtime::enter(2);
+            }
         }
 
         let agg = drain_thread_agg();
@@ -220,8 +221,7 @@ fn async_preamble_has_nonzero_self_time() {
             fn clone_fn(p: *const ()) -> RawWaker {
                 RawWaker::new(p, &VTABLE)
             }
-            static VTABLE: RawWakerVTable =
-                RawWakerVTable::new(clone_fn, no_op, no_op, no_op);
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, no_op, no_op, no_op);
             unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
         }
 

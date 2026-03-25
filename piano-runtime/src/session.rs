@@ -52,7 +52,16 @@ impl ProfileSession {
 
         if let Some(ref fs) = file_sink {
             let mut file = fs.lock();
-            if write_header(&mut *file, names, calibration.bias_ns(), calibration.cpu_bias_ns(), run_id, timestamp_ms).is_err() {
+            if write_header(
+                &mut *file,
+                names,
+                calibration.bias_ns(),
+                calibration.cpu_bias_ns(),
+                run_id,
+                timestamp_ms,
+            )
+            .is_err()
+            {
                 fs.record_io_error();
             }
             if std::io::Write::flush(&mut *file).is_err() {
@@ -92,9 +101,7 @@ impl ProfileSession {
                 }
                 global
             })
-            .unwrap_or_else(|_| {
-                GLOBAL_SESSION.load(Ordering::Acquire)
-            });
+            .unwrap_or_else(|_| GLOBAL_SESSION.load(Ordering::Acquire));
 
         if ptr.is_null() {
             None

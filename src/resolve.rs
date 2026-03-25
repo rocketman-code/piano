@@ -139,8 +139,7 @@ pub fn resolve_targets(
                                 source,
                             }
                         })?;
-                        let (all_fns, file_skipped) =
-                            extract_functions(&source, rel_path(file));
+                        let (all_fns, file_skipped) = extract_functions(&source, rel_path(file));
                         all_seen_names.extend(all_fns.iter().map(|qf| qf.minimal.clone()));
                         let matched: Vec<crate::naming::QualifiedFunction> = all_fns
                             .into_iter()
@@ -185,8 +184,7 @@ pub fn resolve_targets(
                                 source,
                             }
                         })?;
-                        let (all_fns, file_skipped) =
-                            extract_functions(&source, rel_path(file));
+                        let (all_fns, file_skipped) = extract_functions(&source, rel_path(file));
                         all_seen_names.extend(all_fns.iter().map(|qf| qf.minimal.clone()));
                         if !all_fns.is_empty() {
                             merge_into(&mut results, file, all_fns);
@@ -216,8 +214,7 @@ pub fn resolve_targets(
                                 source,
                             }
                         })?;
-                        let (all_fns, file_skipped) =
-                            extract_functions(&source, rel_path(file));
+                        let (all_fns, file_skipped) = extract_functions(&source, rel_path(file));
                         all_seen_names.extend(all_fns.iter().map(|qf| qf.minimal.clone()));
                         if !all_fns.is_empty() {
                             merge_into(&mut results, file, all_fns);
@@ -378,9 +375,11 @@ pub(crate) fn extract_functions(
             let minimal = collector.scope.render_minimal(&qualified);
             let medium = collector.scope.render_medium(&qualified);
             let full = collector.scope.render_full(&qualified);
-            collector.functions.push(crate::naming::QualifiedFunction::new(
-                &minimal, &medium, &full,
-            ));
+            collector
+                .functions
+                .push(crate::naming::QualifiedFunction::new(
+                    &minimal, &medium, &full,
+                ));
         }
     }
 
@@ -389,10 +388,7 @@ pub(crate) fn extract_functions(
 
 /// Determine if a macro call at `byte_offset` is inside an `impl` block.
 /// If so, returns the impl type name (e.g., "S" or "S<T>").
-fn macro_call_impl_context(
-    root: &ra_ap_syntax::SyntaxNode,
-    byte_offset: usize,
-) -> Option<String> {
+fn macro_call_impl_context(root: &ra_ap_syntax::SyntaxNode, byte_offset: usize) -> Option<String> {
     use ra_ap_syntax::TextSize;
 
     // Find the deepest node covering this offset.
@@ -435,12 +431,11 @@ fn has_cfg_test_cst(attrs: impl Iterator<Item = ast::Attr>) -> bool {
         }
         // Check if the token tree content is just "test".
         // The token tree text is "(test)" -- strip parens and check.
-        a.token_tree()
-            .is_some_and(|tt| {
-                let text = tt.syntax().text().to_string();
-                let inner = text.trim_start_matches('(').trim_end_matches(')').trim();
-                inner == "test"
-            })
+        a.token_tree().is_some_and(|tt| {
+            let text = tt.syntax().text().to_string();
+            let inner = text.trim_start_matches('(').trim_end_matches(')').trim();
+            inner == "test"
+        })
     })
 }
 
@@ -999,7 +994,11 @@ mod tests {
         let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
         assert_eq!(result.targets.len(), 1);
-        let fns: Vec<&str> = result.targets[0].functions.iter().map(|qf| qf.minimal.as_str()).collect();
+        let fns: Vec<&str> = result.targets[0]
+            .functions
+            .iter()
+            .map(|qf| qf.minimal.as_str())
+            .collect();
         assert!(fns.contains(&"helper"));
         assert!(fns.contains(&"Resolver::internal_resolve"));
         assert!(fns.contains(&"Resolver::resolve"));
@@ -1014,7 +1013,11 @@ mod tests {
         let result = resolve_targets(&tmp.path().join("src"), &specs, false).unwrap();
 
         assert_eq!(result.targets.len(), 1);
-        let fns: Vec<&str> = result.targets[0].functions.iter().map(|qf| qf.minimal.as_str()).collect();
+        let fns: Vec<&str> = result.targets[0]
+            .functions
+            .iter()
+            .map(|qf| qf.minimal.as_str())
+            .collect();
         assert!(fns.contains(&"walk_dir"));
         assert!(fns.contains(&"scan"));
     }
@@ -1461,7 +1464,9 @@ mod tests {
             "unsafe fn should not be skipped: {skipped_names:?}"
         );
         assert!(
-            !skipped_names.iter().any(|(name, _)| *name == "Widget::raw_ptr"),
+            !skipped_names
+                .iter()
+                .any(|(name, _)| *name == "Widget::raw_ptr"),
             "unsafe impl method should not be skipped: {skipped_names:?}"
         );
 
@@ -1675,7 +1680,10 @@ fn main() {}
         // Verify classify_cst_fn extracts properties from CST ast::Fn
         // and delegates to the unified classify().
         let func = parse_fn("fn foo()");
-        assert!(matches!(classify_cst_fn(&func), Classification::Instrumentable));
+        assert!(matches!(
+            classify_cst_fn(&func),
+            Classification::Instrumentable
+        ));
 
         let func = parse_fn("const fn foo()");
         assert!(matches!(
@@ -1817,28 +1825,32 @@ fn main() {}
 "#;
         let (functions, _) = extract_functions(source, PathBuf::from("test.rs"));
         for f in &functions {
-            eprintln!("  minimal={:?}  medium={:?}  full={:?}", f.minimal, f.medium, f.full);
+            eprintln!(
+                "  minimal={:?}  medium={:?}  full={:?}",
+                f.minimal, f.medium, f.full
+            );
         }
 
         let macro_fn = functions.iter().find(|f| f.minimal.contains("get_value"));
-        let regular_fn = functions.iter().find(|f| f.minimal.contains("regular_method"));
+        let regular_fn = functions
+            .iter()
+            .find(|f| f.minimal.contains("regular_method"));
 
         assert!(
             macro_fn.is_some(),
             "macro-generated method should be discovered"
         );
-        assert!(
-            regular_fn.is_some(),
-            "regular method should be discovered"
-        );
+        assert!(regular_fn.is_some(), "regular method should be discovered");
 
         // Both should have the same S:: prefix
         assert_eq!(
-            macro_fn.unwrap().minimal, "S::get_value",
+            macro_fn.unwrap().minimal,
+            "S::get_value",
             "macro-generated method should be impl-qualified"
         );
         assert_eq!(
-            regular_fn.unwrap().minimal, "S::regular_method",
+            regular_fn.unwrap().minimal,
+            "S::regular_method",
             "regular method should be impl-qualified"
         );
     }

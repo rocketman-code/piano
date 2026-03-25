@@ -10,10 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 
 use crate::error::{Error, io_context};
-use crate::rewrite::{
-    instrument_source,
-    EntryPointParams,
-};
+use crate::rewrite::{EntryPointParams, instrument_source};
 use crate::source_map::SourceMap;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,14 +83,28 @@ impl ParsedRustcArgs {
             prev = arg;
         }
 
-        Self { crate_name, crate_type, source_file, is_info_query, has_print }
+        Self {
+            crate_name,
+            crate_type,
+            source_file,
+            is_info_query,
+            has_print,
+        }
     }
 
     pub fn should_skip(&self) -> bool {
-        if self.is_info_query || self.has_print { return true }
-        if self.crate_name.as_deref() == Some("build_script_build") { return true }
-        if self.crate_name.as_deref() == Some("___") { return true }
-        if self.crate_type.as_deref() == Some("proc-macro") { return true }
+        if self.is_info_query || self.has_print {
+            return true;
+        }
+        if self.crate_name.as_deref() == Some("build_script_build") {
+            return true;
+        }
+        if self.crate_name.as_deref() == Some("___") {
+            return true;
+        }
+        if self.crate_type.as_deref() == Some("proc-macro") {
+            return true;
+        }
         false
     }
 }
@@ -102,7 +113,10 @@ impl ParsedRustcArgs {
 pub fn run_wrapper() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        let _ = writeln!(std::io::stderr(), "piano wrapper: expected rustc path as first argument");
+        let _ = writeln!(
+            std::io::stderr(),
+            "piano wrapper: expected rustc path as first argument"
+        );
         return 1;
     }
 
@@ -124,7 +138,10 @@ pub fn run_wrapper() -> i32 {
     let config: WrapperConfig = match load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "piano wrapper: failed to read config: {e}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "piano wrapper: failed to read config: {e}"
+            );
             return 1;
         }
     };
@@ -143,13 +160,24 @@ pub fn run_wrapper() -> i32 {
 
     let crate_name = parsed.crate_name.as_deref().unwrap_or("unknown");
     match rewrite_and_compile(
-        real_rustc, &rustc_args, source_path, &source_key, &config,
-        Path::new(&config_path), crate_name,
+        real_rustc,
+        &rustc_args,
+        source_path,
+        &source_key,
+        &config,
+        Path::new(&config_path),
+        crate_name,
     ) {
         Ok(code) => code,
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "piano wrapper: failed to instrument {source_path}: {e}");
-            let _ = writeln!(std::io::stderr(), "piano wrapper: compiling without instrumentation");
+            let _ = writeln!(
+                std::io::stderr(),
+                "piano wrapper: failed to instrument {source_path}: {e}"
+            );
+            let _ = writeln!(
+                std::io::stderr(),
+                "piano wrapper: compiling without instrumentation"
+            );
             exec_rustc(real_rustc, &rustc_args)
         }
     }
@@ -178,7 +206,9 @@ fn rewrite_and_compile(
     let mut all_source_maps: Vec<(String, SourceMap)> = Vec::new();
 
     // Build entry point params (shared across all entry point calls)
-    let name_refs: Vec<(u32, &str)> = config.entry_point.name_table
+    let name_refs: Vec<(u32, &str)> = config
+        .entry_point
+        .name_table
         .iter()
         .map(|(id, name)| (*id, name.as_str()))
         .collect();
@@ -231,9 +261,11 @@ fn rewrite_and_compile(
     write_source_maps(&all_source_maps, config_path);
 
     // Phase 2: Create staging overlay
-    let ws_root = std::env::current_dir()
-        .map_err(io_context("get working directory", Path::new(".")))?;
-    let staging_root = config_path.parent().unwrap_or(Path::new("."))
+    let ws_root =
+        std::env::current_dir().map_err(io_context("get working directory", Path::new(".")))?;
+    let staging_root = config_path
+        .parent()
+        .unwrap_or(Path::new("."))
         .join(format!("staging-{crate_name}"));
     crate::staging::create_staging_overlay(&ws_root, &staging_root, &instrumented_files)?;
     let _staging_guard = crate::staging::StagingGuard(staging_root.clone());
@@ -259,7 +291,9 @@ fn rewrite_and_compile(
 }
 
 fn write_source_maps(entries: &[(String, SourceMap)], config_path: &Path) {
-    if entries.is_empty() { return }
+    if entries.is_empty() {
+        return;
+    }
     let maps_path = source_maps_path(config_path);
     let mut maps: HashMap<PathBuf, SourceMap> = std::fs::read_to_string(&maps_path)
         .ok()
@@ -278,7 +312,10 @@ fn exec_rustc(rustc: &str, args: &[String]) -> i32 {
     match status {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "piano wrapper: failed to execute {rustc}: {e}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "piano wrapper: failed to execute {rustc}: {e}"
+            );
             1
         }
     }

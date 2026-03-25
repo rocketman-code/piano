@@ -1343,7 +1343,9 @@ fn complex_cfg_allocator_negation_works() {
     let content = fs::read_to_string(&run_file).unwrap();
 
     let stats = common::aggregate_ndjson(&content);
-    let do_allocs = stats.get("do_allocs").expect("do_allocs should be in output");
+    let do_allocs = stats
+        .get("do_allocs")
+        .expect("do_allocs should be in output");
 
     assert!(
         do_allocs.alloc_count > 0,

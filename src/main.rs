@@ -332,7 +332,16 @@ fn run(cli: Cli) -> Result<(), Error> {
             output_dir,
         } => {
             let (show_all, limit) = resolve_display_limit(all, top);
-            cmd_report(run, show_all, limit, json, threads, uncorrected, &project_root, output_dir)
+            cmd_report(
+                run,
+                show_all,
+                limit,
+                json,
+                threads,
+                uncorrected,
+                &project_root,
+                output_dir,
+            )
         }
         Commands::Diff {
             a,
@@ -515,7 +524,11 @@ fn build_project(
         bin_rel.parent().unwrap_or(&pkg_root).to_path_buf()
     };
 
-    let ResolveResult { targets, skipped, all_functions } = resolve_targets(&src_dir, &specs, exact)?;
+    let ResolveResult {
+        targets,
+        skipped,
+        all_functions,
+    } = resolve_targets(&src_dir, &specs, exact)?;
 
     // Apply --skip: remove functions matching skip patterns from the measured set.
     // Two-phase precedence: selectors pick the inclusion set, --skip removes from it.
@@ -527,7 +540,9 @@ fn build_project(
             .filter_map(|mut t| {
                 t.functions.retain(|qf| {
                     let bare = qf.minimal.rsplit("::").next().unwrap_or(&qf.minimal);
-                    !skip_patterns.iter().any(|skip| bare == skip.as_str() || qf.minimal == *skip)
+                    !skip_patterns
+                        .iter()
+                        .any(|skip| bare == skip.as_str() || qf.minimal == *skip)
                 });
                 if t.functions.is_empty() {
                     None
@@ -619,7 +634,9 @@ fn build_project(
         .iter()
         .flat_map(|t| {
             let prefix = module_prefix(t.file.strip_prefix(&src_dir).unwrap_or(&t.file));
-            t.functions.iter().map(move |qf| qualify(&prefix, &qf.minimal))
+            t.functions
+                .iter()
+                .map(move |qf| qualify(&prefix, &qf.minimal))
         })
         .collect();
 
@@ -656,7 +673,9 @@ fn build_project(
             .filter_map(|qf| {
                 let qualified = qualify(&prefix, &qf.minimal);
                 if measured_names.contains(&qualified) {
-                    global_name_ids.get(&qualified).map(|&id| (qf.minimal.clone(), id))
+                    global_name_ids
+                        .get(&qualified)
+                        .map(|&id| (qf.minimal.clone(), id))
                 } else {
                     None
                 }
@@ -722,7 +741,6 @@ fn build_project(
     std::fs::write(&config_path, config_json)
         .map_err(io_context("write wrapper config", &config_path))?;
 
-
     // Build with wrapper
     let pkg_arg = if member_subdir.is_some() {
         Some(package_name.as_str())
@@ -736,7 +754,6 @@ fn build_project(
         bin.as_deref(),
         &config_path,
     )?;
-
 
     Ok(Some((binary, runs_dir, total_fns)))
 }
@@ -1029,7 +1046,9 @@ fn cmd_run(
 
     // When --output-dir is provided, override the runs directory via env var
     // so the instrumented binary writes output there.
-    let output_dir_str = output_dir.as_ref().map(|d| d.to_string_lossy().into_owned());
+    let output_dir_str = output_dir
+        .as_ref()
+        .map(|d| d.to_string_lossy().into_owned());
     let env: Vec<(&str, &str)> = match &output_dir_str {
         Some(dir) => vec![("PIANO_RUNS_DIR", dir.as_str())],
         None => vec![],
@@ -1098,9 +1117,7 @@ fn cmd_profile(
                 "warning: program exited with code {code}; profiling results may be incomplete"
             );
         } else {
-            eprintln!(
-                "warning: program terminated by signal; profiling results may be incomplete"
-            );
+            eprintln!("warning: program terminated by signal; profiling results may be incomplete");
         }
     }
 
@@ -1128,7 +1145,16 @@ fn cmd_profile(
     }
 
     eprintln!("--- profiling report ---");
-    let report_result = match cmd_report(None, show_all, limit, json, threads, false, project_root, None) {
+    let report_result = match cmd_report(
+        None,
+        show_all,
+        limit,
+        json,
+        threads,
+        false,
+        project_root,
+        None,
+    ) {
         Ok(()) => Ok(()),
         Err(Error::NoRuns)
             if !outcome.status.success() && !ignore_exit_code && !intentional_stop =>
@@ -1243,10 +1269,7 @@ fn cmd_report(
                                 .expect("JSON serialization should not fail")
                         );
                     } else {
-                        anstream::print!(
-                            "{}",
-                            format_per_thread_tables(&runs, show_all, limit)
-                        );
+                        anstream::print!("{}", format_per_thread_tables(&runs, show_all, limit));
                     }
                 }
                 None => {
@@ -1277,7 +1300,10 @@ fn cmd_report(
     if threads {
         let dir = default_runs_dir(project_root)?;
         let thread_runs = load_latest_runs_per_thread(&dir)?;
-        anstream::print!("{}", format_per_thread_tables(&thread_runs, show_all, limit));
+        anstream::print!(
+            "{}",
+            format_per_thread_tables(&thread_runs, show_all, limit)
+        );
         return Ok(());
     }
 
@@ -1333,7 +1359,10 @@ fn cmd_diff(
             if json {
                 println!("{}", diff_runs_json(&run_a, &run_b, show_all, limit));
             } else {
-                anstream::print!("{}", diff_runs(&run_a, &run_b, &label_a, &label_b, show_all, limit));
+                anstream::print!(
+                    "{}",
+                    diff_runs(&run_a, &run_b, &label_a, &label_b, show_all, limit)
+                );
             }
         }
         (None, None) => {
@@ -1347,7 +1376,10 @@ fn cmd_diff(
                 let label_a = resolve_diff_label(&tags_dir, &previous, &runs_dir, "previous");
                 let label_b = resolve_diff_label(&tags_dir, &latest, &runs_dir, "latest");
                 eprintln!("comparing: {label_a} vs {label_b}");
-                anstream::print!("{}", diff_runs(&previous, &latest, &label_a, &label_b, show_all, limit));
+                anstream::print!(
+                    "{}",
+                    diff_runs(&previous, &latest, &label_a, &label_b, show_all, limit)
+                );
             }
         }
         _ => {
@@ -1390,7 +1422,11 @@ fn resolve_diff_label(
     format!("{role} ({stem})")
 }
 
-fn cmd_tag(name: Option<String>, project_root: &Option<PathBuf>, output_dir: Option<PathBuf>) -> Result<(), Error> {
+fn cmd_tag(
+    name: Option<String>,
+    project_root: &Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+) -> Result<(), Error> {
     // When --output-dir is provided, set the env var so default_runs_dir picks it up.
     if let Some(ref dir) = output_dir {
         // SAFETY: single-threaded CLI -- no concurrent env reads.

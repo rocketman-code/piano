@@ -13,9 +13,11 @@
 //! (guard injection) depend on it.
 
 use ra_ap_mbe::DeclarativeMacro;
-use ra_ap_span::{Edition, EditionedFileId, ErasedFileAstId, FileId, Span, SpanAnchor, SyntaxContext};
-use ra_ap_syntax::{AstNode, SourceFile, SyntaxKind, SyntaxNode, ast};
+use ra_ap_span::{
+    Edition, EditionedFileId, ErasedFileAstId, FileId, Span, SpanAnchor, SyntaxContext,
+};
 use ra_ap_syntax::ast::HasName;
+use ra_ap_syntax::{AstNode, SourceFile, SyntaxKind, SyntaxNode, ast};
 use ra_ap_tt::TextRange;
 
 /// A macro_rules! definition found in the source.
@@ -52,12 +54,17 @@ pub(crate) fn find_macro_defs(root: &SyntaxNode) -> Vec<MacroDef> {
         if node.kind() != SyntaxKind::MACRO_RULES {
             continue;
         }
-        let Some(mac) = ast::MacroRules::cast(node) else { continue };
+        let Some(mac) = ast::MacroRules::cast(node) else {
+            continue;
+        };
         let name = mac.name().map(|n| n.text().to_string()).unwrap_or_default();
         let Some(tt) = mac.token_tree() else { continue };
         let tt_text = tt.syntax().text().to_string();
         let body = strip_outer_delimiters(&tt_text);
-        defs.push(MacroDef { name, body_text: body });
+        defs.push(MacroDef {
+            name,
+            body_text: body,
+        });
     }
     defs
 }
@@ -69,9 +76,15 @@ pub(crate) fn find_macro_calls(root: &SyntaxNode) -> Vec<MacroCall> {
         if node.kind() != SyntaxKind::MACRO_CALL {
             continue;
         }
-        let Some(mac) = ast::MacroCall::cast(node.clone()) else { continue };
-        let name = mac.path().map(|p| p.syntax().text().to_string()).unwrap_or_default();
-        let args_text = mac.token_tree()
+        let Some(mac) = ast::MacroCall::cast(node.clone()) else {
+            continue;
+        };
+        let name = mac
+            .path()
+            .map(|p| p.syntax().text().to_string())
+            .unwrap_or_default();
+        let args_text = mac
+            .token_tree()
             .map(|tt| strip_outer_delimiters(&tt.syntax().text().to_string()))
             .unwrap_or_default();
 
@@ -119,8 +132,9 @@ pub(crate) fn expand_macro(def: &MacroDef, call: &MacroCall) -> Result<String, S
         ast_id: ErasedFileAstId::from_raw(0),
     };
 
-    let arg_tt = ra_ap_syntax_bridge::parse_to_token_tree(edition, call_anchor, ctx, &call.args_text)
-        .ok_or_else(|| format!("failed to parse invocation args for '{}'", call.name))?;
+    let arg_tt =
+        ra_ap_syntax_bridge::parse_to_token_tree(edition, call_anchor, ctx, &call.args_text)
+            .ok_or_else(|| format!("failed to parse invocation args for '{}'", call.name))?;
 
     let call_site = Span {
         range: TextRange::up_to(ra_ap_tt::TextSize::of(&call.args_text)),
@@ -178,8 +192,12 @@ pub(crate) fn expand_fn_generating_macros(
     let mut expansions = Vec::new();
 
     for (i, call) in calls.iter().enumerate() {
-        let Some(def) = def_map.get(call.name.as_str()) else { continue };
-        let Ok(expanded) = expand_macro(def, call) else { continue };
+        let Some(def) = def_map.get(call.name.as_str()) else {
+            continue;
+        };
+        let Ok(expanded) = expand_macro(def, call) else {
+            continue;
+        };
         let fn_names = find_fn_names(&expanded);
 
         // Safety fence: skip if expansion contains no fn items.
@@ -224,21 +242,25 @@ mod tests {
 
     #[test]
     fn literal_template_expands() {
-        let (exps, _) = parse_and_expand(r#"
+        let (exps, _) = parse_and_expand(
+            r#"
             macro_rules! setup { () => { fn process() { let _ = 1; } }; }
             setup!();
-        "#);
+        "#,
+        );
         assert_eq!(exps.len(), 1);
         assert_eq!(exps[0].fn_names, vec!["process"]);
     }
 
     #[test]
     fn ident_metavar_expands() {
-        let (exps, _) = parse_and_expand(r#"
+        let (exps, _) = parse_and_expand(
+            r#"
             macro_rules! make_fn { ($name:ident) => { fn $name() { let _ = 1; } }; }
             make_fn!(compute);
             make_fn!(helper);
-        "#);
+        "#,
+        );
         assert_eq!(exps.len(), 2);
         assert_eq!(exps[0].fn_names, vec!["compute"]);
         assert_eq!(exps[1].fn_names, vec!["helper"]);
@@ -246,91 +268,125 @@ mod tests {
 
     #[test]
     fn multiple_fns_in_template() {
-        let (exps, _) = parse_and_expand(r#"
+        let (exps, _) = parse_and_expand(
+            r#"
             macro_rules! pair { () => { fn alpha() {} fn beta() {} }; }
             pair!();
-        "#);
+        "#,
+        );
         assert_eq!(exps.len(), 1);
         assert_eq!(exps[0].fn_names, vec!["alpha", "beta"]);
     }
 
     #[test]
     fn expr_metavar_expands() {
-        let (exps, _) = parse_and_expand(r#"
+        let (exps, _) = parse_and_expand(
+            r#"
             macro_rules! make_fn {
                 ($name:ident, $body:expr) => { fn $name() -> u64 { $body } };
             }
             make_fn!(compute, { let mut s = 0u64; for i in 0..100 { s += i; } s });
-        "#);
+        "#,
+        );
         assert_eq!(exps.len(), 1);
         assert_eq!(exps[0].fn_names, vec!["compute"]);
     }
 
     #[test]
     fn safety_fence_skips_expression_macros() {
-        let (exps, _) = parse_and_expand(r#"
+        let (exps, _) = parse_and_expand(
+            r#"
             macro_rules! compute_value { ($x:expr) => { { let h = $x * 2; h + 1 } }; }
             fn main() { let r = compute_value!(5); }
-        "#);
-        assert!(exps.is_empty(), "expression-position macro should be skipped");
+        "#,
+        );
+        assert!(
+            exps.is_empty(),
+            "expression-position macro should be skipped"
+        );
     }
 
     #[test]
     fn impl_block_macro_expands() {
-        let (exps, _) = parse_and_expand(r#"
+        let (exps, _) = parse_and_expand(
+            r#"
             struct S;
             macro_rules! add_method { ($name:ident) => { fn $name(&self) -> u32 { 42 } }; }
             impl S { add_method!(get_value); }
-        "#);
+        "#,
+        );
         assert_eq!(exps.len(), 1);
         assert_eq!(exps[0].fn_names, vec!["get_value"]);
     }
 
     #[test]
     fn external_macro_call_skipped() {
-        let (exps, _) = parse_and_expand(r#"
+        let (exps, _) = parse_and_expand(
+            r#"
             fn main() { println!("hello"); }
-        "#);
-        assert!(exps.is_empty(), "external macro call with no local def should produce no expansions");
+        "#,
+        );
+        assert!(
+            exps.is_empty(),
+            "external macro call with no local def should produce no expansions"
+        );
     }
 
     #[test]
     fn expand_failure_silently_skipped() {
         // Macro expects one ident arg, but invocation provides two -- expansion should
         // fail silently (no panic), and the call is skipped.
-        let (exps, _) = parse_and_expand(r#"
+        let (exps, _) = parse_and_expand(
+            r#"
             macro_rules! make_fn { ($name:ident) => { fn $name() {} }; }
             make_fn!(a, b);
-        "#);
-        assert!(exps.is_empty(), "failed expansion should be silently skipped");
+        "#,
+        );
+        assert!(
+            exps.is_empty(),
+            "failed expansion should be silently skipped"
+        );
     }
 
     #[test]
     fn empty_source_produces_no_expansions() {
         let (exps, calls) = parse_and_expand("fn main() { let x = 1; }");
-        assert!(exps.is_empty(), "source with no macros should produce no expansions");
-        assert!(calls.is_empty(), "source with no macros should produce no calls");
+        assert!(
+            exps.is_empty(),
+            "source with no macros should produce no expansions"
+        );
+        assert!(
+            calls.is_empty(),
+            "source with no macros should produce no calls"
+        );
     }
 
     #[test]
     fn defs_without_calls_produce_no_expansions() {
-        let (exps, _) = parse_and_expand(r#"
+        let (exps, _) = parse_and_expand(
+            r#"
             macro_rules! unused { () => { fn ghost() {} }; }
             fn main() {}
-        "#);
-        assert!(exps.is_empty(), "defined but never invoked macro should produce no expansions");
+        "#,
+        );
+        assert!(
+            exps.is_empty(),
+            "defined but never invoked macro should produce no expansions"
+        );
     }
 
     #[test]
     fn multiple_rules_macro() {
-        let (exps, _) = parse_and_expand(r#"
+        let (exps, _) = parse_and_expand(
+            r#"
             macro_rules! make {
                 (fast $name:ident) => { fn $name() { let _ = "fast"; } };
                 (slow $name:ident) => { fn $name() { let _ = "slow"; } };
             }
             make!(fast speedy);
             make!(slow turtle);
-        "#);
+        "#,
+        );
         assert_eq!(exps.len(), 2, "both invocations should expand");
         assert_eq!(exps[0].fn_names, vec!["speedy"]);
         assert_eq!(exps[1].fn_names, vec!["turtle"]);
@@ -338,13 +394,19 @@ mod tests {
 
     #[test]
     fn repetition_pattern_expands() {
-        let (exps, _) = parse_and_expand(r#"
+        let (exps, _) = parse_and_expand(
+            r#"
             macro_rules! make_fns {
                 ($($name:ident),*) => { $(fn $name() { let _ = 1; })* };
             }
             make_fns!(a, b, c);
-        "#);
-        assert_eq!(exps.len(), 1, "single invocation should produce one expansion");
+        "#,
+        );
+        assert_eq!(
+            exps.len(),
+            1,
+            "single invocation should produce one expansion"
+        );
         assert_eq!(exps[0].fn_names, vec!["a", "b", "c"]);
     }
 

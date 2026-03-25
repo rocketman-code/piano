@@ -60,10 +60,12 @@ pub(crate) fn register(
     #[cfg(unix)]
     signal::register(names, &file_sink, &agg_registry);
 
-    let mut state = shutdown_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    *state = Some(ShutdownState { file_sink, names, agg_registry });
+    let mut state = shutdown_state().lock().unwrap_or_else(|e| e.into_inner());
+    *state = Some(ShutdownState {
+        file_sink,
+        names,
+        agg_registry,
+    });
 
     // Register atexit handler. Multiple registrations are safe --
     // each invocation drains (first finds data, subsequent find empty).
@@ -81,9 +83,7 @@ extern "C" fn atexit_handler() {
     // Clone Arcs and names pointer, then release the shutdown state
     // lock before doing any I/O. Minimizes lock hold time.
     let (file_sink, names, agg_registry) = {
-        let state = shutdown_state()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let state = shutdown_state().lock().unwrap_or_else(|e| e.into_inner());
         match state.as_ref() {
             Some(s) => (
                 Arc::clone(&s.file_sink),
@@ -104,7 +104,14 @@ extern "C" fn atexit_handler() {
             file_sink.record_io_error();
         }
     }
-    if crate::output::write_trailer(&mut *file, names, calibration.bias_ns(), calibration.cpu_bias_ns()).is_err() {
+    if crate::output::write_trailer(
+        &mut *file,
+        names,
+        calibration.bias_ns(),
+        calibration.cpu_bias_ns(),
+    )
+    .is_err()
+    {
         file_sink.record_io_error();
     }
     if std::io::Write::flush(&mut *file).is_err() {
@@ -188,7 +195,9 @@ mod signal {
                             for a in buf.drain(..) {
                                 let mut stack_buf = [0u8; 512];
                                 let len = serialize_aggregate_to_stack(
-                                    &mut stack_buf, &a, thread_idx as u64,
+                                    &mut stack_buf,
+                                    &a,
+                                    thread_idx as u64,
                                 );
                                 write(fd, stack_buf.as_ptr(), len);
                             }
@@ -238,8 +247,11 @@ mod signal {
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             let calibration = crate::time::CalibrationData::calibrate();
-            let trailer_bytes = serialize_trailer(names, calibration.bias_ns(), calibration.cpu_bias_ns());
-            let trailer = Box::new(SignalTrailer { bytes: trailer_bytes });
+            let trailer_bytes =
+                serialize_trailer(names, calibration.bias_ns(), calibration.cpu_bias_ns());
+            let trailer = Box::new(SignalTrailer {
+                bytes: trailer_bytes,
+            });
             TRAILER.store(Box::into_raw(trailer) as usize, Ordering::Relaxed);
 
             let file = file_sink.lock();
