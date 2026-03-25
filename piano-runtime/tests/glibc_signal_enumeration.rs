@@ -19,45 +19,44 @@ fn posix_signals_exhaustive() {
     struct Signal {
         name: &'static str,
         number: i32,
-        default_action: &'static str,
         piano_handles: bool,
-        reason: &'static str,
     }
 
     let signals = [
         // ISO C99 signals
-        Signal { name: "SIGHUP",    number: 1,  default_action: "T", piano_handles: false, reason: "programs use SIGHUP for config reload; overriding breaks that convention" },
-        Signal { name: "SIGINT",    number: 2,  default_action: "T", piano_handles: true,  reason: "user interrupt (Ctrl+C); most common graceful termination path" },
-        Signal { name: "SIGQUIT",   number: 3,  default_action: "C", piano_handles: false, reason: "user wants core dump, not graceful shutdown" },
-        Signal { name: "SIGILL",    number: 4,  default_action: "C", piano_handles: false, reason: "program bug; undefined behavior, data structures may be corrupt" },
-        Signal { name: "SIGTRAP",   number: 5,  default_action: "C", piano_handles: false, reason: "debugger breakpoint; not a user termination signal" },
-        Signal { name: "SIGABRT",   number: 6,  default_action: "C", piano_handles: false, reason: "abort(); may be called from within another signal handler" },
-        Signal { name: "SIGBUS",    number: 7,  default_action: "C", piano_handles: false, reason: "hardware fault; data structures may be corrupt" },
-        Signal { name: "SIGFPE",    number: 8,  default_action: "C", piano_handles: false, reason: "arithmetic fault; program bug" },
-        Signal { name: "SIGKILL",   number: 9,  default_action: "T", piano_handles: false, reason: "uncatchable by POSIX spec" },
-        Signal { name: "SIGUSR1",   number: 10, default_action: "T", piano_handles: false, reason: "user-defined; overriding breaks application protocol" },
-        Signal { name: "SIGSEGV",   number: 11, default_action: "C", piano_handles: false, reason: "program bug; undefined behavior, stack may be corrupt" },
-        Signal { name: "SIGUSR2",   number: 12, default_action: "T", piano_handles: false, reason: "user-defined; overriding breaks application protocol" },
-        Signal { name: "SIGPIPE",   number: 13, default_action: "T", piano_handles: false, reason: "Rust ignores SIGPIPE by default (returns EPIPE instead)" },
-        Signal { name: "SIGALRM",   number: 14, default_action: "T", piano_handles: false, reason: "timer; overriding breaks application timers" },
-        Signal { name: "SIGTERM",   number: 15, default_action: "T", piano_handles: true,  reason: "graceful termination; standard process management signal" },
+        // T=terminate, C=core dump, S=stop, I=ignore (POSIX default actions)
+        Signal { name: "SIGHUP",    number: 1,  piano_handles: false }, // T: programs use for config reload
+        Signal { name: "SIGINT",    number: 2,  piano_handles: true  }, // T: user interrupt (Ctrl+C)
+        Signal { name: "SIGQUIT",   number: 3,  piano_handles: false }, // C: user wants core dump
+        Signal { name: "SIGILL",    number: 4,  piano_handles: false }, // C: program bug
+        Signal { name: "SIGTRAP",   number: 5,  piano_handles: false }, // C: debugger breakpoint
+        Signal { name: "SIGABRT",   number: 6,  piano_handles: false }, // C: abort()
+        Signal { name: "SIGBUS",    number: 7,  piano_handles: false }, // C: hardware fault
+        Signal { name: "SIGFPE",    number: 8,  piano_handles: false }, // C: arithmetic fault
+        Signal { name: "SIGKILL",   number: 9,  piano_handles: false }, // T: uncatchable
+        Signal { name: "SIGUSR1",   number: 10, piano_handles: false }, // T: user-defined
+        Signal { name: "SIGSEGV",   number: 11, piano_handles: false }, // C: program bug
+        Signal { name: "SIGUSR2",   number: 12, piano_handles: false }, // T: user-defined
+        Signal { name: "SIGPIPE",   number: 13, piano_handles: false }, // T: Rust ignores by default
+        Signal { name: "SIGALRM",   number: 14, piano_handles: false }, // T: timer
+        Signal { name: "SIGTERM",   number: 15, piano_handles: true  }, // T: graceful termination
         // Linux-specific (from signum-arch.h)
-        Signal { name: "SIGSTKFLT", number: 16, default_action: "T", piano_handles: false, reason: "obsolete (coprocessor stack fault)" },
-        Signal { name: "SIGCHLD",   number: 17, default_action: "I", piano_handles: false, reason: "ignored by default; not a termination signal" },
-        Signal { name: "SIGCONT",   number: 18, default_action: "I", piano_handles: false, reason: "resumes stopped process; not a termination signal" },
-        Signal { name: "SIGSTOP",   number: 19, default_action: "S", piano_handles: false, reason: "uncatchable by POSIX spec" },
-        Signal { name: "SIGTSTP",   number: 20, default_action: "S", piano_handles: false, reason: "stop signal (Ctrl+Z); not a termination signal" },
-        Signal { name: "SIGTTIN",   number: 21, default_action: "S", piano_handles: false, reason: "background read; stop signal, not termination" },
-        Signal { name: "SIGTTOU",   number: 22, default_action: "S", piano_handles: false, reason: "background write; stop signal, not termination" },
-        Signal { name: "SIGURG",    number: 23, default_action: "I", piano_handles: false, reason: "ignored by default; not a termination signal" },
-        Signal { name: "SIGXCPU",   number: 24, default_action: "C", piano_handles: false, reason: "resource limit; program should fix its CPU usage, not mask the signal" },
-        Signal { name: "SIGXFSZ",   number: 25, default_action: "C", piano_handles: false, reason: "resource limit; program should fix its file sizes" },
-        Signal { name: "SIGVTALRM", number: 26, default_action: "T", piano_handles: false, reason: "virtual timer; overriding breaks application timers" },
-        Signal { name: "SIGPROF",   number: 27, default_action: "T", piano_handles: false, reason: "profiling timer; conflicts with piano's own profiling" },
-        Signal { name: "SIGWINCH",  number: 28, default_action: "I", piano_handles: false, reason: "ignored by default; terminal resize, not termination" },
-        Signal { name: "SIGPOLL",   number: 29, default_action: "T", piano_handles: false, reason: "pollable event; rarely used in modern code" },
-        Signal { name: "SIGPWR",    number: 30, default_action: "T", piano_handles: false, reason: "power failure; platform-specific UPS signal" },
-        Signal { name: "SIGSYS",    number: 31, default_action: "C", piano_handles: false, reason: "bad syscall; program bug in seccomp/sandbox" },
+        Signal { name: "SIGSTKFLT", number: 16, piano_handles: false }, // T: obsolete
+        Signal { name: "SIGCHLD",   number: 17, piano_handles: false }, // I: not termination
+        Signal { name: "SIGCONT",   number: 18, piano_handles: false }, // I: resumes stopped process
+        Signal { name: "SIGSTOP",   number: 19, piano_handles: false }, // S: uncatchable
+        Signal { name: "SIGTSTP",   number: 20, piano_handles: false }, // S: Ctrl+Z
+        Signal { name: "SIGTTIN",   number: 21, piano_handles: false }, // S: background read
+        Signal { name: "SIGTTOU",   number: 22, piano_handles: false }, // S: background write
+        Signal { name: "SIGURG",    number: 23, piano_handles: false }, // I: not termination
+        Signal { name: "SIGXCPU",   number: 24, piano_handles: false }, // C: resource limit
+        Signal { name: "SIGXFSZ",   number: 25, piano_handles: false }, // C: resource limit
+        Signal { name: "SIGVTALRM", number: 26, piano_handles: false }, // T: virtual timer
+        Signal { name: "SIGPROF",   number: 27, piano_handles: false }, // T: profiling timer
+        Signal { name: "SIGWINCH",  number: 28, piano_handles: false }, // I: terminal resize
+        Signal { name: "SIGPOLL",   number: 29, piano_handles: false }, // T: pollable event
+        Signal { name: "SIGPWR",    number: 30, piano_handles: false }, // T: power failure
+        Signal { name: "SIGSYS",    number: 31, piano_handles: false }, // C: bad syscall
     ];
 
     // Verify the signal constants match the system headers
