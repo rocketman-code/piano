@@ -95,4 +95,9 @@ exclude_re = [
     # exercised by shutdown.rs (atexit_handler) which is itself excluded
     # as process-lifecycle code.
     "drain_all_agg",
+
+    # --- output.rs: control char boundary ---
+    # b < 0x20 vs b <= 0x20: byte 0x20 is space, which is valid
+    # unescaped in JSON. Both produce correct output. False positive.
+    "replace < with <= in write_json_escaped",
 ]
