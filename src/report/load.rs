@@ -734,6 +734,31 @@ mod tests {
         )
     }
 
+    /// Build an NDJSON aggregate line.
+    fn ndjson_aggregate(
+        thread: u64,
+        name_id: u32,
+        calls: u64,
+        self_ns: u64,
+        inclusive_ns: u64,
+        cpu_self_ns: u64,
+        alloc_count: u64,
+        alloc_bytes: u64,
+        free_count: u64,
+        free_bytes: u64,
+    ) -> String {
+        format!(
+            concat!(
+                "{{\"thread\":{},\"name_id\":{},\"calls\":{},\"self_ns\":{},",
+                "\"inclusive_ns\":{},\"cpu_self_ns\":{},",
+                "\"alloc_count\":{},\"alloc_bytes\":{},",
+                "\"free_count\":{},\"free_bytes\":{}}}"
+            ),
+            thread, name_id, calls, self_ns, inclusive_ns, cpu_self_ns,
+            alloc_count, alloc_bytes, free_count, free_bytes,
+        )
+    }
+
     fn sample_json() -> &'static str {
         r#"{
             "timestamp_ms": 1700000000000,
@@ -1548,5 +1573,126 @@ mod tests {
             "expected ~0.004ms, got {}",
             physics.self_ms
         );
+    }
+
+    // --- C1: Aggregate-to-Run equivalence (load.rs:49-67 vs load.rs:68-74) ---
+    //
+    // The aggregate path (new format) and raw span path (old format) must produce
+    // identical FnEntry fields for equivalent profiling data.
+
+    #[test]
+    fn c1_flat_spans_match_aggregates() {
+        // Three root spans (no parent-child), two functions.
+        // self_time == inclusive_time since there are no children.
+        //
+        // work (name_id 0): 2 calls, 5000ns each, 3000ns CPU each, 1 alloc of 64 bytes each
+        // helper (name_id 1): 1 call, 2000ns, 1000ns CPU, 0 allocs
+        let dir = TempDir::new().unwrap();
+        let names = &[(0, "work"), (1, "helper")];
+
+        // Raw spans version
+        let span_content = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            ndjson_header("equiv_1", 5000, names),
+            ndjson_measurement(1, 0, 0, 1000, 6000, 1, 100, 3100, 1, 64),
+            ndjson_measurement(2, 0, 1, 7000, 9000, 1, 3200, 4200, 0, 0),
+            ndjson_measurement(3, 0, 0, 10000, 15000, 1, 4300, 7300, 1, 64),
+            ndjson_trailer(names),
+        );
+        let span_path = dir.path().join("spans.ndjson");
+        fs::write(&span_path, span_content).unwrap();
+
+        // Aggregate version (pre-computed self-time matching the span tree output)
+        let agg_content = format!(
+            "{}\n{}\n{}\n{}\n",
+            ndjson_header("equiv_1", 5000, names),
+            ndjson_aggregate(0, 0, 2, 10000, 10000, 6000, 2, 128, 0, 0),
+            ndjson_aggregate(0, 1, 1, 2000, 2000, 1000, 0, 0, 0, 0),
+            ndjson_trailer(names),
+        );
+        let agg_path = dir.path().join("aggs.ndjson");
+        fs::write(&agg_path, agg_content).unwrap();
+
+        let (span_run, _) = load_ndjson(&span_path, false).unwrap();
+        let (agg_run, _) = load_ndjson(&agg_path, false).unwrap();
+
+        assert_eq!(span_run.functions.len(), agg_run.functions.len());
+        for (s, a) in span_run.functions.iter().zip(agg_run.functions.iter()) {
+            assert_eq!(s.name, a.name, "name mismatch");
+            assert_eq!(s.calls, a.calls, "calls mismatch for {}", s.name);
+            assert!(
+                (s.self_ms - a.self_ms).abs() < 1e-9,
+                "self_ms mismatch for {}: span={} agg={}", s.name, s.self_ms, a.self_ms,
+            );
+            assert_eq!(
+                s.cpu_self_ms.is_some(), a.cpu_self_ms.is_some(),
+                "cpu_self_ms presence mismatch for {}", s.name,
+            );
+            if let (Some(sc), Some(ac)) = (s.cpu_self_ms, a.cpu_self_ms) {
+                assert!(
+                    (sc - ac).abs() < 1e-9,
+                    "cpu_self_ms mismatch for {}: span={} agg={}", s.name, sc, ac,
+                );
+            }
+            assert_eq!(s.alloc_count, a.alloc_count, "alloc_count mismatch for {}", s.name);
+            assert_eq!(s.alloc_bytes, a.alloc_bytes, "alloc_bytes mismatch for {}", s.name);
+            assert_eq!(s.free_count, a.free_count, "free_count mismatch for {}", s.name);
+            assert_eq!(s.free_bytes, a.free_bytes, "free_bytes mismatch for {}", s.name);
+        }
+    }
+
+    #[test]
+    fn c1_parent_child_spans_match_aggregates() {
+        // Parent-child relationship: self-time != inclusive-time.
+        //
+        // outer (name_id 0): span 0-10000ns, contains inner as child
+        //   inner (name_id 1): span 2000-7000ns (child of outer)
+        //
+        // Self-attribution from span tree:
+        //   outer: inclusive=10000, children_wall=5000, self=5000
+        //   inner: inclusive=5000, no children, self=5000
+        let dir = TempDir::new().unwrap();
+        let names = &[(0, "outer"), (1, "inner")];
+
+        // Raw spans version
+        let span_content = format!(
+            "{}\n{}\n{}\n{}\n",
+            ndjson_header("equiv_2", 6000, names),
+            ndjson_measurement(1, 0, 0, 0, 10000, 1, 0, 8000, 3, 192),
+            ndjson_measurement(2, 1, 1, 2000, 7000, 1, 0, 4000, 1, 64),
+            ndjson_trailer(names),
+        );
+        let span_path = dir.path().join("parent_child_spans.ndjson");
+        fs::write(&span_path, span_content).unwrap();
+
+        // Aggregate version with pre-computed self-time
+        // outer: self_ns = 10000 - 5000 = 5000, inclusive = 10000
+        //        cpu_self = 8000 - 4000 = 4000
+        //        alloc: 3 - 1 = 2 count, 192 - 64 = 128 bytes
+        // inner: self_ns = 5000, inclusive = 5000, cpu_self = 4000
+        //        alloc: 1 count, 64 bytes
+        let agg_content = format!(
+            "{}\n{}\n{}\n{}\n",
+            ndjson_header("equiv_2", 6000, names),
+            ndjson_aggregate(0, 0, 1, 5000, 10000, 4000, 2, 128, 0, 0),
+            ndjson_aggregate(0, 1, 1, 5000, 5000, 4000, 1, 64, 0, 0),
+            ndjson_trailer(names),
+        );
+        let agg_path = dir.path().join("parent_child_aggs.ndjson");
+        fs::write(&agg_path, agg_content).unwrap();
+
+        let (span_run, _) = load_ndjson(&span_path, false).unwrap();
+        let (agg_run, _) = load_ndjson(&agg_path, false).unwrap();
+
+        for (s, a) in span_run.functions.iter().zip(agg_run.functions.iter()) {
+            assert_eq!(s.name, a.name, "name mismatch");
+            assert_eq!(s.calls, a.calls, "calls mismatch for {}", s.name);
+            assert!(
+                (s.self_ms - a.self_ms).abs() < 1e-9,
+                "self_ms mismatch for {}: span={} agg={}", s.name, s.self_ms, a.self_ms,
+            );
+            assert_eq!(s.alloc_count, a.alloc_count, "alloc_count mismatch for {}", s.name);
+            assert_eq!(s.alloc_bytes, a.alloc_bytes, "alloc_bytes mismatch for {}", s.name);
+        }
     }
 }
