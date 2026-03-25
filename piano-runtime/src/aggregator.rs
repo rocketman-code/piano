@@ -1,6 +1,6 @@
 //! In-flight per-function aggregation.
 //!
-//! Each thread maintains a Vec<FnAgg> that accumulates self-time, call
+//! Each thread maintains a `Vec<FnAgg>` that accumulates self-time, call
 //! counts, and allocation deltas as Guards drop. At shutdown, the vecs
 //! are drained and written as summary NDJSON (one line per function per
 //! thread, instead of one line per call).
@@ -43,6 +43,7 @@ thread_local! {
 /// Linear scan for matching name_id. If found, accumulates. If not, pushes.
 /// Initializes the thread's buffer and registers it on first call.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub fn aggregate(
     name_id: u32,
     self_ns: u64,

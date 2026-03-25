@@ -1,4 +1,6 @@
 // Codegen inspection targets for ASM verification tests.
+// This example runs on the dev toolchain (1.88), not on MSRV (1.59).
+#![allow(clippy::incompatible_msrv)]
 //
 // Each function is #[inline(never)] so cargo-asm can extract it as a
 // standalone symbol. Functions fall into three groups:
@@ -16,7 +18,6 @@
 //
 // IMPORTANT: every function body must be unique. LLVM merges identical
 // functions in release mode, making cargo-asm unable to find the symbol.
-
 #![allow(unused)]
 
 use piano_runtime::time::read;

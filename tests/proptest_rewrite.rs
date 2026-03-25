@@ -90,8 +90,6 @@ fn rust_fn() -> impl Strategy<Value = (String, String, bool)> {
         let instrumentable = is_instrumentable(decorator);
         let body = if decorator.contains("const") {
             format!("{decorator}fn {name}() -> u32 {{ 42 }}")
-        } else if decorator.contains("async") {
-            format!("{decorator}fn {name}() {{ let _ = 1; }}")
         } else {
             format!("{decorator}fn {name}() {{ let _ = 1; }}")
         };

@@ -45,9 +45,8 @@ unsafe fn unsafe_measured(ptr: *const i32) -> i32 {
     unsafe { *ptr }
 }
 
-#[allow(unused_variables)]
 fn with_inner_attr(x: i32) -> i32 {
-    #![allow(unused)]
+    #![allow(unused_variables, unused)]
     let __piano_guard = piano_runtime::enter(0);
     let unused = 42;
     x

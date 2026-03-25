@@ -717,6 +717,7 @@ mod tests {
     }
 
     /// Build an NDJSON measurement line.
+    #[allow(clippy::too_many_arguments)]
     fn ndjson_measurement(
         span_id: u64,
         parent_span_id: u64,
@@ -751,6 +752,7 @@ mod tests {
     }
 
     /// Build an NDJSON aggregate line.
+    #[allow(clippy::too_many_arguments)]
     fn ndjson_aggregate(
         thread: u64,
         name_id: u32,

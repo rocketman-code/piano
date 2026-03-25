@@ -99,10 +99,8 @@ extern "C" fn atexit_handler() {
 
     let _reentry = crate::alloc::ReentrancyGuard::enter();
     let mut file = file_sink.lock();
-    if !aggregates.is_empty() {
-        if crate::output::write_aggregates(&mut *file, &aggregates).is_err() {
-            file_sink.record_io_error();
-        }
+    if !aggregates.is_empty() && crate::output::write_aggregates(&mut *file, &aggregates).is_err() {
+        file_sink.record_io_error();
     }
     if crate::output::write_trailer(
         &mut *file,

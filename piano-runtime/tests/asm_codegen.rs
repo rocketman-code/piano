@@ -42,7 +42,7 @@ const CPU_NOW_CALL: &str = "cpu_now_ns";
 /// Extract the assembly for a function from the codegen_inspect example.
 /// Returns the full ASM text. Panics if cargo-asm fails.
 fn extract_asm(function_name: &str) -> String {
-    let symbol = format!("codegen_inspect::{}", function_name);
+    let symbol = format!("codegen_inspect::{function_name}");
     extract_asm_symbol(&symbol)
 }
 
@@ -182,10 +182,7 @@ fn metrology_rdtsc_detection() {
     let count = count_pattern(&lines, TSC_PATTERN);
     assert!(
         count >= 1,
-        "metrology_has_rdtsc: expected TSC instruction ({}), found {} in:\n{}",
-        TSC_PATTERN,
-        count,
-        asm
+        "metrology_has_rdtsc: expected TSC instruction ({TSC_PATTERN}), found {count} in:\n{asm}"
     );
 
     // Negative: metrology_no_rdtsc must NOT contain the TSC instruction.
@@ -194,8 +191,7 @@ fn metrology_rdtsc_detection() {
     let count = count_pattern(&lines, TSC_PATTERN);
     assert_eq!(
         count, 0,
-        "metrology_no_rdtsc: expected 0 TSC instructions, found {} in:\n{}",
-        count, asm
+        "metrology_no_rdtsc: expected 0 TSC instructions, found {count} in:\n{asm}"
     );
 }
 
@@ -207,10 +203,7 @@ fn metrology_fence_detection() {
     let count = count_pattern(&lines, FENCE_PATTERN);
     assert!(
         count >= 1,
-        "metrology_has_fence: expected {}, found {} in:\n{}",
-        FENCE_PATTERN,
-        count,
-        asm
+        "metrology_has_fence: expected {FENCE_PATTERN}, found {count} in:\n{asm}"
     );
 
     // Negative: metrology_no_fence must NOT contain MEMBARRIER.
@@ -219,8 +212,7 @@ fn metrology_fence_detection() {
     let count = count_pattern(&lines, FENCE_PATTERN);
     assert_eq!(
         count, 0,
-        "metrology_no_fence: expected 0 {}, found {} in:\n{}",
-        FENCE_PATTERN, count, asm
+        "metrology_no_fence: expected 0 {FENCE_PATTERN}, found {count} in:\n{asm}"
     );
 }
 
@@ -411,13 +403,11 @@ fn tm7_enter_stamp_split() {
 
     assert!(
         has_create_call,
-        "tm7_positive: Guard::create must appear as a call instruction\nASM:\n{}",
-        asm
+        "tm7_positive: Guard::create must appear as a call instruction\nASM:\n{asm}"
     );
     assert!(
         has_inline_tsc,
-        "tm7_positive: TSC read must be inlined (from stamp())\nASM:\n{}",
-        asm
+        "tm7_positive: TSC read must be inlined (from stamp())\nASM:\n{asm}"
     );
 
     // Negative: inline TSC but NO call to Guard::create.
@@ -431,13 +421,11 @@ fn tm7_enter_stamp_split() {
 
     assert!(
         !has_create_call,
-        "tm7_negative: must NOT have a call to Guard::create (everything is inline)\nASM:\n{}",
-        asm
+        "tm7_negative: must NOT have a call to Guard::create (everything is inline)\nASM:\n{asm}"
     );
     assert!(
         has_inline_tsc,
-        "tm7_negative: must still have an inline TSC read\nASM:\n{}",
-        asm
+        "tm7_negative: must still have an inline TSC read\nASM:\n{asm}"
     );
 }
 
@@ -504,11 +492,7 @@ fn tm8_piano_future_poll_cpu_ordering() {
     // The ordering fence < first_cpu < second_cpu < post_fence is the claim.
     assert!(
         *pre_fence < *first_cpu && *first_cpu < *second_cpu && *second_cpu < *post_fence,
-        "tm8_positive: ordering violation: fence@{} < cpu@{} < cpu@{} < fence@{}",
-        pre_fence,
-        first_cpu,
-        second_cpu,
-        post_fence
+        "tm8_positive: ordering violation: fence@{pre_fence} < cpu@{first_cpu} < cpu@{second_cpu} < fence@{post_fence}"
     );
 
     // Between the pre-fence and first cpu_now_ns, no bookkeeping calls
