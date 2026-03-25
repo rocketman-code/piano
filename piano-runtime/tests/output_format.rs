@@ -274,3 +274,65 @@ fn ndjson_format_contract_aggregate() {
         );
     }
 }
+
+#[test]
+fn header_with_multiple_names_has_correct_separators() {
+    let mut buf = Vec::new();
+    write_header(
+        &mut buf,
+        &[(0, "alpha"), (1, "beta"), (2, "gamma")],
+        8,
+        3,
+        "test_run",
+        1000,
+    )
+    .unwrap();
+    let line = String::from_utf8(buf).unwrap();
+
+    // Names must be comma-separated with no leading/trailing commas.
+    // Extract the names object: everything between "names":{ and }}
+    let names_start = line.find("\"names\":{").unwrap() + "\"names\":{".len();
+    let names_end = line[names_start..].find("}}").unwrap() + names_start;
+    let names_block = &line[names_start..names_end];
+
+    // Should be: "0":"alpha","1":"beta","2":"gamma"
+    assert!(
+        names_block.contains("\"0\":\"alpha\",\"1\":\"beta\",\"2\":\"gamma\""),
+        "names must be comma-separated without leading comma. Got: {names_block}"
+    );
+    assert!(
+        !names_block.starts_with(','),
+        "names must not start with comma"
+    );
+}
+
+#[test]
+fn json_escaping_handles_special_characters() {
+    let mut buf = Vec::new();
+    write_header(
+        &mut buf,
+        &[(0, "has\"quote"), (1, "has\\slash"), (2, "has\nnewline")],
+        0,
+        0,
+        "test",
+        0,
+    )
+    .unwrap();
+    let line = String::from_utf8(buf).unwrap();
+
+    // Quotes must be escaped as \"
+    assert!(
+        line.contains("has\\\"quote"),
+        "quotes must be escaped. Got: {line}"
+    );
+    // Backslashes must be escaped as \\
+    assert!(
+        line.contains("has\\\\slash"),
+        "backslashes must be escaped. Got: {line}"
+    );
+    // Newlines must be escaped as \n
+    assert!(
+        line.contains("has\\nnewline"),
+        "newlines must be escaped. Got: {line}"
+    );
+}
