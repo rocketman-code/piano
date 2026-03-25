@@ -1,6 +1,5 @@
 [workspace]
 members = ["piano-runtime"]
-resolver = "2"
 
 [package]
 name = "piano"
@@ -13,35 +12,22 @@ repository = "https://github.com/rocketman-code/piano"
 keywords = ["profiling", "profiler", "instrumentation", "performance", "timing"]
 categories = ["development-tools::profiling"]
 
-include = [
-    "src/**",
-    "tests/**",
-    "build.rs",
-    "LICENSE",
-    "README.md",
-    "CHANGELOG.md",
-    "CONTRIBUTING.md",
-    ".cargo/**",
-    ".github/**",
-    ".gitignore",
-    "codecov.yml",
-    "docs/standards/**",
-    "rust-toolchain.toml",
-]
-
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-syn = { version = "2", features = ["full", "visit", "visit-mut"] }
-quote = "1"
 toml_edit = "0.22"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ignore = "0.4"
-proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 anstyle = "1"
 anstream = "0.6"
 regex = "1"
+ra_ap_syntax = "=0.0.270"
+ra_ap_mbe = "=0.0.270"
+ra_ap_span = "=0.0.270"
+ra_ap_tt = "=0.0.270"
+ra_ap_parser = "=0.0.270"
+ra_ap_syntax-bridge = "=0.0.270"
 
 [[bin]]
 name = "piano"

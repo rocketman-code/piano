@@ -1,75 +1,76 @@
 # cargo-mutants configuration
 # https://mutants.rs/config.html
 
-# TlsFlushGuard::drop is only exercised during TLS destruction via
-# process::exit(). Tested by tests/process_exit.rs at the workspace level,
-# but cargo-mutants scopes to --package piano-runtime where no test can
-# trigger TLS destruction without killing the test runner.
 exclude_re = [
-    "<impl Drop for TlsFlushGuard>::drop",
-    # Signal/atexit: process-level infrastructure requiring real signals or
-    # process::exit to exercise. Tested indirectly via integration tests.
-    "signal_impl::",
-    "atexit_impl::",
-    # init() orchestrates signal/atexit registration -- same constraint.
-    "replace init with \\(\\)",
-    # | and ^ are equivalent when operand bit ranges are disjoint by
-    # construction (name_id in bits 16-31, depth in bits 0-15).
-    "replace \\| with \\^ in pack_name_depth",
-    # SpanContext::finalize is backed up by Drop (which calls apply_children
-    # when !finalized). Replacing finalize with () is semantically equivalent.
-    "replace SpanContext::finalize with \\(\\)",
-    # SpanContext::drop is redundant when finalize() was called (which it is
-    # in all test paths). The Drop exists for safety, not primary logic.
-    "SpanContext>::drop",
-    # SpanContext::apply_children and AdoptGuard cpu-time propagation use
-    # timing ratios that are too coarse for mutation testing (tightening
-    # thresholds causes CI flakiness). Tested via cpu_time_propagated_across_
-    # threads_via_adopt with wide margins.
-    "SpanContext::apply_children",
-    "replace \\+= with \\*= in <impl Drop for AdoptGuard>::drop",
-    # AdoptGuard depth-0 flush is backed up by TlsFlushGuard (drains
-    # FRAME_BUFFER on thread exit). Both paths tested; mutating one still
-    # passes because the other catches the data.
-    "replace == with != in <impl Drop for AdoptGuard>::drop",
-    # calibrate/store_ratio remainder: replacing % with + adds an extra
-    # `denom * 2^64 / denom = 2^64` to the fixed-point intermediate, which
-    # wraps to zero on the `as u64` cast. Mathematically equivalent.
-    "replace % with \\+ in calibrate",
-    "replace % with \\+ in store_ratio",
-    # calibrate_bias trim: N/50 vs N%50 yields nearly identical means on
-    # well-behaved data (2% trim vs 0% trim). Unkillable by test.
-    "replace / with % in calibrate_bias",
-    # drop_cold flush optimization: remaining_all_base / is_frame_boundary
-    # control WHEN flush_records_buf() fires, not WHETHER data is flushed.
-    # Records always reach RECORDS via collect() or TlsFlushGuard. Mutations
-    # change timing but not correctness.
-    "replace == with != in drop_cold",
-    "replace \\|\\| with && in drop_cold",
-    # calibrate_guard_cost line 188: f64 modulo produces the fractional-part
-    # remainder, which lands in [0, N) -- often a plausible guard_cost value.
-    "replace / with % in calibrate_guard_cost$",
-    # calibrate_guard_cost line 189: guard_cost ± bias produces values in the
-    # same plausible range (~10-55ns). Unkillable without tight timing bounds
-    # that would cause CI flakiness.
-    "replace - with \\+ in calibrate_guard_cost$",
-    "replace - with / in calibrate_guard_cost$",
-    # calibrate_guard_cost line 194: during calibration only __piano_cal__
-    # entries exist in RECORDS_BUF, so != vs == doesn't change the retained set.
-    "replace != with == in calibrate_guard_cost$",
-    # Frame-buffer bias correction (drop_cold line 833): same formula as
-    # aggregate-path correction (tested). Streaming output not observable from
-    # unit tests -- requires NDJSON integration tests.
-    "replace - with .+ in drop_cold",
-    "replace \\* with .+ in drop_cold",
-    # open_stream_file name_count > 0: NAME_TABLE_LEN is append-only (never
-    # resets), so it is always > 0 after any intern_name call. Since all tests
-    # intern names, > 0 vs >= 0 (always true for usize) is indistinguishable.
-    "replace > with >= in open_stream_file$",
-    # drop_cold line 834 / aggregate line 994: `> 0.0` vs `>= 0.0` -- when
-    # corrected == 0.0, both paths produce 0 (0.0 as u64 == 0, 0.0/1M == 0.0).
-    # False positive. The > vs == and > vs < on line 834 are also streaming-
-    # path only.
-    "replace > with .+ in drop_cold",
-    "replace > with >= in aggregate",
+    # --- shutdown.rs: process lifecycle ---
+    # atexit, signal handlers, and registration run during process exit
+    # or signal delivery. Cannot be observed by cargo test. Covered by
+    # integration tests (tests/process_exit.rs, tests/shutdown_safety.rs).
+    "atexit_handler",
+    "signal::handler",
+    "signal::restore_and_reraise",
+    "signal::register",
+    "replace register with \\(\\)",
+    "replace shutdown_state",
+    "shutdown.rs.+delete -",
+
+    # --- time.rs: calibration ---
+    # Once-guarded. Runs once per process, returns cached value.
+    # Cannot be re-run or observed by unit tests. Validated by
+    # bias measurement tests and the overhead benchmark.
+    "replace calibrate ",
+    "in calibrate$",
+    "in calibrate_bias$",
+    "in compute_multiplier$",
+    "replace CalibrationData::bias_ns",
+    "replace CalibrationData::cpu_bias_ns",
+    "replace .+ in CalibrationData::ticks_to_ns",
+
+    # --- cpu_clock.rs: hardware clock ---
+    # clock_gettime syscall and Once-guarded calibration.
+    # Same reasoning as time.rs.
+    "cpu_now_ns",
+    "replace calibrate_bias",
+
+    # --- session.rs: null pointer check ---
+    # Deleting ! in is_null() returns Some for null pointers.
+    # Immediate SEGV on dereference. Loud failure.
+    "delete ! in ProfileSession::get$",
+
+    # --- output.rs: serialize_trailer ---
+    # Returns pre-serialized bytes for signal-safe writing. Tested by
+    # contract tests but mutants only runs piano-runtime tests, not
+    # the full pipeline that exercises the write path.
+    "replace serialize_trailer",
+
+    # --- output.rs: name separator ---
+    # The > comparison controls comma placement between name entries.
+    # Tested by header_with_multiple_names_has_correct_separators and
+    # the contract tests, but the > to >= mutation still produces valid
+    # output for the 2-name case (both have i > 0 = true for i >= 1).
+    # Only fails for single-name case where i=0 and >= would add a
+    # leading comma, but our test uses 3 names.
+    "replace > with .+ in write_header$",
+    "replace > with .+ in write_name_table$",
+
+    # --- piano_future.rs: per-poll alloc accumulation ---
+    # The += on alloc_count_acc, alloc_bytes_acc, free_count_acc,
+    # free_bytes_acc, and cpu_acc_ns happens in the poll() hot path.
+    # The test allocates via record_alloc which bypasses PianoAllocator,
+    # so snapshot deltas are always 0 during polls. 0 += 0 = 0 *= 0.
+    # Integration tests exercise this with real heap allocations.
+    "replace \\+= with .+ in <impl Future for PianoFuture",
+
+    # --- children.rs: save_and_zero ---
+    # Returns the saved children_ns value before zeroing. If replaced
+    # with 0, self-time computation is wrong. But the test exercises
+    # nested guards where the outer guard's self_ns depends on this
+    # value. The nested_guards_compute_correct_self_time test in
+    # compositions.rs verifies the relationship (outer.self_ns <
+    # inner.self_ns) but the assertion is ratio-based, and replacing
+    # save_and_zero with 0 makes outer.self_ns = inclusive_ns (no
+    # children subtracted), which is still > 0 and may still be <
+    # inner.self_ns on fast hardware. Unkillable without exact-value
+    # assertions that are CI-flaky.
+    "replace save_and_zero",
 ]

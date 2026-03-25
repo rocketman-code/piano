@@ -1,5 +1,6 @@
 pub mod build;
 pub mod error;
+pub(crate) mod macro_expand;
 pub mod naming;
 pub mod report;
 pub mod resolve;
