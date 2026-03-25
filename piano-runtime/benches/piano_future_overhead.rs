@@ -1,16 +1,39 @@
-//! Micro-benchmark: PianoFuture overhead per yield at varying nesting depths.
-//!
-//! Measures the cost of extend_from_slice/truncate on each poll() relative to a bare
-//! tokio::task::yield_now().
+//! Micro-benchmark: measures enter_async per-poll overhead at varying nesting depths.
+
+use std::alloc::System;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use piano_runtime::alloc::PianoAllocator;
+use piano_runtime::session::ProfileSession;
 use tokio::runtime::Runtime;
+
+#[global_allocator]
+static GLOBAL: PianoAllocator<System> = PianoAllocator::new(System);
+
+static NAMES: &[(u32, &str)] = &[
+    (1, "l1"),
+    (2, "l2"),
+    (3, "l3"),
+    (4, "l4"),
+    (5, "l5"),
+    (6, "l6"),
+    (7, "l7"),
+    (8, "l8"),
+    (9, "l9"),
+    (10, "l10"),
+];
 
 fn rt() -> Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
+}
+
+fn init_session() {
+    // ProfileSession::init is idempotent (Once-guarded internally
+    // via CalibrationData::calibrate). Safe to call from multiple benches.
+    ProfileSession::init(None, false, NAMES, "bench", 0);
 }
 
 /// Bare yield_now in a loop -- the baseline.
@@ -20,11 +43,9 @@ async fn bare_yields(n: usize) {
     }
 }
 
-/// Single PianoFuture wrapping yields.
+/// Single enter_async wrapping yields.
 async fn instrumented_depth_1(n: usize) {
-    piano_runtime::PianoFuture::new(async move {
-        let _guard = piano_runtime::enter("depth1");
-        piano_runtime::register("depth1");
+    piano_runtime::enter_async(1, async move {
         for _ in 0..n {
             tokio::task::yield_now().await;
         }
@@ -33,21 +54,11 @@ async fn instrumented_depth_1(n: usize) {
 }
 
 async fn instrumented_depth_5(n: usize) {
-    piano_runtime::PianoFuture::new(async move {
-        let _guard = piano_runtime::enter("l1");
-        piano_runtime::register("l1");
-        piano_runtime::PianoFuture::new(async move {
-            let _guard = piano_runtime::enter("l2");
-            piano_runtime::register("l2");
-            piano_runtime::PianoFuture::new(async move {
-                let _guard = piano_runtime::enter("l3");
-                piano_runtime::register("l3");
-                piano_runtime::PianoFuture::new(async move {
-                    let _guard = piano_runtime::enter("l4");
-                    piano_runtime::register("l4");
-                    piano_runtime::PianoFuture::new(async move {
-                        let _guard = piano_runtime::enter("l5");
-                        piano_runtime::register("l5");
+    piano_runtime::enter_async(1, async move {
+        piano_runtime::enter_async(2, async move {
+            piano_runtime::enter_async(3, async move {
+                piano_runtime::enter_async(4, async move {
+                    piano_runtime::enter_async(5, async move {
                         for _ in 0..n {
                             tokio::task::yield_now().await;
                         }
@@ -64,36 +75,16 @@ async fn instrumented_depth_5(n: usize) {
 }
 
 async fn instrumented_depth_10(n: usize) {
-    piano_runtime::PianoFuture::new(async move {
-        let _guard = piano_runtime::enter("l1");
-        piano_runtime::register("l1");
-        piano_runtime::PianoFuture::new(async move {
-            let _guard = piano_runtime::enter("l2");
-            piano_runtime::register("l2");
-            piano_runtime::PianoFuture::new(async move {
-                let _guard = piano_runtime::enter("l3");
-                piano_runtime::register("l3");
-                piano_runtime::PianoFuture::new(async move {
-                    let _guard = piano_runtime::enter("l4");
-                    piano_runtime::register("l4");
-                    piano_runtime::PianoFuture::new(async move {
-                        let _guard = piano_runtime::enter("l5");
-                        piano_runtime::register("l5");
-                        piano_runtime::PianoFuture::new(async move {
-                            let _guard = piano_runtime::enter("l6");
-                            piano_runtime::register("l6");
-                            piano_runtime::PianoFuture::new(async move {
-                                let _guard = piano_runtime::enter("l7");
-                                piano_runtime::register("l7");
-                                piano_runtime::PianoFuture::new(async move {
-                                    let _guard = piano_runtime::enter("l8");
-                                    piano_runtime::register("l8");
-                                    piano_runtime::PianoFuture::new(async move {
-                                        let _guard = piano_runtime::enter("l9");
-                                        piano_runtime::register("l9");
-                                        piano_runtime::PianoFuture::new(async move {
-                                            let _guard = piano_runtime::enter("l10");
-                                            piano_runtime::register("l10");
+    piano_runtime::enter_async(1, async move {
+        piano_runtime::enter_async(2, async move {
+            piano_runtime::enter_async(3, async move {
+                piano_runtime::enter_async(4, async move {
+                    piano_runtime::enter_async(5, async move {
+                        piano_runtime::enter_async(6, async move {
+                            piano_runtime::enter_async(7, async move {
+                                piano_runtime::enter_async(8, async move {
+                                    piano_runtime::enter_async(9, async move {
+                                        piano_runtime::enter_async(10, async move {
                                             for _ in 0..n {
                                                 tokio::task::yield_now().await;
                                             }
@@ -120,6 +111,7 @@ async fn instrumented_depth_10(n: usize) {
 }
 
 fn bench_yield_overhead(c: &mut Criterion) {
+    init_session();
     let rt = rt();
     let yields = 1000;
 
@@ -135,7 +127,6 @@ fn bench_yield_overhead(c: &mut Criterion) {
 
     group.bench_function("depth_1", |b| {
         b.iter(|| {
-            piano_runtime::reset();
             rt.block_on(async {
                 instrumented_depth_1(black_box(yields)).await;
             });
@@ -144,7 +135,6 @@ fn bench_yield_overhead(c: &mut Criterion) {
 
     group.bench_function("depth_5", |b| {
         b.iter(|| {
-            piano_runtime::reset();
             rt.block_on(async {
                 instrumented_depth_5(black_box(yields)).await;
             });
@@ -153,7 +143,6 @@ fn bench_yield_overhead(c: &mut Criterion) {
 
     group.bench_function("depth_10", |b| {
         b.iter(|| {
-            piano_runtime::reset();
             rt.block_on(async {
                 instrumented_depth_10(black_box(yields)).await;
             });
