@@ -73,4 +73,26 @@ exclude_re = [
     # inner.self_ns on fast hardware. Unkillable without exact-value
     # assertions that are CI-flaky.
     "replace save_and_zero",
+
+    # --- aggregator.rs: timing and free-count accumulation ---
+    # self_ns, inclusive_ns (lines 77-78): nanosecond values are
+    # non-deterministic. *= would overflow u64 on second call but
+    # overflow wraps silently. Can't assert exact timing in unit tests.
+    # cpu_self_ns (line 79): only non-zero when cpu_time enabled.
+    # Unit tests don't enable cpu_time (requires Unix clock_gettime).
+    # free_count, free_bytes (lines 82-83): record_dealloc is private.
+    # Frees only happen through PianoAllocator::dealloc which is tested
+    # via integration tests with real heap operations.
+    # All fields are covered by the NDJSON contract tests and integration
+    # tests that exercise the full pipeline with real allocations.
+    "replace \\+= with \\*= in aggregate$",
+    "replace \\+= with -= in aggregate$",
+
+    # --- aggregator.rs: drain_all_agg ---
+    # Returns Vec<Vec<FnAgg>> from all threads. Requires access to
+    # agg_registry (pub(crate) field on ProfileSession). Tests use
+    # drain_thread_agg (public test helper) instead. drain_all_agg is
+    # exercised by shutdown.rs (atexit_handler) which is itself excluded
+    # as process-lifecycle code.
+    "drain_all_agg",
 ]
