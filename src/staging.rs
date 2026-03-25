@@ -102,7 +102,7 @@ fn populate_overlay(
 
         if file_type.is_dir() {
             if real_dirs.contains(&rel_path) {
-                // This directory contains instrumented files — recurse
+                // This directory contains instrumented files; recurse
                 populate_overlay(
                     ws_root,
                     staging_root,
@@ -112,17 +112,17 @@ fn populate_overlay(
                     instrumented_set,
                 )?;
             } else {
-                // No instrumented files in subtree — symlink entire directory
+                // No instrumented files in subtree, symlink entire directory
                 std::os::unix::fs::symlink(&original_abs, &staging_path)
                     .map_err(io_context("create directory symlink", &staging_path))?;
             }
         } else if instrumented_set.contains(rel_path.as_path()) {
-            // Instrumented file — write the modified content
+            // Instrumented file: write the modified content
             let content = &instrumented.iter().find(|(p, _)| p == &rel_path).unwrap().1;
             std::fs::write(&staging_path, content)
                 .map_err(io_context("write instrumented file", &staging_path))?;
         } else {
-            // Non-instrumented file — symlink to original
+            // Non-instrumented file: symlink to original
             std::os::unix::fs::symlink(&original_abs, &staging_path)
                 .map_err(io_context("create file symlink", &staging_path))?;
         }

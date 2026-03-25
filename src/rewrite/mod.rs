@@ -1,2758 +1,892 @@
-pub(crate) mod allocator;
-pub(crate) mod macro_rules;
-pub(crate) mod select_inject;
-pub(crate) mod shutdown;
-mod token_util;
+//! Source rewriter: single-pass injection of profiling infrastructure.
+//!
+//! One CST parse. One StringInjector. One apply(). One SourceMap.
+//!
+//! For non-entry files: inject guards into measured function bodies.
+//! For the entry point: guards + name table + allocator wrapping + lifecycle.
+//! All injection points are collected from the ORIGINAL source, then applied
+//! in one pass. No multi-pass offset drift. No source map chaining.
 
 use std::collections::HashMap;
 
-use quote::quote;
-use syn::spanned::Spanned;
-use syn::visit::Visit;
-use syn::visit_mut::VisitMut;
+use ra_ap_syntax::{AstNode, SourceFile, SyntaxKind, ast, T};
+use ra_ap_syntax::ast::{HasAttrs, HasName};
 
-use crate::resolve::{Classification, classify};
-use crate::source_map::{SourceMap, StringInjector, skip_inner_attrs};
+use crate::source_map::{SourceMap, StringInjector};
 
-pub use allocator::{AllocatorKind, detect_allocator_kind, inject_global_allocator};
-pub use shutdown::inject_shutdown;
-
-use macro_rules::MacroInstrumenter;
-
-/// Result of instrumenting a source file.
 pub struct InstrumentResult {
     pub source: String,
     pub source_map: SourceMap,
-    /// Functions that contain concurrency patterns, with the pattern name.
-    /// e.g. [("concurrent_discover", "rayon::scope"), ("process_all", "par_iter")]
-    pub concurrency: Vec<(String, String)>,
-    /// Literal function names found in macro_rules! bodies.
-    /// Metavar names are excluded -- they resolve at macro expansion time.
-    pub macro_fn_names: Vec<String>,
 }
 
-/// Rewrite `source` so that every function whose name (or qualified name) is in
-/// `targets` gets an RAII timing guard injected as its first statement.
+/// Parameters for entry-point-only injections (name table, allocator, lifecycle).
+pub struct EntryPointParams<'a> {
+    pub name_table: &'a [(u32, &'a str)],
+    pub runs_dir: &'a str,
+    pub cpu_time: bool,
+}
+
+/// Instrument a source file in a single pass.
 ///
-/// Top-level functions match by bare name (e.g. "walk"). Impl methods match by
-/// "Type::method" (e.g. "Walker::walk"). Trait default methods match by "Trait::method" (e.g. "Drawable::draw").
-///
+/// When `entry_point` is None: only inject guards into measured functions.
+/// When `entry_point` is Some: also inject name table, allocator wrapping,
+/// and lifecycle code. All from the original source, one StringInjector.
 pub fn instrument_source(
     source: &str,
-    targets: &HashMap<String, String>,
-    instrument_macros: bool,
-    module_prefix: &str,
-) -> Result<InstrumentResult, syn::Error> {
-    let file: syn::File = syn::parse_str(source)?;
+    measured: &HashMap<String, u32>,
+    entry_point: Option<&EntryPointParams<'_>>,
+) -> Result<InstrumentResult, String> {
+    let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+    let file = parse.tree();
 
-    // Collect injection points via read-only visitor.
-    let mut collector = InjectionCollector {
-        source,
-        targets: targets.clone(),
-        injector: StringInjector::new(),
-        current_impl: None,
-        current_trait: None,
-        concurrency: Vec::new(),
-        module_prefix: module_prefix.to_string(),
-        scope: crate::naming::ScopeState::new(),
-    };
-    collector.visit_file(&file);
-
-    let (rewritten, source_map) = collector.injector.apply(source);
-
-    // Inject stats recording calls into crossbeam select! arm bodies.
-    // Only apply when the source contains crossbeam select macros to avoid
-    // unnecessary token round-tripping that changes whitespace.
-    //
-    // Note: the token round-trip may alter intra-line whitespace but preserves
-    // line structure, so `source_map` (which tracks line offsets) remains valid.
-    // If select injection ever adds or removes lines, this invariant breaks.
-    let rewritten = if select_inject::source_has_crossbeam_select(&rewritten) {
-        match rewritten.parse::<proc_macro2::TokenStream>() {
-            Ok(ts) => select_inject::inject_select_arm_stats(ts).to_string(),
-            Err(_) => rewritten,
-        }
-    } else {
-        rewritten
-    };
-
-    // Macro instrumentation uses token-stream mutation (separate from the
-    // string-injection path). Apply it on the rewritten source if needed.
-    // ToTokens reformats the entire file, invalidating our source_map,
-    // so we reset it to empty when this path is taken.
-    let (final_source, final_map, macro_fn_names) = if instrument_macros {
-        let mut rewritten_file: syn::File = syn::parse_str(&rewritten)?;
-        let mut macro_visitor = MacroInstrumenter {
-            module_prefix: module_prefix.to_string(),
-            collected_names: Vec::new(),
-        };
-        macro_visitor.visit_file_mut(&mut rewritten_file);
-        // Use ToTokens instead of prettyplease to preserve #[cfg] attributes.
-        // prettyplease::unparse destroys cfg attrs on block exprs in match arms
-        // (#560, #561). The output here is compiled and discarded, so formatting
-        // quality doesn't matter.
-        let token_source = quote!(#rewritten_file).to_string();
-        (
-            token_source,
-            SourceMap::default(),
-            macro_visitor.collected_names,
-        )
-    } else {
-        (rewritten, source_map, Vec::new())
-    };
-
-    Ok(InstrumentResult {
-        source: final_source,
-        source_map: final_map,
-        concurrency: collector.concurrency,
-        macro_fn_names,
-    })
-}
-
-/// Method names that indicate parallel iterator chains.
-const PARALLEL_ITER_METHODS: &[&str] = &[
-    "par_iter",
-    "par_iter_mut",
-    "into_par_iter",
-    "par_bridge",
-    "par_chunks",
-    "par_chunks_mut",
-    "par_windows",
-];
-
-/// Function/method names where closures should receive adopt injection
-/// (i.e., the closure body starts with `adopt(ctx)` so its time is attributed
-/// to the parent span).
-const ADOPT_INJECTION_TARGETS: &[&str] = &["spawn", "scope", "scope_fifo", "join"];
-/// Scope-like functions whose closures coordinate workers (don't adopt, recurse body).
-const SCOPE_FUNCTIONS: &[&str] = &["scope", "scope_fifo"];
-
-/// Functions that trigger fork injection at the call site (i.e., the parent
-/// function gets `let ctx = fork()` so child closures can adopt the span).
-///
-/// "spawn" is intentionally excluded: all free-function spawns
-/// (std::thread::spawn, rayon::spawn, tokio::spawn) require F: Send + 'static.
-/// Moving the owned SpanContext into the closure compiles, but CPU time
-/// attribution breaks: SpanContext::drop calls apply_children() which accesses
-/// the STACK thread-local. When SpanContext drops on the child thread, the
-/// child's stack is empty (AdoptGuard already popped the synthetic parent),
-/// so the child's CPU contribution is silently lost.
-///
-/// Scoped s.spawn() method calls inside scope closure bodies are handled
-/// separately by recurse_closure_body_for_spawns -- they work because the
-/// scope guarantees the closure completes before the parent returns, so
-/// SpanContext stays on the parent thread.
-const FORK_INJECTION_TRIGGERS: &[&str] = &["scope", "scope_fifo", "join"];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FutureReturnKind {
-    ImplFuture,
-    PinBoxDynFuture,
-    KnownAlias,
-}
-
-fn returns_future(sig: &syn::Signature) -> Option<FutureReturnKind> {
-    let syn::ReturnType::Type(_, ty) = &sig.output else {
-        return None;
-    };
-    returns_future_ty(ty)
-}
-
-fn returns_future_ty(ty: &syn::Type) -> Option<FutureReturnKind> {
-    match ty {
-        syn::Type::ImplTrait(impl_trait) => {
-            if has_future_bound(&impl_trait.bounds) {
-                Some(FutureReturnKind::ImplFuture)
-            } else {
-                None
-            }
-        }
-        syn::Type::Path(type_path) => {
-            let last = type_path.path.segments.last()?;
-            let ident = last.ident.to_string();
-            match ident.as_str() {
-                "Pin" => check_pin_box_dyn_future(last),
-                "BoxFuture" | "LocalBoxFuture" => Some(FutureReturnKind::KnownAlias),
-                _ => None,
-            }
-        }
-        syn::Type::Paren(paren) => returns_future_ty(&paren.elem),
-        _ => None,
-    }
-}
-
-fn has_future_bound(
-    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::token::Plus>,
-) -> bool {
-    bounds.iter().any(|bound| {
-        if let syn::TypeParamBound::Trait(trait_bound) = bound {
-            is_future_path(&trait_bound.path)
-        } else {
-            false
-        }
-    })
-}
-
-fn is_future_path(path: &syn::Path) -> bool {
-    path.segments
-        .last()
-        .is_some_and(|seg| seg.ident == "Future")
-}
-
-fn check_pin_box_dyn_future(pin_seg: &syn::PathSegment) -> Option<FutureReturnKind> {
-    let inner_ty = first_type_arg(pin_seg)?;
-    if let syn::Type::Path(type_path) = inner_ty {
-        let last = type_path.path.segments.last()?;
-        if last.ident == "Box" {
-            let box_inner = first_type_arg(last)?;
-            if let syn::Type::TraitObject(trait_obj) = box_inner {
-                if has_future_bound(&trait_obj.bounds) {
-                    return Some(FutureReturnKind::PinBoxDynFuture);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn first_type_arg(seg: &syn::PathSegment) -> Option<&syn::Type> {
-    if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-        args.args.iter().find_map(|arg| {
-            if let syn::GenericArgument::Type(ty) = arg {
-                Some(ty)
-            } else {
-                None
-            }
-        })
-    } else {
-        None
-    }
-}
-
-/// Convert a proc_macro2 LineColumn to a byte offset in the source string.
-/// Handles both `\n` and `\r\n` line endings correctly by splitting on `\n`
-/// so that any trailing `\r` stays in the line's byte length.
-pub(super) fn line_col_to_byte(source: &str, lc: proc_macro2::LineColumn) -> usize {
-    debug_assert!(lc.line >= 1, "proc_macro2 lines are 1-indexed");
-    let mut byte = 0;
-    for (i, line) in source.split('\n').enumerate() {
-        if i + 1 == lc.line {
-            return byte + lc.column;
-        }
-        byte += line.len() + 1; // +1 for the \n we split on
-    }
-    byte + lc.column
-}
-
-/// Read-only AST visitor that collects text injection points.
-struct InjectionCollector<'s> {
-    source: &'s str,
-    targets: HashMap<String, String>,
-    injector: StringInjector,
-    current_impl: Option<String>,
-    current_trait: Option<String>,
-    /// Collected concurrency info: (function_name, pattern_name).
-    concurrency: Vec<(String, String)>,
-    module_prefix: String,
-    /// Scope tracking (mod, fn, block).
-    scope: crate::naming::ScopeState,
-}
-
-impl<'s> InjectionCollector<'s> {
-    fn qualify_name(&self, name: &str) -> String {
-        crate::resolve::qualify(&self.module_prefix, name)
-    }
-
-    fn collect_guard(&mut self, block: &syn::Block, guard_name: &str, sig: &syn::Signature) {
-        let is_async = sig.asyncness.is_some();
-
-        // For non-async functions returning futures, apply future-aware wrapping.
-        if !is_async {
-            if let Some(kind) = returns_future(sig) {
-                self.collect_future_return_guard(block, guard_name, sig, kind);
-                return;
-            }
-        }
-
-        let open_pos = block.brace_token.span.open().start();
-        let open_byte = skip_inner_attrs(self.source, line_col_to_byte(self.source, open_pos) + 1);
-
-        // Check for concurrency patterns.
-        if let Some(pattern) = find_concurrency_pattern(block) {
-            self.concurrency.push((guard_name.to_string(), pattern));
-
-            if is_async {
-                // Async + concurrency: wrap entire body in PianoFuture with
-                // guard + fork inside.
-                let close_pos = block.brace_token.span.close().start();
-                let close_byte = line_col_to_byte(self.source, close_pos);
-
-                self.injector.insert(
-                    open_byte,
-                    format!(
-                        "\npiano_runtime::PianoFuture::new(async move {{\
-                         \n    let __piano_guard = piano_runtime::enter({guard_name:?});\
-                         \n    let __piano_ctx_owned = piano_runtime::fork();\
-                         \n    let __piano_ctx = __piano_ctx_owned.as_ref();"
-                    ),
-                );
-
-                // Collect adopt injections for closures inside the block.
-                let mut adopt = AdoptCollector {
-                    in_parallel_chain: false,
-                    in_scope_body: false,
-                    source: self.source,
-                    injector: &mut self.injector,
-                };
-                for stmt in &block.stmts {
-                    adopt.visit_stmt(stmt);
-                }
-
-                self.injector.insert(close_byte, "\n}).await\n");
-            } else {
-                // Sync + concurrency: guard + fork at top.
-                self.injector.insert(
-                    open_byte,
-                    format!(
-                        "\n    let __piano_guard = piano_runtime::enter({guard_name:?});\
-                         \n    let __piano_ctx_owned = piano_runtime::fork();\
-                         \n    let __piano_ctx = __piano_ctx_owned.as_ref();"
-                    ),
-                );
-
-                // Collect adopt injections for closures inside the block.
-                let mut adopt = AdoptCollector {
-                    in_parallel_chain: false,
-                    in_scope_body: false,
-                    source: self.source,
-                    injector: &mut self.injector,
-                };
-                for stmt in &block.stmts {
-                    adopt.visit_stmt(stmt);
-                }
-            }
-            return;
-        }
-
-        // Simple case: no concurrency.
-        if is_async {
-            // Async function: wrap body in PianoFuture.
-            let close_pos = block.brace_token.span.close().start();
-            let close_byte = line_col_to_byte(self.source, close_pos);
-
-            self.injector.insert(
-                open_byte,
-                format!(
-                    "\npiano_runtime::PianoFuture::new(async move {{\
-                     \n    let __piano_guard = piano_runtime::enter({guard_name:?});"
-                ),
-            );
-            self.injector.insert(close_byte, "\n}).await\n");
-        } else {
-            // Sync function: just inject guard.
-            self.injector.insert(
-                open_byte,
-                format!("\n    let __piano_guard = piano_runtime::enter({guard_name:?});"),
-            );
-        }
-    }
-
-    /// Collect injections for a future-returning (non-async) function.
-    fn collect_future_return_guard(
-        &mut self,
-        block: &syn::Block,
-        guard_name: &str,
-        sig: &syn::Signature,
-        kind: FutureReturnKind,
-    ) {
-        match kind {
-            FutureReturnKind::ImplFuture => {
-                // Whole-body wrapping: wrap the entire function body in
-                // PianoFuture::new(async move { ... }) so all code paths
-                // (including early returns) are instrumented.
-                let open_pos = block.brace_token.span.open().start();
-                let close_pos = block.brace_token.span.close().start();
-                let open_byte =
-                    skip_inner_attrs(self.source, line_col_to_byte(self.source, open_pos) + 1);
-                let close_byte = line_col_to_byte(self.source, close_pos);
-
-                self.injector.insert(
-                    open_byte,
-                    format!(
-                        "\n    piano_runtime::PianoFuture::new(async move {{\
-                         \n        let __piano_guard = piano_runtime::enter({guard_name:?});"
-                    ),
-                );
-                self.injector.insert(close_byte, "\n    })\n");
-
-                // The body is now inside `async move { ... }`. Any `async { expr }`
-                // expressions (trailing or returned) would create nested futures.
-                // Add `.await` to unwrap them so the types align.
-                if let Some(syn::Stmt::Expr(trailing_expr, None)) = block.stmts.last() {
-                    if matches!(trailing_expr, syn::Expr::Async(_)) {
-                        let trailing_end =
-                            line_col_to_byte(self.source, trailing_expr.span().end());
-                        self.injector.insert(trailing_end, ".await");
-                    }
-                }
-                // Walk preceding statements for `return async { ... }` and add .await.
-                self.collect_async_return_awaits(block);
-            }
-            FutureReturnKind::PinBoxDynFuture | FutureReturnKind::KnownAlias => {
-                // Find trailing expression.
-                let Some(syn::Stmt::Expr(trailing_expr, None)) = block.stmts.last() else {
-                    // No trailing expression -- fall back to sync guard.
-                    let open_pos = block.brace_token.span.open().start();
-                    let open_byte =
-                        skip_inner_attrs(self.source, line_col_to_byte(self.source, open_pos) + 1);
-                    self.injector.insert(
-                        open_byte,
-                        format!("\n    let __piano_guard = piano_runtime::enter({guard_name:?});"),
-                    );
-                    return;
-                };
-
-                let trailing_span = trailing_expr.span();
-                let trailing_start = line_col_to_byte(self.source, trailing_span.start());
-                let trailing_end = line_col_to_byte(self.source, trailing_span.end());
-
-                let return_type = match &sig.output {
-                    syn::ReturnType::Type(_, ty) => quote!(#ty).to_string(),
-                    _ => unreachable!("returns_future already checked this"),
-                };
-
-                // For boxed-future returns, wrap early `return` expressions too.
-                self.collect_return_wrappers(block, guard_name, &return_type);
-
-                self.injector.insert(
-                    trailing_start,
-                    format!(
-                        "Box::pin(piano_runtime::PianoFuture::new(async move {{\
-                         \n        let __piano_guard = piano_runtime::enter({guard_name:?});\
-                         \n        let __piano_inner: {return_type} = "
-                    ),
-                );
-                self.injector
-                    .insert(trailing_end, ";\n        __piano_inner.await\n    }))");
-            }
-        }
-    }
-
-    /// Walk the block's statements for `return async { ... }` and add `.await`.
-    ///
-    /// Used by whole-body ImplFuture wrapping: the body is inside `async move { ... }`,
-    /// so `return async { expr }` would return a nested future. Adding `.await` unwraps
-    /// it to `return expr`.
-    fn collect_async_return_awaits(&mut self, block: &syn::Block) {
-        let mut visitor = AsyncReturnAwaiter {
-            source: self.source,
-            injector: &mut self.injector,
-        };
-        for stmt in &block.stmts {
-            visitor.visit_stmt(stmt);
-        }
-    }
-
-    /// Walk the block's preceding statements for `return <expr>` and wrap them.
-    fn collect_return_wrappers(&mut self, block: &syn::Block, name: &str, return_type: &str) {
-        // Walk all stmts except the last (trailing expr) for return expressions.
-        let stmts = if block.stmts.len() > 1 {
-            &block.stmts[..block.stmts.len() - 1]
-        } else {
-            return;
-        };
-        let mut collector = ReturnWrapperCollector {
-            name,
-            return_type,
-            source: self.source,
-            injector: &mut self.injector,
-        };
-        for stmt in stmts {
-            collector.visit_stmt(stmt);
-        }
-    }
-}
-
-struct ReturnWrapperCollector<'a> {
-    name: &'a str,
-    return_type: &'a str,
-    source: &'a str,
-    injector: &'a mut StringInjector,
-}
-
-impl<'ast, 'a> Visit<'ast> for ReturnWrapperCollector<'a> {
-    fn visit_expr_return(&mut self, ret: &'ast syn::ExprReturn) {
-        if let Some(inner) = &ret.expr {
-            let inner_start = line_col_to_byte(self.source, inner.span().start());
-            let inner_end = line_col_to_byte(self.source, inner.span().end());
-            self.injector.insert(
-                inner_start,
-                format!(
-                    "Box::pin(piano_runtime::PianoFuture::new(async move {{\
-                     \n            let __piano_guard = piano_runtime::enter({:?});\
-                     \n            let __piano_inner: {} = ",
-                    self.name, self.return_type
-                ),
-            );
-            self.injector
-                .insert(inner_end, ";\n            __piano_inner.await\n        }))");
-        }
-        // Don't recurse into the return's inner expression -- it's already wrapped.
-    }
-
-    // Boundaries: return inside closures/async blocks is not our function's return.
-    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
-    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
-}
-
-/// Visitor that adds `.await` to `return async { ... }` expressions.
-///
-/// Used by whole-body ImplFuture wrapping to unwrap nested futures.
-struct AsyncReturnAwaiter<'a> {
-    source: &'a str,
-    injector: &'a mut StringInjector,
-}
-
-impl<'ast, 'a> Visit<'ast> for AsyncReturnAwaiter<'a> {
-    fn visit_expr_return(&mut self, ret: &'ast syn::ExprReturn) {
-        if let Some(inner) = &ret.expr {
-            if matches!(inner.as_ref(), syn::Expr::Async(_)) {
-                let inner_end = line_col_to_byte(self.source, inner.span().end());
-                self.injector.insert(inner_end, ".await");
-            }
-        }
-        // Don't recurse into the return's inner expression.
-    }
-
-    // Boundaries: return inside closures/async blocks is not our function's return.
-    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
-    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
-}
-
-/// Find the first concurrency pattern in a block and return its name.
-///
-/// For method calls matching PARALLEL_ITER_METHODS: returns the method name (e.g. "par_iter").
-/// For method calls matching FORK_INJECTION_TRIGGERS: returns the method name (e.g. "scope").
-/// For function calls matching FORK_INJECTION_TRIGGERS: returns the full path (e.g. "rayon::scope").
-/// Stops recursion at detached spawn calls (method or function) since their
-/// 'static boundary prevents fork/adopt from working.
-fn find_concurrency_pattern(block: &syn::Block) -> Option<String> {
-    let mut finder = ConcurrencyPatternFinder { found: None };
-    for stmt in &block.stmts {
-        finder.visit_stmt(stmt);
-        if finder.found.is_some() {
-            return finder.found;
-        }
-    }
-    None
-}
-
-struct ConcurrencyPatternFinder {
-    found: Option<String>,
-}
-
-impl<'ast> Visit<'ast> for ConcurrencyPatternFinder {
-    fn visit_expr_method_call(&mut self, mc: &'ast syn::ExprMethodCall) {
-        if self.found.is_some() {
-            return;
-        }
-        let method = mc.method.to_string();
-        if PARALLEL_ITER_METHODS.contains(&method.as_str()) {
-            self.found = Some(method);
-            return;
-        }
-        if FORK_INJECTION_TRIGGERS.contains(&method.as_str()) {
-            self.found = Some(method);
-            return;
-        }
-        // Don't recurse into detached .spawn() args -- anything inside
-        // inherits the 'static boundary, so fork/adopt can't help.
-        if method == "spawn" {
-            return;
-        }
-        // Default recursion into receiver and args.
-        syn::visit::visit_expr_method_call(self, mc);
-    }
-
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-        if self.found.is_some() {
-            return;
-        }
-        let name = call_func_name(call);
-        if let Some(ref n) = name
-            && FORK_INJECTION_TRIGGERS.contains(&n.as_str())
-        {
-            // Build the full path, e.g. "rayon::scope"
-            if let syn::Expr::Path(path) = &*call.func {
-                let full_path: String = path
-                    .path
-                    .segments
-                    .iter()
-                    .map(|s| s.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::");
-                self.found = Some(full_path);
-                return;
-            }
-        }
-        // Don't recurse into detached spawn args.
-        if name.as_deref() == Some("spawn") {
-            return;
-        }
-        // Default recursion into func and args.
-        syn::visit::visit_expr_call(self, call);
-    }
-
-    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
-        // Recurse into closure body (concurrency can be inside a closure arg).
-        self.visit_expr(&c.body);
-    }
-
-    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
-}
-
-/// Extract the last path segment name from a function call expression.
-/// e.g. `rayon::scope(...)` -> Some("scope"), `foo(...)` -> Some("foo").
-fn call_func_name(call: &syn::ExprCall) -> Option<String> {
-    if let syn::Expr::Path(path) = &*call.func {
-        path.path.segments.last().map(|s| s.ident.to_string())
-    } else {
-        None
-    }
-}
-
-// ---------------------------------------------------------------------------
-// String-injection adopt collection (read-only AST walk)
-// ---------------------------------------------------------------------------
-
-// Hard-coded 8-space indent — may not match user's style, but the
-// instrumented source is transient (never shown to users).
-const ADOPT_STMT_TEXT: &str =
-    "\n        let __piano_adopt = __piano_ctx.map(|c| piano_runtime::adopt(c));";
-
-struct AdoptCollector<'a> {
-    in_parallel_chain: bool,
-    in_scope_body: bool,
-    source: &'a str,
-    injector: &'a mut StringInjector,
-}
-
-impl<'a> AdoptCollector<'a> {
-    fn visit_with_chain(&mut self, expr: &syn::Expr, chain: bool) {
-        let prev = self.in_parallel_chain;
-        self.in_parallel_chain = chain;
-        self.visit_expr(expr);
-        self.in_parallel_chain = prev;
-    }
-}
-
-impl<'ast, 'a> Visit<'ast> for AdoptCollector<'a> {
-    fn visit_expr_method_call(&mut self, mc: &'ast syn::ExprMethodCall) {
-        let method = mc.method.to_string();
-        let is_par = PARALLEL_ITER_METHODS.contains(&method.as_str());
-        let is_spawn = ADOPT_INJECTION_TARGETS.contains(&method.as_str());
-        let is_scope = SCOPE_FUNCTIONS.contains(&method.as_str());
-        let is_detached = method == "spawn" && !self.in_scope_body;
-
-        // Recurse into receiver first (preserving current chain state).
-        self.visit_expr(&mc.receiver);
-
-        let chain_active =
-            self.in_parallel_chain || is_par || receiver_has_parallel_method(&mc.receiver);
-
-        if is_detached {
-            // Detached spawn -- don't inject adopt, don't recurse into args.
-        } else if is_scope {
-            // Scope closures are coordinators -- recurse body for nested spawns.
-            for arg in &mc.args {
-                if let syn::Expr::Closure(closure) = arg {
-                    collect_adopt_in_scope_closure(closure, self.source, self.injector);
-                } else {
-                    let prev = self.in_parallel_chain;
-                    self.in_parallel_chain = false;
-                    self.visit_expr(arg);
-                    self.in_parallel_chain = prev;
-                }
-            }
-        } else if (chain_active && !is_par) || is_spawn {
-            // Worker closures: inject adopt, then recurse body.
-            for arg in &mc.args {
-                if let syn::Expr::Closure(closure) = arg {
-                    collect_adopt_at_closure_start(closure, self.source, self.injector);
-                    if let syn::Expr::Block(block) = &*closure.body {
-                        let prev_chain = self.in_parallel_chain;
-                        self.in_parallel_chain = false;
-                        for stmt in &block.block.stmts {
-                            self.visit_stmt(stmt);
-                        }
-                        self.in_parallel_chain = prev_chain;
-                    }
-                } else {
-                    let prev = self.in_parallel_chain;
-                    self.in_parallel_chain = false;
-                    self.visit_expr(arg);
-                    self.in_parallel_chain = prev;
-                }
-            }
-        } else {
-            // Non-special method: propagate chain state through args.
-            for arg in &mc.args {
-                self.visit_with_chain(arg, chain_active);
-            }
-        }
-    }
-
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-        let func_name = call_func_name(call);
-        let is_spawn = func_name
-            .as_ref()
-            .is_some_and(|n| ADOPT_INJECTION_TARGETS.contains(&n.as_str()));
-        let is_scope = func_name
-            .as_ref()
-            .is_some_and(|n| SCOPE_FUNCTIONS.contains(&n.as_str()));
-        let is_detached = func_name.as_deref() == Some("spawn");
-
-        if is_scope {
-            for arg in &call.args {
-                if let syn::Expr::Closure(closure) = arg {
-                    collect_adopt_in_scope_closure(closure, self.source, self.injector);
-                } else {
-                    let prev = self.in_parallel_chain;
-                    self.in_parallel_chain = false;
-                    self.visit_expr(arg);
-                    self.in_parallel_chain = prev;
-                }
-            }
-        } else if is_spawn && !is_detached {
-            for arg in &call.args {
-                if let syn::Expr::Closure(closure) = arg {
-                    collect_adopt_at_closure_start(closure, self.source, self.injector);
-                    if let syn::Expr::Block(block) = &*closure.body {
-                        let prev_chain = self.in_parallel_chain;
-                        self.in_parallel_chain = false;
-                        for stmt in &block.block.stmts {
-                            self.visit_stmt(stmt);
-                        }
-                        self.in_parallel_chain = prev_chain;
-                    }
-                } else {
-                    let prev = self.in_parallel_chain;
-                    self.in_parallel_chain = false;
-                    self.visit_expr(arg);
-                    self.in_parallel_chain = prev;
-                }
-            }
-        } else if is_detached {
-            // Detached spawn -- don't recurse into args.
-        } else {
-            // Default: recurse into func and args, no chain propagation.
-            for arg in &call.args {
-                let prev = self.in_parallel_chain;
-                self.in_parallel_chain = false;
-                self.visit_expr(arg);
-                self.in_parallel_chain = prev;
-            }
-        }
-    }
-
-    // Boundaries: closures and async blocks are separate scopes.
-    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
-    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
-}
-
-/// Inject adopt at the start of a closure body.
-fn collect_adopt_at_closure_start(
-    closure: &syn::ExprClosure,
-    source: &str,
-    injector: &mut StringInjector,
-) {
-    match &*closure.body {
-        syn::Expr::Block(block) => {
-            let open_pos = block.block.brace_token.span.open().start();
-            let open_byte = skip_inner_attrs(source, line_col_to_byte(source, open_pos) + 1);
-            injector.insert(open_byte, ADOPT_STMT_TEXT);
-        }
-        other => {
-            // Closure without braces (e.g. `|x| x + 1`).
-            // Inject adopt before the body expression by wrapping in a block.
-            let body_start = line_col_to_byte(source, other.span().start());
-            let body_end = line_col_to_byte(source, other.span().end());
-            injector.insert(body_start, format!("{{ {ADOPT_STMT_TEXT}\n        "));
-            injector.insert(body_end, "\n    }");
-        }
-    }
-}
-
-/// Recurse into a scope closure body for nested spawn calls.
-fn collect_adopt_in_scope_closure(
-    closure: &syn::ExprClosure,
-    source: &str,
-    injector: &mut StringInjector,
-) {
-    if let syn::Expr::Block(block) = &*closure.body {
-        let mut adopt = AdoptCollector {
-            in_parallel_chain: false,
-            in_scope_body: true,
-            source,
-            injector,
-        };
-        for stmt in &block.block.stmts {
-            adopt.visit_stmt(stmt);
-        }
-    }
-}
-
-fn receiver_has_parallel_method(expr: &syn::Expr) -> bool {
-    match expr {
-        syn::Expr::MethodCall(mc) => {
-            let method = mc.method.to_string();
-            PARALLEL_ITER_METHODS.contains(&method.as_str())
-                || receiver_has_parallel_method(&mc.receiver)
-        }
-        syn::Expr::Paren(p) => receiver_has_parallel_method(&p.expr),
-        _ => false,
-    }
-}
-
-impl<'s> Visit<'s> for InjectionCollector<'s> {
-    fn visit_item_mod(&mut self, node: &'s syn::ItemMod) {
-        self.scope.push_mod(&node.ident.to_string());
-        syn::visit::visit_item_mod(self, node);
-        self.scope.pop();
-    }
-
-    fn visit_item_fn(&mut self, node: &'s syn::ItemFn) {
-        if matches!(classify(&node.sig), Classification::Instrumentable) {
-            let name = node.sig.ident.to_string();
-            let scope_qualified = self.scope.render_full(&name);
-            let full_name = self.qualify_name(&scope_qualified);
-            if let Some(display_name) = self.targets.get(&full_name).cloned() {
-                self.collect_guard(&node.block, &display_name, &node.sig);
-            }
-        }
-        // Push fn scope for nested items, visit ONLY the block body.
-        // Using the free function skips our visit_block override.
-        self.scope.push_fn(&node.sig.ident.to_string());
-        syn::visit::visit_block(self, &node.block);
-        self.scope.pop();
-    }
-
-    fn visit_item_impl(&mut self, node: &'s syn::ItemImpl) {
-        let prev = self.current_impl.take();
-        let impl_name = crate::naming::render_impl_name(
-            &node.self_ty,
-            node.trait_.as_ref().map(|(_, path, _)| path),
-        );
-        self.current_impl = Some(impl_name);
-        syn::visit::visit_item_impl(self, node);
-        self.current_impl = prev;
-    }
-
-    fn visit_impl_item_fn(&mut self, node: &'s syn::ImplItemFn) {
-        if matches!(classify(&node.sig), Classification::Instrumentable) {
-            let method = node.sig.ident.to_string();
-            let impl_qualified = match &self.current_impl {
-                Some(ty) => format!("{ty}::{method}"),
-                None => method,
-            };
-            let scope_qualified = self.scope.render_full(&impl_qualified);
-            let full_name = self.qualify_name(&scope_qualified);
-            if let Some(display_name) = self.targets.get(&full_name).cloned() {
-                self.collect_guard(&node.block, &display_name, &node.sig);
-            }
-        }
-        // Push fn scope for nested items.
-        self.scope.push_fn(&node.sig.ident.to_string());
-        syn::visit::visit_block(self, &node.block);
-        self.scope.pop();
-    }
-
-    fn visit_item_trait(&mut self, node: &'s syn::ItemTrait) {
-        let trait_name = node.ident.to_string();
-        let prev = self.current_trait.take();
-        self.current_trait = Some(trait_name);
-        syn::visit::visit_item_trait(self, node);
-        self.current_trait = prev;
-    }
-
-    fn visit_trait_item_fn(&mut self, node: &'s syn::TraitItemFn) {
-        if let Some(ref block) = node.default {
-            if matches!(classify(&node.sig), Classification::Instrumentable) {
-                let method = node.sig.ident.to_string();
-                let trait_qualified = match &self.current_trait {
-                    Some(trait_name) => format!("{trait_name}::{method}"),
-                    None => method,
-                };
-                let scope_qualified = self.scope.render_full(&trait_qualified);
-                let full_name = self.qualify_name(&scope_qualified);
-                if let Some(display_name) = self.targets.get(&full_name).cloned() {
-                    self.collect_guard(block, &display_name, &node.sig);
-                }
-            }
-            // Push fn scope for nested items.
-            self.scope.push_fn(&node.sig.ident.to_string());
-            syn::visit::visit_block(self, block);
-            self.scope.pop();
-        } else {
-            syn::visit::visit_trait_item_fn(self, node);
-        }
-    }
-
-    fn visit_block(&mut self, node: &'s syn::Block) {
-        self.scope.push_block();
-        syn::visit::visit_block(self, node);
-        self.scope.pop();
-    }
-}
-
-/// Inject `piano_runtime::register(name)` calls at the top of `fn main`.
-///
-/// This ensures every instrumented function appears in the output, even if it
-/// was never called during the run.
-pub fn inject_registrations(
-    source: &str,
-    names: &[String],
-) -> Result<(String, SourceMap), syn::Error> {
-    let file: syn::File = syn::parse_str(source)?;
     let mut injector = StringInjector::new();
-    for item in &file.items {
-        if let syn::Item::Fn(func) = item {
-            if func.sig.ident == "main" {
-                let open = func.block.brace_token.span.open().start();
-                let byte_offset = skip_inner_attrs(source, line_col_to_byte(source, open) + 1);
-                let mut text = String::new();
-                for name in names {
-                    text.push_str(&format!("\n    piano_runtime::register(\"{name}\");"));
-                }
-                injector.insert(byte_offset, text);
-                break;
+
+    // --- Entry point: registrations at offset 0 ---
+    if let Some(ep) = entry_point {
+        let reg_offset = file_level_inner_attr_end(&file);
+        let mut entries = String::new();
+        for (id, name) in ep.name_table {
+            if !entries.is_empty() {
+                entries.push_str(", ");
+            }
+            entries.push_str(&format!("({id}, \"{name}\")"));
+        }
+        injector.insert(
+            reg_offset,
+            format!("\nconst PIANO_NAMES: &[(u32, &str)] = &[{entries}];\n"),
+        );
+    }
+
+    // --- Entry point: allocator detection and wrapping ---
+    if entry_point.is_some() {
+        inject_allocator(&file, source, &mut injector)?;
+    }
+
+    // --- Guards + shutdown: walk all descendants ---
+    for node in file.syntax().descendants() {
+        let Some(func) = ast::Fn::cast(node) else { continue };
+        let Some(body) = func.body() else { continue };
+        let Some(name) = func.name() else { continue };
+        let fn_name = name.text().to_string();
+
+        // Shutdown: inject lifecycle into fn main()
+        if fn_name == "main" {
+            if let Some(ep) = entry_point {
+                let stmt_list = body.stmt_list()
+                    .ok_or_else(|| "no stmt_list for fn main".to_string())?;
+                let inject_offset = brace_offset_after_inner_attrs(&stmt_list)?;
+                injector.insert(inject_offset, build_lifecycle_prefix(ep.runs_dir, ep.cpu_time));
+            }
+            continue; // main is excluded from the name table
+        }
+
+        // Guard: only for measured functions
+        let Some(&name_id) = measured.get(&fn_name) else { continue };
+
+        // Skip const fn and non-Rust ABI
+        if func.const_token().is_some() { continue }
+        if let Some(abi) = func.abi() {
+            if let Some(token) = abi.string_token() {
+                let abi_str = token.text();
+                if abi_str != "\"Rust\"" { continue }
+            }
+        }
+
+        let stmt_list = body.stmt_list()
+            .ok_or_else(|| format!("no stmt_list for fn {fn_name}"))?;
+        let inject_offset = brace_offset_after_inner_attrs(&stmt_list)?;
+
+        let is_async_fn = func.async_token().is_some();
+        let is_impl_future = returns_impl_future(&func);
+
+        if is_async_fn || is_impl_future {
+            let close_brace = stmt_list.syntax().children_with_tokens()
+                .filter(|t| t.kind() == T!['}'])
+                .last()
+                .ok_or_else(|| format!("no closing brace for fn {fn_name}"))?;
+            let close_offset: usize = close_brace.text_range().start().into();
+
+            if is_async_fn {
+                injector.insert(
+                    inject_offset,
+                    format!("\npiano_runtime::enter_async({name_id}, async move {{"),
+                );
+                injector.insert(close_offset, "}).await");
+            } else {
+                injector.insert(
+                    inject_offset,
+                    format!("\npiano_runtime::enter_async({name_id},"),
+                );
+                injector.insert(close_offset, ")");
+            }
+        } else {
+            injector.insert(
+                inject_offset,
+                format!("\nlet __piano_guard = piano_runtime::enter({name_id});"),
+            );
+        }
+    }
+
+    // --- Macro expansion: replace fn-generating invocations ---
+    expand_and_replace_macros(file.syntax(), measured, &mut injector);
+
+    let (source, source_map) = injector.apply(source);
+    Ok(InstrumentResult { source, source_map })
+}
+
+/// Find the byte offset after all file-level inner attributes (#![...]).
+/// Returns 0 if there are none.
+fn file_level_inner_attr_end(file: &SourceFile) -> usize {
+    let mut offset = 0usize;
+    for child in file.syntax().children() {
+        if child.kind() == SyntaxKind::ATTR {
+            let text = child.text().to_string();
+            if text.starts_with("#!") {
+                offset = child.text_range().end().into();
             }
         }
     }
-    Ok(injector.apply(source))
+    offset
+}
+
+/// Find the injection offset inside a statement list: after the opening
+/// brace and any inner attributes.
+fn brace_offset_after_inner_attrs(stmt_list: &ast::StmtList) -> Result<usize, String> {
+    let open_brace = stmt_list.syntax().children_with_tokens()
+        .find(|t| t.kind() == T!['{'])
+        .ok_or_else(|| "no opening brace".to_string())?;
+    let mut offset: usize = open_brace.text_range().end().into();
+
+    for child in stmt_list.syntax().children() {
+        if child.kind() == SyntaxKind::ATTR {
+            let text = child.text().to_string();
+            if text.starts_with("#!") {
+                offset = child.text_range().end().into();
+            }
+        }
+    }
+    Ok(offset)
+}
+
+/// Check if a function's return type contains `impl Future`.
+fn returns_impl_future(func: &ast::Fn) -> bool {
+    let Some(ret) = func.ret_type() else { return false };
+    let ret_text = ret.syntax().text().to_string();
+    ret_text.contains("impl") && ret_text.contains("Future")
+}
+
+// ---------------------------------------------------------------------------
+// Allocator injection (CST-based, single-pass)
+// ---------------------------------------------------------------------------
+
+/// Detect #[global_allocator] via CST and inject wrapping into the StringInjector.
+///
+/// Case 1 (absent): insert PianoAllocator<System> at offset 0.
+/// Case 2 (present, no cfg): replace the static item with wrapped version.
+/// Case 3 (present, with cfg): replace with wrapped + negated cfg fallback.
+fn inject_allocator(
+    file: &SourceFile,
+    source: &str,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    // Find the static item with #[global_allocator]
+    let alloc_info = find_global_allocator(file, source);
+
+    match alloc_info {
+        None => {
+            // Case 1: no allocator. Inject PianoAllocator<System>.
+            injector.insert(0, concat!(
+                "#[global_allocator]\n",
+                "static __PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>\n",
+                "    = piano_runtime::PianoAllocator::new(std::alloc::System);\n",
+            ));
+        }
+        Some(info) => {
+            let replacement = if let Some(ref cfg) = info.cfg_attr {
+                // Case 3: cfg-gated allocator
+                let neg_cfg = negate_cfg(cfg);
+                format!(
+                    "{cfg}\n\
+                     #[global_allocator]\n\
+                     static {name}: piano_runtime::PianoAllocator<{ty}>\n\
+                     \x20   = piano_runtime::PianoAllocator::new({init});\n\
+                     {neg_cfg}\n\
+                     #[global_allocator]\n\
+                     static {name}: piano_runtime::PianoAllocator<std::alloc::System>\n\
+                     \x20   = piano_runtime::PianoAllocator::new(std::alloc::System);",
+                    name = info.name,
+                    ty = info.type_expr,
+                    init = info.init_expr,
+                )
+            } else {
+                // Case 2: no cfg, simple wrap
+                format!(
+                    "#[global_allocator]\n\
+                     static {name}: piano_runtime::PianoAllocator<{ty}>\n\
+                     \x20   = piano_runtime::PianoAllocator::new({init});",
+                    name = info.name,
+                    ty = info.type_expr,
+                    init = info.init_expr,
+                )
+            };
+            injector.replace(info.start, info.end, replacement);
+        }
+    }
+
+    Ok(())
+}
+
+struct AllocatorInfo {
+    start: usize,
+    end: usize,
+    name: String,
+    type_expr: String,
+    init_expr: String,
+    cfg_attr: Option<String>,
+}
+
+/// Find a static item with #[global_allocator] using CST, extract its components.
+fn find_global_allocator(file: &SourceFile, source: &str) -> Option<AllocatorInfo> {
+    for node in file.syntax().descendants() {
+        let Some(static_item) = ast::Static::cast(node) else { continue };
+
+        // Check for #[global_allocator] attribute
+        let has_global_alloc = static_item.attrs().any(|attr| {
+            let text = attr.syntax().text().to_string();
+            text.contains("global_allocator") && !text.starts_with("#!")
+        });
+        if !has_global_alloc {
+            continue;
+        }
+
+        // Extract the full range (includes attributes)
+        let start: usize = static_item.syntax().text_range().start().into();
+        let end: usize = static_item.syntax().text_range().end().into();
+
+        // Extract name, type, initializer from the source text
+        let item_text = &source[start..end];
+
+        let static_kw = item_text.find("static ")?;
+        let after_static = &item_text[static_kw + 7..];
+        let colon = after_static.find(':')?;
+        let name = after_static[..colon].trim().to_string();
+
+        let after_colon = &after_static[colon + 1..];
+        let eq = after_colon.find('=')?;
+        let type_expr = after_colon[..eq].trim().to_string();
+
+        let after_eq = &after_colon[eq + 1..];
+        let init_expr = after_eq.trim_end_matches(';').trim().to_string();
+
+        // Check for #[cfg(...)] attribute
+        let cfg_attr = static_item.attrs().find_map(|attr| {
+            let text = attr.syntax().text().to_string();
+            if text.starts_with("#[cfg(") || text.starts_with("#[cfg_attr(") {
+                Some(text)
+            } else {
+                None
+            }
+        });
+
+        return Some(AllocatorInfo {
+            start,
+            end,
+            name,
+            type_expr,
+            init_expr,
+            cfg_attr,
+        });
+    }
+    None
+}
+
+/// Negate a #[cfg(...)] attribute to #[cfg(not(...))].
+fn negate_cfg(cfg: &str) -> String {
+    if let Some(inner) = cfg.strip_prefix("#[cfg(").and_then(|s| s.strip_suffix(")]")) {
+        format!("#[cfg(not({inner}))]")
+    } else {
+        // Can't negate complex cfg_attr, fall back to not(any())
+        "#[cfg(not(any()))]".to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle injection (shutdown)
+// ---------------------------------------------------------------------------
+
+const FILE_COLLISION_RETRIES: u32 = 4;
+
+/// Build the lifecycle code injected at the top of main().
+fn build_lifecycle_prefix(runs_dir: &str, cpu_time: bool) -> String {
+    let mut s = String::new();
+    s.push_str("\n    use std::io::Write as _;");
+    s.push_str("\n    let __piano_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();");
+    s.push_str("\n    let __piano_pid = std::process::id();");
+    s.push_str("\n    let __piano_sink = {");
+    s.push_str(&format!(
+        "\n        let __piano_dir = std::path::PathBuf::from(std::env::var(\"PIANO_RUNS_DIR\").unwrap_or_else(|_| \"{runs_dir}\".into()));"
+    ));
+    s.push_str("\n        match std::fs::create_dir_all(&__piano_dir) {");
+    s.push_str("\n            Ok(()) => {");
+    s.push_str("\n                let mut __piano_file = None;");
+    s.push_str("\n                let mut __piano_warned = false;");
+    s.push_str(&format!(
+        "\n                for __piano_suffix in 0u32..{FILE_COLLISION_RETRIES} {{"
+    ));
+    s.push_str("\n                    let __piano_name = if __piano_suffix == 0 {");
+    s.push_str("\n                        format!(\"{}-{}.ndjson\", __piano_ts, __piano_pid)");
+    s.push_str("\n                    } else {");
+    s.push_str("\n                        format!(\"{}-{}-{}.ndjson\", __piano_ts, __piano_pid, __piano_suffix)");
+    s.push_str("\n                    };");
+    s.push_str("\n                    let __piano_path = __piano_dir.join(&__piano_name);");
+    s.push_str("\n                    match std::fs::OpenOptions::new().write(true).create_new(true).open(&__piano_path) {");
+    s.push_str("\n                        Ok(f) => { __piano_file = Some(f); break; }");
+    s.push_str("\n                        Err(_) => {}");
+    s.push_str("\n                    }");
+    s.push_str("\n                }");
+    s.push_str("\n                if __piano_file.is_none() && !__piano_warned {");
+    s.push_str("\n                    let _ = writeln!(std::io::stderr(), \"piano: warning: could not create profiling output (all suffixes exhausted)\");");
+    s.push_str("\n                }");
+    s.push_str("\n                __piano_file.map(|f| std::sync::Arc::new(piano_runtime::file_sink::FileSink::new(f)))");
+    s.push_str("\n            }");
+    s.push_str("\n            Err(e) => {");
+    s.push_str("\n                let _ = writeln!(std::io::stderr(), \"piano: warning: could not create profiling output directory {}: {}\", __piano_dir.display(), e);");
+    s.push_str("\n                None");
+    s.push_str("\n            }");
+    s.push_str("\n        }");
+    s.push_str("\n    };");
+    s.push_str("\n    let __piano_run_id = format!(\"{}-{}\", __piano_ts, __piano_pid);");
+    s.push_str(&format!(
+        "\n    piano_runtime::session::ProfileSession::init(__piano_sink, {cpu_time}, &PIANO_NAMES, &__piano_run_id, __piano_ts);"
+    ));
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Macro guards: token-tree walk
+// ---------------------------------------------------------------------------
+
+/// Expand fn-generating macro_rules! invocations and replace them with
+/// instrumented expansions. Expression-position macros are skipped
+/// (safety fence: no fn items in expansion).
+fn expand_and_replace_macros(
+    root: &ra_ap_syntax::SyntaxNode,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) {
+    use crate::macro_expand;
+
+    let (expansions, _defs, calls) = macro_expand::expand_fn_generating_macros(root);
+
+    for exp in &expansions {
+        let call = &calls[exp.call_idx];
+
+        // Inject guards into the expanded text for measured functions.
+        let instrumented = inject_guards_into_expansion(&exp.expanded_text, measured);
+
+        // Replace the MACRO_CALL byte range with the instrumented expansion.
+        injector.replace(call.byte_start, call.byte_end, instrumented);
+    }
+}
+
+/// Inject guards into expanded macro text. Parses the expansion, finds fn
+/// items, and inserts guards for functions that are in the measured map.
+/// Inject guards into expanded macro text. Uses the same guard logic as
+/// the main instrument_source loop: sync enter(), async enter_async(),
+/// impl-Future wrapping. Skips const fn and non-Rust ABI.
+fn inject_guards_into_expansion(
+    expanded: &str,
+    measured: &HashMap<String, u32>,
+) -> String {
+    let parse = SourceFile::parse(expanded, ra_ap_syntax::Edition::Edition2021);
+
+    // Collect insertions: (byte_offset, text, is_close_brace_insert)
+    // We use a Vec of insertions applied in reverse order.
+    let mut insertions: Vec<(usize, String)> = Vec::new();
+
+    for node in parse.tree().syntax().descendants() {
+        let Some(func) = ast::Fn::cast(node) else { continue };
+        let Some(body) = func.body() else { continue };
+        let Some(name) = func.name() else { continue };
+        let fn_name = name.text().to_string();
+
+        let Some(&name_id) = measured.get(&fn_name) else { continue };
+
+        // Skip const fn
+        if func.const_token().is_some() { continue }
+
+        // Skip non-Rust ABI
+        if let Some(abi) = func.abi() {
+            if let Some(token) = abi.string_token() {
+                if token.text() != "\"Rust\"" { continue }
+            }
+        }
+
+        let Some(stmt_list) = body.stmt_list() else { continue };
+        let Some(open_brace) = stmt_list.syntax().children_with_tokens()
+            .find(|t| t.kind() == T!['{']) else { continue };
+        let offset: usize = open_brace.text_range().end().into();
+
+        let is_async_fn = func.async_token().is_some();
+        let is_impl_future = returns_impl_future(&func);
+
+        if is_async_fn || is_impl_future {
+            let Some(close_brace) = stmt_list.syntax().children_with_tokens()
+                .filter(|t| t.kind() == T!['}'])
+                .last() else { continue };
+            let close_offset: usize = close_brace.text_range().start().into();
+
+            if is_async_fn {
+                insertions.push((
+                    offset,
+                    format!("\npiano_runtime::enter_async({name_id}, async move {{"),
+                ));
+                insertions.push((close_offset, "}).await".to_string()));
+            } else {
+                insertions.push((
+                    offset,
+                    format!("\npiano_runtime::enter_async({name_id},"),
+                ));
+                insertions.push((close_offset, ")".to_string()));
+            }
+        } else {
+            insertions.push((
+                offset,
+                format!("\nlet __piano_guard = piano_runtime::enter({name_id});"),
+            ));
+        }
+    }
+
+    // Apply in reverse order to preserve offsets.
+    insertions.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut result = expanded.to_string();
+    for (offset, text) in &insertions {
+        result.insert_str(*offset, text);
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_targets(names: &[&str]) -> HashMap<String, String> {
-        names
-            .iter()
-            .map(|&n| (n.to_string(), n.to_string()))
-            .collect()
+    #[test]
+    fn cst_finds_function() {
+        let source = "fn work() {\n    let x = 1;\n}\n";
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let file = parse.tree();
+        let funcs: Vec<_> = file.syntax().descendants()
+            .filter_map(ast::Fn::cast)
+            .collect();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].name().unwrap().text(), "work");
+        assert!(funcs[0].body().is_some());
     }
 
     #[test]
-    fn instruments_top_level_function() {
-        let source = r#"
-fn walk() {
-    do_stuff();
-}
-
-fn other() {
-    do_other();
-}
-"#;
-        let targets = test_targets(&["walk"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        assert!(
-            result.contains("piano_runtime::enter(\"walk\")"),
-            "walk should be instrumented"
-        );
-        assert!(
-            !result.contains("piano_runtime::enter(\"other\")"),
-            "other should not be instrumented",
-        );
+    fn brace_offset_is_correct() {
+        let source = "fn work() {\n    let x = 1;\n}\n";
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let file = parse.tree();
+        let func = file.syntax().descendants()
+            .find_map(ast::Fn::cast).unwrap();
+        let body = func.body().unwrap();
+        let stmt_list = body.stmt_list().unwrap();
+        let brace = stmt_list.syntax().children_with_tokens()
+            .find(|t| t.kind() == T!['{'])
+            .unwrap();
+        let offset: usize = brace.text_range().end().into();
+        assert_eq!(offset, 11, "brace end offset");
+        let mut s = source.to_string();
+        s.insert_str(offset, "\nGUARD;");
+        assert!(s.contains("{\nGUARD;"), "injection after brace. Got:\n{s}");
     }
 
     #[test]
-    fn instruments_impl_method() {
-        let source = r#"
-struct Walker;
-
-impl Walker {
-    fn walk(&self) {
-        self.step();
-    }
-}
-"#;
-        let targets = test_targets(&["Walker::walk"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        assert!(
-            result.contains("piano_runtime::enter(\"Walker::walk\")"),
-            "Walker::walk should be instrumented. Got:\n{result}",
-        );
+    fn inner_attrs_skipped() {
+        let source = "fn work() {\n    #![allow(unused)]\n    let x = 1;\n}\n";
+        let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        let attr_pos = result.source.find("#![allow(unused)]").unwrap();
+        let guard_pos = result.source.find("piano_runtime::enter(0)").unwrap();
+        assert!(guard_pos > attr_pos, "guard must come after inner attr");
     }
 
     #[test]
-    fn preserves_function_signature_and_body() {
-        let source = r#"
-fn compute(x: i32, y: i32) -> i32 {
-    x + y
-}
-"#;
-        let targets = test_targets(&["compute"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        assert!(
-            result.contains("fn compute(x: i32, y: i32) -> i32"),
-            "signature preserved"
-        );
-        assert!(result.contains("x + y"), "body preserved");
-        assert!(
-            result.contains("piano_runtime::enter(\"compute\")"),
-            "guard injected"
-        );
+    fn injects_guard_in_simple_function() {
+        let source = "fn work() {\n    let x = 1;\n}\n";
+        let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("piano_runtime::enter(0)"));
     }
 
     #[test]
-    fn multiple_functions_instrumented() {
-        let source = r#"
-fn a() {}
-fn b() {}
-fn c() {}
-"#;
-        let targets = test_targets(&["a", "c"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        assert!(
-            result.contains("piano_runtime::enter(\"a\")"),
-            "a should be instrumented"
-        );
-        assert!(
-            !result.contains("piano_runtime::enter(\"b\")"),
-            "b should NOT be instrumented",
-        );
-        assert!(
-            result.contains("piano_runtime::enter(\"c\")"),
-            "c should be instrumented"
-        );
+    fn skips_unmeasured_functions() {
+        let source = "fn work() {\n    1;\n}\nfn helper() {\n    2;\n}\n";
+        let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert_eq!(result.source.matches("piano_runtime::enter").count(), 1);
     }
 
     #[test]
-    fn injects_register_calls_in_main() {
-        let source = r#"
-fn main() {
-    do_stuff();
-}
-"#;
-        let names = vec!["walk".to_string(), "parse".to_string()];
-        let (result, _map) = inject_registrations(source, &names).unwrap();
-        assert!(
-            result.contains("piano_runtime::register(\"walk\")"),
-            "Got:\n{result}"
-        );
-        assert!(
-            result.contains("piano_runtime::register(\"parse\")"),
-            "Got:\n{result}"
-        );
-    }
-
-    #[test]
-    fn injects_fork_and_adopt_for_par_iter() {
-        let source = r#"
-fn process_all(items: &[Item]) -> Vec<Result> {
-    items.par_iter()
-         .map(|item| transform(item))
-         .collect()
-}
-"#;
-        let targets = test_targets(&["process_all"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        assert!(
-            result.contains("piano_runtime::enter(\"process_all\")"),
-            "should have guard. Got:\n{result}"
-        );
-        assert!(
-            result.contains("piano_runtime::fork()"),
-            "should inject fork. Got:\n{result}"
-        );
-        assert!(
-            result.contains("piano_runtime::adopt"),
-            "should inject adopt in closure. Got:\n{result}"
-        );
-    }
-
-    #[test]
-    fn skips_fork_for_thread_spawn() {
-        let source = r#"
-fn do_work() {
-    std::thread::spawn(|| {
-        heavy_computation();
-    });
-}
-"#;
-        let targets = test_targets(&["do_work"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-
-        assert!(
-            !result.source.contains("piano_runtime::fork()"),
-            "should NOT inject fork for std::thread::spawn. Got:\n{}",
-            result.source
-        );
-        assert!(
-            !result.source.contains("piano_runtime::adopt"),
-            "should NOT inject adopt for std::thread::spawn. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.source.contains("piano_runtime::enter(\"do_work\")"),
-            "should still inject enter guard. Got:\n{}",
-            result.source
-        );
-        // Detached spawns should not report concurrency (no fork/adopt to act on)
-        assert!(
-            result.concurrency.is_empty(),
-            "should not report concurrency for detached spawn. Got: {:?}",
-            result.concurrency
-        );
-    }
-
-    #[test]
-    fn mixed_scope_and_thread_spawn() {
-        let source = r#"
-fn mixed() {
-    rayon::scope(|s| {
-        s.spawn(|_| { work_a(); });
-    });
-    std::thread::spawn(|| {
-        work_b();
-    });
-}
-"#;
-        let targets = test_targets(&["mixed"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-
-        // Fork should be injected (rayon::scope triggers it)
-        assert!(
-            result.source.contains("piano_runtime::fork()"),
-            "should inject fork for rayon::scope. Got:\n{}",
-            result.source
-        );
-        // Adopt should appear (for s.spawn inside scope)
-        assert!(
-            result.source.contains("piano_runtime::adopt"),
-            "should inject adopt for scoped s.spawn. Got:\n{}",
-            result.source
-        );
-
-        // Count adopt occurrences -- should be exactly 1 (in s.spawn, NOT in thread::spawn)
-        let adopt_count = result.source.matches("piano_runtime::adopt").count();
-        assert_eq!(
-            adopt_count, 1,
-            "should have exactly 1 adopt (in s.spawn), not in thread::spawn. Got {adopt_count} in:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn skips_fork_for_short_path_thread_spawn() {
-        // `use std::thread::spawn; spawn(|| ...)` -- bare name, no path prefix
-        let source = r#"
-fn do_work() {
-    spawn(|| {
-        heavy_computation();
-    });
-}
-"#;
-        let targets = test_targets(&["do_work"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-
-        assert!(
-            !result.source.contains("piano_runtime::fork()"),
-            "should NOT inject fork for bare spawn(). Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn no_concurrency_for_thread_spawn() {
-        let source = r#"
-fn do_work() {
-    std::thread::spawn(|| { work(); });
-}
-"#;
-        let targets = test_targets(&["do_work"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-
-        assert!(
-            result.concurrency.is_empty(),
-            "detached spawn should not report concurrency. Got: {:?}",
-            result.concurrency
-        );
-    }
-
-    #[test]
-    fn skips_fork_for_rayon_spawn_free_function() {
-        // rayon::spawn(|| ...) is a free function call (Call arm, not MethodCall).
-        // It is detached ('static bound), so no fork/adopt should be injected.
-        let source = r#"
-fn do_work() {
-    rayon::spawn(|| {
-        heavy_computation();
-    });
-}
-"#;
-        let targets = test_targets(&["do_work"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-
-        assert!(
-            !result.source.contains("piano_runtime::fork()"),
-            "should NOT inject fork for rayon::spawn free function. Got:\n{}",
-            result.source
-        );
-        assert!(
-            !result.source.contains("piano_runtime::adopt"),
-            "should NOT inject adopt for rayon::spawn free function. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.source.contains("piano_runtime::enter(\"do_work\")"),
-            "should still inject enter guard. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.concurrency.is_empty(),
-            "rayon::spawn free function should not report concurrency. Got: {:?}",
-            result.concurrency
-        );
-    }
-
-    #[test]
-    fn nested_scope_inside_detached_spawn() {
-        // A scoped concurrency primitive (rayon::scope) nested inside a
-        // detached spawn (std::thread::spawn). The outer detached spawn
-        // suppresses fork/adopt for the entire function body -- the inner
-        // rayon::scope should not trigger fork/adopt injection.
-        let source = r#"
-fn work() {
-    std::thread::spawn(|| {
-        rayon::scope(|s| {
-            s.spawn(|_| { inner(); });
-        });
-    });
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-
-        assert!(
-            !result.source.contains("piano_runtime::fork()"),
-            "should NOT inject fork when scope is nested inside detached spawn. Got:\n{}",
-            result.source
-        );
-        assert!(
-            !result.source.contains("piano_runtime::adopt"),
-            "should NOT inject adopt when scope is nested inside detached spawn. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.source.contains("piano_runtime::enter(\"work\")"),
-            "should still inject enter guard. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.concurrency.is_empty(),
-            "nested scope inside detached spawn should not report concurrency. Got: {:?}",
-            result.concurrency
-        );
-    }
-
-    #[test]
-    fn par_iter_inside_async_block_not_detected() {
-        // par_iter inside an async block is a separate scope -- it should NOT
-        // cause fork/adopt injection in the enclosing function.
-        let source = r#"
-fn outer() {
-    async {
-        items.par_iter().for_each(|x| process(x));
-    };
-}
-"#;
-        let targets = test_targets(&["outer"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-
-        assert!(
-            !result.source.contains("piano_runtime::fork()"),
-            "should NOT inject fork for par_iter inside async block. Got:\n{}",
-            result.source
-        );
-        assert!(
-            !result.source.contains("piano_runtime::adopt"),
-            "should NOT inject adopt for par_iter inside async block. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.concurrency.is_empty(),
-            "par_iter inside async block should not report concurrency. Got: {:?}",
-            result.concurrency
-        );
-    }
-
-    #[test]
-    fn injects_adopt_in_rayon_scope_spawn() {
-        let source = r#"
-fn parallel_work() {
-    rayon::scope(|s| {
-        s.spawn(|_| { work_a(); });
-        s.spawn(|_| { work_b(); });
-    });
-}
-"#;
-        let targets = test_targets(&["parallel_work"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        assert!(
-            result.contains("piano_runtime::fork()"),
-            "should inject fork. Got:\n{result}"
-        );
-        assert!(
-            result.contains("piano_runtime::adopt"),
-            "should inject adopt. Got:\n{result}"
-        );
-    }
-
-    #[test]
-    fn rayon_scope_spawn_in_loop_with_move_closures() {
-        // Simulates real rayon pattern: s.spawn(move |_| { ... }) in a for loop.
-        // `__piano_ctx` is `Option<&SpanContext>` which is Copy, so move closures work.
-        let source = r#"
-fn concurrent_discover() {
-    rayon::scope(|s| {
-        for i in 0..4 {
-            s.spawn(move |_| {
-                do_work(i);
-            });
-        }
-    });
-}
-"#;
-        let targets = test_targets(&["concurrent_discover"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        assert!(
-            result.contains("piano_runtime::fork()"),
-            "should inject fork. Got:\n{result}"
-        );
-        assert!(
-            result.contains("piano_runtime::adopt"),
-            "should inject adopt in spawn closures. Got:\n{result}"
-        );
-        // The scope closure itself should NOT have an adopt (it's the coordinator).
-        // The adopt should only be inside the s.spawn closures.
-        // Verify by checking the generated code compiles structurally.
-        let parsed: syn::File = syn::parse_str(&result)
-            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
-        assert!(!parsed.items.is_empty());
-    }
-
-    #[test]
-    fn injects_adopt_in_let_binding_inside_for_loop() {
-        // Concurrency closure assigned to a let binding inside a for loop.
-        // Regression: inject_adopt_in_concurrency_closures only handled
-        // Stmt::Expr, missing Stmt::Local (let bindings).
-        let source = r#"
-fn work() {
-    rayon::scope(|s| {
-        for item in items {
-            let handle = s.spawn(|_| { compute(item); });
-        }
-    });
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        assert!(
-            result.contains("piano_runtime::fork()"),
-            "should inject fork. Got:\n{result}"
-        );
-        assert!(
-            result.contains("piano_runtime::adopt"),
-            "should inject adopt inside spawn closure bound to let. Got:\n{result}"
-        );
-        let parsed: syn::File = syn::parse_str(&result)
-            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
-        assert!(!parsed.items.is_empty());
-    }
-
-    #[test]
-    fn injects_adopt_in_match_arms_inside_scope() {
-        // Concurrency closures inside match arms should get adopt injection.
-        // Bug #331: match expressions were skipped by the catch-all.
-        let source = r#"
-fn work(kind: Kind) {
-    rayon::scope(|s| {
-        match kind {
-            Kind::A => { s.spawn(|_| { work_a(); }); }
-            Kind::B => { s.spawn(|_| { work_b(); }); }
-        }
-    });
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        assert!(
-            result.contains("piano_runtime::fork()"),
-            "should inject fork. Got:\n{result}"
-        );
-        assert!(
-            result.contains("piano_runtime::adopt"),
-            "should inject adopt inside spawn closures in match arms. Got:\n{result}"
-        );
-        let parsed: syn::File = syn::parse_str(&result)
-            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
-        assert!(!parsed.items.is_empty());
-    }
-
-    #[test]
-    fn injects_adopt_in_unsafe_block_inside_scope() {
-        // Concurrency closures inside unsafe blocks should get adopt injection.
-        // Bug #331: unsafe expressions were skipped by the catch-all.
-        let source = r#"
-fn work() {
-    rayon::scope(|s| {
-        unsafe {
-            s.spawn(|_| { do_unsafe_work(); });
-        }
-    });
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        assert!(
-            result.contains("piano_runtime::fork()"),
-            "should inject fork. Got:\n{result}"
-        );
-        assert!(
-            result.contains("piano_runtime::adopt"),
-            "should inject adopt inside spawn closure in unsafe block. Got:\n{result}"
-        );
-        let parsed: syn::File = syn::parse_str(&result)
-            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
-        assert!(!parsed.items.is_empty());
-    }
-
-    #[test]
-    fn propagates_parallel_chain_through_control_flow() {
-        // in_parallel_chain must propagate through if/else, for, while,
-        // loop, block, match, and unsafe so that closures nested inside
-        // control flow within a par_iter chain still get adopt injection.
-        // Bug #344: inject_adopt_in_stmts hardcoded false, losing context.
-        let source = r#"
-fn work(items: &[Item]) {
-    items.par_iter().for_each(|item| {
-        if item.ready {
-            item.parts.par_iter().for_each(|p| process(p));
-        } else {
-            item.fallbacks.par_iter().for_each(|f| fallback(f));
-        }
-        for sub in &item.subs {
-            sub.entries.par_iter().for_each(|e| handle(e));
-        }
-        match item.kind {
-            Kind::A => item.as_.par_iter().for_each(|a| do_a(a)),
-            Kind::B => item.bs.par_iter().for_each(|b| do_b(b)),
-        }
-    });
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        // Count adopt injections: outer for_each closure + 5 inner par_iter closures
-        // (if-branch, else-branch, for-body, match-arm-A, match-arm-B)
-        let adopt_count = result.matches("piano_runtime::adopt").count();
-        assert!(
-            adopt_count >= 6,
-            "expected at least 6 adopt injections (1 outer + 5 inner), got {adopt_count}. Got:\n{result}"
-        );
-        let parsed: syn::File = syn::parse_str(&result)
-            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
-        assert!(!parsed.items.is_empty());
-    }
-
-    #[test]
-    fn no_fork_inject_in_non_target_function() {
-        let source = r#"
-fn not_targeted() {
-    items.par_iter().map(|x| x).collect()
-}
-"#;
-        let targets = test_targets(&[]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        assert!(
-            !result.contains("piano_runtime::fork()"),
-            "should NOT inject fork in non-target function. Got:\n{result}"
-        );
-    }
-
-    #[test]
-    fn reports_concurrency_for_par_iter() {
-        let source = r#"
-fn process_all(items: &[Item]) -> Vec<Result> {
-    items.par_iter()
-         .map(|item| transform(item))
-         .collect()
-}
-"#;
-        let targets = test_targets(&["process_all"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert_eq!(result.concurrency.len(), 1);
-        assert_eq!(result.concurrency[0].0, "process_all");
-        assert_eq!(result.concurrency[0].1, "par_iter");
-    }
-
-    #[test]
-    fn reports_concurrency_for_rayon_scope() {
-        let source = r#"
-fn concurrent_discover() {
-    rayon::scope(|s| {
-        s.spawn(|_| { work(); });
-    });
-}
-"#;
-        let targets = test_targets(&["concurrent_discover"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert_eq!(result.concurrency.len(), 1);
-        assert_eq!(result.concurrency[0].0, "concurrent_discover");
-        assert_eq!(result.concurrency[0].1, "rayon::scope");
-    }
-
-    #[test]
-    fn no_concurrency_for_regular_function() {
-        let source = r#"
-fn simple() {
-    do_stuff();
-}
-"#;
-        let targets = test_targets(&["simple"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(result.concurrency.is_empty());
-    }
-
-    #[test]
-    fn instruments_async_fn() {
-        let source = r#"
-async fn fetch_data(id: u32) -> String {
-    format!("data-{id}")
-}
-"#;
-        let targets = test_targets(&["fetch_data"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result
-                .source
-                .contains("piano_runtime::enter(\"fetch_data\")"),
-            "async function SHOULD be instrumented. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.source.contains("piano_runtime::PianoFuture::new"),
-            "async fn should be wrapped in PianoFuture. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.source.contains("async move"),
-            "async fn body should use async move. Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn does_not_skip_sync_fn() {
-        let source = r#"
-fn compute(x: u64) -> u64 {
-    x * 2
-}
-"#;
-        let targets = test_targets(&["compute"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-
-        assert!(
-            result.source.contains("piano_runtime::enter(\"compute\")"),
-            "sync function should be instrumented. Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn instruments_async_impl_method() {
-        let source = r#"
-struct Client;
-
-impl Client {
-    async fn fetch(&self) -> String {
-        "data".to_string()
-    }
-}
-"#;
-        let targets = test_targets(&["Client::fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result
-                .source
-                .contains("piano_runtime::enter(\"Client::fetch\")"),
-            "async impl method SHOULD be instrumented. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.source.contains("piano_runtime::PianoFuture::new"),
-            "async impl method should be wrapped in PianoFuture. Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn instruments_async_trait_default_method() {
-        let source = r#"
-trait Service {
-    async fn handle(&self) -> String {
-        "ok".to_string()
-    }
-}
-"#;
-        let targets = test_targets(&["Service::handle"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result
-                .source
-                .contains("piano_runtime::enter(\"Service::handle\")"),
-            "async trait default method SHOULD be instrumented. Got:\n{}",
-            result.source
-        );
-        assert!(
-            result.source.contains("piano_runtime::PianoFuture::new"),
-            "async trait method should be wrapped in PianoFuture. Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn skips_uninstrumentable_trait_default_methods() {
-        let source = r#"
-trait Processor {
-    fn process(&self);
-    fn default_method(&self) {
-        do_work();
-    }
-    unsafe fn unsafe_default(&self) {
-        dangerous_work();
-    }
-}
-"#;
-        // Only the safe default method is targeted
-        let targets = test_targets(&["Processor::default_method", "Processor::unsafe_default"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result
-                .source
-                .contains("piano_runtime::enter(\"Processor::default_method\")"),
-            "safe trait default method should be instrumented. Got:\n{}",
-            result.source
-        );
-        assert!(
-            !result
-                .source
-                .contains("piano_runtime::enter(\"Processor::unsafe_default\")"),
-            "unsafe trait default method should NOT be instrumented. Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn wraps_async_fn_body_in_piano_future() {
-        let source = r#"
-async fn handler(x: i32) -> String {
-    let result = fetch(x).await;
-    format!("{result}")
-}
-"#;
-        let targets = test_targets(&["handler"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(result.source.contains("piano_runtime::PianoFuture::new"));
-        assert!(result.source.contains("async move"));
-        assert!(result.source.contains(".await"));
-        assert!(result.source.contains("piano_runtime::enter"));
-        // Should NOT have check(), save(), resume(), or AllocAccumulator
-        assert!(!result.source.contains("__piano_guard.check()"));
-        assert!(!result.source.contains("__piano_alloc"));
-        assert!(!result.source.contains("AllocAccumulator"));
-    }
-
-    #[test]
-    fn does_not_wrap_sync_fn_in_piano_future() {
-        let source = r#"
-fn compute(x: u64) -> u64 {
-    x * 2
-}
-"#;
-        let targets = test_targets(&["compute"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result.source.contains("piano_runtime::enter(\"compute\")"),
-            "sync fn should be instrumented"
-        );
-        assert!(
-            !result.source.contains("PianoFuture"),
-            "sync fn should NOT be wrapped in PianoFuture. Got:\n{}",
-            result.source
-        );
-    }
-
-    #[test]
-    fn non_target_async_fn_not_wrapped() {
-        let targets = test_targets(&["other"]);
-        let source = r#"
-async fn not_targeted() {
-    fetch().await;
-}
-"#;
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            !result.source.contains("PianoFuture"),
-            "non-target async fn should not be wrapped"
-        );
+    fn skips_const_fn() {
+        let source = "const fn compute() -> u32 {\n    42\n}\n";
+        let measured: HashMap<String, u32> = [("compute".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
         assert!(!result.source.contains("piano_runtime::enter"));
     }
 
     #[test]
-    fn returns_future_detects_impl_future() {
-        let sig: syn::Signature = syn::parse_quote! {
-            fn foo() -> impl Future<Output = i32>
+    fn skips_extern_c_fn() {
+        let source = "extern \"C\" fn callback(x: i32) -> i32 {\n    x + 1\n}\n";
+        let measured: HashMap<String, u32> = [("callback".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(!result.source.contains("piano_runtime::enter"));
+    }
+
+    #[test]
+    fn instruments_unsafe_fn() {
+        let source = "unsafe fn danger() {\n    let x = 1;\n}\n";
+        let measured: HashMap<String, u32> = [("danger".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("piano_runtime::enter(0)"));
+    }
+
+    #[test]
+    fn instruments_trait_method_impl() {
+        let source = "struct S;\nimpl std::fmt::Display for S {\n    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {\n        write!(f, \"S\")\n    }\n}\n";
+        let measured: HashMap<String, u32> = [("fmt".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("piano_runtime::enter(0)"));
+    }
+
+    #[test]
+    fn no_parameter_injection() {
+        let source = "fn work(x: i32) -> i32 {\n    x + 1\n}\n";
+        let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("fn work(x: i32) -> i32"));
+        assert!(!result.source.contains("__piano_ctx"));
+    }
+
+    #[test]
+    fn no_call_site_injection() {
+        let source = "fn caller() {\n    work();\n}\nfn work() {\n    let x = 1;\n}\n";
+        let measured: HashMap<String, u32> =
+            [("caller".into(), 0), ("work".into(), 1)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("    work();"), "call site unchanged");
+        assert!(!result.source.contains(".clone()"));
+    }
+
+    #[test]
+    fn multiple_functions_get_different_ids() {
+        let source = "fn a() {\n    1;\n}\nfn b() {\n    2;\n}\n";
+        let measured: HashMap<String, u32> =
+            [("a".into(), 0), ("b".into(), 1)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("enter(0)"));
+        assert!(result.source.contains("enter(1)"));
+    }
+
+    #[test]
+    fn instruments_inherent_impl_method() {
+        let source = "struct S;\nimpl S {\n    fn method(&self) {\n        let x = 1;\n    }\n}\n";
+        let measured: HashMap<String, u32> = [("method".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("piano_runtime::enter(0)"));
+        assert!(result.source.contains("fn method(&self)"), "signature unchanged");
+    }
+
+    #[test]
+    fn instruments_trait_default_method() {
+        let source = "trait T {\n    fn default_impl(&self) {\n        let x = 1;\n    }\n}\n";
+        let measured: HashMap<String, u32> = [("default_impl".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("piano_runtime::enter(0)"));
+    }
+
+    #[test]
+    fn skips_trait_abstract_method() {
+        let source = "trait T {\n    fn abstract_method(&self);\n}\n";
+        let measured: HashMap<String, u32> = [("abstract_method".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(!result.source.contains("piano_runtime::enter"), "no body = no guard");
+    }
+
+    #[test]
+    fn skips_foreign_function() {
+        let source = "extern {\n    fn c_function(x: i32) -> i32;\n}\n";
+        let measured: HashMap<String, u32> = [("c_function".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(!result.source.contains("piano_runtime::enter"), "foreign fn has no body");
+    }
+
+    #[test]
+    fn instruments_nested_function() {
+        let source = "fn outer() {\n    fn inner() {\n        let x = 1;\n    }\n    inner();\n}\n";
+        let measured: HashMap<String, u32> =
+            [("outer".into(), 0), ("inner".into(), 1)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("enter(0)"), "outer gets guard");
+        assert!(result.source.contains("enter(1)"), "inner gets guard");
+    }
+
+    #[test]
+    fn async_fn_uses_enter_async() {
+        let source = "async fn fetch() {\n    let x = 1;\n}\n";
+        let measured: HashMap<String, u32> = [("fetch".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("enter_async(0"), "async fn must use enter_async");
+        assert!(!result.source.contains("piano_runtime::enter(0)"), "must NOT use sync enter");
+    }
+
+    #[test]
+    fn impl_future_uses_enter_async() {
+        let source = "fn fetch() -> impl std::future::Future<Output = i32> {\n    async { 42 }\n}\n";
+        let measured: HashMap<String, u32> = [("fetch".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("enter_async(0"), "impl Future must use enter_async");
+    }
+
+    #[test]
+    fn impl_future_short_path() {
+        let source = "fn fetch() -> impl Future<Output = ()> {\n    async {}\n}\n";
+        let measured: HashMap<String, u32> = [("fetch".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("enter_async(0"));
+    }
+
+    #[test]
+    fn sync_fn_does_not_use_enter_async() {
+        let source = "fn work() -> i32 {\n    42\n}\n";
+        let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("piano_runtime::enter(0)"));
+        assert!(!result.source.contains("enter_async"));
+    }
+
+    #[test]
+    fn async_wrapping_preserves_body() {
+        let source = "async fn fetch() {\n    let x = do_work();\n    x + 1\n}\n";
+        let measured: HashMap<String, u32> = [("fetch".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(result.source.contains("do_work()"), "original body preserved");
+        assert!(result.source.contains("async move {"), "body wrapped in async move");
+    }
+
+    // === Entry point injection tests ===
+
+    #[test]
+    fn single_pass_injects_all_entry_point_concerns() {
+        let source = "fn work() {\n    1;\n}\nfn main() {\n    work();\n}\n";
+        let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
+        let ep = EntryPointParams {
+            name_table: &[(0, "work")],
+            runs_dir: "/tmp/runs",
+            cpu_time: false,
         };
-        assert_eq!(returns_future(&sig), Some(FutureReturnKind::ImplFuture));
+        let result = instrument_source(source, &measured, Some(&ep)).unwrap();
+
+        // Guard in work()
+        assert!(result.source.contains("piano_runtime::enter(0)"), "work gets guard");
+        // Name table
+        assert!(result.source.contains("PIANO_NAMES"), "name table injected");
+        assert!(result.source.contains("(0, \"work\")"), "name table has work");
+        // Allocator (case 1: absent)
+        assert!(result.source.contains("PianoAllocator<std::alloc::System>"), "allocator injected");
+        // Lifecycle in main
+        assert!(result.source.contains("ProfileSession::init"), "lifecycle in main");
+        // Valid syntax
+        let re_parse = SourceFile::parse(&result.source, ra_ap_syntax::Edition::Edition2021);
+        assert!(
+            re_parse.errors().is_empty(),
+            "output must be valid Rust. Errors: {:?}\nSource:\n{}",
+            re_parse.errors(), result.source
+        );
     }
 
     #[test]
-    fn returns_future_detects_impl_future_with_send() {
-        let sig: syn::Signature = syn::parse_quote! {
-            fn foo() -> impl Future<Output = i32> + Send
+    fn single_pass_wraps_existing_allocator() {
+        let source = "#[global_allocator]\nstatic ALLOC: MyAlloc = MyAlloc;\n\nfn work() {\n    1;\n}\nfn main() {\n    work();\n}\n";
+        let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
+        let ep = EntryPointParams {
+            name_table: &[(0, "work")],
+            runs_dir: "/tmp/runs",
+            cpu_time: false,
         };
-        assert_eq!(returns_future(&sig), Some(FutureReturnKind::ImplFuture));
+        let result = instrument_source(source, &measured, Some(&ep)).unwrap();
+
+        assert!(result.source.contains("PianoAllocator<MyAlloc>"), "allocator wrapped");
+        assert!(result.source.contains("PianoAllocator::new(MyAlloc)"), "init wrapped");
+        assert!(result.source.contains("piano_runtime::enter(0)"), "work gets guard");
+        assert!(result.source.contains("ProfileSession::init"), "lifecycle in main");
     }
 
     #[test]
-    fn returns_future_detects_impl_future_with_lifetime() {
-        let sig: syn::Signature = syn::parse_quote! {
-            fn foo(s: &str) -> impl Future<Output = usize> + '_
+    fn single_pass_no_source_map_chaining() {
+        let source = "fn work() {\n    1;\n}\nfn main() {\n    work();\n}\n";
+        let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
+        let ep = EntryPointParams {
+            name_table: &[(0, "work")],
+            runs_dir: "/tmp/runs",
+            cpu_time: false,
         };
-        assert_eq!(returns_future(&sig), Some(FutureReturnKind::ImplFuture));
+        let result = instrument_source(source, &measured, Some(&ep)).unwrap();
+
+        // The source map is flat (no chain). Lines far past injections
+        // should map back correctly.
+        let total_injected_lines = result.source.lines().count() - source.lines().count();
+        let far_line = (source.lines().count() + total_injected_lines + 10) as u32;
+        let remapped = result.source_map.remap_line(far_line);
+        assert!(remapped > 0, "remap of far line should be positive");
     }
 
-    #[test]
-    fn returns_future_detects_pin_box_dyn_future() {
-        let sig: syn::Signature = syn::parse_quote! {
-            fn foo() -> Pin<Box<dyn Future<Output = i32>>>
-        };
-        assert_eq!(
-            returns_future(&sig),
-            Some(FutureReturnKind::PinBoxDynFuture)
-        );
-    }
+    // === Exhaustive enumeration: fn parent node kinds ===
 
     #[test]
-    fn returns_future_detects_pin_box_dyn_future_send() {
-        let sig: syn::Signature = syn::parse_quote! {
-            fn foo() -> Pin<Box<dyn Future<Output = i32> + Send>>
-        };
-        assert_eq!(
-            returns_future(&sig),
-            Some(FutureReturnKind::PinBoxDynFuture)
-        );
-    }
+    fn fn_parent_kinds_exhaustive() {
+        use std::collections::BTreeSet;
 
-    #[test]
-    fn returns_future_detects_box_future_alias() {
-        let sig: syn::Signature = syn::parse_quote! {
-            fn foo() -> BoxFuture<'static, i32>
-        };
-        assert_eq!(returns_future(&sig), Some(FutureReturnKind::KnownAlias));
-    }
-
-    #[test]
-    fn returns_future_detects_local_box_future_alias() {
-        let sig: syn::Signature = syn::parse_quote! {
-            fn foo() -> LocalBoxFuture<'_, i32>
-        };
-        assert_eq!(returns_future(&sig), Some(FutureReturnKind::KnownAlias));
-    }
-
-    #[test]
-    fn returns_future_rejects_plain_type() {
-        let sig: syn::Signature = syn::parse_quote! {
-            fn foo() -> i32
-        };
-        assert_eq!(returns_future(&sig), None);
-    }
-
-    #[test]
-    fn returns_future_rejects_result_of_future() {
-        let sig: syn::Signature = syn::parse_quote! {
-            fn foo() -> Result<impl Future<Output = i32>, Error>
-        };
-        assert_eq!(returns_future(&sig), None);
-    }
-
-    #[test]
-    fn returns_future_rejects_no_return_type() {
-        let sig: syn::Signature = syn::parse_quote! {
-            fn foo()
-        };
-        assert_eq!(returns_future(&sig), None);
-    }
-
-    #[test]
-    fn returns_future_rejects_string_return() {
-        let sig: syn::Signature = syn::parse_quote! {
-            fn foo() -> String
-        };
-        assert_eq!(returns_future(&sig), None);
-    }
-
-    #[test]
-    fn returns_future_detects_fully_qualified_future() {
-        let sig: syn::Signature = syn::parse_quote! {
-            fn foo() -> impl std::future::Future<Output = i32>
-        };
-        assert_eq!(returns_future(&sig), Some(FutureReturnKind::ImplFuture));
-    }
-
-    #[test]
-    fn instruments_impl_future_fn() {
         let source = r#"
-use std::future::Future;
-
-fn fetch() -> impl Future<Output = String> {
-    async { "data".to_string() }
-}
+fn free() { let _ = 1; }
+mod inner { fn in_module() { let _ = 1; } }
+struct S;
+impl S { fn inherent_method(&self) { let _ = 1; } }
+trait T { fn trait_default(&self) { let _ = 1; } fn trait_abstract(&self); }
+impl T for S { fn trait_impl(&self) { let _ = 1; } fn trait_abstract(&self) { let _ = 1; } }
+extern "C" { fn foreign(x: i32) -> i32; }
+fn outer() { fn nested() { let _ = 1; } }
+macro_rules! m { () => { fn macro_fn() { let _ = 1; } }; }
+m!();
 "#;
-        let targets = test_targets(&["fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result.source.contains("piano_runtime::PianoFuture::new"),
-            "impl Future fn should be wrapped in PianoFuture. Got:\n{}",
-            result.source,
-        );
-        assert!(
-            result.source.contains("piano_runtime::enter(\"fetch\")"),
-            "guard should be inside PianoFuture wrapper. Got:\n{}",
-            result.source,
-        );
-        assert!(
-            result.source.contains(".await"),
-            "trailing expression should be awaited inside async block. Got:\n{}",
-            result.source,
-        );
-    }
 
-    #[test]
-    fn impl_future_whole_body_includes_setup_stmts() {
-        // With whole-body wrapping, setup code is inside the PianoFuture async
-        // block (deferred to first poll, same semantics as async fn).
-        let source = r#"
-use std::future::Future;
-
-fn fetch(x: i32) -> impl Future<Output = i32> {
-    let doubled = x * 2;
-    async move { doubled }
-}
-"#;
-        let targets = test_targets(&["fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        let setup_pos = result.source.find("let doubled").unwrap();
-        let piano_pos = result.source.find("PianoFuture::new").unwrap();
-        assert!(
-            piano_pos < setup_pos,
-            "PianoFuture should wrap entire body including setup. Got:\n{}",
-            result.source,
-        );
-        assert!(
-            result.source.contains(".await"),
-            "trailing async block should be awaited. Got:\n{}",
-            result.source,
-        );
-    }
-
-    #[test]
-    fn impl_future_no_sync_guard() {
-        let source = r#"
-use std::future::Future;
-
-fn fetch() -> impl Future<Output = String> {
-    async { "data".to_string() }
-}
-"#;
-        let targets = test_targets(&["fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        let count = result.source.matches("piano_runtime::enter").count();
-        assert_eq!(
-            count, 1,
-            "should have exactly one enter() call (inside PianoFuture). Got {} in:\n{}",
-            count, result.source,
-        );
-    }
-
-    #[test]
-    fn impl_future_delegation() {
-        let source = r#"
-use std::future::Future;
-
-async fn helper() -> i32 { 42 }
-
-fn delegator() -> impl Future<Output = i32> {
-    helper()
-}
-"#;
-        let targets = test_targets(&["delegator"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result.source.contains("piano_runtime::PianoFuture::new"),
-            "delegation should be wrapped in PianoFuture. Got:\n{}",
-            result.source,
-        );
-    }
-
-    #[test]
-    fn impl_future_with_send_bound() {
-        let source = r#"
-use std::future::Future;
-
-fn fetch() -> impl Future<Output = String> + Send {
-    async { "data".to_string() }
-}
-"#;
-        let targets = test_targets(&["fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result.source.contains("piano_runtime::PianoFuture::new"),
-            "impl Future + Send should be wrapped in PianoFuture. Got:\n{}",
-            result.source,
-        );
-    }
-
-    #[test]
-    fn instruments_pin_box_dyn_future_fn() {
-        let source = r#"
-use std::future::Future;
-use std::pin::Pin;
-
-fn fetch() -> Pin<Box<dyn Future<Output = String> + Send>> {
-    Box::pin(async { "data".to_string() })
-}
-"#;
-        let targets = test_targets(&["fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result.source.contains("piano_runtime::PianoFuture::new"),
-            "Pin<Box<dyn Future>> fn should be wrapped in PianoFuture. Got:\n{}",
-            result.source,
-        );
-        assert!(
-            result.source.contains("Box::pin"),
-            "should re-box the PianoFuture for Pin<Box<dyn Future>> return. Got:\n{}",
-            result.source,
-        );
-        assert!(
-            result.source.contains("__piano_inner"),
-            "should use type-annotated binding for coercion. Got:\n{}",
-            result.source,
-        );
-    }
-
-    #[test]
-    fn instruments_box_future_alias() {
-        let source = r#"
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-use std::future::Future;
-use std::pin::Pin;
-
-fn fetch() -> BoxFuture<'static, String> {
-    Box::pin(async { "data".to_string() })
-}
-"#;
-        let targets = test_targets(&["fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result.source.contains("piano_runtime::PianoFuture::new"),
-            "BoxFuture alias fn should be wrapped in PianoFuture. Got:\n{}",
-            result.source,
-        );
-    }
-
-    #[test]
-    fn impl_future_impl_method() {
-        let source = r#"
-use std::future::Future;
-
-struct Client;
-
-impl Client {
-    fn fetch(&self) -> impl Future<Output = String> + '_ {
-        async move { "data".to_string() }
-    }
-}
-"#;
-        let targets = test_targets(&["Client::fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result.source.contains("piano_runtime::PianoFuture::new"),
-            "impl method returning impl Future should be wrapped. Got:\n{}",
-            result.source,
-        );
-        assert!(
-            result
-                .source
-                .contains("piano_runtime::enter(\"Client::fetch\")"),
-            "guard should use qualified name. Got:\n{}",
-            result.source,
-        );
-    }
-
-    #[test]
-    fn impl_future_trait_default_method() {
-        let source = r#"
-use std::future::Future;
-
-trait Service {
-    fn call(&self) -> impl Future<Output = String> {
-        async { "ok".to_string() }
-    }
-}
-"#;
-        let targets = test_targets(&["Service::call"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result.source.contains("piano_runtime::PianoFuture::new"),
-            "trait default method returning impl Future should be wrapped. Got:\n{}",
-            result.source,
-        );
-    }
-
-    #[test]
-    fn sync_fn_unchanged_after_refactor() {
-        let source = r#"
-fn compute(x: u64) -> u64 {
-    x * 2
-}
-"#;
-        let targets = test_targets(&["compute"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result.source.contains("piano_runtime::enter(\"compute\")"),
-            "sync fn should still get sync guard. Got:\n{}",
-            result.source,
-        );
-        assert!(
-            !result.source.contains("PianoFuture"),
-            "sync fn should NOT get PianoFuture. Got:\n{}",
-            result.source,
-        );
-    }
-
-    #[test]
-    fn pin_box_dyn_future_early_return_is_wrapped() {
-        let source = r#"
-use std::future::Future;
-use std::pin::Pin;
-
-fn fetch(flag: bool) -> Pin<Box<dyn Future<Output = String> + Send>> {
-    if flag {
-        return Box::pin(async { "early".to_string() });
-    }
-    Box::pin(async { "normal".to_string() })
-}
-"#;
-        let targets = test_targets(&["fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        let piano_count = result
-            .source
-            .matches("piano_runtime::PianoFuture::new")
-            .count();
-        assert_eq!(
-            piano_count, 2,
-            "both early return and trailing expr should be wrapped in PianoFuture. Got {} in:\n{}",
-            piano_count, result.source,
-        );
-    }
-
-    #[test]
-    fn return_inside_closure_not_wrapped() {
-        let source = r#"
-use std::future::Future;
-
-fn fetch(items: Vec<i32>) -> impl Future<Output = Vec<i32>> {
-    let filtered: Vec<i32> = items.into_iter().filter(|x| {
-        if *x < 0 { return false; }
-        true
-    }).collect();
-    async move { filtered }
-}
-"#;
-        let targets = test_targets(&["fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        let piano_count = result
-            .source
-            .matches("piano_runtime::PianoFuture::new")
-            .count();
-        assert_eq!(
-            piano_count, 1,
-            "closure return should not be wrapped. Got {} in:\n{}",
-            piano_count, result.source,
-        );
-    }
-
-    #[test]
-    fn return_inside_async_block_not_wrapped() {
-        let source = r#"
-use std::future::Future;
-use std::pin::Pin;
-
-fn fetch() -> Pin<Box<dyn Future<Output = i32> + Send>> {
-    Box::pin(async {
-        if true { return 42; }
-        0
-    })
-}
-"#;
-        let targets = test_targets(&["fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        let piano_count = result
-            .source
-            .matches("piano_runtime::PianoFuture::new")
-            .count();
-        assert_eq!(
-            piano_count, 1,
-            "return inside async block should not be wrapped. Got {} in:\n{}",
-            piano_count, result.source,
-        );
-    }
-
-    #[test]
-    fn impl_future_early_return_wrapped_via_whole_body() {
-        // Fixed: whole-body wrapping captures all code paths including early returns.
-        let source = r#"
-use std::future::Future;
-
-fn fetch(flag: bool) -> impl Future<Output = String> {
-    if flag {
-        return async { "early".to_string() };
-    }
-    async { "normal".to_string() }
-}
-"#;
-        let targets = test_targets(&["fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        // Whole body is wrapped in one PianoFuture. Early returns are inside it.
-        let piano_count = result
-            .source
-            .matches("piano_runtime::PianoFuture::new")
-            .count();
-        assert_eq!(
-            piano_count, 1,
-            "whole body should be wrapped in one PianoFuture. Got {} in:\n{}",
-            piano_count, result.source,
-        );
-        // The guard should be inside the async move block.
-        assert!(
-            result.source.contains("piano_runtime::enter(\"fetch\")"),
-            "guard should be present. Got:\n{}",
-            result.source,
-        );
-    }
-
-    #[test]
-    fn impl_future_no_trailing_expr_wraps_whole_body() {
-        let source = r#"
-use std::future::Future;
-
-fn foo() -> impl Future<Output = ()> {
-    return async {};
-}
-"#;
-        let targets = test_targets(&["foo"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-
-        // Whole-body wrapping should capture even return-only bodies.
-        assert!(
-            result.source.contains("PianoFuture"),
-            "should wrap in PianoFuture even with only return statements. Got:\n{}",
-            result.source,
-        );
-        assert!(
-            result.source.contains("piano_runtime::enter(\"foo\")"),
-            "should have guard. Got:\n{}",
-            result.source,
-        );
-        assert!(
-            result.source.contains(".await"),
-            "return async {{}} should get .await appended. Got:\n{}",
-            result.source,
-        );
-        syn::parse_str::<syn::File>(&result.source).expect("rewritten source should parse");
-    }
-
-    #[test]
-    fn impl_future_send_whole_body_wrapped() {
-        let source = r#"
-use std::future::Future;
-
-fn fetch(x: i32) -> impl Future<Output = i32> + Send {
-    let doubled = x * 2;
-    async move { doubled }
-}
-"#;
-        let targets = test_targets(&["fetch"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            result.source.contains("piano_runtime::PianoFuture::new"),
-            "should wrap in PianoFuture. Got:\n{}",
-            result.source,
-        );
-    }
-
-    #[test]
-    fn instrument_preserves_original_line_numbers() {
-        let source =
-            "fn target() {\n    let x = 1;\n    let y = 2;\n}\n\nfn other() {\n    let z = 3;\n}\n";
-        let targets = test_targets(&["target"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        let result_lines: Vec<&str> = result.source.lines().collect();
-        // "fn other()" is on original line 6. With 1 guard line injected for target(),
-        // it should be at line index 6 (0-indexed).
-        let other_pos = result_lines
-            .iter()
-            .position(|l| l.contains("fn other()"))
-            .unwrap();
-        assert_eq!(
-            other_pos, 6,
-            "fn other() should be at line index 6 (orig 5 + 1 injection). Got:\n{}",
-            result.source,
-        );
-        // The source_map should remap correctly.
-        let map = &result.source_map;
-        assert_eq!(map.remap_line(7), Some(6));
-    }
-
-    #[test]
-    fn module_prefix_qualifies_guard_name() {
-        let source = r#"
-fn validate_input(x: i32) -> bool {
-    x > 0
-}
-"#;
-        let targets = test_targets(&["db::query::validate_input"]);
-        let result = instrument_source(source, &targets, false, "db::query")
-            .unwrap()
-            .source;
-        assert!(
-            result.contains(r#"piano_runtime::enter("db::query::validate_input")"#),
-            "guard should use module-qualified name. Got:\n{result}",
-        );
-    }
-
-    #[test]
-    fn module_prefix_qualifies_impl_method() {
-        let source = r#"
-struct Handler;
-impl Handler {
-    fn validate(&self) { }
-}
-"#;
-        let targets = test_targets(&["api::Handler::validate"]);
-        let result = instrument_source(source, &targets, false, "api")
-            .unwrap()
-            .source;
-        assert!(
-            result.contains(r#"piano_runtime::enter("api::Handler::validate")"#),
-            "guard should qualify impl method. Got:\n{result}",
-        );
-    }
-
-    #[test]
-    fn empty_module_prefix_preserves_bare_name() {
-        let source = r#"
-fn walk() {
-    do_stuff();
-}
-"#;
-        let targets = test_targets(&["walk"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-        assert!(
-            result.contains(r#"piano_runtime::enter("walk")"#),
-            "empty prefix should not change name. Got:\n{result}",
-        );
-    }
-
-    #[test]
-    fn module_prefix_qualifies_concurrency_info() {
-        let source = r#"
-fn process_all(data: &[i32]) {
-    data.par_iter().for_each(|x| { let _ = x; });
-}
-"#;
-        let targets = test_targets(&["worker::process_all"]);
-        let result = instrument_source(source, &targets, false, "worker").unwrap();
-        assert_eq!(
-            result.concurrency.first().map(|(name, _)| name.as_str()),
-            Some("worker::process_all"),
-            "concurrency info should use qualified name",
-        );
-    }
-
-    #[test]
-    fn trait_impl_methods_disambiguated() {
-        let source = r#"
-use std::fmt;
-
-struct Point { x: i32, y: i32 }
-
-impl fmt::Display for Point {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "({}, {})", self.x, self.y)
-    }
-}
-
-impl fmt::Debug for Point {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Point({}, {})", self.x, self.y)
-    }
-}
-"#;
-        let targets = test_targets(&["<Point as Display>::fmt", "<Point as Debug>::fmt"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-        assert!(
-            result.contains(r#"piano_runtime::enter("<Point as Display>::fmt")"#),
-            "Display::fmt should be instrumented with trait-qualified name"
-        );
-        assert!(
-            result.contains(r#"piano_runtime::enter("<Point as Debug>::fmt")"#),
-            "Debug::fmt should be instrumented with trait-qualified name"
-        );
-    }
-
-    #[test]
-    fn inherent_impl_methods_unchanged() {
-        let source = r#"
-struct Walker;
-
-impl Walker {
-    fn walk(&self) {
-        // inherent method
-    }
-}
-"#;
-        let targets = test_targets(&["Walker::walk"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-        assert!(
-            result.contains(r#"piano_runtime::enter("Walker::walk")"#),
-            "inherent methods should use Type::method format"
-        );
-    }
-
-    #[test]
-    fn guard_injection_preserves_inner_attrs_in_fn_body() {
-        let source = r#"
-fn work() {
-    #![allow(unused_variables)]
-    let x = 42;
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-
-        // Must re-parse successfully.
-        syn::parse_str::<syn::File>(&result)
-            .unwrap_or_else(|e| panic!("rewritten source should parse: {e}\n\n{result}"));
-
-        // Inner attr must precede the guard.
-        let attr_pos = result.find("#![allow(unused_variables)]").unwrap();
-        let guard_pos = result.find("piano_runtime::enter").unwrap();
-        assert!(
-            attr_pos < guard_pos,
-            "inner attr must precede guard. Got:\n{result}"
-        );
-    }
-
-    #[test]
-    fn registrations_preserve_inner_attrs_in_main() {
-        let source = r#"
-fn main() {
-    #![allow(unused)]
-    do_stuff();
-}
-"#;
-        let (result, _map) = inject_registrations(source, &["work".to_string()]).unwrap();
-
-        syn::parse_str::<syn::File>(&result)
-            .unwrap_or_else(|e| panic!("rewritten source should parse: {e}\n\n{result}"));
-
-        let attr_pos = result.find("#![allow(unused)]").unwrap();
-        let reg_pos = result.find("piano_runtime::register").unwrap();
-        assert!(
-            attr_pos < reg_pos,
-            "inner attr must precede registration. Got:\n{result}"
-        );
-    }
-
-    #[test]
-    fn file_level_inner_attrs_survive_full_pipeline() {
-        let source = r#"#![cfg_attr(test, feature(test))]
-#![allow(dead_code)]
-
-fn main() {
-    let _ = work();
-}
-
-fn work() -> u64 {
-    42
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        let mut map = result.source_map;
-        let mut current = result.source;
-
-        let (s, m) = inject_registrations(&current, &["work".to_string()]).unwrap();
-        map.merge(m);
-        current = s;
-
-        let (s, m) = inject_global_allocator(&current, AllocatorKind::Absent).unwrap();
-        map.merge(m);
-        current = s;
-
-        let (s, m) = inject_shutdown(&current, None).unwrap();
-        map.merge(m);
-
-        // The final source must parse.
-        syn::parse_str::<syn::File>(&s)
-            .unwrap_or_else(|e| panic!("full pipeline output should parse: {e}\n\n{s}"));
-
-        // Inner attrs must be at the top.
-        assert!(
-            s.starts_with("#![cfg_attr"),
-            "inner attrs must stay at top. Got:\n{s}"
-        );
-    }
-
-    #[test]
-    fn detects_concurrency_in_try_expr() {
-        // par_iter inside a ? expression -- previously missed by wildcard
-        let source = r#"
-fn work(items: &[Item]) -> Result<()> {
-    items.par_iter().map(|x| process(x)).collect::<Result<Vec<_>>>()?;
-    Ok(())
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            !result.concurrency.is_empty(),
-            "should detect par_iter inside Try expr. Got: {:?}\n{}",
-            result.concurrency,
-            result.source
-        );
-    }
-
-    #[test]
-    fn detects_concurrency_in_reference_expr() {
-        // scope inside a & reference -- previously missed
-        let source = r#"
-fn work() {
-    let r = &rayon::scope(|s| {
-        s.spawn(|_| { do_work(); });
-    });
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            !result.concurrency.is_empty(),
-            "should detect scope inside Reference expr. Got: {:?}\n{}",
-            result.concurrency,
-            result.source
-        );
-    }
-
-    #[test]
-    fn detects_concurrency_in_tuple_expr() {
-        let source = r#"
-fn work(items: &[Item]) {
-    let _ = (items.par_iter().for_each(|x| process(x)), 42);
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            !result.concurrency.is_empty(),
-            "should detect par_iter inside Tuple expr. Got: {:?}\n{}",
-            result.concurrency,
-            result.source
-        );
-    }
-
-    #[test]
-    fn detects_concurrency_in_if_expr() {
-        let source = r#"
-fn work(items: &[Item], flag: bool) {
-    if flag {
-        items.par_iter().for_each(|x| process(x));
-    }
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            !result.concurrency.is_empty(),
-            "should detect par_iter inside If expr. Got: {:?}\n{}",
-            result.concurrency,
-            result.source
-        );
-    }
-
-    #[test]
-    fn detects_concurrency_in_assign_expr() {
-        let source = r#"
-fn work(items: &[Item]) {
-    let mut result = Vec::new();
-    result = items.par_iter().map(|x| process(x)).collect();
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "").unwrap();
-        assert!(
-            !result.concurrency.is_empty(),
-            "should detect par_iter inside Assign expr. Got: {:?}\n{}",
-            result.concurrency,
-            result.source
-        );
-    }
-
-    #[test]
-    fn wraps_return_inside_assign_in_boxed_future() {
-        // `return` inside an assignment expression -- previously missed by wildcard.
-        // The Assign expr is not handled by the old walker, so the return inside
-        // the if-else (which is the Assign's right-hand side) is never wrapped.
-        let source = r#"
-fn fetch(flag: bool) -> Pin<Box<dyn Future<Output = i32>>> {
-    let mut x = 0;
-    x = if flag { return Box::pin(async { 0 }); } else { 1 };
-    Box::pin(async { x })
-}
-"#;
-        let targets = test_targets(&["fetch"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-        // The return value should be wrapped with PianoFuture.
-        // Count PianoFuture occurrences: one for the trailing expr, one for the return.
-        let future_count = result.matches("PianoFuture::new").count();
-        assert!(
-            future_count >= 2,
-            "should wrap return inside Assign with PianoFuture (expected >= 2, got {future_count}). Got:\n{result}"
-        );
-        let parsed: syn::File = syn::parse_str(&result)
-            .unwrap_or_else(|e| panic!("rewritten code should parse: {e}\n\n{result}"));
-        assert!(!parsed.items.is_empty());
-    }
-
-    #[test]
-    fn injects_adopt_in_try_expr_inside_scope() {
-        // s.spawn wrapped in a Try (?) expression -- previously missed by wildcard.
-        // The spawn is directly inside Ok(...)?, not behind a closure boundary.
-        let source = r#"
-fn work() {
-    rayon::scope(|s| {
-        Ok::<_, ()>(s.spawn(|_| { do_work(); })).unwrap();
-    });
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-        assert!(
-            result.contains("piano_runtime::adopt"),
-            "should inject adopt inside spawn closure in unwrap() expr. Got:\n{result}"
-        );
-    }
-
-    #[test]
-    fn injects_adopt_in_tuple_inside_scope() {
-        // s.spawn inside a tuple expression -- previously missed.
-        let source = r#"
-fn work() {
-    rayon::scope(|s| {
-        let _ = (s.spawn(|_| { work_a(); }), s.spawn(|_| { work_b(); }));
-    });
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-        let adopt_count = result.matches("piano_runtime::adopt").count();
-        assert_eq!(
-            adopt_count, 2,
-            "should inject adopt in both spawn closures inside tuple. Got {adopt_count} in:\n{result}"
-        );
-    }
-
-    #[test]
-    fn injects_adopt_in_reference_inside_scope() {
-        // s.spawn inside a & expression -- previously missed.
-        let source = r#"
-fn work() {
-    rayon::scope(|s| {
-        let r = &s.spawn(|_| { do_work(); });
-    });
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-        assert!(
-            result.contains("piano_runtime::adopt"),
-            "should inject adopt inside spawn closure in Reference expr. Got:\n{result}"
-        );
-    }
-
-    #[test]
-    fn propagates_parallel_chain_through_paren_expr() {
-        // par_iter chain wrapped in parentheses -- previously missed.
-        let source = r#"
-fn work(items: &[Item]) {
-    (items.par_iter()).for_each(|item| process(item));
-}
-"#;
-        let targets = test_targets(&["work"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-        assert!(
-            result.contains("piano_runtime::adopt"),
-            "should inject adopt in for_each closure with parenthesized par_iter. Got:\n{result}"
-        );
-    }
-
-    #[test]
-    fn inline_mod_qualifies_guard_name() {
-        let source = r#"
-mod inner {
-    fn foo() {
-        do_stuff();
-    }
-}
-"#;
-        let targets = test_targets(&["inner::foo"]);
-        let result = instrument_source(source, &targets, false, "")
-            .unwrap()
-            .source;
-        assert!(
-            result.contains(r#"piano_runtime::enter("inner::foo")"#),
-            "inline mod should qualify guard name. Got:\n{result}",
-        );
-    }
-
-    #[test]
-    fn cfg_attr_on_match_arm_block_preserved() {
-        // Regression for #560: prettyplease stripped braces from match arms,
-        // exposing #[cfg] attributes on bare expressions (E0658).
-        let source = r#"
-fn dispatch(step: u8) {
-    match step {
-        1 => {
-            #[cfg(unix)]
-            do_unix_thing();
-        }
-        _ => {}
-    }
-}
-"#;
-        let targets = test_targets(&["dispatch"]);
-        let result = instrument_source(source, &targets, true, "")
-            .unwrap()
-            .source;
-        // The #[cfg(unix)] must remain INSIDE a block, not on a bare expression.
-        assert!(
-            result.contains("# [cfg (unix)]"),
-            "cfg attribute must be preserved. Got:\n{result}",
-        );
-        // Must NOT have `=> #[cfg(unix)]` (attribute on bare match arm expression).
-        assert!(
-            !result.contains("=> # [cfg (unix)]"),
-            "cfg must not be on bare match arm expr (E0658). Got:\n{result}",
-        );
-    }
-
-    #[test]
-    fn cfg_feature_block_in_match_arm_preserved() {
-        // Regression for #561: prettyplease erased #[cfg(feature)] blocks
-        // entirely, making conditional code unconditional (E0433).
-        let source = r#"
-fn dispatch(step: u8) {
-    match step {
-        1 => {
-            #[cfg(feature = "optional")]
-            {
-                optional_mod::do_thing();
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let file = parse.tree();
+
+        let mut parent_kinds: BTreeSet<SyntaxKind> = BTreeSet::new();
+        for node in file.syntax().descendants() {
+            if ast::Fn::cast(node.clone()).is_some() {
+                if let Some(parent) = node.parent() {
+                    parent_kinds.insert(parent.kind());
+                }
             }
         }
-        _ => {}
-    }
-}
-"#;
-        let targets = test_targets(&["dispatch"]);
-        let result = instrument_source(source, &targets, true, "")
-            .unwrap()
-            .source;
-        assert!(
-            result.contains("# [cfg (feature = \"optional\")]"),
-            "cfg(feature) gate must be preserved. Got:\n{result}",
+
+        let expected: BTreeSet<SyntaxKind> = [
+            SyntaxKind::SOURCE_FILE,
+            SyntaxKind::ITEM_LIST,
+            SyntaxKind::ASSOC_ITEM_LIST,
+            SyntaxKind::EXTERN_ITEM_LIST,
+            SyntaxKind::STMT_LIST,
+        ].into_iter().collect();
+
+        assert_eq!(
+            parent_kinds, expected,
+            "ast::Fn parent SyntaxKinds have changed.\n\
+             Found: {parent_kinds:?}\nExpected: {expected:?}"
         );
+
+        let measured: HashMap<String, u32> = [
+            ("free".into(), 0),
+            ("in_module".into(), 1),
+            ("inherent_method".into(), 2),
+            ("trait_default".into(), 3),
+            ("trait_impl".into(), 4),
+            ("trait_abstract".into(), 5),
+            ("nested".into(), 6),
+            ("outer".into(), 7),
+            ("macro_fn".into(), 8),
+        ].into_iter().collect();
+
+        let result = instrument_source(source, &measured, None).unwrap();
+
+        for (name, id) in &measured {
+            if name == "foreign" { continue; }
+            let pattern = format!("piano_runtime::enter({id})");
+            assert!(
+                result.source.contains(&pattern),
+                "fn {name} (id {id}) should be instrumented"
+            );
+        }
+
         assert!(
-            result.contains("optional_mod :: do_thing"),
-            "gated code must still be present. Got:\n{result}",
+            result.source.contains("piano_runtime::enter(8)"),
+            "macro_rules fn should be instrumented"
+        );
+    }
+
+    #[test]
+    fn macro_metavar_fn_gets_guard() {
+        let source = r#"
+macro_rules! make_fn { ($name:ident) => { fn $name() { let _ = 1; } }; }
+make_fn!(dynamic_fn);
+fn main() {}
+"#;
+        let measured: HashMap<String, u32> = [("dynamic_fn".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None)
+            .expect("instrument_source should succeed");
+
+        assert!(
+            result.source.contains("piano_runtime::enter(0)"),
+            "metavar-expanded fn should get a guard. Got:\n{}", result.source
+        );
+    }
+
+    #[test]
+    fn macro_unmeasured_fn_not_guarded() {
+        let source = r#"
+macro_rules! make_fn { ($name:ident) => { fn $name() { let _ = 1; } }; }
+make_fn!(unlisted_fn);
+fn main() {}
+"#;
+        // unlisted_fn is NOT in the measured map.
+        let measured: HashMap<String, u32> = HashMap::new();
+        let result = instrument_source(source, &measured, None)
+            .expect("instrument_source should succeed");
+
+        assert!(
+            !result.source.contains("piano_runtime::enter"),
+            "unmeasured macro fn should not get a guard. Got:\n{}", result.source
+        );
+    }
+
+    #[test]
+    fn macro_const_fn_not_guarded() {
+        let source = r#"
+macro_rules! make_const { () => { const fn fixed() -> u32 { 42 } }; }
+make_const!();
+fn main() {}
+"#;
+        let measured: HashMap<String, u32> = [("fixed".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None)
+            .expect("instrument_source should succeed");
+
+        assert!(
+            !result.source.contains("piano_runtime::enter"),
+            "const fn from macro should be skipped. Got:\n{}", result.source
+        );
+    }
+
+    #[test]
+    fn macro_mixed_measured_unmeasured() {
+        let source = r#"
+macro_rules! pair { () => { fn tracked() { let _ = 1; } fn untracked() { let _ = 2; } }; }
+pair!();
+fn main() {}
+"#;
+        // Only "tracked" is in the measured map.
+        let measured: HashMap<String, u32> = [("tracked".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None)
+            .expect("instrument_source should succeed");
+
+        assert!(
+            result.source.contains("piano_runtime::enter(0)"),
+            "measured fn should get a guard. Got:\n{}", result.source
+        );
+        assert_eq!(
+            result.source.matches("piano_runtime::enter").count(), 1,
+            "only the measured fn should get a guard, not both. Got:\n{}", result.source
         );
     }
 }
