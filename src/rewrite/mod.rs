@@ -1,22 +1,22 @@
-//! Source rewriter: single-pass injection of profiling infrastructure.
+//! Source rewriter: single-pass zero-shift injection of profiling infrastructure.
 //!
-//! One CST parse. One StringInjector. One apply(). One SourceMap.
+//! One CST parse. One StringInjector. One apply(). Zero line shift.
 //!
 //! For non-entry files: inject guards into measured function bodies.
 //! For the entry point: guards + name table + allocator wrapping + lifecycle.
 //! All injection points are collected from the ORIGINAL source, then applied
-//! in one pass. No multi-pass offset drift. No source map chaining.
+//! in one pass. Injections go on the same line as the opening brace (no new
+//! lines added). File-level items appended after user code.
 
 use std::collections::HashMap;
 
 use ra_ap_syntax::ast::{HasAttrs, HasName};
 use ra_ap_syntax::{AstNode, SourceFile, SyntaxKind, T, ast};
 
-use crate::source_map::{SourceMap, StringInjector};
+use crate::source_map::StringInjector;
 
 pub struct InstrumentResult {
     pub source: String,
-    pub source_map: SourceMap,
 }
 
 /// Parameters for entry-point-only injections (name table, allocator, lifecycle).
@@ -41,9 +41,8 @@ pub fn instrument_source(
 
     let mut injector = StringInjector::new();
 
-    // --- Entry point: registrations at offset 0 ---
+    // --- Entry point: registrations appended after user code ---
     if let Some(ep) = entry_point {
-        let reg_offset = file_level_inner_attr_end(&file);
         let mut entries = String::new();
         for (id, name) in ep.name_table {
             if !entries.is_empty() {
@@ -52,7 +51,7 @@ pub fn instrument_source(
             entries.push_str(&format!("({id}, \"{name}\")"));
         }
         injector.insert(
-            reg_offset,
+            source.len(),
             format!("\nconst PIANO_NAMES: &[(u32, &str)] = &[{entries}];\n"),
         );
     }
@@ -124,20 +123,20 @@ pub fn instrument_source(
             if is_async_fn {
                 injector.insert(
                     inject_offset,
-                    format!("\npiano_runtime::enter_async({name_id}, async move {{"),
+                    format!(" piano_runtime::enter_async({name_id}, async move {{"),
                 );
                 injector.insert(close_offset, "}).await");
             } else {
                 injector.insert(
                     inject_offset,
-                    format!("\npiano_runtime::enter_async({name_id},"),
+                    format!(" piano_runtime::enter_async({name_id},"),
                 );
                 injector.insert(close_offset, ")");
             }
         } else {
             injector.insert(
                 inject_offset,
-                format!("\nlet __piano_guard = piano_runtime::enter({name_id});"),
+                format!(" let __piano_guard = piano_runtime::enter({name_id});"),
             );
         }
     }
@@ -145,23 +144,8 @@ pub fn instrument_source(
     // --- Macro expansion: replace fn-generating invocations ---
     expand_and_replace_macros(file.syntax(), measured, &mut injector);
 
-    let (source, source_map) = injector.apply(source);
-    Ok(InstrumentResult { source, source_map })
-}
-
-/// Find the byte offset after all file-level inner attributes (#![...]).
-/// Returns 0 if there are none.
-fn file_level_inner_attr_end(file: &SourceFile) -> usize {
-    let mut offset = 0usize;
-    for child in file.syntax().children() {
-        if child.kind() == SyntaxKind::ATTR {
-            let text = child.text().to_string();
-            if text.starts_with("#!") {
-                offset = child.text_range().end().into();
-            }
-        }
-    }
-    offset
+    let source = injector.apply(source);
+    Ok(InstrumentResult { source })
 }
 
 /// Find the injection offset inside a statement list: after the opening
@@ -213,45 +197,64 @@ fn inject_allocator(
 
     match alloc_info {
         None => {
-            // Case 1: no allocator. Inject PianoAllocator<System>.
+            // Case 1: no allocator. Append PianoAllocator<System> after user code.
             injector.insert(
-                0,
+                source.len(),
                 concat!(
-                    "#[global_allocator]\n",
+                    "\n#[global_allocator]\n",
                     "static __PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>\n",
                     "    = piano_runtime::PianoAllocator::new(std::alloc::System);\n",
                 ),
             );
         }
         Some(info) => {
-            let replacement = if let Some(ref cfg) = info.cfg_attr {
-                // Case 3: cfg-gated allocator
+            if let Some(ref cfg) = info.cfg_attr {
+                // Case 3: cfg-gated allocator.
+                // Replace: wrap the user's allocator (same line count).
+                // Append: add negated-cfg System fallback after user code.
                 let neg_cfg = negate_cfg(cfg);
-                format!(
-                    "{cfg}\n\
-                     #[global_allocator]\n\
-                     static {name}: piano_runtime::PianoAllocator<{ty}>\n\
-                     \x20   = piano_runtime::PianoAllocator::new({init});\n\
-                     {neg_cfg}\n\
-                     #[global_allocator]\n\
-                     static {name}: piano_runtime::PianoAllocator<std::alloc::System>\n\
-                     \x20   = piano_runtime::PianoAllocator::new(std::alloc::System);",
+                let original_text = &source[info.start..info.end];
+                let original_newlines = original_text.chars().filter(|&c| c == '\n').count();
+
+                // Build the wrapped version: cfg + #[global_allocator] + static on one line
+                let wrapped = format!(
+                    "{cfg}\n#[global_allocator]\nstatic {name}: piano_runtime::PianoAllocator<{ty}> = piano_runtime::PianoAllocator::new({init});",
                     name = info.name,
                     ty = info.type_expr,
                     init = info.init_expr,
-                )
+                );
+                // Count newlines in wrapped and pad to match original
+                let wrapped_newlines = wrapped.chars().filter(|&c| c == '\n').count();
+                let padded = if wrapped_newlines < original_newlines {
+                    format!(
+                        "{wrapped}{}",
+                        "\n".repeat(original_newlines - wrapped_newlines)
+                    )
+                } else {
+                    wrapped
+                };
+
+                injector.replace(info.start, info.end, padded);
+
+                // Append the fallback after all user code (zero-shift: no lines added in the middle)
+                injector.insert(
+                    source.len(),
+                    format!(
+                        "\n{neg_cfg}\n#[global_allocator]\nstatic {name}: piano_runtime::PianoAllocator<std::alloc::System> = piano_runtime::PianoAllocator::new(std::alloc::System);\n",
+                        name = info.name,
+                    ),
+                );
             } else {
-                // Case 2: no cfg, simple wrap
-                format!(
+                // Case 2: no cfg, simple wrap (same line count as original)
+                let replacement = format!(
                     "#[global_allocator]\n\
-                     static {name}: piano_runtime::PianoAllocator<{ty}>\n\
-                     \x20   = piano_runtime::PianoAllocator::new({init});",
+                     static {name}: piano_runtime::PianoAllocator<{ty}> = piano_runtime::PianoAllocator::new({init});",
                     name = info.name,
                     ty = info.type_expr,
                     init = info.init_expr,
-                )
-            };
-            injector.replace(info.start, info.end, replacement);
+                );
+                injector.replace(info.start, info.end, replacement);
+            }
         }
     }
 
@@ -331,8 +334,33 @@ fn negate_cfg(cfg: &str) -> String {
         .and_then(|s| s.strip_suffix(")]"))
     {
         format!("#[cfg(not({inner}))]")
+    } else if let Some(rest) = cfg.strip_prefix("#[cfg_attr(") {
+        // Extract predicate from #[cfg_attr(PRED, ...)] using depth-aware parsing
+        let mut depth = 0u32;
+        let mut split_pos = None;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                ',' if depth == 0 => {
+                    split_pos = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(pos) = split_pos {
+            let predicate = rest[..pos].trim();
+            format!("#[cfg(not({predicate}))]")
+        } else {
+            "#[cfg(not(any()))]".to_string()
+        }
     } else {
-        // Can't negate complex cfg_attr, fall back to not(any())
         "#[cfg(not(any()))]".to_string()
     }
 }
@@ -343,48 +371,54 @@ fn negate_cfg(cfg: &str) -> String {
 
 const FILE_COLLISION_RETRIES: u32 = 4;
 
-/// Build the lifecycle code injected at the top of main().
+/// Build the lifecycle code injected on the same line as main()'s opening brace.
+///
+/// Zero-shift: all statements on one line (no newlines).
 fn build_lifecycle_prefix(runs_dir: &str, cpu_time: bool) -> String {
     let mut s = String::new();
-    s.push_str("\n    use std::io::Write as _;");
-    s.push_str("\n    let __piano_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();");
-    s.push_str("\n    let __piano_pid = std::process::id();");
-    s.push_str("\n    let __piano_sink = {");
+    s.push_str(" #[allow(unused_imports)] use std::io::Write as _;");
+    s.push_str(" let __piano_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();");
+    s.push_str(" let __piano_pid = std::process::id();");
+    s.push_str(" let __piano_sink = {");
     s.push_str(&format!(
-        "\n        let __piano_dir = std::path::PathBuf::from(std::env::var(\"PIANO_RUNS_DIR\").unwrap_or_else(|_| \"{runs_dir}\".into()));"
+        " let __piano_dir = std::path::PathBuf::from(std::env::var(\"PIANO_RUNS_DIR\").unwrap_or_else(|_| \"{runs_dir}\".into()));"
     ));
-    s.push_str("\n        match std::fs::create_dir_all(&__piano_dir) {");
-    s.push_str("\n            Ok(()) => {");
-    s.push_str("\n                let mut __piano_file = None;");
-    s.push_str("\n                let mut __piano_warned = false;");
+    s.push_str(" match std::fs::create_dir_all(&__piano_dir) {");
+    s.push_str(" Ok(()) => {");
+    s.push_str(" let mut __piano_file = None;");
+    s.push_str(" let mut __piano_warned = false;");
     s.push_str(&format!(
-        "\n                for __piano_suffix in 0u32..{FILE_COLLISION_RETRIES} {{"
+        " for __piano_suffix in 0u32..{FILE_COLLISION_RETRIES} {{"
     ));
-    s.push_str("\n                    let __piano_name = if __piano_suffix == 0 {");
-    s.push_str("\n                        format!(\"{}-{}.ndjson\", __piano_ts, __piano_pid)");
-    s.push_str("\n                    } else {");
-    s.push_str("\n                        format!(\"{}-{}-{}.ndjson\", __piano_ts, __piano_pid, __piano_suffix)");
-    s.push_str("\n                    };");
-    s.push_str("\n                    let __piano_path = __piano_dir.join(&__piano_name);");
-    s.push_str("\n                    match std::fs::OpenOptions::new().write(true).create_new(true).open(&__piano_path) {");
-    s.push_str("\n                        Ok(f) => { __piano_file = Some(f); break; }");
-    s.push_str("\n                        Err(_) => {}");
-    s.push_str("\n                    }");
-    s.push_str("\n                }");
-    s.push_str("\n                if __piano_file.is_none() && !__piano_warned {");
-    s.push_str("\n                    let _ = writeln!(std::io::stderr(), \"piano: warning: could not create profiling output (all suffixes exhausted)\");");
-    s.push_str("\n                }");
-    s.push_str("\n                __piano_file.map(|f| std::sync::Arc::new(piano_runtime::file_sink::FileSink::new(f)))");
-    s.push_str("\n            }");
-    s.push_str("\n            Err(e) => {");
-    s.push_str("\n                let _ = writeln!(std::io::stderr(), \"piano: warning: could not create profiling output directory {}: {}\", __piano_dir.display(), e);");
-    s.push_str("\n                None");
-    s.push_str("\n            }");
-    s.push_str("\n        }");
-    s.push_str("\n    };");
-    s.push_str("\n    let __piano_run_id = format!(\"{}-{}\", __piano_ts, __piano_pid);");
+    s.push_str(" let __piano_name = if __piano_suffix == 0 {");
+    s.push_str(" format!(\"{}-{}.ndjson\", __piano_ts, __piano_pid)");
+    s.push_str(" } else {");
+    s.push_str(" format!(\"{}-{}-{}.ndjson\", __piano_ts, __piano_pid, __piano_suffix)");
+    s.push_str(" };");
+    s.push_str(" let __piano_path = __piano_dir.join(&__piano_name);");
+    s.push_str(
+        " match std::fs::OpenOptions::new().write(true).create_new(true).open(&__piano_path) {",
+    );
+    s.push_str(" Ok(f) => { __piano_file = Some(f); break; }");
+    s.push_str(" Err(_) => {}");
+    s.push_str(" }");
+    s.push_str(" }");
+    s.push_str(" if __piano_file.is_none() && !__piano_warned {");
+    s.push_str(" let _ = writeln!(std::io::stderr(), \"piano: warning: could not create profiling output (all suffixes exhausted)\");");
+    s.push_str(" }");
+    s.push_str(
+        " __piano_file.map(|f| std::sync::Arc::new(piano_runtime::file_sink::FileSink::new(f)))",
+    );
+    s.push_str(" }");
+    s.push_str(" Err(e) => {");
+    s.push_str(" let _ = writeln!(std::io::stderr(), \"piano: warning: could not create profiling output directory {}: {}\", __piano_dir.display(), e);");
+    s.push_str(" None");
+    s.push_str(" }");
+    s.push_str(" }");
+    s.push_str(" };");
+    s.push_str(" let __piano_run_id = format!(\"{}-{}\", __piano_ts, __piano_pid);");
     s.push_str(&format!(
-        "\n    piano_runtime::session::ProfileSession::init(__piano_sink, {cpu_time}, &PIANO_NAMES, &__piano_run_id, __piano_ts);"
+        " piano_runtime::session::ProfileSession::init(__piano_sink, {cpu_time}, &PIANO_NAMES, &__piano_run_id, __piano_ts);"
     ));
     s
 }
@@ -483,17 +517,17 @@ fn inject_guards_into_expansion(expanded: &str, measured: &HashMap<String, u32>)
             if is_async_fn {
                 insertions.push((
                     offset,
-                    format!("\npiano_runtime::enter_async({name_id}, async move {{"),
+                    format!(" piano_runtime::enter_async({name_id}, async move {{"),
                 ));
                 insertions.push((close_offset, "}).await".to_string()));
             } else {
-                insertions.push((offset, format!("\npiano_runtime::enter_async({name_id},")));
+                insertions.push((offset, format!(" piano_runtime::enter_async({name_id},")));
                 insertions.push((close_offset, ")".to_string()));
             }
         } else {
             insertions.push((
                 offset,
-                format!("\nlet __piano_guard = piano_runtime::enter({name_id});"),
+                format!(" let __piano_guard = piano_runtime::enter({name_id});"),
             ));
         }
     }
@@ -817,25 +851,6 @@ mod tests {
             result.source.contains("ProfileSession::init"),
             "lifecycle in main"
         );
-    }
-
-    #[test]
-    fn single_pass_no_source_map_chaining() {
-        let source = "fn work() {\n    1;\n}\nfn main() {\n    work();\n}\n";
-        let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
-        let ep = EntryPointParams {
-            name_table: &[(0, "work")],
-            runs_dir: "/tmp/runs",
-            cpu_time: false,
-        };
-        let result = instrument_source(source, &measured, Some(&ep)).unwrap();
-
-        // The source map is flat (no chain). Lines far past injections
-        // should map back correctly.
-        let total_injected_lines = result.source.lines().count() - source.lines().count();
-        let far_line = (source.lines().count() + total_injected_lines + 10) as u32;
-        let remapped = result.source_map.remap_line(far_line);
-        assert!(remapped > 0, "remap of far line should be positive");
     }
 
     // === Exhaustive enumeration: fn parent node kinds ===

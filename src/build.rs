@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -8,7 +7,6 @@ use serde::Deserialize;
 use toml_edit::DocumentMut;
 
 use crate::error::{Error, io_context};
-use crate::source_map::SourceMap;
 
 // --- Cargo metadata types ---
 
@@ -277,85 +275,145 @@ fn extract_rendered_errors(json_output: &str) -> Vec<String> {
         .collect()
 }
 
-static SPAN_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r" --> ([^:]+):(\d+):(\d+)").unwrap());
-static GUTTER_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"^(\s*)(\d+)( \|)").unwrap());
+/// Extract rendered errors from cargo JSON, filtering piano-internal diagnostics
+/// and cleaning instrumented source lines back to their original form.
+fn extract_user_errors(
+    json_output: &str,
+    modified_files: &std::collections::HashSet<PathBuf>,
+    project_dir: &Path,
+) -> Vec<String> {
+    json_output
+        .lines()
+        .filter_map(|line| {
+            let msg: serde_json::Value = serde_json::from_str(line).ok()?;
+            if msg.get("reason")?.as_str()? != "compiler-message" {
+                return None;
+            }
+            let message_obj = msg.get("message")?;
+            let message_text = message_obj.get("message")?.as_str()?;
+            if is_piano_diagnostic(message_text) {
+                return None;
+            }
+            let rendered = message_obj.get("rendered")?.as_str()?;
 
-/// Remap line numbers in a rendered rustc error using the provided source maps.
+            // Collect all spans from main diagnostic and children
+            let mut all_spans: Vec<serde_json::Value> = message_obj
+                .get("spans")
+                .and_then(|s| s.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            if let Some(children) = message_obj.get("children").and_then(|c| c.as_array()) {
+                for child in children {
+                    if let Some(child_spans) = child.get("spans").and_then(|s| s.as_array()) {
+                        all_spans.extend(child_spans.iter().cloned());
+                    }
+                }
+            }
+
+            let cleaned = clean_rendered(rendered, &all_spans, modified_files, |file, line_num| {
+                let full_path = project_dir.join(file);
+                let content = std::fs::read_to_string(&full_path).ok()?;
+                content.lines().nth(line_num - 1).map(String::from)
+            });
+
+            Some(cleaned)
+        })
+        .collect()
+}
+
+/// Replace instrumented source lines in rendered diagnostic output with
+/// original (uninstrumented) source lines.
 ///
-/// Processes line-by-line: `-->` lines set the current file context, and
-/// subsequent gutter lines (`N |`) use that file's source map for remapping.
-fn remap_rendered_error(rendered: &str, file_maps: &HashMap<PathBuf, SourceMap>) -> String {
-    let mut lines = Vec::new();
-    let mut current_map: Option<&SourceMap> = None;
+/// For each span referencing a modified file, finds the corresponding
+/// source display line in `rendered` (format: `NN | <text>`) and replaces
+/// the text portion with the original source line read via `read_line`.
+///
+/// Zero-shift guarantees line numbers are correct. The original file
+/// guarantees no injection artifacts. If a pattern doesn't match,
+/// `rendered` is returned unchanged (fail open, not destructive).
+fn clean_rendered(
+    rendered: &str,
+    spans: &[serde_json::Value],
+    modified_files: &std::collections::HashSet<PathBuf>,
+    read_line: impl Fn(&Path, usize) -> Option<String>,
+) -> String {
+    let mut replacements: Vec<(usize, String, String)> = Vec::new();
 
-    for line in rendered.lines() {
-        if let Some(caps) = SPAN_RE.captures(line) {
-            let file = &caps[1];
-            let line_num: u32 = caps[2].parse().unwrap_or(0);
-            let col = &caps[3];
-            let map = file_maps.get(Path::new(file));
-            current_map = map;
-            if let Some(m) = map {
-                let remapped = m.remap_line(line_num);
-                lines.push(
-                    SPAN_RE
-                        .replace(line, format!(" --> {file}:{remapped}:{col}"))
-                        .into_owned(),
-                );
-            } else {
-                lines.push(line.to_string());
+    for span in spans {
+        let Some(file_name) = span.get("file_name").and_then(|f| f.as_str()) else {
+            continue;
+        };
+        let file_path = PathBuf::from(file_name);
+        if !modified_files.contains(&file_path) {
+            continue;
+        }
+
+        let line_start = span.get("line_start").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
+
+        let Some(text_arr) = span.get("text").and_then(|t| t.as_array()) else {
+            continue;
+        };
+
+        let suggested = span.get("suggested_replacement").and_then(|s| s.as_str());
+
+        for (i, text_entry) in text_arr.iter().enumerate() {
+            let Some(instrumented) = text_entry.get("text").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            let line_num = line_start + i;
+            if let Some(original) = read_line(&file_path, line_num) {
+                replacements.push((line_num, instrumented.to_string(), original.clone()));
+
+                // Help suggestions: rustc renders the post-fix source line in
+                // `rendered`. The span's text is the pre-fix line; we must also
+                // replace the post-fix version. Construct it by applying the
+                // suggested_replacement at the highlight range.
+                if let Some(replacement_text) = suggested {
+                    let hl_start = text_entry
+                        .get("highlight_start")
+                        .and_then(|h| h.as_u64())
+                        .unwrap_or(0) as usize;
+                    let hl_end = text_entry
+                        .get("highlight_end")
+                        .and_then(|h| h.as_u64())
+                        .unwrap_or(0) as usize;
+                    // highlight positions are 1-indexed columns
+                    if hl_start > 0 && hl_end > 0 && hl_end <= instrumented.len() + 1 {
+                        let post_fix = format!(
+                            "{}{}{}",
+                            &instrumented[..hl_start - 1],
+                            replacement_text,
+                            &instrumented[hl_end - 1..],
+                        );
+                        replacements.push((line_num, post_fix, original));
+                    }
+                }
             }
-        } else if let Some(caps) = GUTTER_RE.captures(line) {
-            if let Some(map) = current_map {
-                let spaces = &caps[1];
-                let line_num: u32 = caps[2].parse().unwrap_or(0);
-                let suffix = &caps[3];
-                let remapped = map.remap_line(line_num);
-                let width = caps[2].len();
-                let rest = &line[caps[0].len()..];
-                lines.push(format!("{spaces}{remapped:>width$}{suffix}{rest}"));
-            } else {
-                lines.push(line.to_string());
-            }
-        } else {
-            lines.push(line.to_string());
         }
     }
 
-    let mut result = lines.join("\n");
-    // Preserve trailing newline if the original had one.
-    if rendered.ends_with('\n') {
-        result.push('\n');
+    if replacements.is_empty() {
+        return rendered.to_string();
     }
+
+    let mut result = rendered.to_string();
+    for (_line_num, instrumented, original) in &replacements {
+        // In rendered, source lines appear as "NN | <text>". We can't rely on
+        // exact NN formatting (variable padding), so we match on the instrumented
+        // text itself -- which is the exact text from the span.
+        // This is safe because the text comes from structured JSON (not guessing).
+        result = result.replace(instrumented.as_str(), original.as_str());
+    }
+
     result
 }
 
-/// Remove lines referencing piano internals from rendered error output.
-fn filter_piano_internals(rendered: &str) -> String {
-    let mut filtered = Vec::new();
-    let mut skip_annotations = false;
-
-    for line in rendered.lines() {
-        if line.contains("piano_runtime::")
-            || line.contains("__piano_guard")
-            || line.contains("__piano_ctx")
-            || line.contains("_PIANO_ALLOC")
-        {
-            skip_annotations = true;
-            continue;
-        }
-        if skip_annotations {
-            let trimmed = line.trim();
-            if trimmed.starts_with('|') || trimmed.starts_with("...") {
-                continue;
-            }
-            skip_annotations = false;
-        }
-        filtered.push(line);
-    }
-    filtered.join("\n")
+fn is_piano_diagnostic(message: &str) -> bool {
+    message.contains("__piano_")
+        || message.contains("__PIANO_")
+        || message.contains("`PIANO_NAMES`")
+        || message.contains("`piano_runtime::")
 }
 
 /// Detect Send-bound errors caused by piano's async wrapping and return user guidance.
@@ -676,6 +734,7 @@ pub fn build_instrumented(
     package: Option<&str>,
     bin: Option<&str>,
     config_path: &Path,
+    modified_files: &std::collections::HashSet<PathBuf>,
 ) -> Result<PathBuf, Error> {
     let piano_exe = std::env::current_exe()
         .map_err(|e| Error::BuildFailed(format!("failed to locate piano binary: {e}")))?;
@@ -709,16 +768,14 @@ pub fn build_instrumented(
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::BuildFailed(stderr.into_owned()));
         }
-        let error_text = rendered.join("");
-        // Remap line numbers using source maps written by the wrapper
-        let file_maps = crate::wrapper::read_source_maps(config_path);
-        let error_text = remap_rendered_error(&error_text, &file_maps);
-        // Detect Send-bound errors before filtering piano internals (the
-        // filter strips `piano_runtime` lines that the detector needs).
-        if let Some(guidance) = detect_send_bound_guidance(&error_text) {
+        let all_text = rendered.join("");
+        // Detect Send-bound errors on unfiltered text (needs piano references)
+        if let Some(guidance) = detect_send_bound_guidance(&all_text) {
             eprintln!("{guidance}");
         }
-        let error_text = filter_piano_internals(&error_text);
+        // Filter piano diagnostics and clean rendered output
+        let user_errors = extract_user_errors(&stdout, modified_files, project_dir);
+        let error_text = user_errors.join("");
         return Err(Error::BuildFailed(error_text));
     }
 
@@ -1091,37 +1148,42 @@ edition = "2021"
     }
 
     #[test]
-    fn remap_rendered_error_line_numbers() {
-        let rendered = "error[E0308]: mismatched types\n --> src/main.rs:7:18\n  |\n7 |     let x: i32 = \"hello\";\n  |                  ^^^^^^^ expected `i32`, found `&str`\n";
-        let mut file_maps = std::collections::HashMap::new();
-        let mut map = crate::source_map::SourceMap::new();
-        map.record(1, 2);
-        file_maps.insert(PathBuf::from("src/main.rs"), map);
+    fn piano_diagnostic_filtering() {
+        // Piano-internal diagnostics: should be filtered
+        assert!(is_piano_diagnostic("unused variable: `__piano_guard`"));
+        assert!(is_piano_diagnostic("unused variable: `__piano_sink`"));
+        assert!(is_piano_diagnostic("unused import: `piano_runtime::enter`"));
+        assert!(is_piano_diagnostic("constant `PIANO_NAMES` is never used"));
+        assert!(is_piano_diagnostic("static `__PIANO_ALLOC` is never used"));
 
-        let result = remap_rendered_error(rendered, &file_maps);
-        assert!(result.contains("--> src/main.rs:5:18"), "got: {result}");
+        // User diagnostics: should NOT be filtered
+        assert!(!is_piano_diagnostic("mismatched types"));
+        assert!(!is_piano_diagnostic("cannot find type `UnknownType`"));
         assert!(
-            result.contains("5 |"),
-            "gutter should be remapped: {result}"
+            !is_piano_diagnostic("unused variable: `piano_runtime`"),
+            "user variable named piano_runtime should not be filtered"
+        );
+        assert!(
+            !is_piano_diagnostic("function `piano_runtime_func` is never used"),
+            "user function containing piano_runtime should not be filtered"
+        );
+        assert!(
+            !is_piano_diagnostic("unused variable: `PIANO_NAMES_CONFIG`"),
+            "user variable starting with PIANO_NAMES should not be filtered"
         );
     }
 
     #[test]
-    fn filter_piano_internals_from_errors() {
-        let rendered = "error[E0308]: mismatched types\n --> src/main.rs:5:10\n  |\n3 |     let (__piano_guard, __piano_ctx) = __piano_ctx.enter(0);\n  |         -------------- this is of type `Guard`\n4 |     let x: i32 = \"hello\";\n  |                  ^^^^^^^ expected `i32`, found `&str`\n";
-        let result = filter_piano_internals(rendered);
-        assert!(
-            !result.contains("__piano_ctx"),
-            "should filter __piano_ctx: {result}"
-        );
-        assert!(
-            !result.contains("__piano_guard"),
-            "should filter __piano_guard: {result}"
-        );
-        assert!(
-            result.contains("expected `i32`"),
-            "should keep user error: {result}"
-        );
+    fn extract_user_errors_filters_piano_diagnostics() {
+        use std::collections::HashSet;
+        let json_lines = [
+            r#"{"reason":"compiler-message","message":{"message":"mismatched types","rendered":"error: mismatched types\n"}}"#,
+            r#"{"reason":"compiler-message","message":{"message":"unused variable: `__piano_guard`","rendered":"warning: unused variable\n"}}"#,
+        ].join("\n");
+        let modified: HashSet<PathBuf> = HashSet::new();
+        let errors = extract_user_errors(&json_lines, &modified, Path::new("/tmp"));
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("mismatched types"));
     }
 
     #[test]
@@ -1201,5 +1263,100 @@ edition = "2021"
             msg.contains("function 'process_request'"),
             "should extract function name: {msg}"
         );
+    }
+
+    #[test]
+    fn clean_rendered_replaces_instrumented_source_line() {
+        use std::collections::HashSet;
+        let rendered = concat!(
+            "error[E0308]: mismatched types\n",
+            " --> src/main.rs:2:18\n",
+            "  |\n",
+            "2 |     let x: i32 = \"hello\"; let __piano_guard = piano_runtime::enter(0);\n",
+            "  |            ---   ^^^^^^^ expected `i32`, found `&str`\n",
+            "  |            |\n",
+            "  |            expected due to this\n",
+            "\n",
+        );
+        let spans: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"file_name": "src/main.rs", "line_start": 2, "line_end": 2, "text": [{"text": "    let x: i32 = \"hello\"; let __piano_guard = piano_runtime::enter(0);"}]}]"#
+        ).unwrap();
+        let modified_files: HashSet<PathBuf> = [PathBuf::from("src/main.rs")].into();
+
+        let cleaned = clean_rendered(rendered, &spans, &modified_files, |file, line| {
+            if file == Path::new("src/main.rs") && line == 2 {
+                Some("    let x: i32 = \"hello\";".to_string())
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            !cleaned.contains("__piano_guard"),
+            "guard should be removed: {cleaned}"
+        );
+        assert!(
+            !cleaned.contains("piano_runtime"),
+            "runtime should be removed: {cleaned}"
+        );
+        assert!(
+            cleaned.contains("let x: i32 = \"hello\";"),
+            "original source should appear: {cleaned}"
+        );
+        assert!(
+            cleaned.contains(" --> src/main.rs:2:18"),
+            "location preserved: {cleaned}"
+        );
+    }
+
+    #[test]
+    fn clean_rendered_leaves_unmodified_files_alone() {
+        use std::collections::HashSet;
+        let rendered = "error: something\n --> lib.rs:5:3\n  |\n5 | fn helper() {\n";
+        let spans: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"file_name": "lib.rs", "line_start": 5, "line_end": 5, "text": [{"text": "fn helper() {"}]}]"#
+        ).unwrap();
+        let modified_files: HashSet<PathBuf> = [PathBuf::from("src/main.rs")].into();
+
+        let cleaned = clean_rendered(rendered, &spans, &modified_files, |_, _| None);
+        assert_eq!(cleaned, rendered, "unmodified files should be untouched");
+    }
+
+    #[test]
+    fn clean_rendered_handles_multiple_spans() {
+        use std::collections::HashSet;
+        let rendered = concat!(
+            "error: stuff\n",
+            "1 | fn a() { let __piano_guard = piano_runtime::enter(0);\n",
+            "5 | fn b() { let __piano_guard = piano_runtime::enter(1);\n",
+        );
+        let spans: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+                {"file_name": "src/main.rs", "line_start": 1, "line_end": 1, "text": [{"text": "fn a() { let __piano_guard = piano_runtime::enter(0);"}]},
+                {"file_name": "src/main.rs", "line_start": 5, "line_end": 5, "text": [{"text": "fn b() { let __piano_guard = piano_runtime::enter(1);"}]}
+            ]"#
+        ).unwrap();
+        let modified_files: HashSet<PathBuf> = [PathBuf::from("src/main.rs")].into();
+
+        let cleaned = clean_rendered(rendered, &spans, &modified_files, |_, line| match line {
+            1 => Some("fn a() {".to_string()),
+            5 => Some("fn b() {".to_string()),
+            _ => None,
+        });
+
+        assert!(!cleaned.contains("__piano_guard"));
+        assert!(cleaned.contains("1 | fn a() {"));
+        assert!(cleaned.contains("5 | fn b() {"));
+    }
+
+    #[test]
+    fn clean_rendered_no_spans_returns_unchanged() {
+        use std::collections::HashSet;
+        let rendered = "error: something bad\n";
+        let spans: Vec<serde_json::Value> = vec![];
+        let modified_files: HashSet<PathBuf> = [PathBuf::from("src/main.rs")].into();
+
+        let cleaned = clean_rendered(rendered, &spans, &modified_files, |_, _| None);
+        assert_eq!(cleaned, rendered);
     }
 }
