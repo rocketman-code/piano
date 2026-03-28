@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.14.2] - 2026-03-27
+
+Fixes compilation error display and two correctness bugs in allocator wrapping.
+
+### Fixed
+
+- Compilation errors no longer show piano injection artifacts (`__piano_guard`, `piano_runtime::enter`, lifecycle code) in source display lines. Errors now show the original source, verified by a 16-cell exhaustive proof matrix across all injection types and diagnostic categories.
+- User identifiers containing `piano_runtime` or `PIANO_NAMES` as substrings were silently filtered from compilation errors. Diagnostic filtering now uses exact identifier patterns matching rustc's backtick formatting.
+- Projects with `#[cfg_attr(..., global_allocator)]` failed with "cannot define multiple global allocators" because the fallback allocator gate was always-true. The negated cfg predicate is now extracted correctly.
+
+### Changed
+
+- Error cleaning no longer uses a manifest file. Instrumented source lines in error output are replaced with original source content using structured JSON spans from cargo, eliminating five classes of manifest bugs (write races, stale accumulation, text corruption, coverage gaps, dead entries).
+
 ## [0.14.0] - 2026-03-25
 
 Runtime and rewriter rebuilt from scratch. Per-call overhead drops 3x, profiling
@@ -356,7 +372,8 @@ Per-frame allocation tracking, cross-thread instrumentation, NDJSON output, and 
 Initial tagged release.
 
 [0.14.0]: https://github.com/rocketman-code/piano/compare/v0.13.0...v0.14.0
-[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.14.0...HEAD
+[0.14.2]: https://github.com/rocketman-code/piano/compare/v0.14.0...v0.14.2
+[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.14.2...HEAD
 [0.12.0]: https://github.com/rocketman-code/piano/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/rocketman-code/piano/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rocketman-code/piano/compare/v0.9.3...v0.10.0
