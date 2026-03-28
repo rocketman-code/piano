@@ -946,14 +946,13 @@ fn multi_file_both_files_instrumented() {
 }
 
 // ---------------------------------------------------------------------------
-// Integration glue: source map 4-pass chain
+// Integration: multi-injection error line preservation
 //
-// Entry point gets 4 injection passes (guard, registrations, allocator,
-// shutdown). A compilation error after all injections must show the
-// ORIGINAL line number, not a shifted one.
+// Entry point gets multiple injections (guard, name table, allocator,
+// lifecycle). A compilation error must show the ORIGINAL line number.
 // ---------------------------------------------------------------------------
 
-fn create_four_pass_error_project(dir: &Path) {
+fn create_multi_injection_error_project(dir: &Path) {
     fs::create_dir_all(dir.join("src")).unwrap();
 
     fs::write(
@@ -970,10 +969,10 @@ path = "src/main.rs"
     )
     .unwrap();
 
-    // The type error is on line 8 of the original source.
-    // After 4 injection passes (guard, registrations, allocator, shutdown),
-    // the actual line in the instrumented file is much higher.
-    // --remap-path-prefix + source map must recover line 8.
+    // The type error is on line 9 of the original source (let x: u32 = work()).
+    // Multiple injections (guard in work, lifecycle in main, name table,
+    // allocator) all affect the compiled file. Zero-shift + original-source
+    // display must preserve line 9.
     fs::write(
         dir.join("src").join("main.rs"),
         r#"fn work() -> u64 {
@@ -993,10 +992,10 @@ fn main() {
 }
 
 #[test]
-fn four_pass_source_map_preserves_line_numbers() {
+fn multi_injection_preserves_line_numbers() {
     let tmp = tempfile::tempdir().unwrap();
-    let project_dir = tmp.path().join("four-pass-error");
-    create_four_pass_error_project(&project_dir);
+    let project_dir = tmp.path().join("multi-inj-error");
+    create_multi_injection_error_project(&project_dir);
     common::prepopulate_deps(&project_dir, common::mini_seed());
 
     let piano_bin = env!("CARGO_BIN_EXE_piano");
