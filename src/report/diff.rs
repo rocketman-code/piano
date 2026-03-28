@@ -1161,4 +1161,93 @@ mod tests {
         assert_eq!(entries.len(), 1, "should hide zero-call entries");
         assert_eq!(entries[0].name, "active");
     }
+
+    #[test]
+    fn diff_columns_aligned() {
+        use crate::report::test_util::assert_aligned;
+
+        fn run_with(entry: FnEntry) -> Run {
+            Run {
+                run_id: None,
+                timestamp_ms: 1000,
+                source_format: RunFormat::default(),
+                functions: vec![entry],
+            }
+        }
+
+        // DA1: base (no cpu, no alloc)
+        let a = run_with(FnEntry {
+            name: "work".into(),
+            calls: 1,
+            self_ms: 10.0,
+            ..Default::default()
+        });
+        let b = run_with(FnEntry {
+            name: "work".into(),
+            calls: 1,
+            self_ms: 8.0,
+            ..Default::default()
+        });
+        assert_aligned(&diff_runs(&a, &b, "before", "after", false, None), "base");
+
+        // DA2: cpu only
+        let a = run_with(FnEntry {
+            name: "work".into(),
+            calls: 1,
+            self_ms: 10.0,
+            cpu_self_ms: Some(9.0),
+            ..Default::default()
+        });
+        let b = run_with(FnEntry {
+            name: "work".into(),
+            calls: 1,
+            self_ms: 8.0,
+            cpu_self_ms: Some(7.0),
+            ..Default::default()
+        });
+        assert_aligned(&diff_runs(&a, &b, "before", "after", false, None), "cpu");
+
+        // DA3: alloc only
+        let a = run_with(FnEntry {
+            name: "work".into(),
+            calls: 1,
+            self_ms: 10.0,
+            alloc_count: 100,
+            alloc_bytes: 8192,
+            ..Default::default()
+        });
+        let b = run_with(FnEntry {
+            name: "work".into(),
+            calls: 1,
+            self_ms: 8.0,
+            alloc_count: 50,
+            alloc_bytes: 4096,
+            ..Default::default()
+        });
+        assert_aligned(&diff_runs(&a, &b, "before", "after", false, None), "alloc");
+
+        // DA4: cpu + alloc
+        let a = run_with(FnEntry {
+            name: "work".into(),
+            calls: 1,
+            self_ms: 10.0,
+            cpu_self_ms: Some(9.0),
+            alloc_count: 100,
+            alloc_bytes: 8192,
+            ..Default::default()
+        });
+        let b = run_with(FnEntry {
+            name: "work".into(),
+            calls: 1,
+            self_ms: 8.0,
+            cpu_self_ms: Some(7.0),
+            alloc_count: 50,
+            alloc_bytes: 4096,
+            ..Default::default()
+        });
+        assert_aligned(
+            &diff_runs(&a, &b, "before", "after", false, None),
+            "cpu+alloc",
+        );
+    }
 }
