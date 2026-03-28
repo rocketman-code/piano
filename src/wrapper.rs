@@ -11,7 +11,6 @@ use std::io::Write as _;
 
 use crate::error::{Error, io_context};
 use crate::rewrite::{EntryPointParams, instrument_source};
-use crate::source_map::SourceMap;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WrapperConfig {
@@ -32,21 +31,6 @@ pub struct EntryPointConfig {
 }
 
 pub const CONFIG_ENV: &str = "PIANO_WRAPPER_CONFIG";
-
-pub fn source_maps_path(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("source_maps.json")
-}
-
-pub fn read_source_maps(config_path: &Path) -> HashMap<PathBuf, SourceMap> {
-    let path = source_maps_path(config_path);
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    serde_json::from_str(&content).unwrap_or_default()
-}
 
 pub struct ParsedRustcArgs {
     pub crate_name: Option<String>,
@@ -203,7 +187,6 @@ fn rewrite_and_compile(
     let source_parent = source_key.parent().unwrap_or(Path::new(""));
 
     let mut instrumented_files: Vec<(PathBuf, String)> = Vec::new();
-    let mut all_source_maps: Vec<(String, SourceMap)> = Vec::new();
 
     // Build entry point params (shared across all entry point calls)
     let name_refs: Vec<(u32, &str)> = config
@@ -241,7 +224,6 @@ fn rewrite_and_compile(
         let result = instrument_source(&file_source, target_measured, ep)
             .map_err(|e| Error::BuildFailed(format!("rewrite failed for {file_path}: {e}")))?;
 
-        all_source_maps.push((file_path, result.source_map));
         instrumented_files.push((target_path.clone(), result.source));
     }
 
@@ -254,11 +236,8 @@ fn rewrite_and_compile(
         let result = instrument_source(&source, &empty, Some(&ep_params))
             .map_err(|e| Error::BuildFailed(format!("rewrite failed: {e}")))?;
 
-        all_source_maps.push((source_path.to_string(), result.source_map));
         instrumented_files.push((source_key.to_path_buf(), result.source));
     }
-
-    write_source_maps(&all_source_maps, config_path);
 
     // Phase 2: Create staging overlay
     let ws_root =
@@ -288,23 +267,6 @@ fn rewrite_and_compile(
     new_args.push(format!("{staging_prefix}="));
 
     Ok(exec_rustc(real_rustc, &new_args))
-}
-
-fn write_source_maps(entries: &[(String, SourceMap)], config_path: &Path) {
-    if entries.is_empty() {
-        return;
-    }
-    let maps_path = source_maps_path(config_path);
-    let mut maps: HashMap<PathBuf, SourceMap> = std::fs::read_to_string(&maps_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    for (source_file, map) in entries {
-        maps.insert(PathBuf::from(source_file), map.clone());
-    }
-    if let Ok(json) = serde_json::to_string(&maps) {
-        let _ = std::fs::write(&maps_path, json);
-    }
 }
 
 fn exec_rustc(rustc: &str, args: &[String]) -> i32 {

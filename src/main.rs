@@ -722,6 +722,11 @@ fn build_project(
         .collect();
     name_table.sort_by_key(|(id, _)| *id);
 
+    // Collect files that the wrapper will modify (for error remapping)
+    let mut modified_files: std::collections::HashSet<std::path::PathBuf> =
+        targets_relative.keys().cloned().collect();
+    modified_files.insert(bin_entry_relative.clone());
+
     // Write wrapper config
     let config = piano::wrapper::WrapperConfig {
         runtime_rlib: runtime.rlib_path,
@@ -753,6 +758,7 @@ fn build_project(
         pkg_arg,
         bin.as_deref(),
         &config_path,
+        &modified_files,
     )?;
 
     Ok(Some((binary, runs_dir, total_fns)))
