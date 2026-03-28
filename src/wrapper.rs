@@ -94,7 +94,11 @@ impl ParsedRustcArgs {
 }
 
 /// Wrapper entry point. Called when PIANO_WRAPPER_CONFIG is set.
-pub fn run_wrapper() -> i32 {
+///
+/// The config_path is passed by the caller (main.rs) which already
+/// read and validated the env var. This avoids re-reading the env
+/// var with a different function.
+pub fn run_wrapper(config_path: &str) -> i32 {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         let _ = writeln!(
@@ -112,14 +116,7 @@ pub fn run_wrapper() -> i32 {
         return exec_rustc(real_rustc, &rustc_args);
     }
 
-    let config_path = match std::env::var(CONFIG_ENV) {
-        Ok(p) => p,
-        Err(_) => {
-            let _ = writeln!(std::io::stderr(), "piano wrapper: {CONFIG_ENV} not set");
-            return 1;
-        }
-    };
-    let config: WrapperConfig = match load_config(&config_path) {
+    let config: WrapperConfig = match load_config(config_path) {
         Ok(c) => c,
         Err(e) => {
             let _ = writeln!(
