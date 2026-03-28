@@ -222,6 +222,8 @@ mod tests {
     use super::super::{FnEntry, Run, RunFormat};
     use super::*;
 
+    use crate::report::test_util::assert_aligned;
+
     #[test]
     fn format_table_sorts_by_self_time() {
         let run = Run {
@@ -919,26 +921,8 @@ mod tests {
         );
     }
 
-    /// Visible character count, ignoring ANSI escape sequences.
-    fn visible_len(s: &str) -> usize {
-        let mut len = 0;
-        let mut in_escape = false;
-        for c in s.chars() {
-            if c == '\x1b' {
-                in_escape = true;
-            } else if in_escape {
-                if c == 'm' {
-                    in_escape = false;
-                }
-            } else {
-                len += 1;
-            }
-        }
-        len
-    }
-
     /// Structural invariant: all content lines (header, separator, data)
-    /// must have equal visible width. Tested with every column combination.
+    /// must have equal visible width.
     #[test]
     fn format_table_columns_aligned() {
         fn run_with(entry: FnEntry) -> Run {
@@ -991,6 +975,43 @@ mod tests {
         });
         assert_aligned(&format_table(&with_free, false, None), "free");
 
+        // Self + CPU + Calls + Allocs
+        let cpu_alloc = run_with(FnEntry {
+            name: "work".into(),
+            calls: 5,
+            self_ms: 15.0,
+            cpu_self_ms: Some(12.0),
+            alloc_count: 100,
+            alloc_bytes: 2048,
+            ..Default::default()
+        });
+        assert_aligned(&format_table(&cpu_alloc, false, None), "cpu+alloc");
+
+        // Self + CPU + Calls + Frees
+        let cpu_free = run_with(FnEntry {
+            name: "work".into(),
+            calls: 5,
+            self_ms: 15.0,
+            cpu_self_ms: Some(12.0),
+            free_count: 80,
+            free_bytes: 1500,
+            ..Default::default()
+        });
+        assert_aligned(&format_table(&cpu_free, false, None), "cpu+free");
+
+        // Self + Calls + Allocs + Frees
+        let alloc_free = run_with(FnEntry {
+            name: "work".into(),
+            calls: 5,
+            self_ms: 15.0,
+            alloc_count: 100,
+            alloc_bytes: 2048,
+            free_count: 80,
+            free_bytes: 1500,
+            ..Default::default()
+        });
+        assert_aligned(&format_table(&alloc_free, false, None), "alloc+free");
+
         // All columns: Self + CPU + Calls + Allocs + Frees
         let all_cols = run_with(FnEntry {
             name: "work".into(),
@@ -1006,24 +1027,86 @@ mod tests {
         assert_aligned(&format_table(&all_cols, false, None), "all");
     }
 
-    /// Assert all content lines in a table have equal visible width.
-    fn assert_aligned(table: &str, label: &str) {
-        let content_lines: Vec<&str> = table
-            .lines()
-            .filter(|l| !l.is_empty() && !l.contains("hidden"))
-            .collect();
+    #[test]
+    fn per_thread_tables_produces_thread_headers_and_tables() {
+        let runs = vec![
+            Run {
+                run_id: None,
+                timestamp_ms: 1000,
+                source_format: RunFormat::default(),
+                functions: vec![FnEntry {
+                    name: "work".into(),
+                    calls: 10,
+                    self_ms: 50.0,
+                    ..Default::default()
+                }],
+            },
+            Run {
+                run_id: None,
+                timestamp_ms: 1000,
+                source_format: RunFormat::default(),
+                functions: vec![FnEntry {
+                    name: "work".into(),
+                    calls: 5,
+                    self_ms: 25.0,
+                    ..Default::default()
+                }],
+            },
+        ];
+        let output = format_per_thread_tables(&runs, false, None);
         assert!(
-            content_lines.len() >= 3,
-            "[{label}] need header + separator + data, got {}",
-            content_lines.len()
+            output.contains("Thread 1"),
+            "should have Thread 1 header: {output}"
         );
-        let expected = visible_len(content_lines[0]);
-        for (i, line) in content_lines.iter().enumerate() {
-            assert_eq!(
-                visible_len(line),
-                expected,
-                "[{label}] line {i} visible width {} != header width {expected}\n  line: {line:?}",
-                visible_len(line)
+        assert!(
+            output.contains("Thread 2"),
+            "should have Thread 2 header: {output}"
+        );
+        assert_eq!(
+            output.matches("Function").count(),
+            2,
+            "should have two table headers (one per thread): {output}"
+        );
+        assert_eq!(
+            output.matches("work").count(),
+            2,
+            "should show work in both threads: {output}"
+        );
+    }
+
+    #[test]
+    fn per_thread_tables_columns_aligned() {
+        // Alignment originates in format_table, not the composition layer.
+        // Test format_table directly on each thread's Run, matching the
+        // pattern in format_table_columns_aligned.
+        let thread_runs = [
+            Run {
+                run_id: None,
+                timestamp_ms: 1000,
+                source_format: RunFormat::default(),
+                functions: vec![FnEntry {
+                    name: "compute".into(),
+                    calls: 5,
+                    self_ms: 42.0,
+                    ..Default::default()
+                }],
+            },
+            Run {
+                run_id: None,
+                timestamp_ms: 1000,
+                source_format: RunFormat::default(),
+                functions: vec![FnEntry {
+                    name: "render".into(),
+                    calls: 3,
+                    self_ms: 18.0,
+                    ..Default::default()
+                }],
+            },
+        ];
+        for (i, run) in thread_runs.iter().enumerate() {
+            assert_aligned(
+                &format_table(run, false, None),
+                &format!("thread-{}", i + 1),
             );
         }
     }

@@ -5,6 +5,9 @@ pub(crate) mod format;
 pub(crate) mod load;
 pub(crate) mod tag;
 
+#[cfg(test)]
+pub(crate) mod test_util;
+
 pub(super) const HEADER: Style = Style::new().bold();
 pub(super) const DIM: Style = Style::new().effects(Effects::DIMMED);
 
