@@ -368,6 +368,420 @@ fn process() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Report format: text table and JSON pipeline validation
+// ---------------------------------------------------------------------------
+
+fn create_two_function_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "report-fmt"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "report-fmt"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    // slow() uses a black_box loop that the compiler cannot optimize away.
+    // fast() does trivial work. The timing difference must survive release mode.
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"fn main() {
+    let a = slow();
+    let b = fast();
+    println!("{a} {b}");
+}
+
+fn slow() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..10_000_000 {
+        sum = std::hint::black_box(sum.wrapping_add(std::hint::black_box(i)));
+    }
+    sum
+}
+
+fn fast() -> u64 {
+    42
+}
+"#,
+    )
+    .unwrap();
+}
+
+fn create_threaded_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "threaded"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "threaded"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"fn main() {
+    let handle = std::thread::spawn(|| {
+        work();
+    });
+    work();
+    handle.join().unwrap();
+}
+
+fn work() -> u64 {
+    let mut sum = 0u64;
+    for i in 0..1_000_000 {
+        sum = std::hint::black_box(sum.wrapping_add(std::hint::black_box(i)));
+    }
+    sum
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn report_text_table_format_validated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("report-fmt");
+    create_two_function_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Build
+    let build = Command::new(piano_bin)
+        .args(["build", "--fn", "slow", "--fn", "fast", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    let stdout = String::from_utf8_lossy(&build.stdout);
+    assert!(
+        build.status.success(),
+        "build failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    // Run
+    let binary_path = stdout.trim();
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let run = Command::new(binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run instrumented binary");
+    assert!(run.status.success(), "binary failed");
+
+    // Report (text table)
+    let report = Command::new(piano_bin)
+        .args(["report"])
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run piano report");
+    assert!(
+        report.status.success(),
+        "report failed: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+
+    let table = String::from_utf8_lossy(&report.stdout);
+
+    // Table structure
+    assert!(
+        table.contains("Function"),
+        "table should have Function header: {table}"
+    );
+    assert!(
+        table.contains("Self"),
+        "table should have Self header: {table}"
+    );
+    assert!(
+        table.contains("Calls"),
+        "table should have Calls header: {table}"
+    );
+
+    // Both functions present
+    assert!(table.contains("slow"), "table should contain slow: {table}");
+    assert!(table.contains("fast"), "table should contain fast: {table}");
+
+    // Sort order: slow (more work) should appear before fast
+    let slow_pos = table.find("slow").expect("slow not found");
+    let fast_pos = table.find("fast").expect("fast not found");
+    assert!(
+        slow_pos < fast_pos,
+        "slow should appear before fast (sorted by self_ms descending): {table}"
+    );
+
+    // No internal artifacts
+    assert!(
+        !table.contains("__piano_"),
+        "table should not contain piano internals: {table}"
+    );
+    assert!(
+        !table.contains("PIANO_NAMES"),
+        "table should not contain name table: {table}"
+    );
+    assert!(
+        !table.contains("piano_runtime"),
+        "table should not contain runtime references: {table}"
+    );
+}
+
+#[test]
+fn report_json_format_validated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("report-json");
+    create_two_function_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Build
+    let build = Command::new(piano_bin)
+        .args(["build", "--fn", "slow", "--fn", "fast", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+    assert!(build.status.success(), "build failed");
+
+    // Run
+    let binary_path = String::from_utf8_lossy(&build.stdout).trim().to_string();
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let run = Command::new(&binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run instrumented binary");
+    assert!(run.status.success(), "binary failed");
+
+    // Report (JSON)
+    let report = Command::new(piano_bin)
+        .args(["report", "--json"])
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run piano report --json");
+    assert!(
+        report.status.success(),
+        "report --json failed: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+
+    let json_str = String::from_utf8_lossy(&report.stdout);
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(&json_str).expect("report --json should produce valid JSON array");
+
+    // Both functions present
+    let names: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"slow"),
+        "JSON should contain slow: {json_str}"
+    );
+    assert!(
+        names.contains(&"fast"),
+        "JSON should contain fast: {json_str}"
+    );
+
+    // Required fields present on each entry
+    for entry in &entries {
+        assert!(
+            entry.get("self_ms").is_some(),
+            "entry should have self_ms: {entry}"
+        );
+        assert!(
+            entry.get("calls").is_some(),
+            "entry should have calls: {entry}"
+        );
+    }
+
+    // Sort order: first entry should be slow (higher self_ms)
+    assert_eq!(
+        entries[0].get("name").and_then(|n| n.as_str()),
+        Some("slow"),
+        "JSON entries should be sorted by self_ms descending: {json_str}"
+    );
+
+    // self_ms values should be positive
+    let slow_ms = entries[0]
+        .get("self_ms")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    assert!(slow_ms > 0.0, "slow self_ms should be positive: {slow_ms}");
+}
+
+// ---------------------------------------------------------------------------
+// Diff and per-thread report validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn diff_text_table_format_validated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("diff-fmt");
+    create_two_function_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Build
+    let build = Command::new(piano_bin)
+        .args(["build", "--fn", "slow", "--fn", "fast", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+    assert!(build.status.success(), "build failed");
+
+    let binary_path = String::from_utf8_lossy(&build.stdout).trim().to_string();
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    // Run twice to produce two NDJSON files for diffing.
+    for _ in 0..2 {
+        let run = Command::new(&binary_path)
+            .env("PIANO_RUNS_DIR", &runs_dir)
+            .output()
+            .expect("failed to run instrumented binary");
+        assert!(run.status.success(), "binary failed");
+    }
+
+    // Diff (auto-detects the two latest runs)
+    let diff = Command::new(piano_bin)
+        .args(["diff"])
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run piano diff");
+    assert!(
+        diff.status.success(),
+        "diff failed: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&diff.stdout);
+
+    // Table structure
+    assert!(
+        stdout.contains("Function"),
+        "diff should have Function header: {stdout}"
+    );
+    assert!(
+        stdout.contains("Delta"),
+        "diff should have Delta header: {stdout}"
+    );
+
+    // Both functions present
+    assert!(
+        stdout.contains("slow"),
+        "diff should contain slow: {stdout}"
+    );
+    assert!(
+        stdout.contains("fast"),
+        "diff should contain fast: {stdout}"
+    );
+}
+
+#[test]
+fn report_threads_format_validated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("threaded");
+    create_threaded_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Build
+    let build = Command::new(piano_bin)
+        .args(["build", "--fn", "work", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let binary_path = String::from_utf8_lossy(&build.stdout).trim().to_string();
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    // Run
+    let run = Command::new(&binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run instrumented binary");
+    assert!(run.status.success(), "binary failed");
+
+    // Report with --threads
+    let report = Command::new(piano_bin)
+        .args(["report", "--threads"])
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run piano report --threads");
+    assert!(
+        report.status.success(),
+        "report --threads failed: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&report.stdout);
+
+    // Per-thread headers present
+    assert!(
+        stdout.contains("Thread 1"),
+        "should have Thread 1 header: {stdout}"
+    );
+    assert!(
+        stdout.contains("Thread 2"),
+        "should have Thread 2 header: {stdout}"
+    );
+
+    // Function name present (appears in both thread tables)
+    assert!(
+        stdout.contains("work"),
+        "should contain work function: {stdout}"
+    );
+
+    // Table header appears at least twice (one per thread)
+    assert!(
+        stdout.matches("Function").count() >= 2,
+        "should have Function header per thread: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Signal recovery
 // ---------------------------------------------------------------------------
 
