@@ -276,8 +276,8 @@ fn resolve_display_limit(all: bool, top: Option<usize>) -> (bool, Option<usize>)
 fn main() {
     // Wrapper mode: when invoked as RUSTC_WORKSPACE_WRAPPER, Cargo passes
     // the real rustc path as argv[1]. Detect via PIANO_WRAPPER_CONFIG env var.
-    if std::env::var_os(piano::wrapper::CONFIG_ENV).is_some() {
-        std::process::exit(piano::wrapper::run_wrapper());
+    if let Ok(config_path) = std::env::var(piano::wrapper::CONFIG_ENV) {
+        std::process::exit(piano::wrapper::run_wrapper(&config_path));
     }
 
     let cli = Cli::parse();
