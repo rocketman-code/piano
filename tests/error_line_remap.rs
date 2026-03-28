@@ -163,133 +163,132 @@ fn compilation_error_shows_original_line_numbers() {
 }
 
 // ---------------------------------------------------------------------------
-// Proof matrix: injection type x grammar production x diagnostic category
+// Per-injection-type error remapping tests
 // ---------------------------------------------------------------------------
 
 #[test]
-fn proof_t1_sync_guard_type_mismatch() {
+fn sync_guard_cleaned_from_type_error() {
     let stderr = piano_build_stderr(
-        "proof-t1",
+        "sync-guard-type",
         "fn work() -> i32 {\n    let x: i32 = \"hello\";\n    x\n}\nfn main() { work(); }\n",
         &["--fn", "work"],
     );
-    assert_no_piano_artifacts(&stderr, "T1");
+    assert_no_piano_artifacts(&stderr, "sync_guard_type");
     assert!(
         stderr.contains(":2:"),
-        "T1: error should reference line 2\nStderr:\n{stderr}"
+        "error should reference line 2\nStderr:\n{stderr}"
     );
 }
 
 #[test]
-fn proof_t2_sync_guard_unresolved_name() {
+fn sync_guard_cleaned_from_unresolved_error() {
     let stderr = piano_build_stderr(
-        "proof-t2",
+        "sync-guard-unresolved",
         "fn work() {\n    unknown_function();\n}\nfn main() { work(); }\n",
         &["--fn", "work"],
     );
-    assert_no_piano_artifacts(&stderr, "T2");
+    assert_no_piano_artifacts(&stderr, "sync_guard_unresolved");
     assert!(
         stderr.contains(":2:"),
-        "T2: error should reference line 2\nStderr:\n{stderr}"
+        "error should reference line 2\nStderr:\n{stderr}"
     );
 }
 
 #[test]
-fn proof_t3_sync_guard_borrow_error() {
+fn sync_guard_cleaned_from_borrow_error() {
     let stderr = piano_build_stderr(
-        "proof-t3",
+        "sync-guard-borrow",
         "fn work() {\n    let mut v = vec![1, 2, 3];\n    let r = &v;\n    v.push(4);\n    println!(\"{:?}\", r);\n}\nfn main() { work(); }\n",
         &["--fn", "work"],
     );
-    assert_no_piano_artifacts(&stderr, "T3");
+    assert_no_piano_artifacts(&stderr, "sync_guard_borrow");
     assert!(
         stderr.contains(":4:"),
-        "T3: error should reference line 4 (push while borrow held)\nStderr:\n{stderr}"
+        "error should reference line 4 (push while borrow held)\nStderr:\n{stderr}"
     );
 }
 
 #[test]
-fn proof_t4_async_wrapper_type_mismatch() {
+fn async_wrapper_cleaned_from_type_error() {
     let stderr = piano_build_stderr(
-        "proof-t4",
+        "async-wrapper-type",
         "async fn work() -> i32 {\n    let x: i32 = \"hello\";\n    x\n}\nfn main() {}\n",
         &["--fn", "work"],
     );
-    assert_no_piano_artifacts(&stderr, "T4");
+    assert_no_piano_artifacts(&stderr, "async_wrapper_type");
     assert!(
         stderr.contains(":2:"),
-        "T4: error should reference line 2\nStderr:\n{stderr}"
+        "error should reference line 2\nStderr:\n{stderr}"
     );
 }
 
 #[test]
-fn proof_t5_async_wrapper_unresolved_name() {
+fn async_wrapper_cleaned_from_unresolved_error() {
     let stderr = piano_build_stderr(
-        "proof-t5",
+        "async-wrapper-unresolved",
         "async fn work() {\n    unknown_thing();\n}\nfn main() {}\n",
         &["--fn", "work"],
     );
-    assert_no_piano_artifacts(&stderr, "T5");
+    assert_no_piano_artifacts(&stderr, "async_wrapper_unresolved");
     assert!(
         stderr.contains(":2:"),
-        "T5: error should reference line 2\nStderr:\n{stderr}"
+        "error should reference line 2\nStderr:\n{stderr}"
     );
 }
 
 #[test]
-fn proof_t6_impl_future_type_mismatch_b2_regression() {
+fn impl_future_wrapper_does_not_corrupt_error_text() {
     let stderr = piano_build_stderr(
-        "proof-t6",
+        "impl-future-type",
         "fn work() -> impl std::future::Future<Output = i32> {\n    async { let x: i32 = \"hello\"; x }\n}\nfn main() {}\n",
         &["--fn", "work"],
     );
-    assert_no_piano_artifacts(&stderr, "T6");
+    assert_no_piano_artifacts(&stderr, "impl_future_type");
     assert!(
         stderr.contains(":2:"),
-        "T6: error should reference line 2\nStderr:\n{stderr}"
+        "error should reference line 2\nStderr:\n{stderr}"
     );
-    // B2 regression: bare `)` corruption would break parentheses in error text.
-    // Verify that if parentheses appear in the error, they are balanced.
+    // Injection cleanup must not leave bare `)` that breaks parentheses balance.
     let open = stderr.chars().filter(|&c| c == '(').count();
     let close = stderr.chars().filter(|&c| c == ')').count();
     assert_eq!(
         open, close,
-        "T6 B2 regression: unbalanced parentheses in error output\nStderr:\n{stderr}"
+        "error parentheses should not be corrupted by injection cleanup\nStderr:\n{stderr}"
     );
 }
 
 #[test]
-fn proof_t7_lifecycle_main_type_mismatch() {
+fn lifecycle_cleaned_from_main_type_error() {
     let stderr = piano_build_stderr(
-        "proof-t7",
+        "lifecycle-main-type",
         "fn work() -> i32 { 1 }\nfn main() {\n    let x: i32 = \"hello\";\n}\n",
         &["--fn", "work"],
     );
-    assert_no_piano_artifacts(&stderr, "T7");
+    assert_no_piano_artifacts(&stderr, "lifecycle_main_type");
     assert!(
         stderr.contains(":3:"),
-        "T7: error should reference line 3\nStderr:\n{stderr}"
+        "error should reference line 3\nStderr:\n{stderr}"
     );
 }
 
 #[test]
-fn proof_t8_lifecycle_name_table_unresolved_in_main() {
+fn lifecycle_cleaned_from_main_unresolved_error() {
     let stderr = piano_build_stderr(
-        "proof-t8",
+        "lifecycle-main-unresolved",
         "fn work() { }\nfn main() {\n    nonexistent();\n}\n",
         &["--fn", "work"],
     );
-    assert_no_piano_artifacts(&stderr, "T8");
+    assert_no_piano_artifacts(&stderr, "lifecycle_main_unresolved");
     assert!(
         stderr.contains(":3:"),
-        "T8: error should reference line 3\nStderr:\n{stderr}"
+        "error should reference line 3\nStderr:\n{stderr}"
     );
 }
 
 #[test]
-fn proof_t9_allocator_wrap_type_mismatch() {
+fn allocator_wrap_preserves_line_numbers() {
     let stderr = piano_build_stderr(
-        "proof-t9",
+        "allocator-wrap-type",
         r#"use std::alloc::{GlobalAlloc, Layout};
 struct MyAlloc;
 unsafe impl GlobalAlloc for MyAlloc {
@@ -306,18 +305,17 @@ fn main() { work(); }
 "#,
         &["--fn", "work"],
     );
-    assert_no_piano_artifacts(&stderr, "T9");
+    assert_no_piano_artifacts(&stderr, "allocator_wrap_type");
     assert!(
         stderr.contains(":10:"),
-        "T9: error should reference line 10\nStderr:\n{stderr}"
+        "error should reference line 10\nStderr:\n{stderr}"
     );
 }
 
-// T10: cfg-gated allocator wrap + type mismatch after allocator
 #[test]
-fn proof_t10_cfg_allocator_type_mismatch() {
+fn cfg_allocator_preserves_line_numbers() {
     let stderr = piano_build_stderr(
-        "t10",
+        "cfg-alloc-type",
         r#"use std::alloc::{GlobalAlloc, Layout};
 struct MyAlloc;
 unsafe impl GlobalAlloc for MyAlloc {
@@ -336,18 +334,18 @@ fn main() { work(); }
         &["--fn", "work"],
     );
     // work() starts on line 10. Error is on line 11.
-    // If the allocator Replace added lines, the error would be on line 12+.
+    // If the allocator replace added lines, the error would be on line 12+.
     assert!(
         stderr.contains(":11:"),
-        "T10: error should reference original line 11, got:\n{stderr}"
+        "error should reference original line 11, got:\n{stderr}"
     );
-    assert_no_piano_artifacts(&stderr, "T10");
+    assert_no_piano_artifacts(&stderr, "cfg_alloc_type");
 }
 
 #[test]
-fn proof_t11_macro_expansion_guard_type_mismatch() {
+fn macro_guard_cleaned_from_type_error() {
     let stderr = piano_build_stderr(
-        "proof-t11",
+        "macro-guard-type",
         r#"macro_rules! make_fn {
     ($name:ident) => {
         fn $name() -> i32 {
@@ -363,57 +361,57 @@ fn main() { work(); }
     );
     // Macro errors reference the macro call site; line numbers vary by compiler.
     // The key property: no piano artifacts leak into the diagnostic.
-    assert_no_piano_artifacts(&stderr, "T11");
+    assert_no_piano_artifacts(&stderr, "macro_guard_type");
 }
 
 #[test]
-fn proof_t12_internal_diagnostic_filtered() {
+fn piano_diagnostics_filtered_from_output() {
     let stderr = piano_build_stderr(
-        "proof-t12",
+        "diagnostics-filtered",
         "fn work() -> i32 {\n    let x: i32 = \"hello\";\n    x\n}\nfn main() { work(); }\n",
         &["--fn", "work"],
     );
-    assert_no_piano_artifacts(&stderr, "T12");
+    assert_no_piano_artifacts(&stderr, "diagnostics_filtered");
     // Piano's injected __piano_guard would trigger "unused variable" if not filtered.
     assert!(
         !stderr.contains("unused variable"),
-        "T12: 'unused variable' warning leaked (likely from piano internals)\nStderr:\n{stderr}"
+        "'unused variable' warning leaked (likely from piano internals)\nStderr:\n{stderr}"
     );
     // The actual user error should still be present.
     assert!(
         stderr.contains("mismatched types") || stderr.contains("expected"),
-        "T12: user error should still appear in stderr\nStderr:\n{stderr}"
+        "user error should still appear in stderr\nStderr:\n{stderr}"
     );
 }
 
 #[test]
-fn proof_t13_sync_guard_lifetime_error() {
+fn sync_guard_cleaned_from_lifetime_error() {
     let stderr = piano_build_stderr(
-        "proof-t13",
+        "sync-guard-lifetime",
         "fn work<'a>(x: &i32) -> &'a i32 {\n    x\n}\nfn main() { let n = 1; let _ = work(&n); }\n",
         &["--fn", "work"],
     );
     // Lifetime errors may reference multiple lines; just verify no artifacts.
-    assert_no_piano_artifacts(&stderr, "T13");
+    assert_no_piano_artifacts(&stderr, "sync_guard_lifetime");
 }
 
 #[test]
-fn proof_t14_async_borrow_error() {
+fn async_wrapper_cleaned_from_borrow_error() {
     let stderr = piano_build_stderr(
-        "proof-t14",
+        "async-wrapper-borrow",
         "async fn work() {\n    let mut v = vec![1];\n    let r = &v;\n    v.push(2);\n    println!(\"{:?}\", r);\n}\nfn main() {}\n",
         &["--fn", "work"],
     );
-    assert_no_piano_artifacts(&stderr, "T14");
+    assert_no_piano_artifacts(&stderr, "async_wrapper_borrow");
 }
 
 #[test]
-fn proof_t15_multiple_injections_two_errors() {
+fn multiple_injections_cleaned_from_combined_errors() {
     let stderr = piano_build_stderr(
-        "proof-t15",
+        "multi-injection",
         "fn work() -> i32 {\n    let x: i32 = \"hello\";\n    x\n}\nfn main() {\n    let y: bool = 42i32;\n}\n",
         &["--fn", "work"],
     );
     // Both work() (guard injection) and main() (lifecycle injection) have errors.
-    assert_no_piano_artifacts(&stderr, "T15");
+    assert_no_piano_artifacts(&stderr, "multi_injection");
 }
