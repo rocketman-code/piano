@@ -178,6 +178,73 @@ fn workspace_binary_in_member_crate_builds_from_workspace_root() {
     );
 }
 
+/// Create a workspace with a binary crate (`app`) depending on a library-only
+/// crate (`mathlib`).  Tests that the wrapper passes non-instrumented library
+/// crates through to rustc unchanged.
+fn create_workspace_with_lib_dependency(root: &Path) {
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["crates/app", "crates/mathlib"]
+resolver = "2"
+"#,
+    )
+    .unwrap();
+
+    // Library crate (no binary, no measured functions)
+    let mathlib = root.join("crates/mathlib");
+    fs::create_dir_all(mathlib.join("src")).unwrap();
+    fs::write(
+        mathlib.join("Cargo.toml"),
+        r#"[package]
+name = "mathlib"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        mathlib.join("src/lib.rs"),
+        r#"pub fn add(a: u64, b: u64) -> u64 { a + b }
+"#,
+    )
+    .unwrap();
+
+    // Binary crate depending on the library
+    let app = root.join("crates/app");
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::write(
+        app.join("Cargo.toml"),
+        r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[dependencies]
+mathlib = { path = "../mathlib" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        app.join("src/main.rs"),
+        r#"fn main() {
+    let result = work();
+    println!("sum: {result}");
+}
+
+fn work() -> u64 {
+    mathlib::add(100, 200)
+}
+"#,
+    )
+    .unwrap();
+}
+
 /// Create a workspace with two member crates (cli and lib-user), each with
 /// its own binary.  This exercises the multi-package branch in build dispatch
 /// that the single-member tests above skip.
@@ -369,5 +436,68 @@ fn multi_member_workspace_builds_from_member_dir() {
     assert!(
         content.contains("lib_work"),
         "output should contain instrumented function name 'lib_work'"
+    );
+}
+
+#[test]
+fn workspace_lib_dependency_compiles_via_wrapper_passthrough() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().join("dep-ws");
+    create_workspace_with_lib_dependency(&workspace_root);
+
+    common::prepopulate_deps(&workspace_root, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    // Instrument only the app crate's work() function.
+    // The mathlib crate is a dependency with no measured functions.
+    // The wrapper must pass mathlib through to rustc unchanged.
+    let output = Command::new(piano_bin)
+        .args(["build", "--fn", "work", "--project"])
+        .arg(&workspace_root)
+        .arg("--bin")
+        .arg("app")
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "build should succeed (mathlib passes through wrapper): stderr: {stderr}\nstdout: {stdout}"
+    );
+
+    // Run and verify the library function was callable
+    let binary_path = stdout.trim();
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let run_output = Command::new(binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run_output.status.success(),
+        "binary should run correctly: {}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let program_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        program_stdout.contains("sum: 300"),
+        "mathlib::add(100, 200) should produce 300: {program_stdout}"
+    );
+
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+    assert!(
+        content.contains("work"),
+        "output should contain instrumented function name 'work'"
     );
 }
