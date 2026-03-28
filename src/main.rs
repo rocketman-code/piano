@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -845,28 +845,23 @@ struct ChildOutcome {
     stop_reason: StopReason,
 }
 
-static CHILD_PID: AtomicU32 = AtomicU32::new(0);
-static DURATION_EXPIRED: AtomicBool = AtomicBool::new(false);
-static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
-static FORCE_KILLED: AtomicBool = AtomicBool::new(false);
+/// Single global: set-once flag for Ctrl-C. One writer (signal handler),
+/// one reader (polling loop). No PID, no cross-thread coordination.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-/// Send a termination signal to a child process by PID.
-///
-/// Unix: sends SIGTERM (triggers graceful shutdown in the instrumented binary).
-/// Windows: calls TerminateProcess (immediate kill -- the runtime does not
-/// register Windows signal handlers, so graceful flush is not available).
-fn kill_child(pid: u32) {
+/// Terminate a child process (SIGTERM on Unix, TerminateProcess on Windows).
+fn terminate_child(child: &process::Child) {
     #[cfg(unix)]
-    // SAFETY: sending a signal to a known PID. The PID comes from
-    // Child::id() stored in CHILD_PID and is valid while the child runs.
+    // SAFETY: child.id() returns the PID from spawn. The child has not been
+    // reaped by this process. Sending SIGTERM to a zombie is harmless (returns ESRCH).
     unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
     }
 
     #[cfg(windows)]
-    // SAFETY: OpenProcess/TerminateProcess/CloseHandle are safe to call with
-    // a valid PID (from Child::id()). OpenProcess returns null on failure
-    // (checked before use). The handle is closed immediately after use.
+    // Note: TerminateProcess is an immediate kill (no graceful shutdown on Windows).
+    // SAFETY: OpenProcess/TerminateProcess/CloseHandle with a valid PID from
+    // Child::id(). Handle closed immediately after use.
     unsafe {
         extern "system" {
             fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
@@ -874,7 +869,7 @@ fn kill_child(pid: u32) {
             fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
         }
         const PROCESS_TERMINATE: u32 = 0x0001;
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, child.id());
         if !handle.is_null() {
             TerminateProcess(handle, 1);
             CloseHandle(handle);
@@ -882,20 +877,55 @@ fn kill_child(pid: u32) {
     }
 }
 
+/// Wait for a child to exit, escalating to SIGKILL after a grace period.
+///
+/// Polls try_wait in a loop. If the child doesn't exit within `grace`,
+/// sends SIGKILL via Child::kill() and waits for exit.
+fn wait_or_kill(
+    child: &mut process::Child,
+    grace: Duration,
+    binary: &Path,
+) -> Result<(process::ExitStatus, bool), Error> {
+    if grace == Duration::ZERO {
+        let status = child.wait().map_err(|e| {
+            Error::RunFailed(format!("failed to wait for {}: {e}", binary.display()))
+        })?;
+        return Ok((status, false));
+    }
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok((status, false)),
+            Ok(None) => {
+                if start.elapsed() >= grace {
+                    let _ = child.kill();
+                    let status = child.wait().map_err(|e| {
+                        Error::RunFailed(format!("failed to wait for {}: {e}", binary.display()))
+                    })?;
+                    return Ok((status, true));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(Error::RunFailed(format!(
+                    "failed to wait for {}: {e}",
+                    binary.display()
+                )));
+            }
+        }
+    }
+}
+
 /// Spawn a child process, optionally killing it after a timeout.
 ///
-/// When `timeout` is `Some`, a background thread sleeps for the given duration
-/// then sends SIGTERM to the child. The existing signal handler in the
-/// instrumented binary flushes profiling data on SIGTERM, so this composes
-/// cleanly with signal recovery.
+/// Single-threaded polling loop. No background threads, no global PID.
+/// The child is in the parent's process group, so terminal Ctrl-C delivers
+/// SIGINT to both parent and child. For programmatic kill(pid, SIGINT),
+/// only the parent receives it; the loop forwards SIGTERM to the child.
 ///
-/// When `kill_timeout` is non-zero, a second background thread waits for
-/// SIGTERM to be sent (via --duration or Ctrl-C), then sleeps the grace
-/// period. If the child has not exited, it escalates to SIGKILL (Unix).
-///
-/// On Unix, a SIGINT handler forwards SIGTERM to the child so that Ctrl-C
-/// triggers graceful shutdown instead of orphaning the child. The handler
-/// uses `SA_RESETHAND` so a second Ctrl-C force-kills the parent.
+/// The only global state is INTERRUPTED (AtomicBool), set once by the
+/// SIGINT handler so the parent survives Ctrl-C and collects the child's
+/// exit status before reporting.
 fn run_child(
     binary: &Path,
     args: &[String],
@@ -904,10 +934,22 @@ fn run_child(
     suppress_stdout: bool,
     env: &[(&str, &str)],
 ) -> Result<ChildOutcome, Error> {
-    // Reset flags from any previous invocation.
-    DURATION_EXPIRED.store(false, Ordering::SeqCst);
-    SIGINT_RECEIVED.store(false, Ordering::SeqCst);
-    FORCE_KILLED.store(false, Ordering::SeqCst);
+    INTERRUPTED.store(false, Ordering::SeqCst);
+
+    #[cfg(unix)]
+    {
+        extern "C" fn sigint_handler(_sig: i32) {
+            INTERRUPTED.store(true, Ordering::SeqCst);
+        }
+
+        // SAFETY: sigaction with a valid handler function pointer.
+        unsafe {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = sigint_handler as *const () as usize;
+            act.sa_flags = libc::SA_RESETHAND;
+            libc::sigaction(libc::SIGINT, &act, std::ptr::null_mut());
+        }
+    }
 
     let mut cmd = process::Command::new(binary);
     cmd.args(args);
@@ -917,126 +959,97 @@ fn run_child(
     if suppress_stdout {
         cmd.stdout(process::Stdio::null());
     }
-    // Install SIGINT handler that forwards SIGTERM to the child.
-    // Installed before spawn so no Ctrl-C gap can orphan the child.
-    // The handler guards `pid == 0` so it is safe before the child exists.
-    #[cfg(unix)]
-    {
-        extern "C" fn sigint_handler(_sig: i32) {
-            SIGINT_RECEIVED.store(true, Ordering::SeqCst);
-            let pid = CHILD_PID.load(Ordering::SeqCst);
-            if pid != 0 {
-                // SAFETY: sending a signal to a known PID is safe.
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                }
-            }
-        }
-
-        unsafe {
-            let mut act: libc::sigaction = std::mem::zeroed();
-            act.sa_sigaction = sigint_handler as *const () as usize;
-            act.sa_flags = libc::SA_RESETHAND;
-            libc::sigaction(libc::SIGINT, &act, std::ptr::null_mut());
-        }
-    }
 
     let mut child = cmd
         .spawn()
         .map_err(|e| Error::RunFailed(format!("failed to run {}: {e}", binary.display())))?;
 
-    CHILD_PID.store(child.id(), Ordering::SeqCst);
-
-    if let Some(mut dur) = timeout {
-        const MIN_DURATION: Duration = Duration::from_millis(1);
-        if dur < MIN_DURATION {
-            eprintln!(
-                "warning: --duration {}s is below minimum resolution, using {}ms",
-                dur.as_secs_f64(),
-                MIN_DURATION.as_millis()
-            );
-            dur = MIN_DURATION;
-        }
+    if let Some(dur) = timeout {
         eprintln!("will stop after {}s", dur.as_secs_f64());
-        std::thread::spawn(move || {
-            std::thread::sleep(dur);
-            DURATION_EXPIRED.store(true, Ordering::SeqCst);
-            let pid = CHILD_PID.load(Ordering::SeqCst);
-            if pid != 0 {
-                kill_child(pid);
-            }
-            // Escalate to SIGKILL if child doesn't exit within kill_timeout.
-            #[cfg(unix)]
-            if kill_timeout > Duration::ZERO {
-                std::thread::sleep(kill_timeout);
-                let pid = CHILD_PID.load(Ordering::SeqCst);
-                if pid != 0 {
-                    FORCE_KILLED.store(true, Ordering::SeqCst);
-                    // SAFETY: sending SIGKILL to a known PID.
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
-                }
-            }
-        });
     }
 
-    // Spawn a background thread to escalate SIGINT→SIGKILL after the grace
-    // period. This covers the Ctrl-C case (--duration has its own escalation
-    // inside the timeout thread above).
-    #[cfg(unix)]
-    if kill_timeout > Duration::ZERO {
-        std::thread::spawn(move || {
-            // Wait for SIGINT to be received, then start the grace period.
-            loop {
-                if SIGINT_RECEIVED.load(Ordering::SeqCst) {
-                    break;
-                }
-                if CHILD_PID.load(Ordering::SeqCst) == 0 {
-                    return; // Child already exited, nothing to escalate.
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            std::thread::sleep(kill_timeout);
-            let pid = CHILD_PID.load(Ordering::SeqCst);
-            if pid != 0 {
-                FORCE_KILLED.store(true, Ordering::SeqCst);
-                // SAFETY: sending SIGKILL to a known PID.
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
-        });
-    }
+    let start = std::time::Instant::now();
+    let poll_interval = Duration::from_millis(10);
+    let mut sigterm_sent_at: Option<std::time::Instant> = None;
 
-    let status = child
-        .wait()
-        .map_err(|e| Error::RunFailed(format!("failed to wait for {}: {e}", binary.display())))?;
+    let outcome = loop {
+        // 1. Check if child exited.
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Duration takes precedence over Interrupted when both are true
+                // because the duration timeout was the root cause (it fired first).
+                let stop_reason = if sigterm_sent_at.is_some() {
+                    StopReason::Duration
+                } else if INTERRUPTED.load(Ordering::SeqCst) {
+                    StopReason::Interrupted
+                } else {
+                    StopReason::Normal
+                };
+                break ChildOutcome {
+                    status,
+                    stop_reason,
+                };
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(Error::RunFailed(format!(
+                    "failed to wait for {}: {e}",
+                    binary.display()
+                )));
+            }
+        }
 
-    let stop_reason = if FORCE_KILLED.load(Ordering::SeqCst) {
-        StopReason::ForceKilled
-    } else if DURATION_EXPIRED.load(Ordering::SeqCst) {
-        StopReason::Duration
-    } else if SIGINT_RECEIVED.load(Ordering::SeqCst) {
-        StopReason::Interrupted
-    } else {
-        StopReason::Normal
+        // 2. Duration timeout: send SIGTERM.
+        if let Some(dur) = timeout {
+            if sigterm_sent_at.is_none() && start.elapsed() >= dur {
+                terminate_child(&child);
+                sigterm_sent_at = Some(std::time::Instant::now());
+            }
+        }
+
+        // 3. Ctrl-C: forward SIGTERM to child (terminal Ctrl-C sends to
+        // process group, but programmatic kill(pid, SIGINT) only hits us).
+        // Then wait for graceful exit, escalate to SIGKILL after kill_timeout.
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            terminate_child(&child);
+            let (status, force_killed) = wait_or_kill(&mut child, kill_timeout, binary)?;
+            break ChildOutcome {
+                status,
+                stop_reason: if force_killed {
+                    StopReason::ForceKilled
+                } else {
+                    StopReason::Interrupted
+                },
+            };
+        }
+
+        // 4. SIGKILL escalation after duration SIGTERM.
+        if let Some(sent_at) = sigterm_sent_at {
+            if kill_timeout > Duration::ZERO && sent_at.elapsed() >= kill_timeout {
+                let _ = child.kill();
+                let status = child.wait().map_err(|e| {
+                    Error::RunFailed(format!("failed to wait for {}: {e}", binary.display()))
+                })?;
+                break ChildOutcome {
+                    status,
+                    stop_reason: StopReason::ForceKilled,
+                };
+            }
+        }
+
+        std::thread::sleep(poll_interval);
     };
 
-    CHILD_PID.store(0, Ordering::SeqCst);
-
-    // Restore default SIGINT handler for the rest of the process lifetime.
+    // Restore default SIGINT handler.
     #[cfg(unix)]
+    // SAFETY: restoring SIG_DFL for SIGINT via sigaction.
     unsafe {
         let mut act: libc::sigaction = std::mem::zeroed();
         act.sa_sigaction = libc::SIG_DFL;
         libc::sigaction(libc::SIGINT, &act, std::ptr::null_mut());
     }
 
-    Ok(ChildOutcome {
-        status,
-        stop_reason,
-    })
+    Ok(outcome)
 }
 
 fn cmd_run(
