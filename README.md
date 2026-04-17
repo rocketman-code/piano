@@ -1,7 +1,7 @@
 # piano
 
 [![Crates.io](https://img.shields.io/crates/v/piano.svg)](https://crates.io/crates/piano)
-[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![GPLv3 licensed](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
 Automatic instrumentation-based profiler for Rust. Measures self-time, call counts, and heap allocations per function across sync, threaded, and async code.
 
@@ -160,4 +160,4 @@ The runtime has zero external dependencies to avoid conflicts with your project.
 
 ## License
 
-MIT
+GPLv3. See [LICENSE](LICENSE).
