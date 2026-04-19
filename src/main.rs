@@ -8,8 +8,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use piano::build::{
-    build_instrumented, cargo_metadata, clean_stale_piano_files, find_bin_target,
-    find_current_package, find_project_root, prebuild_runtime, prebuild_runtime_from_path,
+    CargoTarget, build_instrumented, cargo_metadata, clean_stale_piano_files, find_current_package,
+    find_project_root, find_target, prebuild_runtime, prebuild_runtime_from_path,
 };
 use piano::error::{Error, io_context};
 use piano::report::{
@@ -74,8 +74,12 @@ struct BuildOpts {
 
     /// Build and profile a specific binary target (for projects with multiple
     /// [[bin]] entries). Matches cargo's --bin flag.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "example")]
     bin: Option<String>,
+
+    /// Build and profile an example target. Matches cargo's --example flag.
+    #[arg(long, conflicts_with = "bin")]
+    example: Option<String>,
 
     /// Capture per-thread CPU time alongside wall time (Unix only).
     #[arg(long)]
@@ -424,6 +428,7 @@ fn build_project(
         project,
         runtime_path,
         bin,
+        example,
         cpu_time,
         output_dir,
         list_skipped,
@@ -471,25 +476,25 @@ fn build_project(
         ))
     })?;
 
-    // Find the target package and binary.
-    // If the user specified --bin, look for it. Otherwise find the current
-    // package from the project directory.
-    let (package_name, bin_src_path) = if bin.is_some() || metadata.packages.len() == 1 {
+    // Find the target package and binary/example.
+    let target_kind = if example.is_some() { "example" } else { "bin" };
+    let target_name = example.as_deref().or(bin.as_deref());
+    let (package_name, bin_src_path) = if target_name.is_some() || metadata.packages.len() == 1 {
         let pkg_filter = if metadata.packages.len() == 1 {
             None
         } else {
             find_current_package(&metadata, &project).map(|p| p.name.as_str())
         };
-        find_bin_target(&metadata, pkg_filter, bin.as_deref())?
+        find_target(&metadata, pkg_filter, target_name, target_kind)?
     } else {
-        // Multiple packages, no --bin: find the package matching project dir.
+        // Multiple packages, no --bin/--example: find the package matching project dir.
         let pkg = find_current_package(&metadata, &project).ok_or_else(|| {
             Error::BuildFailed(format!(
                 "could not determine which package to build in workspace at {}",
                 workspace_root.display()
             ))
         })?;
-        find_bin_target(&metadata, Some(&pkg.name), None)?
+        find_target(&metadata, Some(&pkg.name), None, "bin")?
     };
 
     // Derive source directory from the binary's src_path.
@@ -752,11 +757,16 @@ fn build_project(
     } else {
         None
     };
+    let cargo_target = if let Some(ref ex) = example {
+        Some(CargoTarget::Example(ex.as_str()))
+    } else {
+        bin.as_deref().map(CargoTarget::Bin)
+    };
     let binary = build_instrumented(
         &workspace_root,
         &target_dir,
         pkg_arg,
-        bin.as_deref(),
+        cargo_target,
         &config_path,
         &modified_files,
     )?;
@@ -789,39 +799,45 @@ fn is_binary_extension(ext: &std::ffi::OsStr) -> bool {
 
 fn find_latest_binary(project_root: &Option<PathBuf>) -> Result<PathBuf, Error> {
     let project = project_root.as_ref().ok_or(Error::NoBinary)?;
-    let dir = project.join("target/piano/release");
-    if !dir.is_dir() {
+    let release_dir = project.join("target/piano/release");
+    if !release_dir.is_dir() {
         return Err(Error::NoBinary);
     }
+    let mut dirs = vec![release_dir.clone()];
+    let examples_dir = release_dir.join("examples");
+    if examples_dir.is_dir() {
+        dirs.push(examples_dir);
+    }
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
-    for entry in std::fs::read_dir(&dir).map_err(io_context("read directory", &dir))? {
-        let entry = entry.map_err(io_context("read directory entry", &dir))?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        // Skip non-binary files by extension. On Unix, binaries have no extension.
-        // On Windows, binaries have .exe extension -- allow those through.
-        if let Some(ext) = path.extension() {
-            if !is_binary_extension(ext) {
+    for dir in &dirs {
+        let entries = std::fs::read_dir(dir).map_err(io_context("read directory", dir))?;
+        for entry in entries {
+            let entry = entry.map_err(io_context("read directory entry", dir))?;
+            let path = entry.path();
+            if !path.is_file() {
                 continue;
             }
-        }
-        let meta = entry
-            .metadata()
-            .map_err(io_context("read metadata", &path))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if meta.permissions().mode() & 0o111 == 0 {
-                continue; // not executable
+            if let Some(ext) = path.extension() {
+                if !is_binary_extension(ext) {
+                    continue;
+                }
             }
-        }
-        let mtime = meta
-            .modified()
-            .map_err(io_context("read modified time", &path))?;
-        if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
-            best = Some((path, mtime));
+            let meta = entry
+                .metadata()
+                .map_err(io_context("read metadata", &path))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o111 == 0 {
+                    continue;
+                }
+            }
+            let mtime = meta
+                .modified()
+                .map_err(io_context("read modified time", &path))?;
+            if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
+                best = Some((path, mtime));
+            }
         }
     }
     best.map(|(p, _)| p).ok_or(Error::NoBinary)
