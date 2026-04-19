@@ -8,6 +8,12 @@ use toml_edit::DocumentMut;
 
 use crate::error::{Error, io_context};
 
+/// Which cargo target to build.
+pub enum CargoTarget<'a> {
+    Bin(&'a str),
+    Example(&'a str),
+}
+
 // --- Cargo metadata types ---
 
 #[derive(Debug, Deserialize)]
@@ -55,19 +61,20 @@ pub fn cargo_metadata(project_dir: &Path) -> Result<CargoMetadata, Error> {
         .map_err(|e| Error::BuildFailed(format!("failed to parse cargo metadata: {e}")))
 }
 
-/// Find a binary target in the metadata for the given package.
+/// Find a target of the given kind in the metadata for the given package.
 ///
-/// When `bin_name` is `Some`, looks for that specific binary target.
-/// When `None`, returns the first binary target found.
+/// `kind` is the cargo target kind: "bin" or "example".
+/// When `name` is `Some`, looks for that specific target.
+/// When `None`, returns the first target of that kind found.
 ///
 /// Returns `(package_name, src_path)` where src_path is the absolute path
-/// to the binary's entry point.
-pub fn find_bin_target(
+/// to the target's entry point.
+pub fn find_target(
     metadata: &CargoMetadata,
     package_name: Option<&str>,
-    bin_name: Option<&str>,
+    name: Option<&str>,
+    kind: &str,
 ) -> Result<(String, PathBuf), Error> {
-    // Filter packages: if package_name given, match it; otherwise use all.
     let candidates: Vec<&MetadataPackage> = if let Some(pkg) = package_name {
         metadata.packages.iter().filter(|p| p.name == pkg).collect()
     } else {
@@ -75,18 +82,18 @@ pub fn find_bin_target(
     };
 
     if candidates.is_empty() {
-        let name = package_name.unwrap_or("<any>");
+        let pkg = package_name.unwrap_or("<any>");
         return Err(Error::BuildFailed(format!(
-            "no package '{name}' found in cargo metadata"
+            "no package '{pkg}' found in cargo metadata"
         )));
     }
 
     for pkg in &candidates {
         for target in &pkg.targets {
-            if !target.kind.iter().any(|k| k == "bin") {
+            if !target.kind.iter().any(|k| k == kind) {
                 continue;
             }
-            if let Some(wanted) = bin_name {
+            if let Some(wanted) = name {
                 if target.name != wanted {
                     continue;
                 }
@@ -95,10 +102,10 @@ pub fn find_bin_target(
         }
     }
 
-    let bin_desc = bin_name.unwrap_or("default");
+    let target_desc = name.unwrap_or("default");
     let pkg_desc = package_name.unwrap_or("<any>");
     Err(Error::BuildFailed(format!(
-        "no binary target '{bin_desc}' found in package '{pkg_desc}'"
+        "no {kind} target '{target_desc}' found in package '{pkg_desc}'"
     )))
 }
 
@@ -732,7 +739,7 @@ pub fn build_instrumented(
     project_dir: &Path,
     target_dir: &Path,
     package: Option<&str>,
-    bin: Option<&str>,
+    target: Option<CargoTarget<'_>>,
     config_path: &Path,
     modified_files: &std::collections::HashSet<PathBuf>,
 ) -> Result<PathBuf, Error> {
@@ -756,8 +763,14 @@ pub fn build_instrumented(
     if let Some(pkg) = package {
         cmd.arg("-p").arg(pkg);
     }
-    if let Some(bin_name) = bin {
-        cmd.arg("--bin").arg(bin_name);
+    match target {
+        Some(CargoTarget::Bin(name)) => {
+            cmd.arg("--bin").arg(name);
+        }
+        Some(CargoTarget::Example(name)) => {
+            cmd.arg("--example").arg(name);
+        }
+        None => {}
     }
     let output = cmd.output()?;
 
@@ -936,7 +949,7 @@ edition = "2021"
             }],
         };
 
-        let (name, path) = find_bin_target(&metadata, None, None).unwrap();
+        let (name, path) = find_target(&metadata, None, None, "bin").unwrap();
         assert_eq!(name, "demo");
         assert_eq!(path, PathBuf::from("/project/src/main.rs"));
     }
@@ -963,7 +976,7 @@ edition = "2021"
             }],
         };
 
-        let (name, path) = find_bin_target(&metadata, None, Some("worker")).unwrap();
+        let (name, path) = find_target(&metadata, None, Some("worker"), "bin").unwrap();
         assert_eq!(name, "demo");
         assert_eq!(path, PathBuf::from("/project/src/worker.rs"));
     }
@@ -990,7 +1003,7 @@ edition = "2021"
             }],
         };
 
-        let (_, path) = find_bin_target(&metadata, None, None).unwrap();
+        let (_, path) = find_target(&metadata, None, None, "bin").unwrap();
         assert_eq!(path, PathBuf::from("/project/src/main.rs"));
     }
 
@@ -1009,7 +1022,7 @@ edition = "2021"
             }],
         };
 
-        let result = find_bin_target(&metadata, None, Some("nonexistent"));
+        let result = find_target(&metadata, None, Some("nonexistent"), "bin");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -1044,9 +1057,47 @@ edition = "2021"
             ],
         };
 
-        let (name, path) = find_bin_target(&metadata, Some("core"), None).unwrap();
+        let (name, path) = find_target(&metadata, Some("core"), None, "bin").unwrap();
         assert_eq!(name, "core");
         assert_eq!(path, PathBuf::from("/ws/crates/core/src/main.rs"));
+    }
+
+    #[test]
+    fn find_target_finds_example() {
+        let metadata = CargoMetadata {
+            workspace_root: PathBuf::from("/project"),
+            packages: vec![MetadataPackage {
+                name: "demo".to_string(),
+                manifest_path: PathBuf::from("/project/Cargo.toml"),
+                targets: vec![
+                    MetadataTarget {
+                        name: "demo".to_string(),
+                        kind: vec!["lib".to_string()],
+                        src_path: PathBuf::from("/project/src/lib.rs"),
+                    },
+                    MetadataTarget {
+                        name: "demo".to_string(),
+                        kind: vec!["bin".to_string()],
+                        src_path: PathBuf::from("/project/src/main.rs"),
+                    },
+                    MetadataTarget {
+                        name: "bench".to_string(),
+                        kind: vec!["example".to_string()],
+                        src_path: PathBuf::from("/project/examples/bench.rs"),
+                    },
+                ],
+            }],
+        };
+
+        let (name, path) = find_target(&metadata, None, Some("bench"), "example").unwrap();
+        assert_eq!(name, "demo");
+        assert_eq!(path, PathBuf::from("/project/examples/bench.rs"));
+
+        let result = find_target(&metadata, None, None, "example");
+        assert!(result.is_ok());
+
+        let result = find_target(&metadata, None, None, "bin");
+        assert_eq!(result.unwrap().1, PathBuf::from("/project/src/main.rs"));
     }
 
     #[test]
