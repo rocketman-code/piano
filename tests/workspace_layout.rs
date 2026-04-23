@@ -245,6 +245,134 @@ fn work() -> u64 {
     .unwrap();
 }
 
+/// Create a single-package project with both `[lib]` and `[[bin]]` targets.
+/// The library crate (`src/lib.rs`) re-exports a `compute` module containing
+/// functions.  The binary (`src/bin/main.rs`) calls those library functions.
+/// This layout triggers the wrapper gate bug: `lib.rs` has no functions itself,
+/// so it is not in `config.targets`, causing the wrapper to skip the entire
+/// library crate and leaving `compute::add` / `compute::multiply`
+/// uninstrumented.
+fn create_lib_bin_package(root: &Path) {
+    fs::create_dir_all(root.join("src/compute")).unwrap();
+    fs::create_dir_all(root.join("src/bin")).unwrap();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "libbin"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "libbin"
+path = "src/bin/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(root.join("src/lib.rs"), "pub mod compute;\n").unwrap();
+
+    fs::write(
+        root.join("src/compute/mod.rs"),
+        r#"pub fn add(a: u64, b: u64) -> u64 {
+    a + b
+}
+
+pub fn multiply(a: u64, b: u64) -> u64 {
+    a * b
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/bin/main.rs"),
+        r#"fn main() {
+    let product = libbin::compute::multiply(5, 6);
+    let sum = libbin::compute::add(5, 7);
+    println!("{product} {sum}");
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn single_package_lib_bin_instruments_library_functions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("libbin");
+    create_lib_bin_package(&project_dir);
+
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let output = Command::new(piano_bin)
+        .args(["build", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let binary_path = stdout.trim();
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let run_output = Command::new(binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run_output.status.success(),
+        "instrumented binary failed:\n{}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    let program_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        program_stdout.contains("30 12"),
+        "program should produce '30 12', got: {program_stdout}"
+    );
+
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+    let stats = common::aggregate_ndjson(&content);
+
+    // Library functions should be instrumented even though lib.rs itself
+    // has no functions (only `pub mod compute;`).
+    assert!(
+        stats.contains_key("compute::add"),
+        "library function 'compute::add' should be instrumented, got keys: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        stats["compute::add"].calls >= 1,
+        "compute::add should have at least 1 call"
+    );
+
+    assert!(
+        stats.contains_key("compute::multiply"),
+        "library function 'compute::multiply' should be instrumented, got keys: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        stats["compute::multiply"].calls >= 1,
+        "compute::multiply should have at least 1 call"
+    );
+}
+
 /// Create a workspace with two member crates (cli and lib-user), each with
 /// its own binary.  This exercises the multi-package branch in build dispatch
 /// that the single-member tests above skip.
