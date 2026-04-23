@@ -67,8 +67,9 @@ pub fn instrument_source(
             continue;
         };
         let Some(body) = func.body() else { continue };
-        let Some(name) = func.name() else { continue };
-        let fn_name = name.text().to_string();
+        let Some(fn_name) = qualified_fn_name(&func) else {
+            continue;
+        };
 
         // Shutdown: inject lifecycle into fn main()
         if fn_name == "main" {
@@ -167,6 +168,26 @@ fn brace_offset_after_inner_attrs(stmt_list: &ast::StmtList) -> Result<usize, St
         }
     }
     Ok(offset)
+}
+
+/// Construct the qualified name for a function, matching the format used by the
+/// resolve module. For standalone functions, returns the bare name. For methods
+/// inside `impl` blocks, returns `Type::method` (e.g., `Frame::check`).
+fn qualified_fn_name(func: &ast::Fn) -> Option<String> {
+    let bare = func.name()?.text().to_string();
+    let mut node = func.syntax().parent();
+    while let Some(n) = node {
+        if let Some(imp) = ast::Impl::cast(n.clone()) {
+            let self_ty = imp.self_ty()?;
+            let impl_name = crate::naming::render_impl_name(&self_ty, imp.trait_().as_ref());
+            return Some(format!("{impl_name}::{bare}"));
+        }
+        if ast::Fn::can_cast(n.kind()) {
+            break;
+        }
+        node = n.parent();
+    }
+    Some(bare)
 }
 
 /// Check if a function's return type contains `impl Future`.
@@ -467,8 +488,9 @@ fn inject_guards_into_expansion(expanded: &str, measured: &HashMap<String, u32>)
             continue;
         };
         let Some(body) = func.body() else { continue };
-        let Some(name) = func.name() else { continue };
-        let fn_name = name.text().to_string();
+        let Some(fn_name) = qualified_fn_name(&func) else {
+            continue;
+        };
 
         let Some(&name_id) = measured.get(&fn_name) else {
             continue;
@@ -633,7 +655,8 @@ mod tests {
     #[test]
     fn instruments_trait_method_impl() {
         let source = "struct S;\nimpl std::fmt::Display for S {\n    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {\n        write!(f, \"S\")\n    }\n}\n";
-        let measured: HashMap<String, u32> = [("fmt".into(), 0)].into_iter().collect();
+        let measured: HashMap<String, u32> =
+            [("<S as Display>::fmt".into(), 0)].into_iter().collect();
         let result = instrument_source(source, &measured, None).unwrap();
         assert!(result.source.contains("piano_runtime::enter(0)"));
     }
@@ -671,7 +694,7 @@ mod tests {
     #[test]
     fn instruments_inherent_impl_method() {
         let source = "struct S;\nimpl S {\n    fn method(&self) {\n        let x = 1;\n    }\n}\n";
-        let measured: HashMap<String, u32> = [("method".into(), 0)].into_iter().collect();
+        let measured: HashMap<String, u32> = [("S::method".into(), 0)].into_iter().collect();
         let result = instrument_source(source, &measured, None).unwrap();
         assert!(result.source.contains("piano_runtime::enter(0)"));
         assert!(
@@ -903,10 +926,10 @@ m!();
         let measured: HashMap<String, u32> = [
             ("free".into(), 0),
             ("in_module".into(), 1),
-            ("inherent_method".into(), 2),
+            ("S::inherent_method".into(), 2),
             ("trait_default".into(), 3),
-            ("trait_impl".into(), 4),
-            ("trait_abstract".into(), 5),
+            ("<S as T>::trait_impl".into(), 4),
+            ("<S as T>::trait_abstract".into(), 5),
             ("nested".into(), 6),
             ("outer".into(), 7),
             ("macro_fn".into(), 8),
