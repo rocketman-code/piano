@@ -136,7 +136,10 @@ pub fn run_wrapper(config_path: &str) -> i32 {
     let has_target = config.targets.contains_key(&source_key);
 
     if !has_target && !is_entry_point {
-        return exec_rustc(real_rustc, &rustc_args);
+        let source_parent = source_key.parent().unwrap_or(Path::new(""));
+        if !config.targets.keys().any(|t| t.starts_with(source_parent)) {
+            return exec_rustc(real_rustc, &rustc_args);
+        }
     }
 
     let crate_name = parsed.crate_name.as_deref().unwrap_or("unknown");
