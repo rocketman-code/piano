@@ -348,8 +348,6 @@ pub(crate) fn extract_functions(
         functions: Vec::new(),
         skipped: Vec::new(),
         path: rel_path,
-        current_impl: None,
-        current_trait: None,
         scope: crate::naming::ScopeState::new(),
     };
     collector.walk_source_file(&file);
@@ -364,7 +362,32 @@ pub(crate) fn extract_functions(
         let call = &calls[exp.call_idx];
 
         // Determine impl context from the macro call's position in the CST.
-        let impl_prefix = macro_call_impl_context(file.syntax(), call.byte_start);
+        // Inline parent-walk with fn-break guard: macro-expanded fns are parsed
+        // from expanded text, so we can't call qualified_name_for_fn on them.
+        let impl_prefix = {
+            use ra_ap_syntax::TextSize;
+            let offset = TextSize::from(call.byte_start as u32);
+            file.syntax()
+                .token_at_offset(offset)
+                .right_biased()
+                .and_then(|token| {
+                    let mut node = token.parent();
+                    while let Some(n) = node {
+                        if let Some(imp) = ast::Impl::cast(n.clone()) {
+                            let self_ty = imp.self_ty()?;
+                            return Some(crate::naming::render_impl_name(
+                                &self_ty,
+                                imp.trait_().as_ref(),
+                            ));
+                        }
+                        if ast::Fn::can_cast(n.kind()) {
+                            break;
+                        }
+                        node = n.parent();
+                    }
+                    None
+                })
+        };
 
         for fn_name in &exp.fn_names {
             let qualified = if let Some(ref prefix) = impl_prefix {
@@ -384,27 +407,6 @@ pub(crate) fn extract_functions(
     }
 
     (collector.functions, collector.skipped)
-}
-
-/// Determine if a macro call at `byte_offset` is inside an `impl` block.
-/// If so, returns the impl type name (e.g., "S" or "S<T>").
-fn macro_call_impl_context(root: &ra_ap_syntax::SyntaxNode, byte_offset: usize) -> Option<String> {
-    use ra_ap_syntax::TextSize;
-
-    // Find the deepest node covering this offset.
-    let offset = TextSize::from(byte_offset as u32);
-    let token = root.token_at_offset(offset).right_biased()?;
-
-    // Walk up ancestors looking for an IMPL node.
-    for ancestor in token.parent_ancestors() {
-        if ancestor.kind() == SyntaxKind::IMPL {
-            let imp = ast::Impl::cast(ancestor)?;
-            let self_ty = imp.self_ty()?;
-            let trait_ty = imp.trait_();
-            return Some(crate::naming::render_impl_name(&self_ty, trait_ty.as_ref()));
-        }
-    }
-    None
 }
 
 /// Check whether a CST node's attributes contain a specific simple attribute (e.g. `#[test]`).
@@ -513,10 +515,6 @@ struct FnCollector {
     skipped: Vec<SkippedFunction>,
     /// File path relative to the project root (e.g. "src/core.rs").
     path: PathBuf,
-    /// When inside an `impl` block, holds the type name (e.g. "Resolver").
-    current_impl: Option<String>,
-    /// When inside a `trait` block, holds the trait name.
-    current_trait: Option<String>,
     /// Scope tracking (mod, fn, block).
     scope: crate::naming::ScopeState,
 }
@@ -582,13 +580,6 @@ impl FnCollector {
     }
 
     fn visit_impl(&mut self, imp: &ast::Impl) {
-        let self_ty = imp.self_ty();
-        let trait_ty = imp.trait_();
-        let impl_name = crate::naming::render_impl_name(
-            self_ty.as_ref().expect("impl should have self type"),
-            trait_ty.as_ref(),
-        );
-        let prev = self.current_impl.replace(impl_name);
         if let Some(assoc_list) = imp.assoc_item_list() {
             for assoc in assoc_list.assoc_items() {
                 if let ast::AssocItem::Fn(func) = assoc {
@@ -596,23 +587,13 @@ impl FnCollector {
                 }
             }
         }
-        self.current_impl = prev;
     }
 
     fn visit_impl_fn(&mut self, func: &ast::Fn) {
         if !has_attr_cst(func.attrs(), "test") {
-            let method_name = func
-                .name()
-                .map(|n| n.text().to_string())
-                .unwrap_or_default();
-            let impl_qualified = if let Some(ref impl_name) = self.current_impl {
-                format!("{impl_name}::{method_name}")
-            } else {
-                method_name
-            };
-            self.record_function(func, &impl_qualified);
+            let qualified = crate::naming::qualified_name_for_fn(func);
+            self.record_function(func, &qualified);
         }
-        // Push fn scope for nested items.
         let fn_name = func
             .name()
             .map(|n| n.text().to_string())
@@ -625,11 +606,6 @@ impl FnCollector {
     }
 
     fn visit_trait(&mut self, tr: &ast::Trait) {
-        let trait_name = tr
-            .name()
-            .map(|n| n.text().to_string())
-            .unwrap_or_else(|| "_".to_string());
-        let prev = self.current_trait.replace(trait_name);
         if let Some(assoc_list) = tr.assoc_item_list() {
             for assoc in assoc_list.assoc_items() {
                 if let ast::AssocItem::Fn(func) = assoc {
@@ -637,23 +613,12 @@ impl FnCollector {
                 }
             }
         }
-        self.current_trait = prev;
     }
 
     fn visit_trait_fn(&mut self, func: &ast::Fn) {
-        // Only collect trait fns with default bodies.
         if func.body().is_some() {
-            let method_name = func
-                .name()
-                .map(|n| n.text().to_string())
-                .unwrap_or_default();
-            let trait_qualified = if let Some(ref trait_name) = self.current_trait {
-                format!("{trait_name}::{method_name}")
-            } else {
-                method_name
-            };
-            self.record_function(func, &trait_qualified);
-            // Push fn scope for nested items in the default body.
+            let qualified = crate::naming::qualified_name_for_fn(func);
+            self.record_function(func, &qualified);
             let fn_name = func
                 .name()
                 .map(|n| n.text().to_string())
@@ -684,30 +649,17 @@ impl FnCollector {
                     continue;
                 }
                 if let Some(inner_fn) = ast::Fn::cast(node.clone()) {
-                    // Only process if the parent is NOT another FN we already handle
-                    // via recursive visit. Check if this fn is a direct item
-                    // (not inside another nested fn's body that would be visited
-                    // by its own walk_fn_body call).
-                    // The ancestor walking approach: find the enclosing context.
-                    let context = find_ancestor_impl_context(&node);
-                    self.visit_nested_fn(&inner_fn, context.as_deref());
+                    let qualified = crate::naming::qualified_name_for_fn(&inner_fn);
+                    self.visit_nested_fn(&inner_fn, &qualified);
                 }
             }
         }
     }
 
     /// Process a nested function found inside another function's body.
-    fn visit_nested_fn(&mut self, func: &ast::Fn, impl_context: Option<&str>) {
+    fn visit_nested_fn(&mut self, func: &ast::Fn, qualified: &str) {
         if !has_attr_cst(func.attrs(), "test") {
-            let name = func
-                .name()
-                .map(|n| n.text().to_string())
-                .unwrap_or_default();
-            let fn_qualified = match impl_context {
-                Some(prefix) => format!("{prefix}::{name}"),
-                None => name,
-            };
-            self.record_function(func, &fn_qualified);
+            self.record_function(func, qualified);
         }
     }
 
@@ -733,21 +685,6 @@ impl FnCollector {
             }
         }
     }
-}
-
-/// Walk up the syntax tree from a FN node to find the nearest enclosing `impl`
-/// block and extract its qualified type name (e.g. "Local" or "<Local as Trait>").
-fn find_ancestor_impl_context(fn_node: &ra_ap_syntax::SyntaxNode) -> Option<String> {
-    let mut current = fn_node.parent();
-    while let Some(node) = current {
-        if let Some(imp) = ast::Impl::cast(node.clone()) {
-            let self_ty = imp.self_ty()?;
-            let trait_ty = imp.trait_();
-            return Some(crate::naming::render_impl_name(&self_ty, trait_ty.as_ref()));
-        }
-        current = node.parent();
-    }
-    None
 }
 
 /// Levenshtein edit distance between two strings.
