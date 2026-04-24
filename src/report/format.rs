@@ -18,7 +18,7 @@ const BYTES_DECIMALS: usize = 1; // human-readable: "1.5MB"
 /// When `show_all` is false, entries with zero calls are hidden.
 /// When `limit` is `Some(n)`, only the top `n` entries are shown.
 /// A footer indicates how many were omitted (zero-call and/or truncated).
-pub fn format_table(run: &Run, show_all: bool, limit: Option<usize>) -> String {
+pub fn format_table(run: &Run, show_all: bool, limit: Option<usize>, show_footer: bool) -> String {
     let mut entries = run.functions.clone();
     let total_count = entries.len();
     if !show_all {
@@ -90,7 +90,9 @@ pub fn format_table(run: &Run, show_all: bool, limit: Option<usize>) -> String {
         out.push_str(&line);
         out.push('\n');
     }
-    append_hidden_footer(&mut out, total_count, after_filter_count, entries.len());
+    if show_footer {
+        append_hidden_footer(&mut out, total_count, after_filter_count, entries.len());
+    }
     out
 }
 
@@ -154,14 +156,19 @@ fn append_hidden_footer(
 /// Each section is prefixed with a thread header showing the 1-based index.
 /// For a single thread, this produces output identical to `format_table` but
 /// with a "Thread 1" header.
-pub fn format_per_thread_tables(runs: &[Run], show_all: bool, limit: Option<usize>) -> String {
+pub fn format_per_thread_tables(
+    runs: &[Run],
+    show_all: bool,
+    limit: Option<usize>,
+    show_footer: bool,
+) -> String {
     let mut out = String::new();
     for (i, run) in runs.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
         out.push_str(&format!("{HEADER}--- Thread {} ---{HEADER:#}\n", i + 1));
-        out.push_str(&format_table(run, show_all, limit));
+        out.push_str(&format_table(run, show_all, limit, show_footer));
     }
     out
 }
@@ -247,7 +254,7 @@ mod tests {
                 },
             ],
         };
-        let table = format_table(&run, true, None);
+        let table = format_table(&run, true, None, true);
         let slow_pos = table.find("slow").expect("slow not in table");
         let fast_pos = table.find("fast").expect("fast not in table");
         assert!(
@@ -276,7 +283,7 @@ mod tests {
                 },
             ],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(table.contains("called"), "should show called function");
         assert!(
             !table.contains("uncalled"),
@@ -289,7 +296,7 @@ mod tests {
             "should show hidden footer. Got:\n{table}"
         );
 
-        let table_all = format_table(&run, true, None);
+        let table_all = format_table(&run, true, None, true);
         assert!(
             table_all.contains("uncalled"),
             "should show zero-call function with show_all"
@@ -315,7 +322,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(
             !table.contains("hidden"),
             "no footer when nothing hidden. Got:\n{table}"
@@ -337,7 +344,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(
             table.contains("CPU"),
             "should have CPU column header. Got:\n{table}"
@@ -362,7 +369,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(
             !table.contains("CPU"),
             "should not have CPU column. Got:\n{table}"
@@ -392,7 +399,7 @@ mod tests {
             ],
         };
         // Without --all: hides unused.
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(table.contains("CPU"), "should have CPU column");
         assert!(!table.contains("unused"), "should hide zero-call fn");
         assert!(
@@ -401,7 +408,7 @@ mod tests {
         );
 
         // With --all: shows unused with CPU column present.
-        let table_all = format_table(&run, true, None);
+        let table_all = format_table(&run, true, None, true);
         assert!(table_all.contains("CPU"), "should have CPU column");
         assert!(
             table_all.contains("unused"),
@@ -427,7 +434,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(
             !table.contains("Total"),
             "Total column should not appear. Got:\n{table}"
@@ -448,7 +455,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         let self_pos = table.find("Self").expect("Self header missing");
         let calls_pos = table.find("Calls").expect("Calls header missing");
         assert!(
@@ -472,7 +479,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(
             !table.contains("Total"),
             "Total column should not appear with CPU. Got:\n{table}"
@@ -592,7 +599,7 @@ mod tests {
     #[test]
     fn format_table_limit_truncates_output() {
         let run = make_run_with_n_fns(5);
-        let table = format_table(&run, true, Some(3));
+        let table = format_table(&run, true, Some(3), true);
         // Only the top 3 by self_ms should appear (fn_1, fn_2, fn_3).
         assert!(table.contains("fn_1"), "should show fn_1 (highest self_ms)");
         assert!(table.contains("fn_2"), "should show fn_2");
@@ -604,7 +611,7 @@ mod tests {
     #[test]
     fn format_table_limit_shows_truncation_footer() {
         let run = make_run_with_n_fns(5);
-        let table = format_table(&run, false, Some(2));
+        let table = format_table(&run, false, Some(2), true);
         // 5 entries, all called, top 2 shown => 3 truncated.
         assert!(
             table.contains("3 functions hidden; use --top N or --all to show"),
@@ -626,7 +633,7 @@ mod tests {
         });
         // show_all=false hides the 2 zero-call entries; limit=Some(2) truncates to 2.
         // Total functions: 6, after zero-call filter: 4, shown: 2, hidden: 4.
-        let table = format_table(&run, false, Some(2));
+        let table = format_table(&run, false, Some(2), true);
         assert!(
             table.contains("4 functions hidden"),
             "should combine zero-call and truncation count. Got:\n{table}"
@@ -641,7 +648,7 @@ mod tests {
     fn format_table_limit_none_shows_all_called() {
         let run = make_run_with_n_fns(5);
         // No limit, show_all=true => all 5 shown, no footer.
-        let table = format_table(&run, true, None);
+        let table = format_table(&run, true, None, true);
         for i in 1..=5 {
             assert!(
                 table.contains(&format!("fn_{i}")),
@@ -651,6 +658,16 @@ mod tests {
         assert!(
             !table.contains("hidden"),
             "no footer when nothing hidden. Got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn format_table_no_footer_when_show_footer_false() {
+        let run = make_run_with_n_fns(6);
+        let table = format_table(&run, false, Some(2), false);
+        assert!(
+            !table.contains("hidden"),
+            "footer should be suppressed when show_footer is false. Got:\n{table}"
         );
     }
 
@@ -699,7 +716,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(
             table.contains("Allocs"),
             "should have Allocs column header. Got:\n{table}"
@@ -732,7 +749,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(
             !table.contains("Allocs"),
             "should not have Allocs column. Got:\n{table}"
@@ -760,7 +777,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(
             table.contains("CPU"),
             "should have CPU column header. Got:\n{table}"
@@ -817,7 +834,7 @@ mod tests {
                 },
             ],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(
             table.contains("512B"),
             "should show bytes for small values. Got:\n{table}"
@@ -848,7 +865,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(
             table.contains("Frees"),
             "should have Frees column header. Got:\n{table}"
@@ -881,7 +898,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(
             !table.contains("Frees"),
             "should not have Frees column. Got:\n{table}"
@@ -909,7 +926,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let table = format_table(&run, false, None);
+        let table = format_table(&run, false, None, true);
         assert!(table.contains("Allocs"), "should have Allocs column");
         assert!(table.contains("Frees"), "should have Frees column");
         // Verify column order: Allocs before Frees
@@ -941,7 +958,7 @@ mod tests {
             self_ms: 15.0,
             ..Default::default()
         });
-        assert_aligned(&format_table(&base, false, None), "base");
+        assert_aligned(&format_table(&base, false, None, true), "base");
 
         // Self + CPU + Calls
         let with_cpu = run_with(FnEntry {
@@ -951,7 +968,7 @@ mod tests {
             cpu_self_ms: Some(12.0),
             ..Default::default()
         });
-        assert_aligned(&format_table(&with_cpu, false, None), "cpu");
+        assert_aligned(&format_table(&with_cpu, false, None, true), "cpu");
 
         // Self + Calls + Allocs
         let with_alloc = run_with(FnEntry {
@@ -962,7 +979,7 @@ mod tests {
             alloc_bytes: 2048,
             ..Default::default()
         });
-        assert_aligned(&format_table(&with_alloc, false, None), "alloc");
+        assert_aligned(&format_table(&with_alloc, false, None, true), "alloc");
 
         // Self + Calls + Frees
         let with_free = run_with(FnEntry {
@@ -973,7 +990,7 @@ mod tests {
             free_bytes: 1500,
             ..Default::default()
         });
-        assert_aligned(&format_table(&with_free, false, None), "free");
+        assert_aligned(&format_table(&with_free, false, None, true), "free");
 
         // Self + CPU + Calls + Allocs
         let cpu_alloc = run_with(FnEntry {
@@ -985,7 +1002,7 @@ mod tests {
             alloc_bytes: 2048,
             ..Default::default()
         });
-        assert_aligned(&format_table(&cpu_alloc, false, None), "cpu+alloc");
+        assert_aligned(&format_table(&cpu_alloc, false, None, true), "cpu+alloc");
 
         // Self + CPU + Calls + Frees
         let cpu_free = run_with(FnEntry {
@@ -997,7 +1014,7 @@ mod tests {
             free_bytes: 1500,
             ..Default::default()
         });
-        assert_aligned(&format_table(&cpu_free, false, None), "cpu+free");
+        assert_aligned(&format_table(&cpu_free, false, None, true), "cpu+free");
 
         // Self + Calls + Allocs + Frees
         let alloc_free = run_with(FnEntry {
@@ -1010,7 +1027,7 @@ mod tests {
             free_bytes: 1500,
             ..Default::default()
         });
-        assert_aligned(&format_table(&alloc_free, false, None), "alloc+free");
+        assert_aligned(&format_table(&alloc_free, false, None, true), "alloc+free");
 
         // All columns: Self + CPU + Calls + Allocs + Frees
         let all_cols = run_with(FnEntry {
@@ -1024,7 +1041,7 @@ mod tests {
             free_bytes: 1500,
             ..Default::default()
         });
-        assert_aligned(&format_table(&all_cols, false, None), "all");
+        assert_aligned(&format_table(&all_cols, false, None, true), "all");
     }
 
     #[test]
@@ -1053,7 +1070,7 @@ mod tests {
                 }],
             },
         ];
-        let output = format_per_thread_tables(&runs, false, None);
+        let output = format_per_thread_tables(&runs, false, None, true);
         assert!(
             output.contains("Thread 1"),
             "should have Thread 1 header: {output}"
@@ -1105,7 +1122,7 @@ mod tests {
         ];
         for (i, run) in thread_runs.iter().enumerate() {
             assert_aligned(
-                &format_table(run, false, None),
+                &format_table(run, false, None, true),
                 &format!("thread-{}", i + 1),
             );
         }

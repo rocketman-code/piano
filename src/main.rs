@@ -264,16 +264,16 @@ fn parse_kill_timeout(s: &str) -> Result<f64, String> {
 /// Default number of functions shown in report output.
 const DEFAULT_TOP_N: usize = 10;
 
-/// Resolve `--all` and `--top N` flags into `(show_all, limit)`.
+/// Resolve `--all` and `--top N` flags into `(show_all, limit, show_footer)`.
 ///
-/// - `--all`: show everything, no limit.
-/// - `--top N`: show top N, hide zero-call entries.
-/// - Neither: show top DEFAULT_TOP_N, hide zero-call entries.
-fn resolve_display_limit(all: bool, top: Option<usize>) -> (bool, Option<usize>) {
+/// - `--all`: show everything, no limit, no footer.
+/// - `--top N`: show top N, hide zero-call entries, no footer.
+/// - Neither: show top DEFAULT_TOP_N, hide zero-call entries, show footer.
+fn resolve_display_limit(all: bool, top: Option<usize>) -> (bool, Option<usize>, bool) {
     if all {
-        (true, None)
+        (true, None, false)
     } else {
-        (false, Some(top.unwrap_or(DEFAULT_TOP_N)))
+        (false, Some(top.unwrap_or(DEFAULT_TOP_N)), top.is_none())
     }
 }
 
@@ -312,12 +312,13 @@ fn run(cli: Cli) -> Result<(), Error> {
             kill_timeout,
             args,
         } => {
-            let (show_all, limit) = resolve_display_limit(all, top);
+            let (show_all, limit, show_footer) = resolve_display_limit(all, top);
             cmd_profile(
                 opts,
                 &project_root,
                 show_all,
                 limit,
+                show_footer,
                 json,
                 threads,
                 ignore_exit_code,
@@ -335,11 +336,12 @@ fn run(cli: Cli) -> Result<(), Error> {
             uncorrected,
             output_dir,
         } => {
-            let (show_all, limit) = resolve_display_limit(all, top);
+            let (show_all, limit, show_footer) = resolve_display_limit(all, top);
             cmd_report(
                 run,
                 show_all,
                 limit,
+                show_footer,
                 json,
                 threads,
                 uncorrected,
@@ -355,8 +357,17 @@ fn run(cli: Cli) -> Result<(), Error> {
             json,
             output_dir,
         } => {
-            let (show_all, limit) = resolve_display_limit(all, top);
-            cmd_diff(a, b, show_all, limit, json, &project_root, output_dir)
+            let (show_all, limit, show_footer) = resolve_display_limit(all, top);
+            cmd_diff(
+                a,
+                b,
+                show_all,
+                limit,
+                show_footer,
+                json,
+                &project_root,
+                output_dir,
+            )
         }
         Commands::Tag { name, output_dir } => cmd_tag(name, &project_root, output_dir),
     }
@@ -1110,6 +1121,7 @@ fn cmd_profile(
     project_root: &Option<PathBuf>,
     show_all: bool,
     limit: Option<usize>,
+    show_footer: bool,
     json: bool,
     threads: bool,
     ignore_exit_code: bool,
@@ -1184,6 +1196,7 @@ fn cmd_profile(
         None,
         show_all,
         limit,
+        show_footer,
         json,
         threads,
         false,
@@ -1231,6 +1244,7 @@ fn cmd_report(
     run_path: Option<PathBuf>,
     show_all: bool,
     limit: Option<usize>,
+    show_footer: bool,
     json: bool,
     threads: bool,
     uncorrected: bool,
@@ -1264,7 +1278,7 @@ fn cmd_report(
                     if json {
                         println!("{}", format_json(&run, show_all, limit));
                     } else {
-                        anstream::print!("{}", format_table(&run, show_all, limit));
+                        anstream::print!("{}", format_table(&run, show_all, limit, show_footer));
                     }
                     return Ok(());
                 }
@@ -1305,7 +1319,10 @@ fn cmd_report(
                                 .expect("JSON serialization should not fail")
                         );
                     } else {
-                        anstream::print!("{}", format_per_thread_tables(&runs, show_all, limit));
+                        anstream::print!(
+                            "{}",
+                            format_per_thread_tables(&runs, show_all, limit, show_footer)
+                        );
                     }
                 }
                 None => {
@@ -1317,7 +1334,7 @@ fn cmd_report(
                     if json {
                         println!("{}", format_json(&run, show_all, limit));
                     } else {
-                        anstream::print!("{}", format_table(&run, show_all, limit));
+                        anstream::print!("{}", format_table(&run, show_all, limit, show_footer));
                     }
                 }
             }
@@ -1326,7 +1343,7 @@ fn cmd_report(
             if json {
                 println!("{}", format_json(&run, show_all, limit));
             } else {
-                anstream::print!("{}", format_table(&run, show_all, limit));
+                anstream::print!("{}", format_table(&run, show_all, limit, show_footer));
             }
         }
         return Ok(());
@@ -1338,7 +1355,7 @@ fn cmd_report(
         let thread_runs = load_latest_runs_per_thread(&dir)?;
         anstream::print!(
             "{}",
-            format_per_thread_tables(&thread_runs, show_all, limit)
+            format_per_thread_tables(&thread_runs, show_all, limit, show_footer)
         );
         return Ok(());
     }
@@ -1354,7 +1371,7 @@ fn cmd_report(
     if json {
         println!("{}", format_json(&run, show_all, limit));
     } else {
-        anstream::print!("{}", format_table(&run, show_all, limit));
+        anstream::print!("{}", format_table(&run, show_all, limit, show_footer));
     }
     Ok(())
 }
@@ -1372,11 +1389,13 @@ fn diff_label(arg: &Path) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_diff(
     a: Option<PathBuf>,
     b: Option<PathBuf>,
     show_all: bool,
     limit: Option<usize>,
+    _show_footer: bool,
     json: bool,
     project_root: &Option<PathBuf>,
     output_dir: Option<PathBuf>,
