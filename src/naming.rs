@@ -4,9 +4,8 @@ use ra_ap_syntax::ast;
 /// Render a CST type node to a human-readable string.
 ///
 /// Uses the exact source text from the CST node, which preserves the
-/// original formatting (generics, references, etc.). Matches
-/// `type_ident_cst` in rewrite/mod.rs, ensuring FnCollector and
-/// InjectionCollector agree on qualified names.
+/// original formatting (generics, references, etc.). Called by
+/// render_impl_name, which is called by qualified_name_for_fn.
 pub fn render_type(ty: &ast::Type) -> String {
     ty.syntax().text().to_string()
 }
@@ -29,6 +28,43 @@ pub fn render_impl_name(self_ty: &ast::Type, trait_ty: Option<&ast::Type>) -> St
     } else {
         type_str
     }
+}
+
+/// Derive the impl/trait-qualified name for a function from its AST position.
+///
+/// Walks up from the function node to find the nearest enclosing `impl` or
+/// `trait` block and prepends the appropriate context:
+/// - Inherent impl: `"S::method"`
+/// - Trait impl: `"<S as T>::method"`
+/// - Trait definition: `"T::default_method"`
+/// - Standalone / nested inside another fn: bare name only
+///
+/// Stops walking at an enclosing `fn` node (nested fns are bare).
+pub fn qualified_name_for_fn(func: &ast::Fn) -> String {
+    use ast::HasName;
+    let bare = func
+        .name()
+        .map(|n| n.text().to_string())
+        .unwrap_or_default();
+    let mut node = func.syntax().parent();
+    while let Some(n) = node {
+        if let Some(imp) = ast::Impl::cast(n.clone()) {
+            if let Some(self_ty) = imp.self_ty() {
+                let ctx = render_impl_name(&self_ty, imp.trait_().as_ref());
+                return format!("{ctx}::{bare}");
+            }
+        }
+        if let Some(tr) = ast::Trait::cast(n.clone()) {
+            if let Some(name) = tr.name() {
+                return format!("{}::{bare}", name.text());
+            }
+        }
+        if ast::Fn::can_cast(n.kind()) {
+            break;
+        }
+        node = n.parent();
+    }
+    bare
 }
 
 /// Extract the last segment name from a trait type in a CST.
@@ -62,8 +98,7 @@ pub enum ScopeEntry {
 
 /// Tracks the current scope chain during AST visitation.
 ///
-/// Both `FnCollector` and `InjectionCollector` embed this to ensure
-/// identical scope tracking -- one code path, no divergence.
+/// Embedded by `FnCollector` for module-level scope tracking.
 pub struct ScopeState {
     scope: Vec<ScopeEntry>,
     /// Counts sibling blocks at each nesting level.
@@ -221,7 +256,7 @@ fn find_duplicates(names: &[String]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ra_ap_syntax::Edition;
+    use ra_ap_syntax::{Edition, SourceFile};
 
     /// Parse a type string into a CST `ast::Type` by embedding it in a
     /// dummy function return type and extracting the type node.
@@ -393,6 +428,62 @@ mod tests {
         assert!(name.contains("MyTrait"), "trait preserved: {name}");
     }
 
+    // --- qualified_name_for_fn tests ---
+
+    /// Helper: parse source and find the Nth `ast::Fn` (0-indexed).
+    fn find_fn(source: &str, index: usize) -> ast::Fn {
+        let parse = ast::SourceFile::parse(source, Edition::Edition2024);
+        let file = parse.tree();
+        file.syntax()
+            .descendants()
+            .filter_map(ast::Fn::cast)
+            .nth(index)
+            .expect("should find fn at given index")
+    }
+
+    #[test]
+    fn qualified_name_standalone_fn() {
+        let func = find_fn("fn standalone() {}", 0);
+        assert_eq!(qualified_name_for_fn(&func), "standalone");
+    }
+
+    #[test]
+    fn qualified_name_inherent_impl_method() {
+        let func = find_fn("struct S; impl S { fn method() {} }", 0);
+        assert_eq!(qualified_name_for_fn(&func), "S::method");
+    }
+
+    #[test]
+    fn qualified_name_trait_impl_method() {
+        let func = find_fn(
+            "trait T { fn m(); } struct S; impl T for S { fn m() {} }",
+            1,
+        );
+        assert_eq!(qualified_name_for_fn(&func), "<S as T>::m");
+    }
+
+    #[test]
+    fn qualified_name_trait_default_method() {
+        let func = find_fn("trait T { fn default_method() { let _ = 1; } }", 0);
+        assert_eq!(qualified_name_for_fn(&func), "T::default_method");
+    }
+
+    #[test]
+    fn qualified_name_nested_fn_breaks_at_enclosing_fn() {
+        let source = "struct S; impl S { fn method() { fn helper() {} } }";
+        // helper is the second fn (index 1)
+        let func = find_fn(source, 1);
+        assert_eq!(qualified_name_for_fn(&func), "helper");
+    }
+
+    #[test]
+    fn qualified_name_inner_impl_inside_fn_body() {
+        let source = "struct Outer; impl Outer { fn method() { struct Inner; impl Inner { fn inner_method() {} } } }";
+        // inner_method is the second fn (index 1)
+        let func = find_fn(source, 1);
+        assert_eq!(qualified_name_for_fn(&func), "Inner::inner_method");
+    }
+
     // --- ScopeState tests ---
 
     #[test]
@@ -476,9 +567,55 @@ mod tests {
         assert!(!result[0].contains("host::Unique"));
     }
 
-    // Cross-path agreement tests removed: the old InjectionCollector (rewrite/mod.rs)
-    // is deleted. The new guard-only rewriter will need its own agreement tests.
-    // TODO(rewriter-rebuild): re-add cross-path agreement tests for the new rewriter.
+    // --- Cross-path agreement tests ---
+
+    #[test]
+    fn resolve_and_rewriter_agree_on_qualified_names() {
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        let source = r#"
+fn standalone() { let _ = 1; }
+struct S;
+impl S {
+    fn inherent(&self) { let _ = 1; }
+    fn with_nested() {
+        fn nested_bare() { let _ = 1; }
+    }
+}
+trait T {
+    fn default_method(&self) { let _ = 1; }
+}
+impl T for S {
+    fn trait_method(&self) { let _ = 1; }
+}
+struct W<U>(U);
+impl W<u32> {
+    fn generic_method(&self) { let _ = 1; }
+}
+"#;
+
+        let (resolve_fns, _) = crate::resolve::extract_functions(source, PathBuf::from("test.rs"));
+        let resolve_names: BTreeSet<String> =
+            resolve_fns.iter().map(|qf| qf.minimal.clone()).collect();
+
+        let file = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2024);
+        let rewriter_names: BTreeSet<String> = file
+            .tree()
+            .syntax()
+            .descendants()
+            .filter_map(ast::Fn::cast)
+            .filter(|f| f.body().is_some())
+            .map(|f| qualified_name_for_fn(&f))
+            .collect();
+
+        assert_eq!(
+            resolve_names, rewriter_names,
+            "resolve and rewriter must produce identical qualified names.\n\
+             resolve:  {resolve_names:?}\n\
+             rewriter: {rewriter_names:?}"
+        );
+    }
 
     // --- Collision regression tests ---
 
