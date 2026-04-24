@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use ra_ap_syntax::ast::{HasAttrs, HasName};
+use ra_ap_syntax::ast::HasAttrs;
 use ra_ap_syntax::{AstNode, SourceFile, SyntaxKind, T, ast};
 
 use crate::source_map::StringInjector;
@@ -67,9 +67,7 @@ pub fn instrument_source(
             continue;
         };
         let Some(body) = func.body() else { continue };
-        let Some(fn_name) = qualified_fn_name(&func) else {
-            continue;
-        };
+        let fn_name = crate::naming::qualified_name_for_fn(&func);
 
         // Shutdown: inject lifecycle into fn main()
         if fn_name == "main" {
@@ -168,26 +166,6 @@ fn brace_offset_after_inner_attrs(stmt_list: &ast::StmtList) -> Result<usize, St
         }
     }
     Ok(offset)
-}
-
-/// Construct the qualified name for a function, matching the format used by the
-/// resolve module. For standalone functions, returns the bare name. For methods
-/// inside `impl` blocks, returns `Type::method` (e.g., `Frame::check`).
-fn qualified_fn_name(func: &ast::Fn) -> Option<String> {
-    let bare = func.name()?.text().to_string();
-    let mut node = func.syntax().parent();
-    while let Some(n) = node {
-        if let Some(imp) = ast::Impl::cast(n.clone()) {
-            let self_ty = imp.self_ty()?;
-            let impl_name = crate::naming::render_impl_name(&self_ty, imp.trait_().as_ref());
-            return Some(format!("{impl_name}::{bare}"));
-        }
-        if ast::Fn::can_cast(n.kind()) {
-            break;
-        }
-        node = n.parent();
-    }
-    Some(bare)
 }
 
 /// Check if a function's return type contains `impl Future`.
@@ -488,9 +466,7 @@ fn inject_guards_into_expansion(expanded: &str, measured: &HashMap<String, u32>)
             continue;
         };
         let Some(body) = func.body() else { continue };
-        let Some(fn_name) = qualified_fn_name(&func) else {
-            continue;
-        };
+        let fn_name = crate::naming::qualified_name_for_fn(&func);
 
         let Some(&name_id) = measured.get(&fn_name) else {
             continue;
@@ -566,6 +542,7 @@ fn inject_guards_into_expansion(expanded: &str, measured: &HashMap<String, u32>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ra_ap_syntax::ast::HasName;
 
     #[test]
     fn cst_finds_function() {
@@ -706,7 +683,7 @@ mod tests {
     #[test]
     fn instruments_trait_default_method() {
         let source = "trait T {\n    fn default_impl(&self) {\n        let x = 1;\n    }\n}\n";
-        let measured: HashMap<String, u32> = [("default_impl".into(), 0)].into_iter().collect();
+        let measured: HashMap<String, u32> = [("T::default_impl".into(), 0)].into_iter().collect();
         let result = instrument_source(source, &measured, None).unwrap();
         assert!(result.source.contains("piano_runtime::enter(0)"));
     }
@@ -927,7 +904,7 @@ m!();
             ("free".into(), 0),
             ("in_module".into(), 1),
             ("S::inherent_method".into(), 2),
-            ("trait_default".into(), 3),
+            ("T::trait_default".into(), 3),
             ("<S as T>::trait_impl".into(), 4),
             ("<S as T>::trait_abstract".into(), 5),
             ("nested".into(), 6),
