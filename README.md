@@ -106,6 +106,14 @@ $ piano profile --bin my-server                 # profile a specific binary
 
 Piano discovers binaries from `[[bin]]` entries and from `src/bin/` automatically.
 
+### Example targets
+
+Profile an example instead of the main binary:
+
+```
+$ piano profile --example my-example            # build and profile an example target
+```
+
 ### Per-thread breakdown
 
 ```
