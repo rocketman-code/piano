@@ -1,9 +1,4 @@
 /target
 /mutants.out/
 /mutants.out.old/
-CLAUDE.md
-/docs/plans/
-/.worktrees/
-/.claude/
-.mcp.json
 /experiments/
