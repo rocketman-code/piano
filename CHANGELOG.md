@@ -7,6 +7,26 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-04-25
+
+Relicensed to GPL-3.0-only, new --example flag for profiling example targets, and fixes for library crate instrumentation and process lifecycle races.
+
+### Added
+
+- `--example` flag to build and profile example targets, matching cargo's `--example` flag (#623)
+
+### Changed
+
+- License changed from MIT to GPL-3.0-only for both `piano` and `piano-runtime`. All versions up to and including 0.14.2 remain available under MIT.
+- `--top` suppresses the "N functions hidden" footer when explicitly passed. The footer still appears when the default limit truncates output.
+- Function names in reports now include the enclosing impl type (e.g., `Parser::parse` instead of `parse`)
+
+### Fixed
+
+- Library crates in single-package projects with both `src/lib.rs` and `src/main.rs` are now instrumented. Previously only the binary crate was instrumented, silently skipping library functions.
+- Three race conditions in process lifecycle eliminated by moving to single-threaded execution for the wrapper-to-child handoff
+- Wrapper passes the config path as a parameter instead of re-reading the environment variable, fixing a class of bugs where the wrapper and child disagreed on configuration
+
 ## [0.14.2] - 2026-03-27
 
 Fixes compilation error display and two correctness bugs in allocator wrapping.
@@ -373,7 +393,8 @@ Initial tagged release.
 
 [0.14.0]: https://github.com/rocketman-code/piano/compare/v0.13.0...v0.14.0
 [0.14.2]: https://github.com/rocketman-code/piano/compare/v0.14.0...v0.14.2
-[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.14.2...HEAD
+[0.15.0]: https://github.com/rocketman-code/piano/compare/v0.14.2...v0.15.0
+[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.15.0...HEAD
 [0.12.0]: https://github.com/rocketman-code/piano/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/rocketman-code/piano/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rocketman-code/piano/compare/v0.9.3...v0.10.0
