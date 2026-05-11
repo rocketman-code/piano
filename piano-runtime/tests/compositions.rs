@@ -95,6 +95,41 @@ fn guard_inside_piano_future_alloc_deltas_compose() {
     .unwrap();
 }
 
+// Regression: async emit bookkeeping must not be charged to an enclosing
+// async future. The type signature forces emit to pass a bookkeeping token to
+// aggregate(); this test verifies that the token actually suppresses allocator
+// accounting for the full async emit path.
+#[test]
+fn nested_piano_future_emit_allocs_are_reentrant() {
+    std::thread::spawn(|| {
+        ProfileSession::init(None, false, &[], "test", 0);
+
+        block_on(async {
+            let fut = enter_async(0, async {
+                enter_async(1, async {}).await;
+                piano_runtime::alloc::record_alloc(100);
+            });
+            block_on(fut);
+        });
+
+        let agg = drain_thread_agg();
+        assert_eq!(agg.len(), 2);
+
+        let outer = agg.iter().find(|a| a.name_id == 0).unwrap();
+        let inner = agg.iter().find(|a| a.name_id == 1).unwrap();
+
+        assert_eq!(inner.alloc_count, 0);
+        assert_eq!(inner.alloc_bytes, 0);
+        assert_eq!(
+            outer.alloc_count, 1,
+            "outer async future should only include the explicit user allocation"
+        );
+        assert_eq!(outer.alloc_bytes, 100);
+    })
+    .join()
+    .unwrap();
+}
+
 fn make_waker() -> std::task::Waker {
     use std::task::{RawWaker, RawWakerVTable, Waker};
     fn no_op(_: *const ()) {}
