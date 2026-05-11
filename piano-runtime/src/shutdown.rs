@@ -97,7 +97,7 @@ extern "C" fn atexit_handler() {
     let aggregates = aggregator::drain_all_agg(&agg_registry);
     let calibration = crate::time::CalibrationData::calibrate();
 
-    let _reentry = crate::alloc::ReentrancyGuard::enter();
+    let _bookkeeping = crate::alloc::ProfilerBookkeeping::enter();
     let mut file = file_sink.lock();
     if !aggregates.is_empty() && crate::output::write_aggregates(&mut *file, &aggregates).is_err() {
         file_sink.record_io_error();

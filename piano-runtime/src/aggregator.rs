@@ -16,6 +16,8 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
+use crate::alloc::ProfilerBookkeeping;
+
 /// Per-function aggregated measurements.
 #[derive(Debug, Clone)]
 pub struct FnAgg {
@@ -45,6 +47,7 @@ thread_local! {
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn aggregate(
+    _bookkeeping: &ProfilerBookkeeping,
     name_id: u32,
     self_ns: u64,
     inclusive_ns: u64,

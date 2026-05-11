@@ -13,6 +13,9 @@
 //!   Enforcement: PhantomData<*const ()>.
 //! - Alloc counters are monotonically increasing, never reset.
 //!   Enforcement: record_alloc only adds. No reset/clear functions.
+//! - Allocator-observable profiler bookkeeping requires a proof token.
+//!   Enforcement: ProfilerBookkeeping owns a ReentrancyGuard, and APIs that
+//!   may allocate during bookkeeping require a live reference to it.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
@@ -122,6 +125,23 @@ impl Drop for ReentrancyGuard {
                 core::ptr::write_volatile(r.as_ptr(), prev.saturating_sub(1));
             }
         });
+    }
+}
+
+/// Proof that profiler bookkeeping is running with allocation tracking
+/// suspended on the current thread.
+///
+/// APIs that may allocate while maintaining profiler state should require this
+/// token instead of relying on callers to remember a separate reentrancy guard.
+pub struct ProfilerBookkeeping {
+    _guard: ReentrancyGuard,
+}
+
+impl ProfilerBookkeeping {
+    pub(crate) fn enter() -> Self {
+        Self {
+            _guard: ReentrancyGuard::enter(),
+        }
     }
 }
 

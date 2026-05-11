@@ -22,7 +22,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::{Context, Poll};
 
 use crate::aggregator;
-use crate::alloc::{snapshot_alloc_counters, ReentrancyGuard};
+use crate::alloc::{snapshot_alloc_counters, ProfilerBookkeeping};
 use crate::children;
 use crate::session::ProfileSession;
 use crate::time::read;
@@ -113,7 +113,7 @@ impl<F: Future> Future for PianoFuture<F> {
         // Pre-poll bookkeeping
         let snap_start;
         {
-            let _reentrancy = ReentrancyGuard::enter();
+            let _bookkeeping = ProfilerBookkeeping::enter();
             snap_start = snapshot_alloc_counters();
 
             if this.start_ticks == 0 {
@@ -144,7 +144,7 @@ impl<F: Future> Future for PianoFuture<F> {
         compiler_fence(Ordering::SeqCst);
 
         {
-            let _reentrancy = ReentrancyGuard::enter();
+            let _bookkeeping = ProfilerBookkeeping::enter();
             let snap_end = snapshot_alloc_counters();
 
             this.alloc_count_acc += snap_end.alloc_count.saturating_sub(snap_start.alloc_count);
@@ -177,12 +177,14 @@ impl<F> PianoFuture<F> {
         self.emitted = true;
 
         let end_ticks = read();
+        let bookkeeping = ProfilerBookkeeping::enter();
         let start_ns = session.calibration.now_ns(self.start_ticks);
         let end_ns = session.calibration.now_ns(end_ticks);
         let inclusive_ns = end_ns.saturating_sub(start_ns);
         let self_ns = inclusive_ns.saturating_sub(self.children_ns_acc);
 
         aggregator::aggregate(
+            &bookkeeping,
             self.name_id,
             self_ns,
             inclusive_ns,

@@ -15,7 +15,7 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::aggregator;
-use crate::alloc::{snapshot_alloc_counters, ReentrancyGuard};
+use crate::alloc::{snapshot_alloc_counters, ProfilerBookkeeping};
 use crate::children;
 use crate::cpu_clock::cpu_now_ns;
 use crate::session::ProfileSession;
@@ -86,7 +86,7 @@ impl Guard {
     /// out of the caller. Only stamp() (one TSC read) is inlined.
     #[inline(never)]
     fn create(session: &'static ProfileSession, name_id: u32) -> Self {
-        let _reentrancy = ReentrancyGuard::enter();
+        let _bookkeeping = ProfilerBookkeeping::enter();
         let saved_children_ns = children::save_and_zero();
         let snap = snapshot_alloc_counters();
         let cpu_start_ns = if session.cpu_time_enabled {
@@ -94,7 +94,7 @@ impl Guard {
         } else {
             0
         };
-        drop(_reentrancy);
+        drop(_bookkeeping);
 
         Self {
             session: Some(session),
@@ -129,7 +129,7 @@ impl Drop for Guard {
             Some(s) => s,
             None => return,
         };
-        let _reentrancy = ReentrancyGuard::enter();
+        let bookkeeping = ProfilerBookkeeping::enter();
         let cpu_end_ns = if self.cpu_time_enabled {
             cpu_now_ns()
         } else {
@@ -146,6 +146,7 @@ impl Drop for Guard {
         let cpu_self_ns = cpu_end_ns.saturating_sub(self.cpu_start_ns);
 
         aggregator::aggregate(
+            &bookkeeping,
             self.name_id,
             self_ns,
             inclusive_ns,

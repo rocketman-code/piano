@@ -7,6 +7,14 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-05-11
+
+Fixes async allocation attribution for nested futures, so allocation counts stay focused on user code instead of profiler bookkeeping.
+
+### Fixed
+
+- Async functions no longer count profiler bookkeeping allocations from completed nested futures as allocations in the enclosing async function.
+
 ## [0.15.0] - 2026-04-25
 
 Relicensed to GPL-3.0-only, new --example flag for profiling example targets, and fixes for library crate instrumentation and process lifecycle races.
@@ -393,8 +401,9 @@ Initial tagged release.
 
 [0.14.0]: https://github.com/rocketman-code/piano/compare/v0.13.0...v0.14.0
 [0.14.2]: https://github.com/rocketman-code/piano/compare/v0.14.0...v0.14.2
+[0.15.1]: https://github.com/rocketman-code/piano/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/rocketman-code/piano/compare/v0.14.2...v0.15.0
-[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/rocketman-code/piano/compare/v0.15.1...HEAD
 [0.12.0]: https://github.com/rocketman-code/piano/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/rocketman-code/piano/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rocketman-code/piano/compare/v0.9.3...v0.10.0

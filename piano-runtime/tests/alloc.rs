@@ -117,11 +117,3 @@ fn cross_thread_isolation() {
     .join()
     .expect("test thread panicked");
 }
-
-// INVARIANT TEST: ReentrancyGuard is !Send.
-// Enforced by PhantomData<*const ()> in the struct definition.
-// This compile-time property can't be tested at runtime, but we verify
-// the observable consequence: the guard works correctly per-thread.
-// The type system prevents cross-thread movement at compile time.
-// If someone removes PhantomData, Guard tests (which depend on
-// ReentrancyGuard being !Send) will catch the regression.
