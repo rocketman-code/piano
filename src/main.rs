@@ -673,7 +673,10 @@ fn build_project(
 
     let runs_dir = match &output_dir {
         Some(dir) => dir.clone(),
-        None => target_dir.join("runs"),
+        None => match std::env::var_os("PIANO_RUNS_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => target_dir.join("runs"),
+        },
     };
     std::fs::create_dir_all(&runs_dir).map_err(io_context("create directory", &runs_dir))?;
 
