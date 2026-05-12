@@ -25,21 +25,21 @@ use crate::aggregator;
 use crate::alloc::{snapshot_alloc_counters, ProfilerBookkeeping};
 use crate::children;
 use crate::session::ProfileSession;
-use crate::time::read;
+use crate::time::{read, Ticks, WallNs};
 
 /// Future wrapper for async function instrumentation.
 pub struct PianoFuture<F> {
     inner: F,
     session: Option<&'static ProfileSession>,
     name_id: u32,
-    start_ticks: u64,
-    saved_children_ns: u64,
+    start_ticks: Ticks,
+    saved_children_ns: WallNs,
     alloc_count_acc: u64,
     alloc_bytes_acc: u64,
     free_count_acc: u64,
     free_bytes_acc: u64,
     cpu_acc_ns: u64,
-    children_ns_acc: u64,
+    children_ns_acc: WallNs,
     emitted: bool,
 }
 
@@ -55,14 +55,14 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
                 inner: body,
                 session: None,
                 name_id: 0,
-                start_ticks: 0,
-                saved_children_ns: 0,
+                start_ticks: Ticks(0),
+                saved_children_ns: WallNs::ZERO,
                 alloc_count_acc: 0,
                 alloc_bytes_acc: 0,
                 free_count_acc: 0,
                 free_bytes_acc: 0,
                 cpu_acc_ns: 0,
-                children_ns_acc: 0,
+                children_ns_acc: WallNs::ZERO,
                 emitted: true, // prevent emit on drop
             };
         }
@@ -76,14 +76,14 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
         inner: body,
         session: Some(session),
         name_id,
-        start_ticks: 0,
+        start_ticks: Ticks(0),
         saved_children_ns,
         alloc_count_acc: 0,
         alloc_bytes_acc: 0,
         free_count_acc: 0,
         free_bytes_acc: 0,
         cpu_acc_ns: 0,
-        children_ns_acc: 0,
+        children_ns_acc: WallNs::ZERO,
         emitted: false,
     }
 }
@@ -116,7 +116,7 @@ impl<F: Future> Future for PianoFuture<F> {
             let _bookkeeping = ProfilerBookkeeping::enter();
             snap_start = snapshot_alloc_counters();
 
-            if this.start_ticks == 0 {
+            if this.start_ticks.0 == 0 {
                 this.start_ticks = read();
             }
         }
@@ -159,7 +159,7 @@ impl<F: Future> Future for PianoFuture<F> {
 
         // Restore TLS children_ns for the outer scope.
         // Don't report our time yet (we might have more polls).
-        children::restore_and_report(poll_children_saved, 0);
+        children::restore_and_report(poll_children_saved, WallNs::ZERO);
 
         if result.is_ready() {
             this.emit(session);
@@ -171,7 +171,7 @@ impl<F: Future> Future for PianoFuture<F> {
 
 impl<F> PianoFuture<F> {
     fn emit(&mut self, session: &'static ProfileSession) {
-        if self.emitted || self.start_ticks == 0 {
+        if self.emitted || self.start_ticks.0 == 0 {
             return;
         }
         self.emitted = true;
@@ -186,8 +186,8 @@ impl<F> PianoFuture<F> {
         aggregator::aggregate(
             &bookkeeping,
             self.name_id,
-            self_ns,
-            inclusive_ns,
+            self_ns.0,
+            inclusive_ns.0,
             self.cpu_acc_ns,
             self.alloc_count_acc,
             self.alloc_bytes_acc,

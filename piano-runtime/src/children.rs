@@ -18,37 +18,38 @@
 //! - Returns 0 when TLS is destroyed (thread teardown).
 //! - `Cell<u64>` has no destructor (no TLS destruction ordering issues).
 
+use crate::time::WallNs;
 use std::cell::Cell;
 
 thread_local! {
-    static CHILDREN_NS: Cell<u64> = const { Cell::new(0) };
+    static CHILDREN_NS: Cell<WallNs> = const { Cell::new(WallNs::ZERO) };
 }
 
 /// Read the current children-time accumulator for this thread.
-/// Returns 0 if TLS is destroyed.
+/// Returns WallNs::ZERO if TLS is destroyed.
 #[inline(always)]
-pub fn current_children_ns() -> u64 {
-    CHILDREN_NS.try_with(|c| c.get()).unwrap_or(0)
+pub fn current_children_ns() -> WallNs {
+    CHILDREN_NS.try_with(|c| c.get()).unwrap_or(WallNs::ZERO)
 }
 
 /// Save the current children-time accumulator and reset to 0.
 /// Returns the saved value (for Guard to restore on drop).
-/// Returns 0 if TLS is destroyed.
+/// Returns WallNs::ZERO if TLS is destroyed.
 #[inline(always)]
-pub fn save_and_zero() -> u64 {
+pub fn save_and_zero() -> WallNs {
     CHILDREN_NS
         .try_with(|c| {
             let prev = c.get();
-            c.set(0);
+            c.set(WallNs::ZERO);
             prev
         })
-        .unwrap_or(0)
+        .unwrap_or(WallNs::ZERO)
 }
 
 /// Restore a previously saved children-time value, adding the
 /// caller's inclusive time so the parent sees it as a child.
 /// Silent no-op if TLS is destroyed.
 #[inline(always)]
-pub fn restore_and_report(saved: u64, own_inclusive_ns: u64) {
-    let _ = CHILDREN_NS.try_with(|c| c.set(saved + own_inclusive_ns));
+pub fn restore_and_report(saved: WallNs, own_inclusive_ns: WallNs) {
+    let _ = CHILDREN_NS.try_with(|c| c.set(WallNs(saved.0 + own_inclusive_ns.0)));
 }

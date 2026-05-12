@@ -19,7 +19,7 @@ use crate::alloc::{snapshot_alloc_counters, ProfilerBookkeeping};
 use crate::children;
 use crate::cpu_clock::cpu_now_ns;
 use crate::session::ProfileSession;
-use crate::time::read;
+use crate::time::{read, Ticks, WallNs};
 use std::marker::PhantomData;
 
 /// RAII sentinel for sync function instrumentation.
@@ -31,11 +31,11 @@ use std::marker::PhantomData;
 pub struct Guard {
     /// None = inactive (profiling not initialized). Drop is a no-op.
     session: Option<&'static ProfileSession>,
-    saved_children_ns: u64,
+    saved_children_ns: WallNs,
     name_id: u32,
     cpu_time_enabled: bool,
     cpu_start_ns: u64,
-    start_ns: u64,
+    start_ticks: Ticks,
     alloc_count_start: u64,
     alloc_bytes_start: u64,
     free_count_start: u64,
@@ -66,11 +66,11 @@ impl Guard {
     fn inactive() -> Self {
         Self {
             session: None,
-            saved_children_ns: 0,
+            saved_children_ns: WallNs::ZERO,
             name_id: 0,
             cpu_time_enabled: false,
             cpu_start_ns: 0,
-            start_ns: 0,
+            start_ticks: Ticks(0),
             alloc_count_start: 0,
             alloc_bytes_start: 0,
             free_count_start: 0,
@@ -102,7 +102,7 @@ impl Guard {
             name_id,
             cpu_time_enabled: session.cpu_time_enabled,
             cpu_start_ns,
-            start_ns: 0,
+            start_ticks: Ticks(0),
             alloc_count_start: snap.alloc_count,
             alloc_bytes_start: snap.alloc_bytes,
             free_count_start: snap.free_count,
@@ -115,7 +115,7 @@ impl Guard {
     #[inline(always)]
     pub fn stamp(&mut self) {
         compiler_fence(Ordering::SeqCst);
-        self.start_ns = read();
+        self.start_ticks = read();
     }
 }
 
@@ -137,7 +137,7 @@ impl Drop for Guard {
         };
         let snap_end = snapshot_alloc_counters();
 
-        let start_ns = session.calibration.now_ns(self.start_ns);
+        let start_ns = session.calibration.now_ns(self.start_ticks);
         let end_ns = session.calibration.now_ns(end_ticks);
         let inclusive_ns = end_ns.saturating_sub(start_ns);
 
@@ -148,8 +148,8 @@ impl Drop for Guard {
         aggregator::aggregate(
             &bookkeeping,
             self.name_id,
-            self_ns,
-            inclusive_ns,
+            self_ns.0,
+            inclusive_ns.0,
             cpu_self_ns,
             snap_end.alloc_count.saturating_sub(self.alloc_count_start),
             snap_end.alloc_bytes.saturating_sub(self.alloc_bytes_start),

@@ -55,7 +55,7 @@ impl ProfileSession {
             if write_header(
                 &mut *file,
                 names,
-                calibration.bias_ns(),
+                calibration.bias_ns().0,
                 calibration.cpu_bias_ns(),
                 run_id,
                 timestamp_ms,
