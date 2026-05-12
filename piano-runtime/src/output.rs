@@ -13,15 +13,20 @@
 
 use std::io::{self, Write};
 
+use crate::cpu_clock::CpuNs;
+use crate::time::WallNs;
+
 /// Write the name table as a header line, including run metadata.
 pub fn write_header(
     w: &mut impl Write,
     names: &[(u32, &str)],
-    bias_ns: u64,
-    cpu_bias_ns: u64,
+    bias_ns: WallNs,
+    cpu_bias_ns: CpuNs,
     run_id: &str,
     timestamp_ms: u128,
 ) -> io::Result<()> {
+    let bias_ns = bias_ns.0;
+    let cpu_bias_ns = cpu_bias_ns.0;
     write!(
         w,
         "{{\"type\":\"header\",\"run_id\":\"{run_id}\",\"timestamp_ms\":{timestamp_ms},"
@@ -45,14 +50,14 @@ pub fn write_header(
 pub fn write_trailer(
     w: &mut impl Write,
     names: &[(u32, &str)],
-    bias_ns: u64,
-    cpu_bias_ns: u64,
+    bias_ns: WallNs,
+    cpu_bias_ns: CpuNs,
 ) -> io::Result<()> {
     write_name_table(w, "trailer", names, bias_ns, cpu_bias_ns)
 }
 
 /// Serialize the trailer to a byte vector for signal-safe writing.
-pub fn serialize_trailer(names: &[(u32, &str)], bias_ns: u64, cpu_bias_ns: u64) -> Vec<u8> {
+pub fn serialize_trailer(names: &[(u32, &str)], bias_ns: WallNs, cpu_bias_ns: CpuNs) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(b'\n');
     let _ = write_trailer(&mut buf, names, bias_ns, cpu_bias_ns);
@@ -77,15 +82,15 @@ pub fn write_aggregates(
                     "\"free_count\":{},\"free_bytes\":{}}}"
                 ),
                 thread_idx,
-                a.name_id,
+                a.name_id.0,
                 a.calls,
-                a.self_ns,
-                a.inclusive_ns,
-                a.cpu_self_ns,
-                a.alloc_count,
-                a.alloc_bytes,
-                a.free_count,
-                a.free_bytes,
+                a.self_ns.0,
+                a.inclusive_ns.0,
+                a.cpu_self_ns.0,
+                a.alloc.alloc_count,
+                a.alloc.alloc_bytes,
+                a.alloc.free_count,
+                a.alloc.free_bytes,
             )?;
         }
     }
@@ -136,23 +141,23 @@ pub fn serialize_aggregate_to_stack(
     put!(b"{\"thread\":");
     put_u64!(thread_idx);
     put!(b",\"name_id\":");
-    put_u64!(a.name_id as u64);
+    put_u64!(a.name_id.0 as u64);
     put!(b",\"calls\":");
     put_u64!(a.calls);
     put!(b",\"self_ns\":");
-    put_u64!(a.self_ns);
+    put_u64!(a.self_ns.0);
     put!(b",\"inclusive_ns\":");
-    put_u64!(a.inclusive_ns);
+    put_u64!(a.inclusive_ns.0);
     put!(b",\"cpu_self_ns\":");
-    put_u64!(a.cpu_self_ns);
+    put_u64!(a.cpu_self_ns.0);
     put!(b",\"alloc_count\":");
-    put_u64!(a.alloc_count);
+    put_u64!(a.alloc.alloc_count);
     put!(b",\"alloc_bytes\":");
-    put_u64!(a.alloc_bytes);
+    put_u64!(a.alloc.alloc_bytes);
     put!(b",\"free_count\":");
-    put_u64!(a.free_count);
+    put_u64!(a.alloc.free_count);
     put!(b",\"free_bytes\":");
-    put_u64!(a.free_bytes);
+    put_u64!(a.alloc.free_bytes);
     put!(b"}\n");
 
     pos
@@ -162,9 +167,11 @@ fn write_name_table(
     w: &mut impl Write,
     kind: &str,
     names: &[(u32, &str)],
-    bias_ns: u64,
-    cpu_bias_ns: u64,
+    bias_ns: WallNs,
+    cpu_bias_ns: CpuNs,
 ) -> io::Result<()> {
+    let bias_ns = bias_ns.0;
+    let cpu_bias_ns = cpu_bias_ns.0;
     write!(
         w,
         "{{\"type\":\"{kind}\",\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{"
