@@ -106,7 +106,7 @@ extern "C" fn atexit_handler() {
         &mut *file,
         names,
         calibration.bias_ns().0,
-        calibration.cpu_bias_ns(),
+        calibration.cpu_bias_ns().0,
     )
     .is_err()
     {
@@ -246,7 +246,7 @@ mod signal {
         ONCE.call_once(|| {
             let calibration = crate::time::CalibrationData::calibrate();
             let trailer_bytes =
-                serialize_trailer(names, calibration.bias_ns().0, calibration.cpu_bias_ns());
+                serialize_trailer(names, calibration.bias_ns().0, calibration.cpu_bias_ns().0);
             let trailer = Box::new(SignalTrailer {
                 bytes: trailer_bytes,
             });

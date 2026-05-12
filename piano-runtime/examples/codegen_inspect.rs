@@ -20,6 +20,7 @@
 // functions in release mode, making cargo-asm unable to find the symbol.
 #![allow(unused)]
 
+use piano_runtime::cpu_clock::CpuNs;
 use piano_runtime::time::{read, Ticks};
 use std::hint::black_box;
 
@@ -141,7 +142,7 @@ pub fn tm8_positive() -> u64 {
 
 /// Negative: bookkeeping between fence and cpu_now_ns (broken pattern).
 #[inline(never)]
-pub fn tm8_negative() -> u64 {
+pub fn tm8_negative() -> CpuNs {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     black_box(99u64);
     piano_runtime::cpu_clock::cpu_now_ns()
