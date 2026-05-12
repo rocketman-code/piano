@@ -17,7 +17,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use crate::aggregator;
 use crate::alloc::{snapshot_alloc_counters, ProfilerBookkeeping};
 use crate::children;
-use crate::cpu_clock::cpu_now_ns;
+use crate::cpu_clock::{cpu_now_ns, CpuNs};
 use crate::session::ProfileSession;
 use crate::time::{read, Ticks, WallNs};
 use std::marker::PhantomData;
@@ -34,7 +34,7 @@ pub struct Guard {
     saved_children_ns: WallNs,
     name_id: u32,
     cpu_time_enabled: bool,
-    cpu_start_ns: u64,
+    cpu_start: CpuNs,
     start_ticks: Ticks,
     alloc_count_start: u64,
     alloc_bytes_start: u64,
@@ -69,7 +69,7 @@ impl Guard {
             saved_children_ns: WallNs::ZERO,
             name_id: 0,
             cpu_time_enabled: false,
-            cpu_start_ns: 0,
+            cpu_start: CpuNs::ZERO,
             start_ticks: Ticks(0),
             alloc_count_start: 0,
             alloc_bytes_start: 0,
@@ -89,10 +89,10 @@ impl Guard {
         let _bookkeeping = ProfilerBookkeeping::enter();
         let saved_children_ns = children::save_and_zero();
         let snap = snapshot_alloc_counters();
-        let cpu_start_ns = if session.cpu_time_enabled {
+        let cpu_start = if session.cpu_time_enabled {
             cpu_now_ns()
         } else {
-            0
+            CpuNs::ZERO
         };
         drop(_bookkeeping);
 
@@ -101,7 +101,7 @@ impl Guard {
             saved_children_ns,
             name_id,
             cpu_time_enabled: session.cpu_time_enabled,
-            cpu_start_ns,
+            cpu_start,
             start_ticks: Ticks(0),
             alloc_count_start: snap.alloc_count,
             alloc_bytes_start: snap.alloc_bytes,
@@ -130,10 +130,10 @@ impl Drop for Guard {
             None => return,
         };
         let bookkeeping = ProfilerBookkeeping::enter();
-        let cpu_end_ns = if self.cpu_time_enabled {
+        let cpu_end = if self.cpu_time_enabled {
             cpu_now_ns()
         } else {
-            0
+            CpuNs::ZERO
         };
         let snap_end = snapshot_alloc_counters();
 
@@ -143,14 +143,14 @@ impl Drop for Guard {
 
         let my_children_ns = children::current_children_ns();
         let self_ns = inclusive_ns.saturating_sub(my_children_ns);
-        let cpu_self_ns = cpu_end_ns.saturating_sub(self.cpu_start_ns);
+        let cpu_self_ns = cpu_end.saturating_sub(self.cpu_start);
 
         aggregator::aggregate(
             &bookkeeping,
             self.name_id,
             self_ns.0,
             inclusive_ns.0,
-            cpu_self_ns,
+            cpu_self_ns.0,
             snap_end.alloc_count.saturating_sub(self.alloc_count_start),
             snap_end.alloc_bytes.saturating_sub(self.alloc_bytes_start),
             snap_end.free_count.saturating_sub(self.free_count_start),

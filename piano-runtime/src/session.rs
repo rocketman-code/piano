@@ -56,7 +56,7 @@ impl ProfileSession {
                 &mut *file,
                 names,
                 calibration.bias_ns().0,
-                calibration.cpu_bias_ns(),
+                calibration.cpu_bias_ns().0,
                 run_id,
                 timestamp_ms,
             )

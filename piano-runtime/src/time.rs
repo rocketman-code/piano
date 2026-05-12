@@ -18,6 +18,8 @@ use std::sync::atomic::{compiler_fence, Ordering};
 use std::sync::Once;
 use std::time::Instant;
 
+use crate::cpu_clock::CpuNs;
+
 /// Raw hardware counter value (TSC on x86_64, CNTVCT on aarch64,
 /// epoch-relative nanoseconds on fallback platforms).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -137,8 +139,8 @@ impl CalibrationData {
 
     /// Return the calibrated CPU-time measurement bias in nanoseconds.
     #[inline(always)]
-    pub fn cpu_bias_ns(&self) -> u64 {
-        self.cpu_bias_ns
+    pub fn cpu_bias_ns(&self) -> CpuNs {
+        CpuNs(self.cpu_bias_ns)
     }
 }
 
