@@ -168,16 +168,16 @@ fn nested_guards_compute_correct_self_time() {
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 3, "3 functions = 3 aggregate entries");
 
-        let f0 = agg.iter().find(|a| a.name_id == 0).unwrap();
-        let f1 = agg.iter().find(|a| a.name_id == 1).unwrap();
-        let f2 = agg.iter().find(|a| a.name_id == 2).unwrap();
+        let f0 = agg.iter().find(|a| a.name_id.raw() == 0).unwrap();
+        let f1 = agg.iter().find(|a| a.name_id.raw() == 1).unwrap();
+        let f2 = agg.iter().find(|a| a.name_id.raw() == 2).unwrap();
 
         // Innermost has no children: self == inclusive
         assert_eq!(f2.self_ns, f2.inclusive_ns);
         // Middle's self < inclusive (inner subtracted)
-        assert!(f1.self_ns < f1.inclusive_ns);
+        assert!(f1.self_ns.raw() < f1.inclusive_ns.raw());
         // Outer's self < inclusive (middle+inner subtracted)
-        assert!(f0.self_ns < f0.inclusive_ns);
+        assert!(f0.self_ns.raw() < f0.inclusive_ns.raw());
     })
     .join()
     .expect("test thread panicked");
@@ -240,7 +240,10 @@ fn async_preamble_has_nonzero_self_time() {
 
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 1);
-        assert!(agg[0].self_ns > 0, "preamble must produce nonzero self_ns");
+        assert!(
+            agg[0].self_ns.raw() > 0,
+            "preamble must produce nonzero self_ns"
+        );
     })
     .join()
     .expect("test thread panicked");

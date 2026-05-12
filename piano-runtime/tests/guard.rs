@@ -18,7 +18,7 @@ fn guard_produces_aggregate_on_drop() {
         }
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 1);
-        assert_eq!(agg[0].name_id, 42);
+        assert_eq!(agg[0].name_id.raw(), 42);
         assert_eq!(agg[0].calls, 1);
     })
     .join()
@@ -34,8 +34,11 @@ fn guard_captures_wall_time() {
             std::hint::black_box(vec![0u8; 1024]);
         }
         let agg = drain_thread_agg();
-        assert!(agg[0].self_ns > 0, "self_ns must be nonzero");
-        assert!(agg[0].inclusive_ns > 0, "inclusive_ns must be nonzero");
+        assert!(agg[0].self_ns.raw() > 0, "self_ns must be nonzero");
+        assert!(
+            agg[0].inclusive_ns.raw() > 0,
+            "inclusive_ns must be nonzero"
+        );
     })
     .join()
     .unwrap();
@@ -51,8 +54,8 @@ fn guard_captures_alloc_deltas() {
             record_alloc(200);
         }
         let agg = drain_thread_agg();
-        assert_eq!(agg[0].alloc_count, 2);
-        assert_eq!(agg[0].alloc_bytes, 300);
+        assert_eq!(agg[0].alloc.alloc_count, 2);
+        assert_eq!(agg[0].alloc.alloc_bytes, 300);
     })
     .join()
     .unwrap();
@@ -66,8 +69,8 @@ fn guard_excludes_own_bookkeeping_allocs() {
             let _g = enter(0);
         }
         let agg = drain_thread_agg();
-        assert_eq!(agg[0].alloc_count, 0);
-        assert_eq!(agg[0].alloc_bytes, 0);
+        assert_eq!(agg[0].alloc.alloc_count, 0);
+        assert_eq!(agg[0].alloc.alloc_bytes, 0);
     })
     .join()
     .unwrap();
@@ -103,8 +106,8 @@ fn different_functions_get_separate_entries() {
         }
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 2);
-        let f0 = agg.iter().find(|a| a.name_id == 0).unwrap();
-        let f1 = agg.iter().find(|a| a.name_id == 1).unwrap();
+        let f0 = agg.iter().find(|a| a.name_id.raw() == 0).unwrap();
+        let f1 = agg.iter().find(|a| a.name_id.raw() == 1).unwrap();
         assert_eq!(f0.calls, 2);
         assert_eq!(f1.calls, 1);
     })
@@ -125,15 +128,15 @@ fn nested_guards_compute_self_time() {
             }
         }
         let agg = drain_thread_agg();
-        let outer = agg.iter().find(|a| a.name_id == 0).unwrap();
-        let inner = agg.iter().find(|a| a.name_id == 1).unwrap();
+        let outer = agg.iter().find(|a| a.name_id.raw() == 0).unwrap();
+        let inner = agg.iter().find(|a| a.name_id.raw() == 1).unwrap();
         // Outer's self_ns should be LESS than its inclusive_ns
         // (because inner's time is subtracted)
         assert!(
-            outer.self_ns < outer.inclusive_ns,
+            outer.self_ns.raw() < outer.inclusive_ns.raw(),
             "outer self ({}) must be < inclusive ({})",
-            outer.self_ns,
-            outer.inclusive_ns
+            outer.self_ns.raw(),
+            outer.inclusive_ns.raw()
         );
         // Inner's self_ns should equal its inclusive_ns (no children)
         assert_eq!(inner.self_ns, inner.inclusive_ns);
@@ -154,8 +157,8 @@ fn alloc_deltas_scoped_to_guard_lifetime() {
         }
         record_alloc(888); // after guard
         let agg = drain_thread_agg();
-        assert_eq!(agg[0].alloc_count, 2, "only allocs during guard");
-        assert_eq!(agg[0].alloc_bytes, 125);
+        assert_eq!(agg[0].alloc.alloc_count, 2, "only allocs during guard");
+        assert_eq!(agg[0].alloc.alloc_bytes, 125);
     })
     .join()
     .unwrap();
@@ -172,8 +175,8 @@ fn guard_captures_free_deltas() {
             drop(v);
         }
         let agg = drain_thread_agg();
-        assert!(agg[0].free_count >= 1);
-        assert!(agg[0].free_bytes >= 100);
+        assert!(agg[0].alloc.free_count >= 1);
+        assert!(agg[0].alloc.free_bytes >= 100);
     })
     .join()
     .unwrap();
@@ -194,7 +197,7 @@ fn guard_captures_cpu_time_when_enabled() {
         }
         let agg = drain_thread_agg();
         assert!(
-            agg[0].cpu_self_ns > 0,
+            agg[0].cpu_self_ns.raw() > 0,
             "cpu_self_ns must be nonzero when enabled"
         );
     })
@@ -210,7 +213,7 @@ fn guard_cpu_time_zero_when_disabled() {
             let _g = enter(0);
         }
         let agg = drain_thread_agg();
-        assert_eq!(agg[0].cpu_self_ns, 0);
+        assert_eq!(agg[0].cpu_self_ns.raw(), 0);
     })
     .join()
     .unwrap();
@@ -256,8 +259,8 @@ fn alloc_accumulates_across_calls() {
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 1, "same name_id should merge");
         assert_eq!(agg[0].calls, 2);
-        assert_eq!(agg[0].alloc_count, 2);
-        assert_eq!(agg[0].alloc_bytes, 300);
+        assert_eq!(agg[0].alloc.alloc_count, 2);
+        assert_eq!(agg[0].alloc.alloc_bytes, 300);
     })
     .join()
     .unwrap();

@@ -45,17 +45,17 @@ fn nested_piano_futures_self_time() {
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 2);
 
-        let outer = agg.iter().find(|a| a.name_id == 0).unwrap();
-        let inner = agg.iter().find(|a| a.name_id == 1).unwrap();
+        let outer = agg.iter().find(|a| a.name_id.raw() == 0).unwrap();
+        let inner = agg.iter().find(|a| a.name_id.raw() == 1).unwrap();
 
         // Inner has no children: self == inclusive
         assert_eq!(inner.self_ns, inner.inclusive_ns);
         // Outer's self < inclusive (inner subtracted)
         assert!(
-            outer.self_ns < outer.inclusive_ns,
+            outer.self_ns.raw() < outer.inclusive_ns.raw(),
             "outer self ({}) must be < inclusive ({})",
-            outer.self_ns,
-            outer.inclusive_ns
+            outer.self_ns.raw(),
+            outer.inclusive_ns.raw()
         );
     })
     .join()
@@ -82,14 +82,14 @@ fn guard_inside_piano_future_alloc_deltas_compose() {
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 2);
 
-        let sync_m = agg.iter().find(|a| a.name_id == 1).unwrap();
-        let async_m = agg.iter().find(|a| a.name_id == 0).unwrap();
+        let sync_m = agg.iter().find(|a| a.name_id.raw() == 1).unwrap();
+        let async_m = agg.iter().find(|a| a.name_id.raw() == 0).unwrap();
 
-        assert_eq!(sync_m.alloc_count, 1);
-        assert_eq!(sync_m.alloc_bytes, 200);
+        assert_eq!(sync_m.alloc.alloc_count, 1);
+        assert_eq!(sync_m.alloc.alloc_bytes, 200);
         // Async's alloc includes its own (100) + sync child (200)
-        assert_eq!(async_m.alloc_count, 2);
-        assert_eq!(async_m.alloc_bytes, 300);
+        assert_eq!(async_m.alloc.alloc_count, 2);
+        assert_eq!(async_m.alloc.alloc_bytes, 300);
     })
     .join()
     .unwrap();
@@ -115,16 +115,16 @@ fn nested_piano_future_emit_allocs_are_reentrant() {
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 2);
 
-        let outer = agg.iter().find(|a| a.name_id == 0).unwrap();
-        let inner = agg.iter().find(|a| a.name_id == 1).unwrap();
+        let outer = agg.iter().find(|a| a.name_id.raw() == 0).unwrap();
+        let inner = agg.iter().find(|a| a.name_id.raw() == 1).unwrap();
 
-        assert_eq!(inner.alloc_count, 0);
-        assert_eq!(inner.alloc_bytes, 0);
+        assert_eq!(inner.alloc.alloc_count, 0);
+        assert_eq!(inner.alloc.alloc_bytes, 0);
         assert_eq!(
-            outer.alloc_count, 1,
+            outer.alloc.alloc_count, 1,
             "outer async future should only include the explicit user allocation"
         );
-        assert_eq!(outer.alloc_bytes, 100);
+        assert_eq!(outer.alloc.alloc_bytes, 100);
     })
     .join()
     .unwrap();
@@ -205,11 +205,11 @@ fn piano_future_thread_migration() {
 
         let m = &agg[0];
         assert_eq!(
-            m.alloc_count, 2,
+            m.alloc.alloc_count, 2,
             "allocs from both polls (thread A + B) must accumulate"
         );
         assert_eq!(
-            m.alloc_bytes, 300,
+            m.alloc.alloc_bytes, 300,
             "bytes from both polls (100 + 200) must accumulate"
         );
     });
@@ -234,28 +234,28 @@ fn nested_guards_compute_correct_self_time() {
         }
 
         let agg = drain_thread_agg();
-        let outer = agg.iter().find(|a| a.name_id == 0).unwrap();
-        let inner = agg.iter().find(|a| a.name_id == 1).unwrap();
+        let outer = agg.iter().find(|a| a.name_id.raw() == 0).unwrap();
+        let inner = agg.iter().find(|a| a.name_id.raw() == 1).unwrap();
 
         // inner's self_ns should be close to 1ms (the sleep).
         // outer's self_ns should be much less than inner's (just overhead).
         assert!(
-            inner.self_ns > 500_000,
+            inner.self_ns.raw() > 500_000,
             "inner should have at least 0.5ms self-time, got {}ns",
-            inner.self_ns
+            inner.self_ns.raw()
         );
         assert!(
-            outer.self_ns < inner.self_ns,
+            outer.self_ns.raw() < inner.self_ns.raw(),
             "outer self-time ({}) must be less than inner ({})",
-            outer.self_ns,
-            inner.self_ns
+            outer.self_ns.raw(),
+            inner.self_ns.raw()
         );
         // outer's inclusive_ns should be >= inner's (it contains inner)
         assert!(
-            outer.inclusive_ns >= inner.inclusive_ns,
+            outer.inclusive_ns.raw() >= inner.inclusive_ns.raw(),
             "outer inclusive ({}) must be >= inner inclusive ({})",
-            outer.inclusive_ns,
-            inner.inclusive_ns
+            outer.inclusive_ns.raw(),
+            inner.inclusive_ns.raw()
         );
     })
     .join()

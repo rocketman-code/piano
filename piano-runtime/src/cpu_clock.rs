@@ -20,6 +20,16 @@ impl CpuNs {
     }
 }
 
+#[cfg(feature = "_test_internals")]
+impl CpuNs {
+    pub fn new(v: u64) -> Self {
+        Self(v)
+    }
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 impl core::ops::AddAssign for CpuNs {
     fn add_assign(&mut self, rhs: Self) {
         self.0 += rhs.0;

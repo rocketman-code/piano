@@ -39,7 +39,7 @@ fn async_enter_emits_aggregate_on_completion() {
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 1);
         assert_eq!(agg[0].calls, 1);
-        assert_eq!(agg[0].name_id, 0);
+        assert_eq!(agg[0].name_id.raw(), 0);
     })
     .join()
     .unwrap();
@@ -102,9 +102,9 @@ fn wall_time_starts_on_first_poll_not_construction() {
         // If timing started at construction, self_ns would be >= 10ms.
         // If timing started at first poll, self_ns should be < 1ms.
         assert!(
-            agg[0].self_ns < 1_000_000,
+            agg[0].self_ns.raw() < 1_000_000,
             "self_ns ({} ns) should be < 1ms; wall time must start at first poll, not construction",
-            agg[0].self_ns
+            agg[0].self_ns.raw()
         );
     })
     .join()
@@ -210,11 +210,11 @@ fn multi_poll_alloc_accumulation() {
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 1);
         assert_eq!(
-            agg[0].alloc_count, 2,
+            agg[0].alloc.alloc_count, 2,
             "allocs from both polls must accumulate"
         );
         assert_eq!(
-            agg[0].alloc_bytes, 300,
+            agg[0].alloc.alloc_bytes, 300,
             "bytes from both polls must accumulate"
         );
     })

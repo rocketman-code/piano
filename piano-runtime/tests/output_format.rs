@@ -2,14 +2,26 @@
 //! contain expected fields.
 
 use piano_runtime::aggregator::FnAgg;
+use piano_runtime::alloc::AllocDelta;
+use piano_runtime::cpu_clock::CpuNs;
 use piano_runtime::output::{
     serialize_aggregate_to_stack, write_aggregates, write_header, write_trailer,
 };
+use piano_runtime::time::WallNs;
+use piano_runtime::NameId;
 
 #[test]
 fn header_contains_type_and_names() {
     let mut buf = Vec::new();
-    write_header(&mut buf, &[(0, "work"), (1, "helper")], 8, 0, "test", 0).unwrap();
+    write_header(
+        &mut buf,
+        &[(0, "work"), (1, "helper")],
+        WallNs::new(8),
+        CpuNs::new(0),
+        "test",
+        0,
+    )
+    .unwrap();
     let line = String::from_utf8(buf).unwrap();
 
     assert!(line.starts_with('{'), "header must start with {{");
@@ -23,9 +35,23 @@ fn header_contains_type_and_names() {
 #[test]
 fn trailer_shares_core_fields_with_header() {
     let mut hdr = Vec::new();
-    write_header(&mut hdr, &[(0, "a"), (1, "b")], 5, 0, "test", 0).unwrap();
+    write_header(
+        &mut hdr,
+        &[(0, "a"), (1, "b")],
+        WallNs::new(5),
+        CpuNs::new(0),
+        "test",
+        0,
+    )
+    .unwrap();
     let mut trl = Vec::new();
-    write_trailer(&mut trl, &[(0, "a"), (1, "b")], 5, 0).unwrap();
+    write_trailer(
+        &mut trl,
+        &[(0, "a"), (1, "b")],
+        WallNs::new(5),
+        CpuNs::new(0),
+    )
+    .unwrap();
 
     let h = String::from_utf8(hdr).unwrap();
     let t = String::from_utf8(trl).unwrap();
@@ -45,15 +71,17 @@ fn trailer_shares_core_fields_with_header() {
 #[test]
 fn aggregate_lines_contain_all_fields() {
     let aggs = vec![vec![FnAgg {
-        name_id: 0,
+        name_id: NameId::new(0),
         calls: 100,
-        self_ns: 5000,
-        inclusive_ns: 8000,
-        cpu_self_ns: 3000,
-        alloc_count: 10,
-        alloc_bytes: 1024,
-        free_count: 5,
-        free_bytes: 512,
+        self_ns: WallNs::new(5000),
+        inclusive_ns: WallNs::new(8000),
+        cpu_self_ns: CpuNs::new(3000),
+        alloc: AllocDelta {
+            alloc_count: 10,
+            alloc_bytes: 1024,
+            free_count: 5,
+            free_bytes: 512,
+        },
     }]];
 
     let mut buf = Vec::new();
@@ -79,26 +107,20 @@ fn aggregate_lines_contain_all_fields() {
 fn multi_thread_aggregates_have_distinct_thread_indices() {
     let aggs = vec![
         vec![FnAgg {
-            name_id: 0,
+            name_id: NameId::new(0),
             calls: 1,
-            self_ns: 100,
-            inclusive_ns: 100,
-            cpu_self_ns: 0,
-            alloc_count: 0,
-            alloc_bytes: 0,
-            free_count: 0,
-            free_bytes: 0,
+            self_ns: WallNs::new(100),
+            inclusive_ns: WallNs::new(100),
+            cpu_self_ns: CpuNs::new(0),
+            alloc: AllocDelta::ZERO,
         }],
         vec![FnAgg {
-            name_id: 0,
+            name_id: NameId::new(0),
             calls: 1,
-            self_ns: 200,
-            inclusive_ns: 200,
-            cpu_self_ns: 0,
-            alloc_count: 0,
-            alloc_bytes: 0,
-            free_count: 0,
-            free_bytes: 0,
+            self_ns: WallNs::new(200),
+            inclusive_ns: WallNs::new(200),
+            cpu_self_ns: CpuNs::new(0),
+            alloc: AllocDelta::ZERO,
         }],
     ];
 
@@ -115,15 +137,17 @@ fn multi_thread_aggregates_have_distinct_thread_indices() {
 #[test]
 fn stack_serializer_produces_valid_ndjson() {
     let agg = FnAgg {
-        name_id: 3,
+        name_id: NameId::new(3),
         calls: 42,
-        self_ns: 999,
-        inclusive_ns: 1500,
-        cpu_self_ns: 200,
-        alloc_count: 7,
-        alloc_bytes: 256,
-        free_count: 2,
-        free_bytes: 64,
+        self_ns: WallNs::new(999),
+        inclusive_ns: WallNs::new(1500),
+        cpu_self_ns: CpuNs::new(200),
+        alloc: AllocDelta {
+            alloc_count: 7,
+            alloc_bytes: 256,
+            free_count: 2,
+            free_bytes: 64,
+        },
     };
 
     let mut stack_buf = [0u8; 512];
@@ -141,15 +165,17 @@ fn stack_serializer_produces_valid_ndjson() {
 #[test]
 fn stack_serializer_matches_write_aggregates() {
     let agg = FnAgg {
-        name_id: 3,
+        name_id: NameId::new(3),
         calls: 42,
-        self_ns: 999,
-        inclusive_ns: 1500,
-        cpu_self_ns: 200,
-        alloc_count: 7,
-        alloc_bytes: 256,
-        free_count: 2,
-        free_bytes: 64,
+        self_ns: WallNs::new(999),
+        inclusive_ns: WallNs::new(1500),
+        cpu_self_ns: CpuNs::new(200),
+        alloc: AllocDelta {
+            alloc_count: 7,
+            alloc_bytes: 256,
+            free_count: 2,
+            free_bytes: 64,
+        },
     };
 
     let mut formatted_buf = Vec::new();
@@ -183,8 +209,8 @@ fn ndjson_format_contract_header() {
     write_header(
         &mut buf,
         &[(0, "work"), (1, "helper")],
-        8,
-        3,
+        WallNs::new(8),
+        CpuNs::new(3),
         "abc_1000",
         1700000000000,
     )
@@ -214,7 +240,7 @@ fn ndjson_format_contract_header() {
 #[test]
 fn ndjson_format_contract_trailer() {
     let mut buf = Vec::new();
-    write_trailer(&mut buf, &[(0, "work")], 8, 3).unwrap();
+    write_trailer(&mut buf, &[(0, "work")], WallNs::new(8), CpuNs::new(3)).unwrap();
     let line = String::from_utf8(buf).unwrap();
 
     let required_fields = [
@@ -237,15 +263,17 @@ fn ndjson_format_contract_trailer() {
 #[test]
 fn ndjson_format_contract_aggregate() {
     let agg = FnAgg {
-        name_id: 5,
+        name_id: NameId::new(5),
         calls: 100,
-        self_ns: 5000,
-        inclusive_ns: 8000,
-        cpu_self_ns: 3000,
-        alloc_count: 10,
-        alloc_bytes: 1024,
-        free_count: 5,
-        free_bytes: 512,
+        self_ns: WallNs::new(5000),
+        inclusive_ns: WallNs::new(8000),
+        cpu_self_ns: CpuNs::new(3000),
+        alloc: AllocDelta {
+            alloc_count: 10,
+            alloc_bytes: 1024,
+            free_count: 5,
+            free_bytes: 512,
+        },
     };
     let mut buf = Vec::new();
     write_aggregates(&mut buf, &[vec![agg]]).unwrap();
@@ -281,8 +309,8 @@ fn header_with_multiple_names_has_correct_separators() {
     write_header(
         &mut buf,
         &[(0, "alpha"), (1, "beta"), (2, "gamma")],
-        8,
-        3,
+        WallNs::new(8),
+        CpuNs::new(3),
         "test_run",
         1000,
     )
@@ -319,8 +347,8 @@ fn json_escaping_handles_special_characters() {
             (4, "has\ttab"),
             (5, "has\x01control"),
         ],
-        0,
-        0,
+        WallNs::new(0),
+        CpuNs::new(0),
         "test",
         0,
     )
