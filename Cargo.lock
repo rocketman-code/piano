@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "piano"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anstream 0.6.21",
  "anstyle",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "piano-runtime"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "criterion",
  "piano-runtime",
