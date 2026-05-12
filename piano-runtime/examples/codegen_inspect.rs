@@ -20,7 +20,7 @@
 // functions in release mode, making cargo-asm unable to find the symbol.
 #![allow(unused)]
 
-use piano_runtime::time::read;
+use piano_runtime::time::{read, Ticks};
 use std::hint::black_box;
 
 // ---------------------------------------------------------------------------
@@ -29,7 +29,7 @@ use std::hint::black_box;
 
 /// Contains a TSC read (rdtsc on x86, mrs cntvct_el0 on aarch64).
 #[inline(never)]
-pub fn metrology_has_rdtsc() -> u64 {
+pub fn metrology_has_rdtsc() -> Ticks {
     read()
 }
 
@@ -68,7 +68,7 @@ pub fn tm6_positive() -> u64 {
 
 /// Negative: bookkeeping between fence and TSC (broken pattern).
 #[inline(never)]
-pub fn tm6_negative() -> u64 {
+pub fn tm6_negative() -> Ticks {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     black_box(99u64);
     read()
@@ -91,7 +91,7 @@ pub fn tm7_positive() -> u64 {
 
 /// Negative: inline TSC only, no function call.
 #[inline(never)]
-pub fn tm7_negative() -> u64 {
+pub fn tm7_negative() -> Ticks {
     let t = read();
     black_box(t)
 }
