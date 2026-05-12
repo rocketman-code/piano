@@ -12,12 +12,12 @@ fn record_alloc_increments_counters() {
         record_alloc(200);
         let after = snapshot_alloc_counters();
         assert_eq!(
-            after.alloc_count - before.alloc_count,
+            after.alloc_count() - before.alloc_count(),
             2,
             "should record 2 allocs"
         );
         assert_eq!(
-            after.alloc_bytes - before.alloc_bytes,
+            after.alloc_bytes() - before.alloc_bytes(),
             300,
             "should record 300 bytes"
         );
@@ -37,12 +37,12 @@ fn reentrancy_guard_excludes_allocs() {
         } // guard dropped, reentrancy exits
         let after = snapshot_alloc_counters();
         assert_eq!(
-            after.alloc_count - before.alloc_count,
+            after.alloc_count() - before.alloc_count(),
             0,
             "guarded allocs should not count"
         );
         assert_eq!(
-            after.alloc_bytes - before.alloc_bytes,
+            after.alloc_bytes() - before.alloc_bytes(),
             0,
             "guarded bytes should not count"
         );
@@ -67,7 +67,7 @@ fn nested_reentrancy() {
         } // outer dropped (counter=0)
         let after = snapshot_alloc_counters();
         assert_eq!(
-            after.alloc_count - before.alloc_count,
+            after.alloc_count() - before.alloc_count(),
             0,
             "all allocs inside nested guards should be excluded"
         );
@@ -106,11 +106,13 @@ fn cross_thread_isolation() {
 
         // Fresh thread TLS starts at 0 -- property of new threads
         assert_eq!(
-            child_snap.alloc_count, 0,
+            child_snap.alloc_count(),
+            0,
             "child should have independent alloc count"
         );
         assert_eq!(
-            child_snap.alloc_bytes, 0,
+            child_snap.alloc_bytes(),
+            0,
             "child should have independent alloc bytes"
         );
     })

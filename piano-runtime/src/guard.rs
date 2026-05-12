@@ -15,7 +15,7 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::aggregator;
-use crate::alloc::{snapshot_alloc_counters, ProfilerBookkeeping};
+use crate::alloc::{snapshot_alloc_counters, AllocSnapshot, ProfilerBookkeeping};
 use crate::children;
 use crate::cpu_clock::{cpu_now_ns, CpuNs};
 use crate::session::ProfileSession;
@@ -36,10 +36,7 @@ pub struct Guard {
     cpu_time_enabled: bool,
     cpu_start: CpuNs,
     start_ticks: Ticks,
-    alloc_count_start: u64,
-    alloc_bytes_start: u64,
-    free_count_start: u64,
-    free_bytes_start: u64,
+    alloc_start: AllocSnapshot,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -71,10 +68,7 @@ impl Guard {
             cpu_time_enabled: false,
             cpu_start: CpuNs::ZERO,
             start_ticks: Ticks(0),
-            alloc_count_start: 0,
-            alloc_bytes_start: 0,
-            free_count_start: 0,
-            free_bytes_start: 0,
+            alloc_start: AllocSnapshot::ZERO,
             _not_send: PhantomData,
         }
     }
@@ -103,10 +97,7 @@ impl Guard {
             cpu_time_enabled: session.cpu_time_enabled,
             cpu_start,
             start_ticks: Ticks(0),
-            alloc_count_start: snap.alloc_count,
-            alloc_bytes_start: snap.alloc_bytes,
-            free_count_start: snap.free_count,
-            free_bytes_start: snap.free_bytes,
+            alloc_start: snap,
             _not_send: PhantomData,
         }
     }
@@ -136,6 +127,7 @@ impl Drop for Guard {
             CpuNs::ZERO
         };
         let snap_end = snapshot_alloc_counters();
+        let alloc_delta = snap_end.delta_since(&self.alloc_start);
 
         let start_ns = session.calibration.now_ns(self.start_ticks);
         let end_ns = session.calibration.now_ns(end_ticks);
@@ -151,10 +143,10 @@ impl Drop for Guard {
             self_ns.0,
             inclusive_ns.0,
             cpu_self_ns.0,
-            snap_end.alloc_count.saturating_sub(self.alloc_count_start),
-            snap_end.alloc_bytes.saturating_sub(self.alloc_bytes_start),
-            snap_end.free_count.saturating_sub(self.free_count_start),
-            snap_end.free_bytes.saturating_sub(self.free_bytes_start),
+            alloc_delta.alloc_count,
+            alloc_delta.alloc_bytes,
+            alloc_delta.free_count,
+            alloc_delta.free_bytes,
             &session.agg_registry,
         );
 
