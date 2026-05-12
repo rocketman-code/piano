@@ -8,7 +8,7 @@
 //! - Guard is !Send. Alloc deltas are computed on the same thread as
 //!   creation. Enforcement: PhantomData<*const ()>.
 //! - Profiler bookkeeping allocs are excluded from user counts.
-//!   Enforcement: ReentrancyGuard (RAII) wraps creation and drop.
+//!   Enforcement: ProfilerBookkeeping proof token wraps creation and drop.
 //! - Guard never panics. All arithmetic uses saturating_sub.
 //! - TLS children_ns is saved/restored on create/drop (RAII stack discipline).
 
