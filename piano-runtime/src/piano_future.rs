@@ -27,12 +27,13 @@ use crate::children;
 use crate::cpu_clock::CpuNs;
 use crate::session::ProfileSession;
 use crate::time::{read, Ticks, WallNs};
+use crate::NameId;
 
 /// Future wrapper for async function instrumentation.
 pub struct PianoFuture<F> {
     inner: F,
     session: Option<&'static ProfileSession>,
-    name_id: u32,
+    name_id: NameId,
     start_ticks: Ticks,
     saved_children_ns: WallNs,
     alloc_acc: AllocDelta,
@@ -46,13 +47,14 @@ pub struct PianoFuture<F> {
 /// If profiling is not active, returns a transparent wrapper whose
 /// poll delegates directly to the inner future with no overhead.
 pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
+    let name_id = NameId(name_id);
     let session = match ProfileSession::get() {
         Some(s) => s,
         None => {
             return PianoFuture {
                 inner: body,
                 session: None,
-                name_id: 0,
+                name_id: NameId(0),
                 start_ticks: Ticks(0),
                 saved_children_ns: WallNs::ZERO,
                 alloc_acc: AllocDelta::ZERO,
@@ -174,7 +176,7 @@ impl<F> PianoFuture<F> {
 
         aggregator::aggregate(
             &bookkeeping,
-            self.name_id,
+            self.name_id.0,
             self_ns.0,
             inclusive_ns.0,
             self.cpu_acc.0,

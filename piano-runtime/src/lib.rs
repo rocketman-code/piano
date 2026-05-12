@@ -59,6 +59,10 @@ pub mod piano_future;
 #[cfg(not(feature = "_test_internals"))]
 mod piano_future;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct NameId(pub(crate) u32);
+
 // Public API for rewriter-generated code
 pub use alloc::PianoAllocator;
 pub use guard::enter;
