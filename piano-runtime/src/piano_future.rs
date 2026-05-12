@@ -34,7 +34,7 @@ pub struct PianoFuture<F> {
     inner: F,
     session: Option<&'static ProfileSession>,
     name_id: NameId,
-    start_ticks: Ticks,
+    start_ticks: Option<Ticks>,
     saved_children_ns: WallNs,
     alloc_acc: AllocDelta,
     cpu_acc: CpuNs,
@@ -55,7 +55,7 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
                 inner: body,
                 session: None,
                 name_id: NameId(0),
-                start_ticks: Ticks(0),
+                start_ticks: None,
                 saved_children_ns: WallNs::ZERO,
                 alloc_acc: AllocDelta::ZERO,
                 cpu_acc: CpuNs::ZERO,
@@ -73,7 +73,7 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
         inner: body,
         session: Some(session),
         name_id,
-        start_ticks: Ticks(0),
+        start_ticks: None,
         saved_children_ns,
         alloc_acc: AllocDelta::ZERO,
         cpu_acc: CpuNs::ZERO,
@@ -110,8 +110,8 @@ impl<F: Future> Future for PianoFuture<F> {
             let _bookkeeping = ProfilerBookkeeping::enter();
             snap_start = snapshot_alloc_counters();
 
-            if this.start_ticks.0 == 0 {
-                this.start_ticks = read();
+            if this.start_ticks.is_none() {
+                this.start_ticks = Some(read());
             }
         }
 
@@ -162,14 +162,15 @@ impl<F: Future> Future for PianoFuture<F> {
 
 impl<F> PianoFuture<F> {
     fn emit(&mut self, session: &'static ProfileSession) {
-        if self.emitted || self.start_ticks.0 == 0 {
-            return;
-        }
+        let start_ticks = match self.start_ticks {
+            Some(t) if !self.emitted => t,
+            _ => return,
+        };
         self.emitted = true;
 
         let end_ticks = read();
         let bookkeeping = ProfilerBookkeeping::enter();
-        let start_ns = session.calibration.now_ns(self.start_ticks);
+        let start_ns = session.calibration.now_ns(start_ticks);
         let end_ns = session.calibration.now_ns(end_ticks);
         let inclusive_ns = end_ns.saturating_sub(start_ns);
         let self_ns = inclusive_ns.saturating_sub(self.children_ns_acc);
