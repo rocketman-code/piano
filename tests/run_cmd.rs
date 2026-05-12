@@ -194,9 +194,7 @@ fn profile_suppresses_no_runs_error_on_nonzero_exit() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let runtime_path = manifest_dir.join("piano-runtime");
 
-    // Create the runs dir so cmd_report hits NoRuns (empty dir) not an IO error.
     let runs_dir = tmp.path().join("runs");
-    fs::create_dir_all(&runs_dir).unwrap();
 
     let output = Command::new(piano_bin)
         .args(["profile", "--fn", "work", "--project"])
@@ -268,9 +266,7 @@ fn profile_ignore_exit_code_surfaces_no_data_written() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let runtime_path = manifest_dir.join("piano-runtime");
 
-    // Create the runs dir so cmd_report hits NoRuns (empty dir) not an IO error.
     let runs_dir = tmp.path().join("runs");
-    fs::create_dir_all(&runs_dir).unwrap();
 
     let output = Command::new(piano_bin)
         .args(["profile", "--fn", "work", "--ignore-exit-code", "--project"])
@@ -317,9 +313,7 @@ fn profile_propagates_child_exit_code() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let runtime_path = manifest_dir.join("piano-runtime");
 
-    // Create runs_dir so cmd_report hits NoRuns (empty dir), not an IO error.
     let runs_dir = tmp.path().join("runs");
-    fs::create_dir_all(&runs_dir).unwrap();
 
     let output = Command::new(piano_bin)
         .args(["profile", "--fn", "work", "--project"])
@@ -352,7 +346,6 @@ fn profile_ignore_exit_code_returns_success() {
     let runtime_path = manifest_dir.join("piano-runtime");
 
     let runs_dir = tmp.path().join("runs");
-    fs::create_dir_all(&runs_dir).unwrap();
 
     let output = Command::new(piano_bin)
         .args(["profile", "--fn", "work", "--ignore-exit-code", "--project"])
