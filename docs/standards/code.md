@@ -56,7 +56,7 @@ Integration tests in `tests/`. Unit tests in source files (`#[cfg(test)]` module
 
 ### ci.yml (all PRs + push to main)
 
-Eight jobs:
+Seven jobs:
 
 1. `fmt` (ubuntu-latest) -- `cargo fmt --check`
 2. `clippy` (ubuntu-latest) -- `cargo clippy --workspace --all-targets -- -D warnings`
@@ -65,7 +65,6 @@ Eight jobs:
 5. `doc` (ubuntu-latest) -- `cargo doc --workspace --no-deps` with `-D warnings`
 6. `coverage` (ubuntu-latest) -- `cargo llvm-cov --workspace --features piano-runtime/cpu-time --lcov`, uploads to Codecov
 7. `test-hygiene` (ubuntu-latest) -- rejects `std::env::set_var` / `remove_var` in `piano-runtime/src/` to prevent flaky test regressions
-8. `mutants` (ubuntu-latest) -- `cargo mutants --package piano-runtime --jobs 4 --timeout 120`
 
 ### release.yml (release/* PRs only)
 
@@ -73,12 +72,7 @@ Eight jobs:
 
 ## QA Infrastructure
 
-Three automated pillars supplement line coverage (CodeCov):
-
-### Mutation Testing (cargo-mutants)
-- Runs on every PR for `piano-runtime` (~3 min)
-- Survivors are test gaps -- fix by adding targeted tests
-- `cargo mutants --package piano-runtime --jobs 4 --timeout 120`
+Two automated pillars supplement line coverage (CodeCov):
 
 ### Property Testing (proptest)
 - `tests/proptest_rewrite.rs` generates random function signatures
