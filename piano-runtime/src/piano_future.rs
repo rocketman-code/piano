@@ -24,6 +24,7 @@ use core::task::{Context, Poll};
 use crate::aggregator;
 use crate::alloc::{snapshot_alloc_counters, ProfilerBookkeeping};
 use crate::children;
+use crate::cpu_clock::CpuNs;
 use crate::session::ProfileSession;
 use crate::time::{read, Ticks, WallNs};
 
@@ -38,7 +39,7 @@ pub struct PianoFuture<F> {
     alloc_bytes_acc: u64,
     free_count_acc: u64,
     free_bytes_acc: u64,
-    cpu_acc_ns: u64,
+    cpu_acc: CpuNs,
     children_ns_acc: WallNs,
     emitted: bool,
 }
@@ -61,7 +62,7 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
                 alloc_bytes_acc: 0,
                 free_count_acc: 0,
                 free_bytes_acc: 0,
-                cpu_acc_ns: 0,
+                cpu_acc: CpuNs::ZERO,
                 children_ns_acc: WallNs::ZERO,
                 emitted: true, // prevent emit on drop
             };
@@ -82,7 +83,7 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
         alloc_bytes_acc: 0,
         free_count_acc: 0,
         free_bytes_acc: 0,
-        cpu_acc_ns: 0,
+        cpu_acc: CpuNs::ZERO,
         children_ns_acc: WallNs::ZERO,
         emitted: false,
     }
@@ -126,7 +127,7 @@ impl<F: Future> Future for PianoFuture<F> {
         let cpu_poll_start = if session.cpu_time_enabled {
             crate::cpu_clock::cpu_now_ns()
         } else {
-            0
+            CpuNs::ZERO
         };
 
         // Poll inner future
@@ -138,7 +139,7 @@ impl<F: Future> Future for PianoFuture<F> {
         let cpu_poll_end = if session.cpu_time_enabled {
             crate::cpu_clock::cpu_now_ns()
         } else {
-            0
+            CpuNs::ZERO
         };
 
         compiler_fence(Ordering::SeqCst);
@@ -151,7 +152,7 @@ impl<F: Future> Future for PianoFuture<F> {
             this.alloc_bytes_acc += snap_end.alloc_bytes.saturating_sub(snap_start.alloc_bytes);
             this.free_count_acc += snap_end.free_count.saturating_sub(snap_start.free_count);
             this.free_bytes_acc += snap_end.free_bytes.saturating_sub(snap_start.free_bytes);
-            this.cpu_acc_ns += cpu_poll_end.saturating_sub(cpu_poll_start);
+            this.cpu_acc += cpu_poll_end.saturating_sub(cpu_poll_start);
         }
 
         // Accumulate children's inclusive time from this poll.
@@ -188,7 +189,7 @@ impl<F> PianoFuture<F> {
             self.name_id,
             self_ns.0,
             inclusive_ns.0,
-            self.cpu_acc_ns,
+            self.cpu_acc.0,
             self.alloc_count_acc,
             self.alloc_bytes_acc,
             self.free_count_acc,
