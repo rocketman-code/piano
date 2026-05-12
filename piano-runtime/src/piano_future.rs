@@ -12,7 +12,7 @@
 //! - Wall time starts on first poll, not construction.
 //! - Each poll saves/restores TLS children_ns (nested guards contribute).
 //! - Alloc deltas accumulated per-poll via snapshot_alloc_counters.
-//! - Bookkeeping allocs excluded via ReentrancyGuard.
+//! - Bookkeeping allocs excluded via ProfilerBookkeeping proof token.
 //! - Cancelled/panicking futures emit best-effort aggregate via Drop.
 //! - Never double-emits (emitted flag).
 
