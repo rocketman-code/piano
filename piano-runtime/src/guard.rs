@@ -20,6 +20,7 @@ use crate::children;
 use crate::cpu_clock::{cpu_now_ns, CpuNs};
 use crate::session::ProfileSession;
 use crate::time::{read, Ticks, WallNs};
+use crate::NameId;
 use std::marker::PhantomData;
 
 /// RAII sentinel for sync function instrumentation.
@@ -32,7 +33,7 @@ pub struct Guard {
     /// None = inactive (profiling not initialized). Drop is a no-op.
     session: Option<&'static ProfileSession>,
     saved_children_ns: WallNs,
-    name_id: u32,
+    name_id: NameId,
     cpu_time_enabled: bool,
     cpu_start: CpuNs,
     start_ticks: Ticks,
@@ -53,7 +54,7 @@ pub fn enter(name_id: u32) -> Guard {
         Some(s) => s,
         None => return Guard::inactive(),
     };
-    let mut guard = Guard::create(session, name_id);
+    let mut guard = Guard::create(session, NameId(name_id));
     guard.stamp();
     guard
 }
@@ -64,7 +65,7 @@ impl Guard {
         Self {
             session: None,
             saved_children_ns: WallNs::ZERO,
-            name_id: 0,
+            name_id: NameId(0),
             cpu_time_enabled: false,
             cpu_start: CpuNs::ZERO,
             start_ticks: Ticks(0),
@@ -79,7 +80,7 @@ impl Guard {
     /// NOT inlined: keeps the heavy bookkeeping (TLS, alloc snapshot)
     /// out of the caller. Only stamp() (one TSC read) is inlined.
     #[inline(never)]
-    fn create(session: &'static ProfileSession, name_id: u32) -> Self {
+    fn create(session: &'static ProfileSession, name_id: NameId) -> Self {
         let _bookkeeping = ProfilerBookkeeping::enter();
         let saved_children_ns = children::save_and_zero();
         let snap = snapshot_alloc_counters();
@@ -139,7 +140,7 @@ impl Drop for Guard {
 
         aggregator::aggregate(
             &bookkeeping,
-            self.name_id,
+            self.name_id.0,
             self_ns.0,
             inclusive_ns.0,
             cpu_self_ns.0,
