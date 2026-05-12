@@ -17,11 +17,11 @@ fn alloc_is_counted() {
 
         let after = snapshot_alloc_counters();
         assert!(
-            after.alloc_count - before.alloc_count >= 1,
+            after.alloc_count() - before.alloc_count() >= 1,
             "expected at least 1 alloc event"
         );
         assert!(
-            after.alloc_bytes - before.alloc_bytes >= 1024,
+            after.alloc_bytes() - before.alloc_bytes() >= 1024,
             "expected at least 1024 bytes"
         );
 
@@ -43,7 +43,7 @@ fn dealloc_does_not_count() {
 
         // Delta-based: no alloc events from dealloc
         assert_eq!(
-            after.alloc_count - before.alloc_count,
+            after.alloc_count() - before.alloc_count(),
             0,
             "dealloc should not increment count"
         );
@@ -65,7 +65,7 @@ fn realloc_counts_as_alloc_event() {
 
         let after = snapshot_alloc_counters();
         assert!(
-            after.alloc_count - before.alloc_count >= 1,
+            after.alloc_count() - before.alloc_count() >= 1,
             "expected allocations to be tracked during realloc growth",
         );
 
@@ -89,12 +89,12 @@ fn reentrancy_excludes_profiler_allocs() {
 
         let after = snapshot_alloc_counters();
         assert_eq!(
-            after.alloc_count - before.alloc_count,
+            after.alloc_count() - before.alloc_count(),
             0,
             "guarded allocs should not count"
         );
         assert_eq!(
-            after.alloc_bytes - before.alloc_bytes,
+            after.alloc_bytes() - before.alloc_bytes(),
             0,
             "guarded bytes should not count"
         );
@@ -130,7 +130,7 @@ fn cross_thread_alloc_isolation() {
             let v = std::hint::black_box(v);
             let after = snapshot_alloc_counters();
             drop(v);
-            after.alloc_count - before.alloc_count >= 1
+            after.alloc_count() - before.alloc_count() >= 1
         })
         .join()
         .expect("child panicked");
@@ -141,7 +141,7 @@ fn cross_thread_alloc_isolation() {
         // Parent's delta should not include child's explicit 2048-byte alloc.
         // Thread spawn overhead may cause small parent delta, but the child's
         // Vec allocation is on the child's TLS, not the parent's.
-        let parent_delta = parent_after.alloc_count - parent_before.alloc_count;
+        let parent_delta = parent_after.alloc_count() - parent_before.alloc_count();
         let _ = parent_delta; // verified structurally: child has independent TLS
     })
     .join()

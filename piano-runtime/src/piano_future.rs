@@ -22,7 +22,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::{Context, Poll};
 
 use crate::aggregator;
-use crate::alloc::{snapshot_alloc_counters, ProfilerBookkeeping};
+use crate::alloc::{snapshot_alloc_counters, AllocDelta, ProfilerBookkeeping};
 use crate::children;
 use crate::cpu_clock::CpuNs;
 use crate::session::ProfileSession;
@@ -35,10 +35,7 @@ pub struct PianoFuture<F> {
     name_id: u32,
     start_ticks: Ticks,
     saved_children_ns: WallNs,
-    alloc_count_acc: u64,
-    alloc_bytes_acc: u64,
-    free_count_acc: u64,
-    free_bytes_acc: u64,
+    alloc_acc: AllocDelta,
     cpu_acc: CpuNs,
     children_ns_acc: WallNs,
     emitted: bool,
@@ -58,10 +55,7 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
                 name_id: 0,
                 start_ticks: Ticks(0),
                 saved_children_ns: WallNs::ZERO,
-                alloc_count_acc: 0,
-                alloc_bytes_acc: 0,
-                free_count_acc: 0,
-                free_bytes_acc: 0,
+                alloc_acc: AllocDelta::ZERO,
                 cpu_acc: CpuNs::ZERO,
                 children_ns_acc: WallNs::ZERO,
                 emitted: true, // prevent emit on drop
@@ -79,10 +73,7 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
         name_id,
         start_ticks: Ticks(0),
         saved_children_ns,
-        alloc_count_acc: 0,
-        alloc_bytes_acc: 0,
-        free_count_acc: 0,
-        free_bytes_acc: 0,
+        alloc_acc: AllocDelta::ZERO,
         cpu_acc: CpuNs::ZERO,
         children_ns_acc: WallNs::ZERO,
         emitted: false,
@@ -148,10 +139,7 @@ impl<F: Future> Future for PianoFuture<F> {
             let _bookkeeping = ProfilerBookkeeping::enter();
             let snap_end = snapshot_alloc_counters();
 
-            this.alloc_count_acc += snap_end.alloc_count.saturating_sub(snap_start.alloc_count);
-            this.alloc_bytes_acc += snap_end.alloc_bytes.saturating_sub(snap_start.alloc_bytes);
-            this.free_count_acc += snap_end.free_count.saturating_sub(snap_start.free_count);
-            this.free_bytes_acc += snap_end.free_bytes.saturating_sub(snap_start.free_bytes);
+            this.alloc_acc += snap_end.delta_since(&snap_start);
             this.cpu_acc += cpu_poll_end.saturating_sub(cpu_poll_start);
         }
 
@@ -190,10 +178,10 @@ impl<F> PianoFuture<F> {
             self_ns.0,
             inclusive_ns.0,
             self.cpu_acc.0,
-            self.alloc_count_acc,
-            self.alloc_bytes_acc,
-            self.free_count_acc,
-            self.free_bytes_acc,
+            self.alloc_acc.alloc_count,
+            self.alloc_acc.alloc_bytes,
+            self.alloc_acc.free_count,
+            self.alloc_acc.free_bytes,
             &session.agg_registry,
         );
 

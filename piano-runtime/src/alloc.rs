@@ -25,10 +25,10 @@ use std::marker::PhantomData;
 /// (global allocator TLS with destructors is forbidden on older Rust versions).
 #[derive(Clone, Copy)]
 pub struct AllocSnapshot {
-    pub alloc_count: u64,
-    pub alloc_bytes: u64,
-    pub free_count: u64,
-    pub free_bytes: u64,
+    alloc_count: u64,
+    alloc_bytes: u64,
+    free_count: u64,
+    free_bytes: u64,
 }
 
 impl AllocSnapshot {
@@ -38,6 +38,58 @@ impl AllocSnapshot {
         free_count: 0,
         free_bytes: 0,
     };
+
+    pub fn delta_since(&self, start: &AllocSnapshot) -> AllocDelta {
+        AllocDelta {
+            alloc_count: self.alloc_count.saturating_sub(start.alloc_count),
+            alloc_bytes: self.alloc_bytes.saturating_sub(start.alloc_bytes),
+            free_count: self.free_count.saturating_sub(start.free_count),
+            free_bytes: self.free_bytes.saturating_sub(start.free_bytes),
+        }
+    }
+}
+
+#[cfg(feature = "_test_internals")]
+impl AllocSnapshot {
+    pub fn alloc_count(&self) -> u64 {
+        self.alloc_count
+    }
+    pub fn alloc_bytes(&self) -> u64 {
+        self.alloc_bytes
+    }
+    pub fn free_count(&self) -> u64 {
+        self.free_count
+    }
+    pub fn free_bytes(&self) -> u64 {
+        self.free_bytes
+    }
+}
+
+/// Delta of allocation counters between two points in time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AllocDelta {
+    pub alloc_count: u64,
+    pub alloc_bytes: u64,
+    pub free_count: u64,
+    pub free_bytes: u64,
+}
+
+impl AllocDelta {
+    pub const ZERO: Self = Self {
+        alloc_count: 0,
+        alloc_bytes: 0,
+        free_count: 0,
+        free_bytes: 0,
+    };
+}
+
+impl core::ops::AddAssign for AllocDelta {
+    fn add_assign(&mut self, rhs: Self) {
+        self.alloc_count += rhs.alloc_count;
+        self.alloc_bytes += rhs.alloc_bytes;
+        self.free_count += rhs.free_count;
+        self.free_bytes += rhs.free_bytes;
+    }
 }
 
 thread_local! {
