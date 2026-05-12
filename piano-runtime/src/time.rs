@@ -18,6 +18,37 @@ use std::sync::atomic::{compiler_fence, Ordering};
 use std::sync::Once;
 use std::time::Instant;
 
+/// Raw hardware counter value (TSC on x86_64, CNTVCT on aarch64,
+/// epoch-relative nanoseconds on fallback platforms).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(transparent)]
+pub struct Ticks(pub(crate) u64);
+
+impl Ticks {
+    pub(crate) fn wrapping_sub(self, other: Ticks) -> Ticks {
+        Ticks(self.0.wrapping_sub(other.0))
+    }
+}
+
+/// Calibrated wall-clock nanoseconds, epoch-relative.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(transparent)]
+pub struct WallNs(pub(crate) u64);
+
+impl WallNs {
+    pub(crate) const ZERO: Self = WallNs(0);
+
+    pub(crate) fn saturating_sub(self, other: WallNs) -> WallNs {
+        WallNs(self.0.saturating_sub(other.0))
+    }
+}
+
+impl core::ops::AddAssign for WallNs {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
 /// Immutable calibration snapshot. Copy-able, no atomics on access.
 ///
 /// Created once per process by `CalibrationData::calibrate()`, then
@@ -94,14 +125,14 @@ impl CalibrationData {
 
     /// Convert a raw tick value to epoch-relative nanoseconds.
     #[inline(always)]
-    pub fn now_ns(&self, raw_ticks: u64) -> u64 {
-        self.ticks_to_ns(raw_ticks.wrapping_sub(self.epoch_tsc))
+    pub fn now_ns(&self, raw_ticks: Ticks) -> WallNs {
+        WallNs(self.ticks_to_ns(raw_ticks.wrapping_sub(Ticks(self.epoch_tsc)).0))
     }
 
     /// Return the calibrated measurement bias in nanoseconds.
     #[inline(always)]
-    pub fn bias_ns(&self) -> u64 {
-        self.ticks_to_ns(self.bias_ticks)
+    pub fn bias_ns(&self) -> WallNs {
+        WallNs(self.ticks_to_ns(self.bias_ticks))
     }
 
     /// Return the calibrated CPU-time measurement bias in nanoseconds.
@@ -116,12 +147,12 @@ impl CalibrationData {
 /// On aarch64: mrs cntvct_el0 (~2-5ns).
 /// Fallback: Instant-based epoch-relative nanoseconds.
 #[inline(always)]
-pub fn read() -> u64 {
+pub fn read() -> Ticks {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: _rdtsc is a stable intrinsic that reads the timestamp counter.
     // No memory safety implications: returns a u64 counter value.
     unsafe {
-        core::arch::x86_64::_rdtsc()
+        Ticks(core::arch::x86_64::_rdtsc())
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -130,7 +161,7 @@ pub fn read() -> u64 {
         // SAFETY: mrs cntvct_el0 reads the generic timer counter register.
         // Architecturally guaranteed available at EL0 on all aarch64.
         unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) val) };
-        val
+        Ticks(val)
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -146,9 +177,11 @@ pub fn read() -> u64 {
             FALLBACK_ONCE.call_once(|| {
                 FALLBACK_EPOCH = Some(Instant::now());
             });
-            Instant::now()
-                .saturating_duration_since(FALLBACK_EPOCH.unwrap_or_else(Instant::now))
-                .as_nanos() as u64
+            Ticks(
+                Instant::now()
+                    .saturating_duration_since(FALLBACK_EPOCH.unwrap_or_else(Instant::now))
+                    .as_nanos() as u64,
+            )
         }
     }
 }
@@ -188,12 +221,12 @@ fn calibrate() -> (u64, u64, u64) {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let wall_start = Instant::now();
-        let tsc_start = read();
+        let tsc_start = read().0;
 
         let target = std::time::Duration::from_millis(CALIBRATION_SPIN_MS);
         while wall_start.elapsed() < target {}
 
-        let tsc_end = read();
+        let tsc_end = read().0;
         let wall_ns = wall_start.elapsed().as_nanos() as u64;
         let tsc_ticks = tsc_end.wrapping_sub(tsc_start);
 
@@ -227,9 +260,9 @@ fn calibrate_bias() -> u64 {
 
         let mut deltas = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
-            let start = read();
+            let start = read().0;
             compiler_fence(Ordering::SeqCst);
-            let end = read();
+            let end = read().0;
             deltas.push(end.wrapping_sub(start));
         }
         deltas.sort_unstable();
