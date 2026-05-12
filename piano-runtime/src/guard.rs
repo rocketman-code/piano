@@ -140,14 +140,11 @@ impl Drop for Guard {
 
         aggregator::aggregate(
             &bookkeeping,
-            self.name_id.0,
-            self_ns.0,
-            inclusive_ns.0,
-            cpu_self_ns.0,
-            alloc_delta.alloc_count,
-            alloc_delta.alloc_bytes,
-            alloc_delta.free_count,
-            alloc_delta.free_bytes,
+            self.name_id,
+            self_ns,
+            inclusive_ns,
+            cpu_self_ns,
+            alloc_delta,
             &session.agg_registry,
         );
 

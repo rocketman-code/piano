@@ -16,20 +16,20 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
-use crate::alloc::ProfilerBookkeeping;
+use crate::alloc::{AllocDelta, ProfilerBookkeeping};
+use crate::cpu_clock::CpuNs;
+use crate::time::WallNs;
+use crate::NameId;
 
 /// Per-function aggregated measurements.
 #[derive(Debug, Clone)]
 pub struct FnAgg {
-    pub name_id: u32,
+    pub name_id: NameId,
     pub calls: u64,
-    pub self_ns: u64,
-    pub inclusive_ns: u64,
-    pub cpu_self_ns: u64,
-    pub alloc_count: u64,
-    pub alloc_bytes: u64,
-    pub free_count: u64,
-    pub free_bytes: u64,
+    pub self_ns: WallNs,
+    pub inclusive_ns: WallNs,
+    pub cpu_self_ns: CpuNs,
+    pub alloc: AllocDelta,
 }
 
 /// Registry of per-thread aggregation buffers for shutdown drain.
@@ -45,17 +45,13 @@ thread_local! {
 /// Linear scan for matching name_id. If found, accumulates. If not, pushes.
 /// Initializes the thread's buffer and registers it on first call.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 pub fn aggregate(
     _bookkeeping: &ProfilerBookkeeping,
-    name_id: u32,
-    self_ns: u64,
-    inclusive_ns: u64,
-    cpu_self_ns: u64,
-    alloc_count: u64,
-    alloc_bytes: u64,
-    free_count: u64,
-    free_bytes: u64,
+    name_id: NameId,
+    self_ns: WallNs,
+    inclusive_ns: WallNs,
+    cpu_self_ns: CpuNs,
+    alloc_delta: AllocDelta,
     registry: &AggRegistry,
 ) {
     let _ = THREAD_AGG.try_with(|cell| {
@@ -80,10 +76,7 @@ pub fn aggregate(
             entry.self_ns += self_ns;
             entry.inclusive_ns += inclusive_ns;
             entry.cpu_self_ns += cpu_self_ns;
-            entry.alloc_count += alloc_count;
-            entry.alloc_bytes += alloc_bytes;
-            entry.free_count += free_count;
-            entry.free_bytes += free_bytes;
+            entry.alloc += alloc_delta;
         } else {
             buf.push(FnAgg {
                 name_id,
@@ -91,10 +84,7 @@ pub fn aggregate(
                 self_ns,
                 inclusive_ns,
                 cpu_self_ns,
-                alloc_count,
-                alloc_bytes,
-                free_count,
-                free_bytes,
+                alloc: alloc_delta,
             });
         }
     });

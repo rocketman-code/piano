@@ -63,6 +63,16 @@ mod piano_future;
 #[repr(transparent)]
 pub struct NameId(pub(crate) u32);
 
+#[cfg(feature = "_test_internals")]
+impl NameId {
+    pub fn new(v: u32) -> Self {
+        Self(v)
+    }
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
+
 // Public API for rewriter-generated code
 pub use alloc::PianoAllocator;
 pub use guard::enter;

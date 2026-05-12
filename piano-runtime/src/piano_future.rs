@@ -176,14 +176,11 @@ impl<F> PianoFuture<F> {
 
         aggregator::aggregate(
             &bookkeeping,
-            self.name_id.0,
-            self_ns.0,
-            inclusive_ns.0,
-            self.cpu_acc.0,
-            self.alloc_acc.alloc_count,
-            self.alloc_acc.alloc_bytes,
-            self.alloc_acc.free_count,
-            self.alloc_acc.free_bytes,
+            self.name_id,
+            self_ns,
+            inclusive_ns,
+            self.cpu_acc,
+            self.alloc_acc,
             &session.agg_registry,
         );
 
