@@ -9,11 +9,13 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [0.15.1] - 2026-05-11
 
-Fixes async allocation attribution for nested futures, so allocation counts stay focused on user code instead of profiler bookkeeping.
+Fixes async allocation attribution, a crash under timed profiling, and a platform-specific timing bug.
 
 ### Fixed
 
 - Async functions no longer count profiler bookkeeping allocations from completed nested futures as allocations in the enclosing async function.
+- Timed profiling (`--duration`) no longer fails with "No such file or directory" when the profiled process is killed before creating the runs directory (#635).
+- Async functions on non-x86/non-aarch64 platforms are no longer silently dropped from profiling output when the clock returns zero on its first read.
 
 ## [0.15.0] - 2026-04-25
 
