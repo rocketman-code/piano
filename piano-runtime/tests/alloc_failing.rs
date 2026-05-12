@@ -37,12 +37,12 @@ fn failed_alloc_not_counted() {
         assert!(ptr.is_null());
         let after = snapshot_alloc_counters();
         assert_eq!(
-            after.alloc_count - before.alloc_count,
+            after.alloc_count() - before.alloc_count(),
             0,
             "failed alloc should not be counted"
         );
         assert_eq!(
-            after.alloc_bytes - before.alloc_bytes,
+            after.alloc_bytes() - before.alloc_bytes(),
             0,
             "failed alloc bytes should be zero"
         );
@@ -62,12 +62,12 @@ fn failed_alloc_zeroed_not_counted() {
         assert!(ptr.is_null());
         let after = snapshot_alloc_counters();
         assert_eq!(
-            after.alloc_count - before.alloc_count,
+            after.alloc_count() - before.alloc_count(),
             0,
             "failed alloc_zeroed should not be counted"
         );
         assert_eq!(
-            after.alloc_bytes - before.alloc_bytes,
+            after.alloc_bytes() - before.alloc_bytes(),
             0,
             "failed alloc_zeroed bytes should be zero"
         );
@@ -87,7 +87,7 @@ fn failed_realloc_not_counted() {
         assert!(ptr.is_null());
         let after = snapshot_alloc_counters();
         assert_eq!(
-            after.alloc_count - before.alloc_count,
+            after.alloc_count() - before.alloc_count(),
             0,
             "failed realloc should not be counted"
         );
