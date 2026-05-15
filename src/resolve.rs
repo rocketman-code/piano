@@ -504,7 +504,7 @@ pub(crate) fn classify(is_const: bool, abi: Option<&str>) -> Classification {
 }
 
 /// Classify a CST function node using primitive properties extracted from the CST.
-fn classify_cst_fn(func: &ast::Fn) -> Classification {
+pub(crate) fn classify_cst_fn(func: &ast::Fn) -> Classification {
     let cst_abi = extract_cst_abi(func);
     classify(func.const_token().is_some(), cst_abi.as_deref())
 }
