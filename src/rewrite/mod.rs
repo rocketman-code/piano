@@ -48,15 +48,9 @@ struct ClassifiedImplFuture(Selected);
 struct ClassifiedSync(Selected);
 
 fn detect_instrumentable(func: ast::Fn) -> Option<Instrumentable> {
-    if func.const_token().is_some() {
+    let classification = crate::resolve::classify_cst_fn(&func);
+    if classification != crate::resolve::Classification::Instrumentable {
         return None;
-    }
-    if let Some(abi) = func.abi() {
-        if let Some(token) = abi.string_token() {
-            if token.text() != "\"Rust\"" {
-                return None;
-            }
-        }
     }
     let body = func.body()?;
     let stmt_list = body.stmt_list()?;
@@ -786,6 +780,18 @@ mod tests {
         let measured: HashMap<String, u32> = [("callback".into(), 0)].into_iter().collect();
         let result = instrument_source(source, &measured, None).unwrap();
         assert!(!result.source.contains("piano_runtime::enter"));
+    }
+
+    #[test]
+    fn skips_bare_extern_fn() {
+        let source = "extern fn callback(x: i32) -> i32 {\n    x + 1\n}\n";
+        let measured: HashMap<String, u32> = [("callback".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(
+            !result.source.contains("piano_runtime::enter"),
+            "bare extern fn has C ABI and must not be instrumented. Got:\n{}",
+            result.source,
+        );
     }
 
     #[test]
