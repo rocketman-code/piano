@@ -1162,6 +1162,28 @@ fn main() {}
     }
 
     #[test]
+    #[ignore = "known bug: macro-expanded fn inside impl gets bare name, not qualified"]
+    fn macro_fn_in_impl_block_gets_guard() {
+        let source = r#"
+struct S;
+macro_rules! make_method { () => { fn method(&self) { let _ = 1; } }; }
+impl S {
+    make_method!();
+}
+fn main() {}
+"#;
+        let measured: HashMap<String, u32> = [("S::method".into(), 0)].into_iter().collect();
+        let result =
+            instrument_source(source, &measured, None).expect("instrument_source should succeed");
+
+        assert!(
+            result.source.contains("piano_runtime::enter(0)"),
+            "macro-expanded fn inside impl should be instrumented with qualified name S::method. Got:\n{}",
+            result.source,
+        );
+    }
+
+    #[test]
     fn macro_mixed_measured_unmeasured() {
         let source = r#"
 macro_rules! pair { () => { fn tracked() { let _ = 1; } fn untracked() { let _ = 2; } }; }
