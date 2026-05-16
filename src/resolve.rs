@@ -361,33 +361,7 @@ pub(crate) fn extract_functions(
     for exp in &expansions {
         let call = &calls[exp.call_idx];
 
-        // Determine impl context from the macro call's position in the CST.
-        // Inline parent-walk with fn-break guard: macro-expanded fns are parsed
-        // from expanded text, so we can't call qualified_name_for_fn on them.
-        let impl_prefix = {
-            use ra_ap_syntax::TextSize;
-            let offset = TextSize::from(call.byte_start as u32);
-            file.syntax()
-                .token_at_offset(offset)
-                .right_biased()
-                .and_then(|token| {
-                    let mut node = token.parent();
-                    while let Some(n) = node {
-                        if let Some(imp) = ast::Impl::cast(n.clone()) {
-                            let self_ty = imp.self_ty()?;
-                            return Some(crate::naming::render_impl_name(
-                                &self_ty,
-                                imp.trait_().as_ref(),
-                            ));
-                        }
-                        if ast::Fn::can_cast(n.kind()) {
-                            break;
-                        }
-                        node = n.parent();
-                    }
-                    None
-                })
-        };
+        let impl_prefix = crate::naming::impl_prefix_at(file.syntax(), call.byte_start);
 
         for fn_name in &exp.fn_names {
             let qualified = if let Some(ref prefix) = impl_prefix {
