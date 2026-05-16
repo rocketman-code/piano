@@ -21,7 +21,7 @@ pub struct InstrumentResult {
 
 /// Parameters for entry-point-only injections (name table, allocator, lifecycle).
 pub struct EntryPointParams<'a> {
-    pub name_table: &'a [(u32, &'a str)],
+    pub name_table: &'a [(u32, &'a str, &'a str)],
     pub runs_dir: &'a str,
     pub cpu_time: bool,
 }
@@ -154,15 +154,15 @@ pub fn instrument_source(
     // --- Entry point: registrations appended after user code ---
     if let Some(ep) = entry_point {
         let mut entries = String::new();
-        for (id, name) in ep.name_table {
+        for (id, display, qualified) in ep.name_table {
             if !entries.is_empty() {
                 entries.push_str(", ");
             }
-            entries.push_str(&format!("({id}, \"{name}\")"));
+            entries.push_str(&format!("({id}, \"{display}\", \"{qualified}\")"));
         }
         injector.insert(
             source.len(),
-            format!("\nconst PIANO_NAMES: &[(u32, &str)] = &[{entries}];\n"),
+            format!("\nconst PIANO_NAMES: &[(u32, &str, &str)] = &[{entries}];\n"),
         );
     }
 
@@ -1173,7 +1173,7 @@ mod tests {
         let source = "fn work() {\n    1;\n}\nfn main() {\n    work();\n}\n";
         let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
         let ep = EntryPointParams {
-            name_table: &[(0, "work")],
+            name_table: &[(0, "work", "work")],
             runs_dir: "/tmp/runs",
             cpu_time: false,
         };
@@ -1187,7 +1187,7 @@ mod tests {
         // Name table
         assert!(result.source.contains("PIANO_NAMES"), "name table injected");
         assert!(
-            result.source.contains("(0, \"work\")"),
+            result.source.contains("(0, \"work\", \"work\")"),
             "name table has work"
         );
         // Allocator (case 1: absent)
@@ -1215,7 +1215,7 @@ mod tests {
         let source = "#[global_allocator]\nstatic ALLOC: MyAlloc = MyAlloc;\n\nfn work() {\n    1;\n}\nfn main() {\n    work();\n}\n";
         let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
         let ep = EntryPointParams {
-            name_table: &[(0, "work")],
+            name_table: &[(0, "work", "work")],
             runs_dir: "/tmp/runs",
             cpu_time: false,
         };

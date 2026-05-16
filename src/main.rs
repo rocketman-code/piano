@@ -729,18 +729,18 @@ fn build_project(
         })?
         .to_path_buf();
 
-    // Build the (id, display_name) name table sorted by id.
-    let mut name_table: Vec<(u32, String)> = global_name_ids
+    // Build the (id, display_name, qualified_name) name table sorted by id.
+    let mut name_table: Vec<(u32, String, String)> = global_name_ids
         .iter()
         .map(|(qualified, &id)| {
             let display = global_display_names
                 .get(qualified)
                 .cloned()
                 .unwrap_or_else(|| qualified.clone());
-            (id, display)
+            (id, display, qualified.clone())
         })
         .collect();
-    name_table.sort_by_key(|(id, _)| *id);
+    name_table.sort_by_key(|(id, _, _)| *id);
 
     // Collect files that the wrapper will modify (for error remapping)
     let mut modified_files: std::collections::HashSet<std::path::PathBuf> =
