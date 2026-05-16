@@ -1765,4 +1765,25 @@ fn main() {}
             "regular method should be impl-qualified"
         );
     }
+
+    #[test]
+    fn block_scoped_siblings_get_distinct_full_names() {
+        let source = r#"
+fn outer() {
+    fn helper() {}
+    {
+        fn helper() {}
+    }
+}
+"#;
+        let (functions, _skipped) = extract_functions(source, PathBuf::from("test.rs"));
+        let full_names: Vec<&str> = functions.iter().map(|f| f.full.as_str()).collect();
+        // "outer" is always distinct. The two "helper" fns must have different full names.
+        let helpers: Vec<&&str> = full_names.iter().filter(|n| n.contains("helper")).collect();
+        assert_eq!(helpers.len(), 2, "should find both helpers");
+        assert_ne!(
+            helpers[0], helpers[1],
+            "block-scoped siblings must have distinct full names"
+        );
+    }
 }
