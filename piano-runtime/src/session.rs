@@ -43,7 +43,7 @@ impl ProfileSession {
     pub fn init(
         file_sink: Option<Arc<FileSink>>,
         cpu_time_enabled: bool,
-        names: &'static [(u32, &'static str)],
+        names: &'static [(u32, &'static str, &'static str)],
         run_id: &str,
         timestamp_ms: u128,
     ) -> &'static Self {

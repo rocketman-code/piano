@@ -19,7 +19,7 @@ use crate::time::WallNs;
 /// Write the name table as a header line, including run metadata.
 pub fn write_header(
     w: &mut impl Write,
-    names: &[(u32, &str)],
+    names: &[(u32, &str, &str)],
     bias_ns: WallNs,
     cpu_bias_ns: CpuNs,
     run_id: &str,
@@ -35,12 +35,21 @@ pub fn write_header(
         w,
         "\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{"
     )?;
-    for (i, (id, name)) in names.iter().enumerate() {
+    for (i, (id, display, _)) in names.iter().enumerate() {
         if i > 0 {
             write!(w, ",")?;
         }
         write!(w, "\"{id}\":\"",)?;
-        write_json_escaped(w, name)?;
+        write_json_escaped(w, display)?;
+        write!(w, "\"")?;
+    }
+    write!(w, "}},\"qualified\":{{")?;
+    for (i, (id, _, qualified)) in names.iter().enumerate() {
+        if i > 0 {
+            write!(w, ",")?;
+        }
+        write!(w, "\"{id}\":\"",)?;
+        write_json_escaped(w, qualified)?;
         write!(w, "\"")?;
     }
     writeln!(w, "}}}}")
@@ -49,7 +58,7 @@ pub fn write_header(
 /// Write the name table as a trailer line.
 pub fn write_trailer(
     w: &mut impl Write,
-    names: &[(u32, &str)],
+    names: &[(u32, &str, &str)],
     bias_ns: WallNs,
     cpu_bias_ns: CpuNs,
 ) -> io::Result<()> {
@@ -57,7 +66,11 @@ pub fn write_trailer(
 }
 
 /// Serialize the trailer to a byte vector for signal-safe writing.
-pub fn serialize_trailer(names: &[(u32, &str)], bias_ns: WallNs, cpu_bias_ns: CpuNs) -> Vec<u8> {
+pub fn serialize_trailer(
+    names: &[(u32, &str, &str)],
+    bias_ns: WallNs,
+    cpu_bias_ns: CpuNs,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(b'\n');
     let _ = write_trailer(&mut buf, names, bias_ns, cpu_bias_ns);
@@ -166,7 +179,7 @@ pub fn serialize_aggregate_to_stack(
 fn write_name_table(
     w: &mut impl Write,
     kind: &str,
-    names: &[(u32, &str)],
+    names: &[(u32, &str, &str)],
     bias_ns: WallNs,
     cpu_bias_ns: CpuNs,
 ) -> io::Result<()> {
@@ -176,12 +189,21 @@ fn write_name_table(
         w,
         "{{\"type\":\"{kind}\",\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{"
     )?;
-    for (i, (id, name)) in names.iter().enumerate() {
+    for (i, (id, display, _)) in names.iter().enumerate() {
         if i > 0 {
             write!(w, ",")?;
         }
         write!(w, "\"{id}\":\"",)?;
-        write_json_escaped(w, name)?;
+        write_json_escaped(w, display)?;
+        write!(w, "\"")?;
+    }
+    write!(w, "}},\"qualified\":{{")?;
+    for (i, (id, _, qualified)) in names.iter().enumerate() {
+        if i > 0 {
+            write!(w, ",")?;
+        }
+        write!(w, "\"{id}\":\"",)?;
+        write_json_escaped(w, qualified)?;
         write!(w, "\"")?;
     }
     writeln!(w, "}}}}")

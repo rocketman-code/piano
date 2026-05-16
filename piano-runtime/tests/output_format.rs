@@ -15,7 +15,7 @@ fn header_contains_type_and_names() {
     let mut buf = Vec::new();
     write_header(
         &mut buf,
-        &[(0, "work"), (1, "helper")],
+        &[(0, "work", "work"), (1, "helper", "helper")],
         WallNs::new(8),
         CpuNs::new(0),
         "test",
@@ -37,7 +37,7 @@ fn trailer_shares_core_fields_with_header() {
     let mut hdr = Vec::new();
     write_header(
         &mut hdr,
-        &[(0, "a"), (1, "b")],
+        &[(0, "a", "a"), (1, "b", "b")],
         WallNs::new(5),
         CpuNs::new(0),
         "test",
@@ -47,7 +47,7 @@ fn trailer_shares_core_fields_with_header() {
     let mut trl = Vec::new();
     write_trailer(
         &mut trl,
-        &[(0, "a"), (1, "b")],
+        &[(0, "a", "a"), (1, "b", "b")],
         WallNs::new(5),
         CpuNs::new(0),
     )
@@ -208,7 +208,7 @@ fn ndjson_format_contract_header() {
     let mut buf = Vec::new();
     write_header(
         &mut buf,
-        &[(0, "work"), (1, "helper")],
+        &[(0, "work", "work"), (1, "helper", "helper")],
         WallNs::new(8),
         CpuNs::new(3),
         "abc_1000",
@@ -240,7 +240,13 @@ fn ndjson_format_contract_header() {
 #[test]
 fn ndjson_format_contract_trailer() {
     let mut buf = Vec::new();
-    write_trailer(&mut buf, &[(0, "work")], WallNs::new(8), CpuNs::new(3)).unwrap();
+    write_trailer(
+        &mut buf,
+        &[(0, "work", "work")],
+        WallNs::new(8),
+        CpuNs::new(3),
+    )
+    .unwrap();
     let line = String::from_utf8(buf).unwrap();
 
     let required_fields = [
@@ -308,7 +314,11 @@ fn header_with_multiple_names_has_correct_separators() {
     let mut buf = Vec::new();
     write_header(
         &mut buf,
-        &[(0, "alpha"), (1, "beta"), (2, "gamma")],
+        &[
+            (0, "alpha", "alpha"),
+            (1, "beta", "beta"),
+            (2, "gamma", "gamma"),
+        ],
         WallNs::new(8),
         CpuNs::new(3),
         "test_run",
@@ -340,12 +350,12 @@ fn json_escaping_handles_special_characters() {
     write_header(
         &mut buf,
         &[
-            (0, "has\"quote"),
-            (1, "has\\slash"),
-            (2, "has\nnewline"),
-            (3, "has\rcarriage"),
-            (4, "has\ttab"),
-            (5, "has\x01control"),
+            (0, "has\"quote", "has\"quote"),
+            (1, "has\\slash", "has\\slash"),
+            (2, "has\nnewline", "has\nnewline"),
+            (3, "has\rcarriage", "has\rcarriage"),
+            (4, "has\ttab", "has\ttab"),
+            (5, "has\x01control", "has\x01control"),
         ],
         WallNs::new(0),
         CpuNs::new(0),

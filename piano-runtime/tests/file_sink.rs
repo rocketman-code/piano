@@ -81,7 +81,7 @@ fn header_write_failure_increments_io_errors() {
         let sink = Arc::new(FileSink::new(read_only));
         let sink_ref = Arc::clone(&sink);
 
-        static NAMES: &[(u32, &str)] = &[(0, "test::func")];
+        static NAMES: &[(u32, &str, &str)] = &[(0, "test::func", "test::func")];
         ProfileSession::init(Some(sink_ref), false, NAMES, "test", 0);
 
         assert!(
