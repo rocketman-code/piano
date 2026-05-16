@@ -25,7 +25,7 @@ pub struct WrapperConfig {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EntryPointConfig {
     pub source_path: PathBuf,
-    pub name_table: Vec<(u32, String)>,
+    pub name_table: Vec<(u32, String, String)>,
     pub runs_dir: PathBuf,
     pub cpu_time: bool,
 }
@@ -189,11 +189,11 @@ fn rewrite_and_compile(
     let mut instrumented_files: Vec<(PathBuf, String)> = Vec::new();
 
     // Build entry point params (shared across all entry point calls)
-    let name_refs: Vec<(u32, &str)> = config
+    let name_refs: Vec<(u32, &str, &str)> = config
         .entry_point
         .name_table
         .iter()
-        .map(|(id, name)| (*id, name.as_str()))
+        .map(|(id, display, qualified)| (*id, display.as_str(), qualified.as_str()))
         .collect();
     let runs_dir_str = config.entry_point.runs_dir.to_string_lossy().to_string();
     let ep_params = EntryPointParams {
