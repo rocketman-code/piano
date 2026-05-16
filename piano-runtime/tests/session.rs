@@ -21,7 +21,7 @@ fn init_returns_static_ref() {
 #[test]
 fn get_returns_some_after_init() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[(0, "test::func")], "test", 0);
+        ProfileSession::init(None, false, &[(0, "test::func", "test::func")], "test", 0);
         let session = ProfileSession::get();
         assert!(session.is_some(), "get must return Some after init");
     })
@@ -32,7 +32,7 @@ fn get_returns_some_after_init() {
 #[test]
 fn cross_thread_access() {
     std::thread::spawn(|| {
-        ProfileSession::init(None, false, &[(0, "test::func")], "test", 0);
+        ProfileSession::init(None, false, &[(0, "test::func", "test::func")], "test", 0);
 
         let handles: Vec<_> = (0..4)
             .map(|_| {
@@ -70,7 +70,10 @@ fn writes_header_when_file_sink_provided() {
         let _session = ProfileSession::init(
             Some(fs),
             false,
-            &[(0, "test::work"), (1, "test::helper")],
+            &[
+                (0, "test::work", "test::work"),
+                (1, "test::helper", "test::helper"),
+            ],
             "test",
             0,
         );

@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, Once};
 
 struct ShutdownState {
     file_sink: Arc<FileSink>,
-    names: &'static [(u32, &'static str)],
+    names: &'static [(u32, &'static str, &'static str)],
     agg_registry: Arc<AggRegistry>,
 }
 
@@ -54,7 +54,7 @@ fn shutdown_state() -> &'static Mutex<Option<ShutdownState>> {
 /// Multiple calls overwrite the previous state (last RootCtx::new wins).
 pub(crate) fn register(
     file_sink: Arc<FileSink>,
-    names: &'static [(u32, &'static str)],
+    names: &'static [(u32, &'static str, &'static str)],
     agg_registry: Arc<AggRegistry>,
 ) {
     #[cfg(unix)]
@@ -236,7 +236,7 @@ mod signal {
     /// Register signal handlers. Pre-serializes the trailer, extracts the
     /// raw fd, and leaks the registry pointer for signal-safe access.
     pub(super) fn register(
-        names: &'static [(u32, &'static str)],
+        names: &'static [(u32, &'static str, &'static str)],
         file_sink: &Arc<FileSink>,
         agg_registry: &Arc<AggRegistry>,
     ) {

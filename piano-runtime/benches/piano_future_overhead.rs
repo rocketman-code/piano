@@ -10,17 +10,17 @@ use tokio::runtime::Runtime;
 #[global_allocator]
 static GLOBAL: PianoAllocator<System> = PianoAllocator::new(System);
 
-static NAMES: &[(u32, &str)] = &[
-    (1, "l1"),
-    (2, "l2"),
-    (3, "l3"),
-    (4, "l4"),
-    (5, "l5"),
-    (6, "l6"),
-    (7, "l7"),
-    (8, "l8"),
-    (9, "l9"),
-    (10, "l10"),
+static NAMES: &[(u32, &str, &str)] = &[
+    (1, "l1", "l1"),
+    (2, "l2", "l2"),
+    (3, "l3", "l3"),
+    (4, "l4", "l4"),
+    (5, "l5", "l5"),
+    (6, "l6", "l6"),
+    (7, "l7", "l7"),
+    (8, "l8", "l8"),
+    (9, "l9", "l9"),
+    (10, "l10", "l10"),
 ];
 
 fn rt() -> Runtime {

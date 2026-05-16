@@ -8,11 +8,11 @@ use piano_runtime::session::ProfileSession;
 use piano_runtime::PianoAllocator;
 use std::alloc::System;
 
-const PIANO_NAMES: &[(u32, &str)] = &[
-    (0, "measured_sync"),
-    (1, "measured_async"),
-    (2, "inner_fn"),
-    (3, "unsafe_measured"),
+const PIANO_NAMES: &[(u32, &str, &str)] = &[
+    (0, "measured_sync", "measured_sync"),
+    (1, "measured_async", "measured_async"),
+    (2, "inner_fn", "inner_fn"),
+    (3, "unsafe_measured", "unsafe_measured"),
 ];
 
 // --- Rewriter output patterns ---
@@ -134,10 +134,10 @@ fn inner_attrs_before_guard() {
 
 #[test]
 fn name_table_format() {
-    assert_eq!(PIANO_NAMES[0], (0, "measured_sync"));
-    assert_eq!(PIANO_NAMES[1], (1, "measured_async"));
-    assert_eq!(PIANO_NAMES[2], (2, "inner_fn"));
-    assert_eq!(PIANO_NAMES[3], (3, "unsafe_measured"));
+    assert_eq!(PIANO_NAMES[0], (0, "measured_sync", "measured_sync"));
+    assert_eq!(PIANO_NAMES[1], (1, "measured_async", "measured_async"));
+    assert_eq!(PIANO_NAMES[2], (2, "inner_fn", "inner_fn"));
+    assert_eq!(PIANO_NAMES[3], (3, "unsafe_measured", "unsafe_measured"));
 }
 
 #[test]
