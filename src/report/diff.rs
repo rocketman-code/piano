@@ -1369,4 +1369,98 @@ mod tests {
             "should match by name when identity is None: {diff}"
         );
     }
+
+    #[test]
+    fn diff_stable_identity_across_disambiguation_change() {
+        let dir = TempDir::new().unwrap();
+
+        // Run A: function displayed as "walk" (no disambiguation needed)
+        let ndjson_a = concat!(
+            r#"{"type":"header","run_id":"a","timestamp_ms":1000,"bias_ns":0,"cpu_bias_ns":0,"names":{"0":"walk"},"qualified":{"0":"mod::walker::walk"}}"#,
+            "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":10000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"type":"trailer","bias_ns":0,"cpu_bias_ns":0,"names":{"0":"walk"},"qualified":{"0":"mod::walker::walk"}}"#,
+            "\n",
+        );
+        // Run B: same function now displayed as "walker::walk" (disambiguation kicked in
+        // because another "walk" was added to the instrumented set)
+        let ndjson_b = concat!(
+            r#"{"type":"header","run_id":"b","timestamp_ms":2000,"bias_ns":0,"cpu_bias_ns":0,"names":{"0":"walker::walk"},"qualified":{"0":"mod::walker::walk"}}"#,
+            "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":8000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"type":"trailer","bias_ns":0,"cpu_bias_ns":0,"names":{"0":"walker::walk"},"qualified":{"0":"mod::walker::walk"}}"#,
+            "\n",
+        );
+
+        fs::write(dir.path().join("1000.ndjson"), ndjson_a).unwrap();
+        fs::write(dir.path().join("2000.ndjson"), ndjson_b).unwrap();
+
+        let (run_a, _) = load_ndjson(&dir.path().join("1000.ndjson"), false).unwrap();
+        let (run_b, _) = load_ndjson(&dir.path().join("2000.ndjson"), false).unwrap();
+
+        // Display names differ (disambiguation changed)
+        assert_ne!(run_a.functions[0].name, run_b.functions[0].name);
+        // Stable identity is the same
+        assert_eq!(run_a.functions[0].identity, run_b.functions[0].identity);
+        assert!(
+            run_a.functions[0].identity.is_some(),
+            "identity should be parsed"
+        );
+
+        // Diff should match by identity and show the delta
+        let diff = diff_runs(&run_a, &run_b, "before", "after", true, None);
+        assert!(
+            diff.contains("-2.00"),
+            "should show -2ms delta despite display name change: {diff}"
+        );
+
+        // JSON diff should also match by identity
+        let json = diff_runs_json(&run_a, &run_b, true, None);
+        let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 1, "should have exactly 1 matched entry");
+        assert!(
+            (entries[0].delta_ms - (-2.0)).abs() < 0.01,
+            "delta should be -2ms"
+        );
+    }
+
+    #[test]
+    fn diff_old_ndjson_without_qualified_falls_back_to_name() {
+        let dir = TempDir::new().unwrap();
+
+        // Old format: no "qualified" field
+        let ndjson_a = concat!(
+            r#"{"type":"header","run_id":"a","timestamp_ms":1000,"bias_ns":0,"cpu_bias_ns":0,"names":{"0":"work"}}"#,
+            "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":5000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"type":"trailer","bias_ns":0,"cpu_bias_ns":0,"names":{"0":"work"}}"#,
+            "\n",
+        );
+        let ndjson_b = concat!(
+            r#"{"type":"header","run_id":"b","timestamp_ms":2000,"bias_ns":0,"cpu_bias_ns":0,"names":{"0":"work"}}"#,
+            "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":8000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"type":"trailer","bias_ns":0,"cpu_bias_ns":0,"names":{"0":"work"}}"#,
+            "\n",
+        );
+
+        fs::write(dir.path().join("1000.ndjson"), ndjson_a).unwrap();
+        fs::write(dir.path().join("2000.ndjson"), ndjson_b).unwrap();
+
+        let (run_a, _) = load_ndjson(&dir.path().join("1000.ndjson"), false).unwrap();
+        let (run_b, _) = load_ndjson(&dir.path().join("2000.ndjson"), false).unwrap();
+
+        // No identity (old format)
+        assert!(run_a.functions[0].identity.is_none());
+        // Falls back to name matching and still shows delta
+        let diff = diff_runs(&run_a, &run_b, "before", "after", true, None);
+        assert!(
+            diff.contains("+3.00"),
+            "should match by name and show +3ms delta: {diff}"
+        );
+    }
 }
