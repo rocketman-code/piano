@@ -1805,4 +1805,29 @@ fn outer() {
             "block-scoped siblings must have distinct full names"
         );
     }
+
+    #[test]
+    fn impl_methods_in_different_fns_get_distinct_full_names() {
+        let source = r#"
+fn outer_a() {
+    struct S;
+    impl S { fn m() {} }
+}
+fn outer_b() {
+    struct S;
+    impl S { fn m() {} }
+}
+"#;
+        let (functions, _skipped) = extract_functions(source, PathBuf::from("test.rs"));
+        let sm_fns: Vec<&str> = functions
+            .iter()
+            .filter(|f| f.minimal.contains("S::m"))
+            .map(|f| f.full.as_str())
+            .collect();
+        assert_eq!(sm_fns.len(), 2, "should find both S::m");
+        assert_ne!(
+            sm_fns[0], sm_fns[1],
+            "S::m in different enclosing fns must have distinct full names"
+        );
+    }
 }
