@@ -5,7 +5,7 @@ use crate::error::Error;
 
 use super::{
     AllocDelta, CpuNs, FnAgg, FnEntry, NdjsonAggregate, NdjsonMeasurement, NdjsonNameTable, Run,
-    RunCompleteness, RunFormat, WallNs,
+    RunCompleteness, RunFormat, StableIdentity, WallNs,
 };
 
 const NS_PER_MS: f64 = 1_000_000.0;
@@ -79,7 +79,14 @@ pub fn load_ndjson(path: &Path, uncorrected: bool) -> Result<(Run, RunCompletene
         (aggregate_self_values(&self_values), has_cpu)
     };
 
-    let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
+    let functions = build_fn_entries(
+        &parsed.fn_names,
+        &parsed.fn_qualified,
+        &fn_agg,
+        has_cpu,
+        bias_ns,
+        cpu_bias_ns,
+    );
 
     let run = Run {
         run_id: parsed.run_id,
@@ -124,8 +131,14 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
                     free_bytes: a.free_bytes,
                 };
             }
-            let functions =
-                build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
+            let functions = build_fn_entries(
+                &parsed.fn_names,
+                &parsed.fn_qualified,
+                &fn_agg,
+                has_cpu,
+                bias_ns,
+                cpu_bias_ns,
+            );
             runs.push((
                 tid,
                 Run {
@@ -161,8 +174,14 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
         .into_iter()
         .map(|(tid, spans)| {
             let fn_agg = aggregate_self_values(spans);
-            let functions =
-                build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
+            let functions = build_fn_entries(
+                &parsed.fn_names,
+                &parsed.fn_qualified,
+                &fn_agg,
+                has_cpu,
+                bias_ns,
+                cpu_bias_ns,
+            );
             (
                 tid,
                 Run {
@@ -275,6 +294,7 @@ struct ParsedNdjson {
     run_id: Option<String>,
     timestamp_ms: u128,
     fn_names: Vec<String>,
+    fn_qualified: Vec<String>,
     measurements: Vec<NdjsonMeasurement>,
     aggregates: Vec<NdjsonAggregate>,
     completeness: RunCompleteness,
@@ -330,12 +350,17 @@ fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
         .get("cpu_bias_ns")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let header_qualified: HashMap<String, String> = header_value
+        .get("qualified")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
 
     // Parse body lines: aggregates, raw measurements, and trailer.
     let body = &all_lines[1..];
     let mut measurements: Vec<NdjsonMeasurement> = Vec::new();
     let mut aggregates: Vec<NdjsonAggregate> = Vec::new();
     let mut trailer_names: Option<HashMap<String, String>> = None;
+    let mut trailer_qualified: Option<HashMap<String, String>> = None;
     let mut completeness = RunCompleteness::Recovered;
 
     for line in body {
@@ -346,6 +371,7 @@ fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
         if let Ok(name_table) = serde_json::from_str::<NdjsonNameTable>(line) {
             if name_table.kind == "trailer" {
                 trailer_names = Some(name_table.names);
+                trailer_qualified = Some(name_table.qualified);
                 completeness = RunCompleteness::Complete;
                 continue;
             }
@@ -364,12 +390,19 @@ fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
     }
 
     let raw_names = trailer_names.unwrap_or(header.names);
+    let raw_qualified = trailer_qualified.unwrap_or(header_qualified);
     let fn_names = build_name_table(&raw_names);
+    let fn_qualified = if raw_qualified.is_empty() {
+        Vec::new()
+    } else {
+        build_name_table(&raw_qualified)
+    };
 
     Ok(ParsedNdjson {
         run_id,
         timestamp_ms,
         fn_names,
+        fn_qualified,
         measurements,
         aggregates,
         completeness,
@@ -402,6 +435,7 @@ fn aggregate_self_values<'a>(
 /// Correction is aggregate, not per-call, to avoid clipping individual samples.
 fn build_fn_entries(
     fn_names: &[String],
+    fn_qualified: &[String],
     fn_agg: &HashMap<u32, FnAgg>,
     has_cpu: bool,
     bias_ns: WallNs,
@@ -422,6 +456,10 @@ fn build_fn_entries(
                 .saturating_sub(CpuNs(cpu_bias_ns.0 * agg.calls));
             FnEntry {
                 name: name.clone(),
+                identity: fn_qualified
+                    .get(idx)
+                    .filter(|q| !q.is_empty())
+                    .map(|q| StableIdentity(q.clone())),
                 calls: agg.calls,
                 total_ms: if agg.inclusive_ns.0 > 0 {
                     Some(corrected_inclusive_ns.0 as f64 / NS_PER_MS)
@@ -516,6 +554,7 @@ fn merge_runs(runs: &[&Run]) -> Run {
         for f in &run.functions {
             let entry = merged.entry(f.name.clone()).or_insert(FnEntry {
                 name: f.name.clone(),
+                identity: f.identity.clone(),
                 calls: 0,
                 total_ms: None,
                 self_ms: 0.0,
