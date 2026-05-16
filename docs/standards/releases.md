@@ -36,7 +36,7 @@ Batch related changes, release when there's a meaningful set of user-facing chan
 3. `cargo clippy --workspace --all-targets -- -D warnings` clean
 4. `cargo doc --workspace --no-deps` builds without warnings
 5. Review README.md -- are all factual claims still true? (overhead numbers, bias numbers, limitations, Rust version, compatibility) Does this release add something that would change whether a new person tries piano?
-6. Update `CHANGELOG.md` (invoke the `changelog` skill -- entries must be user-facing, no internal jargon)
+6. Update `CHANGELOG.md` (entries must be user-facing, no internal jargon)
 7. Bump version in both `Cargo.toml` and `piano-runtime/Cargo.toml`
 8. Run `cargo generate-lockfile --ignore-rust-version` (without this flag, cargo constrains all workspace deps to the lowest member MSRV, downgrading shared dependencies like clap)
 9. Commit: `chore(cargo): bump version to 0.x.y` -- this commit may only touch `Cargo.toml`, `piano-runtime/Cargo.toml`, and `Cargo.lock` (CI enforces this on `release/*` PRs)
@@ -58,7 +58,7 @@ Format: `v0.x.y` (e.g., `v0.1.0`, `v0.2.0`). Tag the merge commit on main.
 Each release maps to a closed GitHub milestone.
 Update the changelog in the release PR, before merging and tagging.
 
-Standards (enforced by the `changelog` skill):
+Standards:
 - Every entry written for users, not the team -- no audit rounds, internal struct names, or milestone labels
 - One-sentence version summary explaining why to upgrade
 - Bullets ordered by impact (data loss > correctness > UX > cosmetic)

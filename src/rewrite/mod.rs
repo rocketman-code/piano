@@ -28,9 +28,8 @@ pub struct EntryPointParams<'a> {
 
 // ── Function classification pipeline ─────────────────────────────
 //
-// 5 types from the carve spec (docs/plans/piano-rewriter.carve).
-// Each classification step is a boundary parser that produces a typed
-// result. Transformation functions accept only the correct type.
+// Each classification step produces a typed result.
+// Transformation functions accept only the correct type.
 
 struct Instrumentable {
     func: ast::Fn,
