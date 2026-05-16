@@ -605,27 +605,46 @@ impl FnCollector {
         }
     }
 
-    /// Walk descendants of a function body to find nested items
-    /// (inner fns, impls, traits, modules defined inside function bodies).
+    /// Walk a function body to find nested items (inner fns, impls, traits)
+    /// using a structured walk that tracks BLOCK_EXPR boundaries for stable
+    /// identity naming via `push_block()`.
     fn walk_fn_body(&mut self, body: &ast::BlockExpr) {
-        // Walk direct statement-level items in the block.
-        // We need to handle nested items like:
-        //   fn outer() {
-        //     struct S;
-        //     impl S { fn m() {} }
-        //     fn inner() {}
-        //   }
-        // Use descendants to find nested items at any depth within the block.
-        for node in body.syntax().descendants() {
-            if node.kind() == SyntaxKind::FN {
-                // Skip the function itself (body's parent fn is already handled).
-                if node.text_range() == body.syntax().text_range() {
-                    continue;
+        let Some(stmt_list) = body.stmt_list() else {
+            return;
+        };
+        for node in stmt_list.syntax().children() {
+            self.walk_body_child(node);
+        }
+    }
+
+    fn walk_body_child(&mut self, node: ra_ap_syntax::SyntaxNode) {
+        let kind = node.kind();
+        if kind == SyntaxKind::FN {
+            if let Some(inner_fn) = ast::Fn::cast(node) {
+                let qualified = crate::naming::qualified_name_for_fn(&inner_fn);
+                self.visit_nested_fn(&inner_fn, &qualified);
+                // Recurse into nested fn's body for further nesting
+                self.scope.push_fn(&qualified);
+                if let Some(inner_body) = inner_fn.body() {
+                    self.walk_fn_body(&inner_body);
                 }
-                if let Some(inner_fn) = ast::Fn::cast(node.clone()) {
-                    let qualified = crate::naming::qualified_name_for_fn(&inner_fn);
-                    self.visit_nested_fn(&inner_fn, &qualified);
-                }
+                self.scope.pop();
+            }
+        } else if kind == SyntaxKind::BLOCK_EXPR {
+            if let Some(inner_block) = ast::BlockExpr::cast(node) {
+                self.scope.push_block();
+                self.walk_fn_body(&inner_block);
+                self.scope.pop();
+            }
+        } else if kind == SyntaxKind::IMPL {
+            if let Some(imp) = ast::Impl::cast(node) {
+                self.visit_impl(&imp);
+            }
+        } else {
+            // Recurse into expression statements, let statements, etc.
+            // to find blocks or nested items within them.
+            for child in node.children() {
+                self.walk_body_child(child);
             }
         }
     }
