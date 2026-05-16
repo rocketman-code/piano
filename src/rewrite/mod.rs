@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use ra_ap_syntax::ast::HasAttrs;
+use ra_ap_syntax::ast::{HasAttrs, HasModuleItem, HasName};
 use ra_ap_syntax::{AstNode, SourceFile, SyntaxKind, T, ast};
 
 use crate::source_map::StringInjector;
@@ -171,55 +171,9 @@ pub fn instrument_source(
         inject_allocator(&file, source, &mut injector)?;
     }
 
-    // --- Guards + shutdown: walk all descendants ---
-    for node in file.syntax().descendants() {
-        let Some(func) = ast::Fn::cast(node) else {
-            continue;
-        };
-
-        // Shutdown: inject lifecycle into fn main()
-        let fn_name = crate::naming::qualified_name_for_fn(&func);
-        if fn_name == "main" {
-            if let Some(ep) = entry_point {
-                let body = func
-                    .body()
-                    .ok_or_else(|| "no body for fn main".to_string())?;
-                let stmt_list = body
-                    .stmt_list()
-                    .ok_or_else(|| "no stmt_list for fn main".to_string())?;
-                let inject_offset = brace_offset_after_inner_attrs(&stmt_list)?;
-                injector.insert(
-                    inject_offset,
-                    build_lifecycle_prefix(ep.runs_dir, ep.cpu_time),
-                );
-            }
-            continue;
-        }
-
-        // Classification pipeline
-        let inst = match detect_instrumentable(func) {
-            Some(i) => i,
-            None => continue,
-        };
-        let sel = match apply_filter(inst, fn_name, measured) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let inject_offset = brace_offset_after_inner_attrs(&sel.inner.stmt_list)?;
-
-        match classify(sel) {
-            FunctionKind::Async(async_fn) => {
-                inject_async_wrap(&mut injector, &async_fn, inject_offset)?;
-            }
-            FunctionKind::ImplFuture(impl_fn) => {
-                inject_impl_future_wrap(&mut injector, &impl_fn, inject_offset)?;
-            }
-            FunctionKind::Sync(sync_fn) => {
-                inject_sync_guard(&mut injector, &sync_fn, inject_offset);
-            }
-        }
-    }
+    // --- Guards + shutdown: structured walk with scope tracking ---
+    let mut scope = crate::naming::ScopeState::new();
+    walk_for_guards(&file, &mut scope, measured, &mut injector, entry_point)?;
 
     // --- Macro expansion: replace fn-generating invocations ---
     expand_and_replace_macros(file.syntax(), measured, &mut injector);
@@ -247,6 +201,258 @@ fn brace_offset_after_inner_attrs(stmt_list: &ast::StmtList) -> Result<usize, St
         }
     }
     Ok(offset)
+}
+
+// ---------------------------------------------------------------------------
+// Structured walk with scope tracking (mirrors resolve.rs FnCollector)
+// ---------------------------------------------------------------------------
+
+/// Walk a source file structurally, tracking scope to produce full qualified
+/// names that match resolve.rs output.
+fn walk_for_guards(
+    file: &SourceFile,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+    entry_point: Option<&EntryPointParams<'_>>,
+) -> Result<(), String> {
+    for item in file.items() {
+        walk_item_for_guards(&item, scope, measured, injector, entry_point)?;
+    }
+    Ok(())
+}
+
+fn walk_item_for_guards(
+    item: &ast::Item,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+    entry_point: Option<&EntryPointParams<'_>>,
+) -> Result<(), String> {
+    match item {
+        ast::Item::Module(module) => {
+            let mod_name = module
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_else(|| "_".to_string());
+            scope.push_mod(&mod_name);
+            if let Some(item_list) = module.item_list() {
+                for child_item in item_list.items() {
+                    walk_item_for_guards(&child_item, scope, measured, injector, entry_point)?;
+                }
+            }
+            scope.pop();
+        }
+        ast::Item::Fn(func) => {
+            visit_top_level_fn_for_guards(func, scope, measured, injector, entry_point)?;
+        }
+        ast::Item::Impl(imp) => {
+            visit_impl_for_guards(imp, scope, measured, injector)?;
+        }
+        ast::Item::Trait(tr) => {
+            visit_trait_for_guards(tr, scope, measured, injector)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn visit_top_level_fn_for_guards(
+    func: &ast::Fn,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+    entry_point: Option<&EntryPointParams<'_>>,
+) -> Result<(), String> {
+    let bare_name = crate::naming::qualified_name_for_fn(func);
+
+    // Handle fn main() lifecycle injection
+    if bare_name == "main" {
+        if let Some(ep) = entry_point {
+            let body = func
+                .body()
+                .ok_or_else(|| "no body for fn main".to_string())?;
+            let stmt_list = body
+                .stmt_list()
+                .ok_or_else(|| "no stmt_list for fn main".to_string())?;
+            let inject_offset = brace_offset_after_inner_attrs(&stmt_list)?;
+            injector.insert(
+                inject_offset,
+                build_lifecycle_prefix(ep.runs_dir, ep.cpu_time),
+            );
+        }
+    } else {
+        // Instrument this function using full scoped name
+        let full_name = scope.render_full(&bare_name);
+        try_inject_guard(func.clone(), full_name, measured, injector)?;
+    }
+
+    // Push fn scope and walk body for nested items
+    let fn_name = func
+        .name()
+        .map(|n| n.text().to_string())
+        .unwrap_or_default();
+    scope.push_fn(&fn_name);
+    if let Some(body) = func.body() {
+        walk_fn_body_for_guards(body, scope, measured, injector)?;
+    }
+    scope.pop();
+    Ok(())
+}
+
+fn visit_impl_for_guards(
+    imp: &ast::Impl,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    if let Some(assoc_list) = imp.assoc_item_list() {
+        for assoc in assoc_list.assoc_items() {
+            if let ast::AssocItem::Fn(func) = assoc {
+                visit_impl_fn_for_guards(&func, scope, measured, injector)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn visit_impl_fn_for_guards(
+    func: &ast::Fn,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    let bare_qualified = crate::naming::qualified_name_for_fn(func);
+    let full_name = scope.render_full(&bare_qualified);
+    try_inject_guard(func.clone(), full_name, measured, injector)?;
+
+    // Push fn scope and walk body for nested items
+    let fn_name = func
+        .name()
+        .map(|n| n.text().to_string())
+        .unwrap_or_default();
+    scope.push_fn(&fn_name);
+    if let Some(body) = func.body() {
+        walk_fn_body_for_guards(body, scope, measured, injector)?;
+    }
+    scope.pop();
+    Ok(())
+}
+
+fn visit_trait_for_guards(
+    tr: &ast::Trait,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    if let Some(assoc_list) = tr.assoc_item_list() {
+        for assoc in assoc_list.assoc_items() {
+            if let ast::AssocItem::Fn(func) = assoc {
+                if func.body().is_some() {
+                    let bare_qualified = crate::naming::qualified_name_for_fn(&func);
+                    let full_name = scope.render_full(&bare_qualified);
+                    try_inject_guard(func.clone(), full_name, measured, injector)?;
+
+                    let fn_name = func
+                        .name()
+                        .map(|n| n.text().to_string())
+                        .unwrap_or_default();
+                    scope.push_fn(&fn_name);
+                    if let Some(body) = func.body() {
+                        walk_fn_body_for_guards(body, scope, measured, injector)?;
+                    }
+                    scope.pop();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk a function body to find nested items, tracking BLOCK_EXPR boundaries.
+fn walk_fn_body_for_guards(
+    body: ast::BlockExpr,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    let Some(stmt_list) = body.stmt_list() else {
+        return Ok(());
+    };
+    for node in stmt_list.syntax().children() {
+        walk_body_child_for_guards(node, scope, measured, injector)?;
+    }
+    Ok(())
+}
+
+fn walk_body_child_for_guards(
+    node: ra_ap_syntax::SyntaxNode,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    let kind = node.kind();
+    if kind == SyntaxKind::FN {
+        if let Some(inner_fn) = ast::Fn::cast(node) {
+            let bare_qualified = crate::naming::qualified_name_for_fn(&inner_fn);
+            let full_name = scope.render_full(&bare_qualified);
+            try_inject_guard(inner_fn.clone(), full_name, measured, injector)?;
+
+            // Recurse into nested fn's body
+            scope.push_fn(&bare_qualified);
+            if let Some(inner_body) = inner_fn.body() {
+                walk_fn_body_for_guards(inner_body, scope, measured, injector)?;
+            }
+            scope.pop();
+        }
+    } else if kind == SyntaxKind::BLOCK_EXPR {
+        if let Some(inner_block) = ast::BlockExpr::cast(node) {
+            scope.push_block();
+            walk_fn_body_for_guards(inner_block, scope, measured, injector)?;
+            scope.pop();
+        }
+    } else if kind == SyntaxKind::IMPL {
+        if let Some(imp) = ast::Impl::cast(node) {
+            visit_impl_for_guards(&imp, scope, measured, injector)?;
+        }
+    } else {
+        for child in node.children() {
+            walk_body_child_for_guards(child, scope, measured, injector)?;
+        }
+    }
+    Ok(())
+}
+
+/// Try to inject a guard into a function. Uses the shared classification pipeline.
+fn try_inject_guard(
+    func: ast::Fn,
+    full_name: String,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    let inst = match detect_instrumentable(func) {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+    let sel = match apply_filter(inst, full_name, measured) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    let inject_offset = brace_offset_after_inner_attrs(&sel.inner.stmt_list)?;
+
+    match classify(sel) {
+        FunctionKind::Async(async_fn) => {
+            inject_async_wrap(injector, &async_fn, inject_offset)?;
+        }
+        FunctionKind::ImplFuture(impl_fn) => {
+            inject_impl_future_wrap(injector, &impl_fn, inject_offset)?;
+        }
+        FunctionKind::Sync(sync_fn) => {
+            inject_sync_guard(injector, &sync_fn, inject_offset);
+        }
+    }
+    Ok(())
 }
 
 /// Check if a function's return type contains `impl Future`.
@@ -893,7 +1099,7 @@ mod tests {
     #[test]
     fn instruments_nested_function() {
         let source = "fn outer() {\n    fn inner() {\n        let x = 1;\n    }\n    inner();\n}\n";
-        let measured: HashMap<String, u32> = [("outer".into(), 0), ("inner".into(), 1)]
+        let measured: HashMap<String, u32> = [("outer".into(), 0), ("outer::inner".into(), 1)]
             .into_iter()
             .collect();
         let result = instrument_source(source, &measured, None).unwrap();
@@ -1082,12 +1288,12 @@ m!();
 
         let measured: HashMap<String, u32> = [
             ("free".into(), 0),
-            ("in_module".into(), 1),
+            ("inner::in_module".into(), 1),
             ("S::inherent_method".into(), 2),
             ("T::trait_default".into(), 3),
             ("<S as T>::trait_impl".into(), 4),
             ("<S as T>::trait_abstract".into(), 5),
-            ("nested".into(), 6),
+            ("outer::nested".into(), 6),
             ("outer".into(), 7),
             ("macro_fn".into(), 8),
         ]
