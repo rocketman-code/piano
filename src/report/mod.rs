@@ -1,3 +1,5 @@
+use std::ops::AddAssign;
+
 use anstyle::{Effects, Style};
 
 pub(crate) mod diff;
@@ -10,6 +12,58 @@ pub(crate) mod test_util;
 
 pub(super) const HEADER: Style = Style::new().bold();
 pub(super) const DIM: Style = Style::new().effects(Effects::DIMMED);
+
+/// Wall-clock nanoseconds (monotonic timestamp or duration).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(transparent)]
+pub(super) struct WallNs(pub(super) u64);
+
+impl WallNs {
+    pub(super) fn saturating_sub(self, rhs: Self) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+}
+
+impl AddAssign for WallNs {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+/// CPU-time nanoseconds (thread_clock or equivalent).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(transparent)]
+pub(super) struct CpuNs(pub(super) u64);
+
+impl CpuNs {
+    pub(super) fn saturating_sub(self, rhs: Self) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+}
+
+impl AddAssign for CpuNs {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+/// Allocation delta counters (alloc minus free).
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct AllocDelta {
+    pub(super) alloc_count: u64,
+    pub(super) alloc_bytes: u64,
+    pub(super) free_count: u64,
+    pub(super) free_bytes: u64,
+}
+
+impl AddAssign for AllocDelta {
+    fn add_assign(&mut self, rhs: Self) {
+        self.alloc_count += rhs.alloc_count;
+        self.alloc_bytes += rhs.alloc_bytes;
+        self.free_count += rhs.free_count;
+        self.free_bytes += rhs.free_bytes;
+    }
+}
 
 /// Describes the file format a Run was loaded from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -70,13 +124,10 @@ pub struct FnEntry {
 #[derive(Default, Clone, Copy)]
 pub(super) struct FnAgg {
     pub(super) calls: u64,
-    pub(super) self_ns: u64,
-    pub(super) inclusive_ns: u64,
-    pub(super) alloc_count: u64,
-    pub(super) alloc_bytes: u64,
-    pub(super) free_count: u64,
-    pub(super) free_bytes: u64,
-    pub(super) cpu_self_ns: u64,
+    pub(super) self_ns: WallNs,
+    pub(super) inclusive_ns: WallNs,
+    pub(super) cpu_self_ns: CpuNs,
+    pub(super) alloc: AllocDelta,
 }
 
 /// NDJSON header/trailer line.
@@ -101,14 +152,14 @@ pub(super) struct NdjsonMeasurement {
     pub(super) span_id: u64,
     pub(super) parent_span_id: u64,
     pub(super) name_id: u32,
-    pub(super) start_ns: u64,
-    pub(super) end_ns: u64,
+    pub(super) start_ns: WallNs,
+    pub(super) end_ns: WallNs,
     #[serde(default)]
     pub(super) thread_id: u64,
     #[serde(default)]
-    pub(super) cpu_start_ns: u64,
+    pub(super) cpu_start_ns: CpuNs,
     #[serde(default)]
-    pub(super) cpu_end_ns: u64,
+    pub(super) cpu_end_ns: CpuNs,
     pub(super) alloc_count: u64,
     pub(super) alloc_bytes: u64,
     #[serde(default)]
@@ -125,11 +176,11 @@ pub(super) struct NdjsonAggregate {
     pub(super) thread: u64,
     pub(super) name_id: u32,
     pub(super) calls: u64,
-    pub(super) self_ns: u64,
+    pub(super) self_ns: WallNs,
     #[serde(default)]
-    pub(super) inclusive_ns: u64,
+    pub(super) inclusive_ns: WallNs,
     #[serde(default)]
-    pub(super) cpu_self_ns: u64,
+    pub(super) cpu_self_ns: CpuNs,
     #[serde(default)]
     pub(super) alloc_count: u64,
     #[serde(default)]
