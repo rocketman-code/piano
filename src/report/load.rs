@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use crate::error::Error;
 
 use super::{
-    FnAgg, FnEntry, NdjsonAggregate, NdjsonMeasurement, NdjsonNameTable, Run, RunCompleteness,
-    RunFormat,
+    AllocDelta, CpuNs, FnAgg, FnEntry, NdjsonAggregate, NdjsonMeasurement, NdjsonNameTable, Run,
+    RunCompleteness, RunFormat, WallNs,
 };
 
 const NS_PER_MS: f64 = 1_000_000.0;
@@ -48,8 +48,8 @@ pub fn load_run(path: &Path) -> Result<Run, Error> {
 /// Aggregation groups self-attributed values by name_id.
 pub fn load_ndjson(path: &Path, uncorrected: bool) -> Result<(Run, RunCompleteness), Error> {
     let parsed = parse_ndjson(path)?;
-    let bias_ns = if uncorrected { 0 } else { parsed.bias_ns };
-    let cpu_bias_ns = if uncorrected { 0 } else { parsed.cpu_bias_ns };
+    let bias_ns = WallNs(if uncorrected { 0 } else { parsed.bias_ns });
+    let cpu_bias_ns = CpuNs(if uncorrected { 0 } else { parsed.cpu_bias_ns });
 
     let (fn_agg, has_cpu) = if !parsed.aggregates.is_empty() {
         // Aggregated format: self-time pre-computed by runtime
@@ -60,12 +60,14 @@ pub fn load_ndjson(path: &Path, uncorrected: bool) -> Result<(Run, RunCompletene
             entry.calls += a.calls;
             entry.self_ns += a.self_ns;
             entry.inclusive_ns += a.inclusive_ns;
-            entry.alloc_count += a.alloc_count;
-            entry.alloc_bytes += a.alloc_bytes;
-            entry.free_count += a.free_count;
-            entry.free_bytes += a.free_bytes;
             entry.cpu_self_ns += a.cpu_self_ns;
-            if a.cpu_self_ns > 0 {
+            entry.alloc += AllocDelta {
+                alloc_count: a.alloc_count,
+                alloc_bytes: a.alloc_bytes,
+                free_count: a.free_count,
+                free_bytes: a.free_bytes,
+            };
+            if a.cpu_self_ns.0 > 0 {
                 has_cpu = true;
             }
         }
@@ -73,7 +75,7 @@ pub fn load_ndjson(path: &Path, uncorrected: bool) -> Result<(Run, RunCompletene
     } else {
         // Raw spans format: compute self-time from span tree
         let self_values = compute_self_attribution(&parsed.measurements);
-        let has_cpu = parsed.measurements.iter().any(|m| m.cpu_end_ns > 0);
+        let has_cpu = parsed.measurements.iter().any(|m| m.cpu_end_ns.0 > 0);
         (aggregate_self_values(&self_values), has_cpu)
     };
 
@@ -93,8 +95,8 @@ pub fn load_ndjson(path: &Path, uncorrected: bool) -> Result<(Run, RunCompletene
 /// thread data (all thread_ids are zero or identical).
 pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<Vec<Run>>, Error> {
     let parsed = parse_ndjson(path)?;
-    let bias_ns = if uncorrected { 0 } else { parsed.bias_ns };
-    let cpu_bias_ns = if uncorrected { 0 } else { parsed.cpu_bias_ns };
+    let bias_ns = WallNs(if uncorrected { 0 } else { parsed.bias_ns });
+    let cpu_bias_ns = CpuNs(if uncorrected { 0 } else { parsed.cpu_bias_ns });
 
     // Aggregated format: group by thread field
     if !parsed.aggregates.is_empty() {
@@ -105,7 +107,7 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
             return Ok(None);
         }
 
-        let has_cpu = parsed.aggregates.iter().any(|a| a.cpu_self_ns > 0);
+        let has_cpu = parsed.aggregates.iter().any(|a| a.cpu_self_ns.0 > 0);
         let mut runs: Vec<(u64, Run)> = Vec::new();
         for &tid in &thread_ids {
             let mut fn_agg: HashMap<u32, FnAgg> = HashMap::new();
@@ -114,11 +116,13 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
                 entry.calls += a.calls;
                 entry.self_ns += a.self_ns;
                 entry.inclusive_ns += a.inclusive_ns;
-                entry.alloc_count += a.alloc_count;
-                entry.alloc_bytes += a.alloc_bytes;
-                entry.free_count += a.free_count;
-                entry.free_bytes += a.free_bytes;
                 entry.cpu_self_ns += a.cpu_self_ns;
+                entry.alloc += AllocDelta {
+                    alloc_count: a.alloc_count,
+                    alloc_bytes: a.alloc_bytes,
+                    free_count: a.free_count,
+                    free_bytes: a.free_bytes,
+                };
             }
             let functions =
                 build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
@@ -145,7 +149,7 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
     }
 
     let self_values = compute_self_attribution(&parsed.measurements);
-    let has_cpu = parsed.measurements.iter().any(|m| m.cpu_end_ns > 0);
+    let has_cpu = parsed.measurements.iter().any(|m| m.cpu_end_ns.0 > 0);
 
     // Group self-attributed values by thread_id.
     let mut by_thread: HashMap<u64, Vec<&SpanSelfValues>> = HashMap::new();
@@ -179,12 +183,17 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
 struct SpanSelfValues {
     name_id: u32,
     thread_id: u64,
-    self_wall_ns: u64,
-    self_cpu_ns: u64,
-    self_alloc_count: u64,
-    self_alloc_bytes: u64,
-    self_free_count: u64,
-    self_free_bytes: u64,
+    self_wall_ns: WallNs,
+    self_cpu_ns: CpuNs,
+    self_alloc: AllocDelta,
+}
+
+/// Accumulated children's inclusive values for a parent span.
+#[derive(Default, Clone, Copy)]
+struct ChildrenSums {
+    wall: WallNs,
+    cpu: CpuNs,
+    alloc: AllocDelta,
 }
 
 /// Compute self-attribution for every span in the measurement list.
@@ -200,17 +209,18 @@ fn compute_self_attribution(measurements: &[NdjsonMeasurement]) -> Vec<SpanSelfV
         .collect();
 
     // For each span, accumulate the sum of its direct children's inclusive values.
-    // Key: parent_span_id, Value: (sum_wall, sum_cpu, sum_alloc_count, sum_alloc_bytes, sum_free_count, sum_free_bytes).
-    let mut children_sums: HashMap<u64, (u64, u64, u64, u64, u64, u64)> = HashMap::new();
+    let mut children_sums: HashMap<u64, ChildrenSums> = HashMap::new();
     for m in measurements {
         if m.parent_span_id != 0 && span_index.contains_key(&m.parent_span_id) {
             let entry = children_sums.entry(m.parent_span_id).or_default();
-            entry.0 += m.end_ns.saturating_sub(m.start_ns);
-            entry.1 += m.cpu_end_ns.saturating_sub(m.cpu_start_ns);
-            entry.2 += m.alloc_count;
-            entry.3 += m.alloc_bytes;
-            entry.4 += m.free_count;
-            entry.5 += m.free_bytes;
+            entry.wall += m.end_ns.saturating_sub(m.start_ns);
+            entry.cpu += m.cpu_end_ns.saturating_sub(m.cpu_start_ns);
+            entry.alloc += AllocDelta {
+                alloc_count: m.alloc_count,
+                alloc_bytes: m.alloc_bytes,
+                free_count: m.free_count,
+                free_bytes: m.free_bytes,
+            };
         }
     }
 
@@ -219,18 +229,19 @@ fn compute_self_attribution(measurements: &[NdjsonMeasurement]) -> Vec<SpanSelfV
         .map(|m| {
             let wall = m.end_ns.saturating_sub(m.start_ns);
             let cpu = m.cpu_end_ns.saturating_sub(m.cpu_start_ns);
-            let (child_wall, child_cpu, child_ac, child_ab, child_fc, child_fb) =
-                children_sums.get(&m.span_id).copied().unwrap_or_default();
+            let cs = children_sums.get(&m.span_id).copied().unwrap_or_default();
 
             SpanSelfValues {
                 name_id: m.name_id,
                 thread_id: m.thread_id,
-                self_wall_ns: wall.saturating_sub(child_wall),
-                self_cpu_ns: cpu.saturating_sub(child_cpu),
-                self_alloc_count: m.alloc_count.saturating_sub(child_ac),
-                self_alloc_bytes: m.alloc_bytes.saturating_sub(child_ab),
-                self_free_count: m.free_count.saturating_sub(child_fc),
-                self_free_bytes: m.free_bytes.saturating_sub(child_fb),
+                self_wall_ns: wall.saturating_sub(cs.wall),
+                self_cpu_ns: cpu.saturating_sub(cs.cpu),
+                self_alloc: AllocDelta {
+                    alloc_count: m.alloc_count.saturating_sub(cs.alloc.alloc_count),
+                    alloc_bytes: m.alloc_bytes.saturating_sub(cs.alloc.alloc_bytes),
+                    free_count: m.free_count.saturating_sub(cs.alloc.free_count),
+                    free_bytes: m.free_bytes.saturating_sub(cs.alloc.free_bytes),
+                },
             }
         })
         .collect()
@@ -377,10 +388,7 @@ fn aggregate_self_values<'a>(
         agg.calls += 1;
         agg.self_ns += sv.self_wall_ns;
         agg.cpu_self_ns += sv.self_cpu_ns;
-        agg.alloc_count += sv.self_alloc_count;
-        agg.alloc_bytes += sv.self_alloc_bytes;
-        agg.free_count += sv.self_free_count;
-        agg.free_bytes += sv.self_free_bytes;
+        agg.alloc += sv.self_alloc;
     }
     fn_agg
 }
@@ -396,8 +404,8 @@ fn build_fn_entries(
     fn_names: &[String],
     fn_agg: &HashMap<u32, FnAgg>,
     has_cpu: bool,
-    bias_ns: u64,
-    cpu_bias_ns: u64,
+    bias_ns: WallNs,
+    cpu_bias_ns: CpuNs,
 ) -> Vec<FnEntry> {
     fn_names
         .iter()
@@ -405,27 +413,31 @@ fn build_fn_entries(
         .map(|(idx, name)| {
             let name_id = idx as u32;
             let agg = fn_agg.get(&name_id).copied().unwrap_or_default();
-            let corrected_self_ns = agg.self_ns.saturating_sub(bias_ns * agg.calls);
-            let corrected_inclusive_ns = agg.inclusive_ns.saturating_sub(bias_ns * agg.calls);
-            let corrected_cpu_self_ns = agg.cpu_self_ns.saturating_sub(cpu_bias_ns * agg.calls);
+            let corrected_self_ns = agg.self_ns.saturating_sub(WallNs(bias_ns.0 * agg.calls));
+            let corrected_inclusive_ns = agg
+                .inclusive_ns
+                .saturating_sub(WallNs(bias_ns.0 * agg.calls));
+            let corrected_cpu_self_ns = agg
+                .cpu_self_ns
+                .saturating_sub(CpuNs(cpu_bias_ns.0 * agg.calls));
             FnEntry {
                 name: name.clone(),
                 calls: agg.calls,
-                total_ms: if agg.inclusive_ns > 0 {
-                    Some(corrected_inclusive_ns as f64 / NS_PER_MS)
+                total_ms: if agg.inclusive_ns.0 > 0 {
+                    Some(corrected_inclusive_ns.0 as f64 / NS_PER_MS)
                 } else {
                     None
                 },
-                self_ms: corrected_self_ns as f64 / NS_PER_MS,
+                self_ms: corrected_self_ns.0 as f64 / NS_PER_MS,
                 cpu_self_ms: if has_cpu {
-                    Some(corrected_cpu_self_ns as f64 / NS_PER_MS)
+                    Some(corrected_cpu_self_ns.0 as f64 / NS_PER_MS)
                 } else {
                     None
                 },
-                alloc_count: agg.alloc_count,
-                alloc_bytes: agg.alloc_bytes,
-                free_count: agg.free_count,
-                free_bytes: agg.free_bytes,
+                alloc_count: agg.alloc.alloc_count,
+                alloc_bytes: agg.alloc.alloc_bytes,
+                free_count: agg.alloc.free_count,
+                free_bytes: agg.alloc.free_bytes,
             }
         })
         .collect()
