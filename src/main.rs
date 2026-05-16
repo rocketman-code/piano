@@ -401,13 +401,13 @@ fn assign_name_ids(
         if qf.minimal == "main" {
             continue;
         }
-        name_ids.entry(qf.minimal.clone()).or_insert_with(|| {
+        name_ids.entry(qf.full.clone()).or_insert_with(|| {
             let id = next_id;
             next_id += 1;
             id
         });
         displays
-            .entry(qf.minimal.clone())
+            .entry(qf.full.clone())
             .or_insert_with(|| display.clone());
     }
     (name_ids, displays, next_id)
@@ -690,11 +690,12 @@ fn build_project(
             .functions
             .iter()
             .filter_map(|qf| {
-                let qualified = qualify(&prefix, &qf.minimal);
-                if measured_names.contains(&qualified) {
+                let qualified_full = qualify(&prefix, &qf.full);
+                let qualified_minimal = qualify(&prefix, &qf.minimal);
+                if measured_names.contains(&qualified_minimal) {
                     global_name_ids
-                        .get(&qualified)
-                        .map(|&id| (qf.minimal.clone(), id))
+                        .get(&qualified_full)
+                        .map(|&id| (qf.full.clone(), id))
                 } else {
                     None
                 }
@@ -1678,6 +1679,27 @@ mod tests {
         assert!(
             name_ids.contains_key("db::query"),
             "module-qualified functions must be in the name table"
+        );
+    }
+
+    #[test]
+    fn assign_name_ids_uses_full_not_minimal() {
+        let entries = vec![
+            piano::naming::QualifiedFunction::new("S::m", "outer_a::S::m", "outer_a::{0}::S::m"),
+            piano::naming::QualifiedFunction::new("S::m", "outer_b::S::m", "outer_b::{0}::S::m"),
+        ];
+        let display = piano::naming::disambiguate(&entries);
+        let (ids, _displays, next_id) = assign_name_ids(&entries, &display);
+        assert_eq!(next_id, 2, "two distinct functions must get two IDs");
+        let id_a = ids
+            .get("outer_a::{0}::S::m")
+            .expect("should have entry for first fn");
+        let id_b = ids
+            .get("outer_b::{0}::S::m")
+            .expect("should have entry for second fn");
+        assert_ne!(
+            id_a, id_b,
+            "different full names must produce different IDs"
         );
     }
 }
