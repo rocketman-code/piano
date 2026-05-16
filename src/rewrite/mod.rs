@@ -610,10 +610,10 @@ fn expand_and_replace_macros(
     for exp in &expansions {
         let call = &calls[exp.call_idx];
 
-        // Inject guards into the expanded text for measured functions.
-        let instrumented = inject_guards_into_expansion(&exp.expanded_text, measured);
+        let impl_prefix = crate::naming::impl_prefix_at(root, call.byte_start);
+        let instrumented =
+            inject_guards_into_expansion(&exp.expanded_text, measured, impl_prefix.as_deref());
 
-        // Replace the MACRO_CALL byte range with the instrumented expansion.
         injector.replace(call.byte_start, call.byte_end, instrumented);
     }
 }
@@ -621,7 +621,11 @@ fn expand_and_replace_macros(
 /// Inject guards into expanded macro text. Uses the shared classification
 /// pipeline (detect_instrumentable -> apply_filter -> classify) to ensure
 /// consistent behavior with the main instrument_source loop.
-fn inject_guards_into_expansion(expanded: &str, measured: &HashMap<String, u32>) -> String {
+fn inject_guards_into_expansion(
+    expanded: &str,
+    measured: &HashMap<String, u32>,
+    impl_prefix: Option<&str>,
+) -> String {
     let parse = SourceFile::parse(expanded, ra_ap_syntax::Edition::Edition2021);
     let mut insertions: Vec<(usize, String)> = Vec::new();
 
@@ -630,7 +634,11 @@ fn inject_guards_into_expansion(expanded: &str, measured: &HashMap<String, u32>)
             continue;
         };
 
-        let fn_name = crate::naming::qualified_name_for_fn(&func);
+        let bare_name = crate::naming::qualified_name_for_fn(&func);
+        let fn_name = match impl_prefix {
+            Some(prefix) => format!("{prefix}::{bare_name}"),
+            None => bare_name,
+        };
 
         let inst = match detect_instrumentable(func) {
             Some(i) => i,
@@ -1162,7 +1170,6 @@ fn main() {}
     }
 
     #[test]
-    #[ignore = "known bug: macro-expanded fn inside impl gets bare name, not qualified"]
     fn macro_fn_in_impl_block_gets_guard() {
         let source = r#"
 struct S;

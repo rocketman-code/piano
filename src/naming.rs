@@ -30,6 +30,38 @@ pub fn render_impl_name(self_ty: &ast::Type, trait_ty: Option<&ast::Type>) -> St
     }
 }
 
+/// Determine the impl context at a byte offset in the source tree.
+///
+/// Walks up from the token at `byte_offset` looking for an enclosing `impl`
+/// block. Returns the rendered impl prefix (e.g., `"S"` or `"<S as Trait>"`)
+/// or `None` if the offset is not inside an impl block.
+///
+/// Stops at an enclosing `fn` node (macros inside function bodies don't
+/// inherit the outer impl context).
+pub(crate) fn impl_prefix_at(
+    root: &ra_ap_syntax::SyntaxNode,
+    byte_offset: usize,
+) -> Option<String> {
+    use ra_ap_syntax::TextSize;
+    let offset = TextSize::from(byte_offset as u32);
+    root.token_at_offset(offset)
+        .right_biased()
+        .and_then(|token| {
+            let mut node = token.parent();
+            while let Some(n) = node {
+                if let Some(imp) = ast::Impl::cast(n.clone()) {
+                    let self_ty = imp.self_ty()?;
+                    return Some(render_impl_name(&self_ty, imp.trait_().as_ref()));
+                }
+                if ast::Fn::can_cast(n.kind()) {
+                    break;
+                }
+                node = n.parent();
+            }
+            None
+        })
+}
+
 /// Derive the impl/trait-qualified name for a function from its AST position.
 ///
 /// Walks up from the function node to find the nearest enclosing `impl` or
