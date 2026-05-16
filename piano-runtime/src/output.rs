@@ -25,34 +25,11 @@ pub fn write_header(
     run_id: &str,
     timestamp_ms: u128,
 ) -> io::Result<()> {
-    let bias_ns = bias_ns.0;
-    let cpu_bias_ns = cpu_bias_ns.0;
     write!(
         w,
         "{{\"type\":\"header\",\"run_id\":\"{run_id}\",\"timestamp_ms\":{timestamp_ms},"
     )?;
-    write!(
-        w,
-        "\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{"
-    )?;
-    for (i, (id, display, _)) in names.iter().enumerate() {
-        if i > 0 {
-            write!(w, ",")?;
-        }
-        write!(w, "\"{id}\":\"",)?;
-        write_json_escaped(w, display)?;
-        write!(w, "\"")?;
-    }
-    write!(w, "}},\"qualified\":{{")?;
-    for (i, (id, _, qualified)) in names.iter().enumerate() {
-        if i > 0 {
-            write!(w, ",")?;
-        }
-        write!(w, "\"{id}\":\"",)?;
-        write_json_escaped(w, qualified)?;
-        write!(w, "\"")?;
-    }
-    writeln!(w, "}}}}")
+    write_name_table_fields(w, names, bias_ns, cpu_bias_ns)
 }
 
 /// Write the name table as a trailer line.
@@ -183,11 +160,21 @@ fn write_name_table(
     bias_ns: WallNs,
     cpu_bias_ns: CpuNs,
 ) -> io::Result<()> {
+    write!(w, "{{\"type\":\"{kind}\",")?;
+    write_name_table_fields(w, names, bias_ns, cpu_bias_ns)
+}
+
+fn write_name_table_fields(
+    w: &mut impl Write,
+    names: &[(u32, &str, &str)],
+    bias_ns: WallNs,
+    cpu_bias_ns: CpuNs,
+) -> io::Result<()> {
     let bias_ns = bias_ns.0;
     let cpu_bias_ns = cpu_bias_ns.0;
     write!(
         w,
-        "{{\"type\":\"{kind}\",\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{"
+        "\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{"
     )?;
     for (i, (id, display, _)) in names.iter().enumerate() {
         if i > 0 {
