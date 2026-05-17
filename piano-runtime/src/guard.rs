@@ -56,6 +56,7 @@ pub fn enter(name_id: u32) -> Guard {
     };
     let mut guard = Guard::create(session, NameId(name_id));
     guard.stamp();
+    crate::inflight::enter(NameId(name_id), guard.start_ticks);
     guard
 }
 
@@ -121,6 +122,7 @@ impl Drop for Guard {
             Some(s) => s,
             None => return,
         };
+        crate::inflight::exit(self.name_id);
         let bookkeeping = ProfilerBookkeeping::enter();
         let cpu_end = if self.cpu_time_enabled {
             cpu_now_ns()

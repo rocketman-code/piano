@@ -87,6 +87,31 @@ pub fn write_aggregates(
     Ok(())
 }
 
+pub(crate) fn write_interrupted_aggregates(
+    w: &mut impl Write,
+    entries: &[crate::inflight::InterruptedEntry],
+    calibration: &crate::time::CalibrationData,
+) -> io::Result<()> {
+    let end_ticks = crate::time::read();
+    for e in entries {
+        let start_ns = calibration.now_ns(e.start_ticks);
+        let end_ns = calibration.now_ns(end_ticks);
+        let elapsed = end_ns.saturating_sub(start_ns);
+        writeln!(
+            w,
+            concat!(
+                "{{\"name_id\":{},\"calls\":{},\"self_ns\":{},\"inclusive_ns\":{},",
+                "\"cpu_self_ns\":0,",
+                "\"alloc_count\":0,\"alloc_bytes\":0,",
+                "\"free_count\":0,\"free_bytes\":0,",
+                "\"interrupted\":true}}"
+            ),
+            e.name_id.0, e.depth, elapsed.0, elapsed.0,
+        )?;
+    }
+    Ok(())
+}
+
 /// Format a u64 as decimal digits into a byte buffer. Returns bytes written.
 /// No allocation. Signal-safe.
 fn itoa(mut n: u64, buf: &mut [u8]) -> usize {

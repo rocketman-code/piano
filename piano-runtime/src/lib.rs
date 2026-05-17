@@ -9,6 +9,7 @@ pub mod cpu_clock;
 mod cpu_clock;
 
 pub(crate) mod children;
+pub(crate) mod inflight;
 
 #[cfg(feature = "_test_internals")]
 #[doc(hidden)]

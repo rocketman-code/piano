@@ -72,6 +72,8 @@ impl ProfileSession {
             shutdown::register(Arc::clone(fs), names, Arc::clone(&agg_registry));
         }
 
+        crate::inflight::init(names.len());
+
         let session = Box::new(Self {
             calibration,
             cpu_time_enabled,
