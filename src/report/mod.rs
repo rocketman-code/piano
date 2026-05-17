@@ -127,6 +127,8 @@ pub struct FnEntry {
     pub free_count: u64,
     #[serde(default)]
     pub free_bytes: u64,
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 /// Accumulated per-function counters (used during NDJSON aggregation).
@@ -137,6 +139,7 @@ pub(super) struct FnAgg {
     pub(super) inclusive_ns: WallNs,
     pub(super) cpu_self_ns: CpuNs,
     pub(super) alloc: AllocDelta,
+    pub(super) interrupted: bool,
 }
 
 /// NDJSON header/trailer line.
@@ -201,6 +204,8 @@ pub(super) struct NdjsonAggregate {
     pub(super) free_count: u64,
     #[serde(default)]
     pub(super) free_bytes: u64,
+    #[serde(default)]
+    pub(super) interrupted: bool,
 }
 
 /// Format a SystemTime as a relative duration string ("N sec/min/hours/days ago").
