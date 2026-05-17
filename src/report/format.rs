@@ -63,7 +63,11 @@ pub fn format_table(run: &Run, show_all: bool, limit: Option<usize>, show_footer
     out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(width)));
 
     for entry in &entries {
-        let self_val = format!("{:.TIME_DECIMALS$}ms", entry.self_ms);
+        let self_val = if entry.interrupted {
+            format!("{:.TIME_DECIMALS$}ms~", entry.self_ms)
+        } else {
+            format!("{:.TIME_DECIMALS$}ms", entry.self_ms)
+        };
         let mut line = format!("{:<FN_W$} {:>TIME_W$}", entry.name, self_val);
         if has_cpu {
             let cpu_val = match entry.cpu_self_ms {
@@ -1149,5 +1153,38 @@ mod tests {
         let entries: Vec<JsonFnEntry> = serde_json::from_str(&json).unwrap();
         assert_eq!(entries[0].free_count, 38);
         assert_eq!(entries[0].free_bytes, 900);
+    }
+
+    #[test]
+    fn format_table_marks_interrupted_entries() {
+        let run = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::Ndjson,
+            functions: vec![
+                FnEntry {
+                    name: "normal".into(),
+                    calls: 5,
+                    self_ms: 10.0,
+                    ..Default::default()
+                },
+                FnEntry {
+                    name: "interrupted_fn".into(),
+                    calls: 1,
+                    self_ms: 22.0,
+                    interrupted: true,
+                    ..Default::default()
+                },
+            ],
+        };
+        let output = format_table(&run, true, None, false);
+        assert!(
+            output.contains("22.00ms~"),
+            "interrupted entry should have ~ suffix: {output}"
+        );
+        assert!(
+            !output.contains("10.00ms~"),
+            "normal entry should NOT have ~ suffix: {output}"
+        );
     }
 }
