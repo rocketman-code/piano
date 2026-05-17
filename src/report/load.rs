@@ -70,6 +70,9 @@ pub fn load_ndjson(path: &Path, uncorrected: bool) -> Result<(Run, RunCompletene
             if a.cpu_self_ns.0 > 0 {
                 has_cpu = true;
             }
+            if a.interrupted {
+                entry.interrupted = true;
+            }
         }
         (agg, has_cpu)
     } else {
@@ -130,6 +133,9 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
                     free_count: a.free_count,
                     free_bytes: a.free_bytes,
                 };
+                if a.interrupted {
+                    entry.interrupted = true;
+                }
             }
             let functions = build_fn_entries(
                 &parsed.fn_names,
@@ -476,6 +482,7 @@ fn build_fn_entries(
                 alloc_bytes: agg.alloc.alloc_bytes,
                 free_count: agg.alloc.free_count,
                 free_bytes: agg.alloc.free_bytes,
+                interrupted: agg.interrupted,
             }
         })
         .collect()
@@ -563,7 +570,11 @@ fn merge_runs(runs: &[&Run]) -> Run {
                 alloc_bytes: 0,
                 free_count: 0,
                 free_bytes: 0,
+                interrupted: false,
             });
+            if f.interrupted {
+                entry.interrupted = true;
+            }
             entry.calls += f.calls;
             if let Some(t) = f.total_ms {
                 *entry.total_ms.get_or_insert(0.0) += t;
