@@ -72,11 +72,11 @@ pub fn write_aggregates(
                     "\"free_count\":{},\"free_bytes\":{}}}"
                 ),
                 thread_idx,
-                a.name_id.0,
+                a.name_id.raw(),
                 a.calls,
-                a.self_ns.0,
-                a.inclusive_ns.0,
-                a.cpu_self_ns.0,
+                a.self_ns.raw(),
+                a.inclusive_ns.raw(),
+                a.cpu_self_ns.raw(),
                 a.alloc.alloc_count,
                 a.alloc.alloc_bytes,
                 a.alloc.free_count,
@@ -106,7 +106,10 @@ pub(crate) fn write_interrupted_aggregates(
                 "\"free_count\":0,\"free_bytes\":0,",
                 "\"interrupted\":true}}"
             ),
-            e.name_id.0, e.depth, elapsed.0, elapsed.0,
+            e.name_id.raw(),
+            e.depth,
+            elapsed.raw(),
+            elapsed.raw(),
         )?;
     }
     Ok(())
@@ -156,15 +159,15 @@ pub fn serialize_aggregate_to_stack(
     put!(b"{\"thread\":");
     put_u64!(thread_idx);
     put!(b",\"name_id\":");
-    put_u64!(a.name_id.0 as u64);
+    put_u64!(a.name_id.raw() as u64);
     put!(b",\"calls\":");
     put_u64!(a.calls);
     put!(b",\"self_ns\":");
-    put_u64!(a.self_ns.0);
+    put_u64!(a.self_ns.raw());
     put!(b",\"inclusive_ns\":");
-    put_u64!(a.inclusive_ns.0);
+    put_u64!(a.inclusive_ns.raw());
     put!(b",\"cpu_self_ns\":");
-    put_u64!(a.cpu_self_ns.0);
+    put_u64!(a.cpu_self_ns.raw());
     put!(b",\"alloc_count\":");
     put_u64!(a.alloc.alloc_count);
     put!(b",\"alloc_bytes\":");
@@ -195,8 +198,8 @@ fn write_name_table_fields(
     bias_ns: WallNs,
     cpu_bias_ns: CpuNs,
 ) -> io::Result<()> {
-    let bias_ns = bias_ns.0;
-    let cpu_bias_ns = cpu_bias_ns.0;
+    let bias_ns = bias_ns.raw();
+    let cpu_bias_ns = cpu_bias_ns.raw();
     write!(
         w,
         "\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{"
