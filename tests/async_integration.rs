@@ -293,6 +293,54 @@ async fn main() {
     .unwrap();
 }
 
+fn create_wall_time_suspension_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "wall-suspension-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wall-suspension-test"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+"#,
+    )
+    .unwrap();
+
+    // sleep_fn awaits a 200ms sleep. Its self_ns should reflect only
+    // active poll time (microseconds), not the 200ms of suspension.
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"use tokio::time::{sleep, Duration};
+
+async fn sleep_fn() -> u64 {
+    sleep(Duration::from_millis(200)).await;
+    42
+}
+
+fn wrapper() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = rt.block_on(sleep_fn());
+    println!("result: {result}");
+}
+
+fn main() {
+    wrapper();
+}
+"#,
+    )
+    .unwrap();
+}
+
 /// Create a small tokio project with async functions.
 fn create_async_project(dir: &Path) {
     fs::create_dir_all(dir.join("src")).unwrap();
@@ -567,20 +615,23 @@ fn async_nested_select_self_time() {
         "output should contain child_a. Got:\n{content}"
     );
 
-    // parent_select does zero computation -- its body is just a select! macro.
-    // Its self_ns should be much smaller than child_a's self_ns (~50ms of sleep).
-    let parent = stats.get("parent_select").unwrap();
+    // Per-poll wall accumulation excludes suspension time.
+    // child_a sleeps 50ms but its self_ns should reflect only active poll
+    // time (microseconds), not the sleep duration.
     let child = stats.get("child_a").unwrap();
+    let parent = stats.get("parent_select").unwrap();
+    let threshold = 10_000_000; // 10ms -- generous, sleep is 50ms per call x5
     assert!(
-        child.self_ns > 0,
-        "child_a should have non-zero self_ns (it sleeps 50ms)"
+        child.self_ns < threshold,
+        "child_a.self_ns ({}) must be < {threshold}ns -- \
+         sleep suspension time should be excluded from wall self_ns",
+        child.self_ns,
     );
     assert!(
-        parent.self_ns < child.self_ns,
-        "parent_select.self_ns ({}) must be < child_a.self_ns ({}) -- \
-         parent does no computation, select! overhead should be negligible",
+        parent.self_ns < threshold,
+        "parent_select.self_ns ({}) must be < {threshold}ns -- \
+         select! overhead should be negligible with per-poll accumulation",
         parent.self_ns,
-        child.self_ns,
     );
 }
 
@@ -850,13 +901,102 @@ fn impl_future_self_time_attribution() {
     let foo = stats.get("foo").unwrap();
     let bar = stats.get("bar").unwrap();
 
-    // foo does the work (80ms sleep x3 calls). bar does nothing.
-    // foo.self_ns must be greater than bar.self_ns.
+    // Per-poll wall accumulation excludes the 80ms sleep.
+    // Both foo and bar have microsecond-level self_ns.
+    let threshold = 50_000_000; // 50ms -- generous, sleep is 80ms per call x3
     assert!(
-        foo.self_ns > bar.self_ns,
-        "foo.self_ns ({}) must be > bar.self_ns ({}) -- \
-         foo does the 80ms sleep, bar just awaits foo",
+        foo.self_ns < threshold,
+        "foo.self_ns ({}) must be < {threshold}ns -- \
+         80ms sleep suspension must be excluded from wall self_ns",
         foo.self_ns,
+    );
+    assert!(
+        bar.self_ns < threshold,
+        "bar.self_ns ({}) must be < {threshold}ns -- \
+         bar just awaits foo, negligible poll overhead",
         bar.self_ns,
+    );
+}
+
+#[test]
+fn async_wall_time_excludes_suspension() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("wall-suspension-test");
+    create_wall_time_suspension_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::tokio_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+
+    let build = Command::new(piano_bin)
+        .args([
+            "build",
+            "--fn",
+            "sleep_fn",
+            "--fn",
+            "wrapper",
+            "--fn",
+            "main",
+            "--project",
+        ])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("failed to run piano build");
+
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    let stdout = String::from_utf8_lossy(&build.stdout);
+    assert!(
+        build.status.success(),
+        "piano build failed:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+
+    let binary_path = stdout.trim();
+    assert!(
+        Path::new(binary_path).exists(),
+        "built binary should exist at: {binary_path}"
+    );
+
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let run = Command::new(binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run instrumented binary");
+
+    assert!(
+        run.status.success(),
+        "instrumented binary failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+
+    let program_stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        program_stdout.contains("result: 42"),
+        "program should produce correct output, got: {program_stdout}"
+    );
+
+    let run_file = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&run_file).unwrap();
+    let stats = common::aggregate_ndjson(&content);
+
+    let sleep_stats = stats
+        .get("sleep_fn")
+        .expect("sleep_fn should appear in output");
+
+    // sleep_fn awaits a 200ms sleep. With per-poll wall accumulation,
+    // self_ns reflects only active poll time (microseconds), not the
+    // 200ms of suspension. 50ms threshold is generous for CI.
+    let threshold = 50_000_000; // 50ms
+    assert!(
+        sleep_stats.self_ns < threshold,
+        "sleep_fn.self_ns ({}) must be < {threshold}ns -- \
+         200ms sleep suspension must be excluded from wall self_ns.\n\
+         NDJSON:\n{content}",
+        sleep_stats.self_ns,
     );
 }

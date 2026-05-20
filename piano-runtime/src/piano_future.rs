@@ -1,17 +1,19 @@
 //! Async function instrumentation -- PianoFuture wrapper.
 //!
-//! PianoFuture wraps an inner Future and accumulates per-poll alloc
-//! and CPU deltas. On completion or cancellation (drop), it computes
-//! self-time via the TLS children-time accumulator and aggregates
-//! into the per-thread FnAgg vec.
+//! PianoFuture wraps an inner Future and accumulates per-poll wall, CPU,
+//! alloc, and children deltas. On completion or cancellation (drop), it
+//! computes self-time and aggregates into the per-thread FnAgg vec.
+//!
+//! Wall time uses per-poll accumulation (same as CPU and alloc), so
+//! suspension time between polls is excluded from self_ns.
 //!
 //! Same exit path as Guard: children TLS save/restore + aggregate.
-//! No Measurement struct. No push_measurement. No span tree.
 //!
 //! Invariants:
-//! - Wall time starts on first poll, not construction.
+//! - Wall time is accumulated per-poll, not measured as a span.
 //! - Each poll saves/restores TLS children_ns (nested guards contribute).
-//! - Alloc deltas accumulated per-poll via snapshot_alloc_counters.
+//! - All four measurements (wall, cpu, alloc, children) are captured
+//!   together in end_poll and destructured exhaustively.
 //! - Bookkeeping allocs excluded via ProfilerBookkeeping proof token.
 //! - Cancelled/panicking futures emit best-effort aggregate via Drop.
 //! - Never double-emits (emitted flag).
@@ -26,7 +28,8 @@ use crate::alloc::{snapshot_alloc_counters, AllocDelta, ProfilerBookkeeping};
 use crate::children;
 use crate::cpu_clock::CpuNs;
 use crate::session::ProfileSession;
-use crate::time::{read, Ticks, WallNs};
+use crate::time::{read, WallNs};
+use crate::types::{PollActive, PollDeltas};
 use crate::NameId;
 
 /// Future wrapper for async function instrumentation.
@@ -34,7 +37,10 @@ pub struct PianoFuture<F> {
     inner: F,
     session: Option<&'static ProfileSession>,
     name_id: NameId,
-    start_ticks: Option<Ticks>,
+    /// None = Constructed (never polled). Some = accumulated wall time.
+    /// Spec: create_async produces Constructed (None).
+    /// First poll transitions to Accumulated (Some).
+    wall_acc: Option<WallNs>,
     saved_children_ns: WallNs,
     alloc_acc: AllocDelta,
     cpu_acc: CpuNs,
@@ -55,7 +61,7 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
                 inner: body,
                 session: None,
                 name_id: NameId(0),
-                start_ticks: None,
+                wall_acc: None,
                 saved_children_ns: WallNs::ZERO,
                 alloc_acc: AllocDelta::ZERO,
                 cpu_acc: CpuNs::ZERO,
@@ -73,12 +79,63 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
         inner: body,
         session: Some(session),
         name_id,
-        start_ticks: None,
+        wall_acc: None,
         saved_children_ns,
         alloc_acc: AllocDelta::ZERO,
         cpu_acc: CpuNs::ZERO,
         children_ns_acc: WallNs::ZERO,
         emitted: false,
+    }
+}
+
+/// Capture pre-poll measurement snapshots.
+/// Spec: capture_poll_start (Constructed -> Polling).
+#[inline(always)]
+fn begin_poll(session: &ProfileSession) -> PollActive {
+    let alloc_start = {
+        let _bookkeeping = ProfilerBookkeeping::enter();
+        snapshot_alloc_counters()
+    };
+    let wall_start = read();
+    let cpu_start = if session.cpu_time_enabled {
+        crate::cpu_clock::cpu_now_ns()
+    } else {
+        CpuNs::ZERO
+    };
+    compiler_fence(Ordering::SeqCst);
+    PollActive {
+        wall_start,
+        cpu_start,
+        alloc_start,
+    }
+}
+
+/// Capture post-poll snapshots and compute all per-poll deltas.
+/// Spec: capture_poll_end + accumulate_poll (Polling -> PollComplete -> Accumulated).
+#[inline(always)]
+fn end_poll(active: PollActive, session: &ProfileSession) -> PollDeltas {
+    compiler_fence(Ordering::SeqCst);
+    let cpu_end = if session.cpu_time_enabled {
+        crate::cpu_clock::cpu_now_ns()
+    } else {
+        CpuNs::ZERO
+    };
+    let wall_end = read();
+    let alloc = {
+        let _bookkeeping = ProfilerBookkeeping::enter();
+        let alloc_end = snapshot_alloc_counters();
+        alloc_end.delta_since(&active.alloc_start)
+    };
+    let children = children::current_children_ns();
+
+    let wall_start_ns = session.calibration.now_ns(active.wall_start);
+    let wall_end_ns = session.calibration.now_ns(wall_end);
+
+    PollDeltas {
+        wall: wall_end_ns.saturating_sub(wall_start_ns),
+        cpu: cpu_end.saturating_sub(active.cpu_start),
+        alloc,
+        children,
     }
 }
 
@@ -104,53 +161,37 @@ impl<F: Future> Future for PianoFuture<F> {
         // PianoFutures will add their inclusive times to TLS during this poll.
         let poll_children_saved = children::save_and_zero();
 
-        // Pre-poll bookkeeping
-        let snap_start;
-        {
-            let _bookkeeping = ProfilerBookkeeping::enter();
-            snap_start = snapshot_alloc_counters();
-
-            if this.start_ticks.is_none() {
-                this.start_ticks = Some(read());
-            }
+        // Transition Constructed -> Polling before the inner poll.
+        // If inner panics, emit() in Drop can still produce output.
+        if this.wall_acc.is_none() {
+            this.wall_acc = Some(WallNs::ZERO);
         }
 
-        compiler_fence(Ordering::SeqCst);
-
-        let cpu_poll_start = if session.cpu_time_enabled {
-            crate::cpu_clock::cpu_now_ns()
-        } else {
-            CpuNs::ZERO
-        };
+        let active = begin_poll(session);
 
         // Poll inner future
         // SAFETY: inner is pinned through self. We never move it.
         let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
         let result = inner.poll(cx);
 
-        // Post-poll bookkeeping
-        let cpu_poll_end = if session.cpu_time_enabled {
-            crate::cpu_clock::cpu_now_ns()
-        } else {
-            CpuNs::ZERO
-        };
-
-        compiler_fence(Ordering::SeqCst);
-
-        {
-            let _bookkeeping = ProfilerBookkeeping::enter();
-            let snap_end = snapshot_alloc_counters();
-
-            this.alloc_acc += snap_end.delta_since(&snap_start);
-            this.cpu_acc += cpu_poll_end.saturating_sub(cpu_poll_start);
-        }
-
-        // Accumulate children's inclusive time from this poll.
-        this.children_ns_acc += children::current_children_ns();
+        let PollDeltas {
+            wall,
+            cpu,
+            alloc,
+            children,
+        } = end_poll(active, session);
 
         // Restore TLS children_ns for the outer scope.
         // Don't report our time yet (we might have more polls).
         children::restore_and_report(poll_children_saved, WallNs::ZERO);
+
+        // Accumulate all four measurements together.
+        if let Some(ref mut acc) = this.wall_acc {
+            *acc += wall;
+        }
+        this.cpu_acc += cpu;
+        this.alloc_acc += alloc;
+        this.children_ns_acc += children;
 
         if result.is_ready() {
             this.emit(session);
@@ -162,17 +203,13 @@ impl<F: Future> Future for PianoFuture<F> {
 
 impl<F> PianoFuture<F> {
     fn emit(&mut self, session: &'static ProfileSession) {
-        let start_ticks = match self.start_ticks {
-            Some(t) if !self.emitted => t,
+        let inclusive_ns = match self.wall_acc {
+            Some(w) if !self.emitted => w,
             _ => return,
         };
         self.emitted = true;
 
-        let end_ticks = read();
         let bookkeeping = ProfilerBookkeeping::enter();
-        let start_ns = session.calibration.now_ns(start_ticks);
-        let end_ns = session.calibration.now_ns(end_ticks);
-        let inclusive_ns = end_ns.saturating_sub(start_ns);
         let self_ns = inclusive_ns.saturating_sub(self.children_ns_acc);
 
         aggregator::aggregate(
