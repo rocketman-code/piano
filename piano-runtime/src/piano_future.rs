@@ -88,8 +88,8 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
     }
 }
 
-/// Capture pre-poll measurement snapshots.
-/// Spec: capture_poll_start (Constructed -> Polling).
+/// Capture pre-poll measurement snapshots (wall, cpu, alloc).
+/// Called after Constructed -> Polling transition.
 #[inline(always)]
 fn begin_poll(session: &ProfileSession) -> PollActive {
     let alloc_start = {
@@ -142,6 +142,7 @@ fn end_poll(active: PollActive, session: &ProfileSession) -> PollDeltas {
 impl<F: Future> Future for PianoFuture<F> {
     type Output = F::Output;
 
+    #[inline(always)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         // SAFETY: We project Pin to `inner` only. All other fields are
         // Unpin primitives. We never move `inner` out of self.
@@ -181,8 +182,7 @@ impl<F: Future> Future for PianoFuture<F> {
             children,
         } = end_poll(active, session);
 
-        // Restore TLS children_ns for the outer scope.
-        // Don't report our time yet (we might have more polls).
+        // end_poll reads children TLS; restore must happen AFTER.
         children::restore_and_report(poll_children_saved, WallNs::ZERO);
 
         // Accumulate all four measurements together.
