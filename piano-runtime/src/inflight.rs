@@ -30,7 +30,7 @@ pub(crate) fn enter(name_id: NameId, start_ticks: Ticks) {
     if ptr.is_null() {
         return;
     }
-    let idx = name_id.0 as usize;
+    let idx = name_id.raw() as usize;
     // SAFETY: ptr was set by init() via Box::into_raw and is never freed.
     // idx is bounds-checked against slots.len before array access.
     unsafe {
@@ -40,7 +40,7 @@ pub(crate) fn enter(name_id: NameId, start_ticks: Ticks) {
         }
         let prev = slots.depth[idx].fetch_add(1, Ordering::Relaxed);
         if prev == 0 {
-            slots.start[idx].store(start_ticks.0, Ordering::Relaxed);
+            slots.start[idx].store(start_ticks.raw(), Ordering::Relaxed);
         }
     }
 }
@@ -51,7 +51,7 @@ pub(crate) fn exit(name_id: NameId) {
     if ptr.is_null() {
         return;
     }
-    let idx = name_id.0 as usize;
+    let idx = name_id.raw() as usize;
     // SAFETY: ptr was set by init() via Box::into_raw and is never freed.
     // idx is bounds-checked against slots.len before array access.
     unsafe {
@@ -86,8 +86,8 @@ pub(crate) fn drain() -> Vec<InterruptedEntry> {
             let start = slots.start[i].load(Ordering::Relaxed);
             if start > 0 {
                 entries.push(InterruptedEntry {
-                    name_id: NameId(i as u32),
-                    start_ticks: Ticks(start),
+                    name_id: NameId::from_raw(i as u32),
+                    start_ticks: Ticks::from_raw(start),
                     depth,
                 });
             }
