@@ -7,4 +7,5 @@ pub mod resolve;
 pub mod rewrite;
 pub mod source_map;
 pub mod staging;
+pub(crate) mod types;
 pub mod wrapper;
