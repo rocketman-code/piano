@@ -53,14 +53,14 @@ pub struct PianoFuture<F> {
 /// If profiling is not active, returns a transparent wrapper whose
 /// poll delegates directly to the inner future with no overhead.
 pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
-    let name_id = NameId(name_id);
+    let name_id = NameId::from_raw(name_id);
     let session = match ProfileSession::get() {
         Some(s) => s,
         None => {
             return PianoFuture {
                 inner: body,
                 session: None,
-                name_id: NameId(0),
+                name_id: NameId::from_raw(0),
                 wall_acc: None,
                 saved_children_ns: WallNs::ZERO,
                 alloc_acc: AllocDelta::ZERO,

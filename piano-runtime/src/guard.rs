@@ -54,9 +54,9 @@ pub fn enter(name_id: u32) -> Guard {
         Some(s) => s,
         None => return Guard::inactive(),
     };
-    let mut guard = Guard::create(session, NameId(name_id));
+    let mut guard = Guard::create(session, NameId::from_raw(name_id));
     guard.stamp();
-    crate::inflight::enter(NameId(name_id), guard.start_ticks);
+    crate::inflight::enter(NameId::from_raw(name_id), guard.start_ticks);
     guard
 }
 
@@ -66,10 +66,10 @@ impl Guard {
         Self {
             session: None,
             saved_children_ns: WallNs::ZERO,
-            name_id: NameId(0),
+            name_id: NameId::from_raw(0),
             cpu_time_enabled: false,
             cpu_start: CpuNs::ZERO,
-            start_ticks: Ticks(0),
+            start_ticks: Ticks::ZERO,
             alloc_start: AllocSnapshot::ZERO,
             _not_send: PhantomData,
         }
@@ -98,7 +98,7 @@ impl Guard {
             name_id,
             cpu_time_enabled: session.cpu_time_enabled,
             cpu_start,
-            start_ticks: Ticks(0),
+            start_ticks: Ticks::ZERO,
             alloc_start: snap,
             _not_send: PhantomData,
         }

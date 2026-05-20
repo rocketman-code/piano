@@ -7,34 +7,7 @@
 //! `unreachable!()`, since the `cpu_time_enabled` bool prevents it from
 //! ever being called at runtime.
 
-/// CPU-time nanoseconds (per-thread, from `clock_gettime`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(transparent)]
-pub struct CpuNs(pub(crate) u64);
-
-impl CpuNs {
-    pub(crate) const ZERO: Self = CpuNs(0);
-
-    pub(crate) fn saturating_sub(self, other: CpuNs) -> CpuNs {
-        CpuNs(self.0.saturating_sub(other.0))
-    }
-}
-
-#[cfg(feature = "_test_internals")]
-impl CpuNs {
-    pub fn new(v: u64) -> Self {
-        Self(v)
-    }
-    pub fn raw(self) -> u64 {
-        self.0
-    }
-}
-
-impl core::ops::AddAssign for CpuNs {
-    fn add_assign(&mut self, rhs: Self) {
-        self.0 += rhs.0;
-    }
-}
+pub use crate::types::CpuNs;
 
 #[cfg(unix)]
 #[repr(C)]
@@ -77,12 +50,12 @@ pub fn calibrate_bias() -> u64 {
     // calibration under 1ms. Higher than time.rs's 10K because CPU-time
     // reads are noisier (syscall vs TSC instruction).
     const SAMPLES: usize = 100_000;
-    let start = cpu_now_ns().0;
+    let start = cpu_now_ns().raw();
     for _ in 0..SAMPLES {
         compiler_fence(Ordering::SeqCst);
         crate::time::read();
     }
-    let end = cpu_now_ns().0;
+    let end = cpu_now_ns().raw();
     let bias = (end - start) as f64 / SAMPLES as f64;
     bias.to_bits()
 }
@@ -102,10 +75,10 @@ pub fn cpu_now_ns() -> CpuNs {
     // pointer to a stack-allocated Timespec and a valid clock ID.
     let ret = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) };
     if ret != 0 {
-        return CpuNs(0);
+        return CpuNs::from_raw(0);
     }
     const NS_PER_SEC: u64 = 1_000_000_000;
-    CpuNs(ts.tv_sec as u64 * NS_PER_SEC + ts.tv_nsec as u64)
+    CpuNs::from_raw(ts.tv_sec as u64 * NS_PER_SEC + ts.tv_nsec as u64)
 }
 
 /// Compilation stub for non-Unix platforms.
