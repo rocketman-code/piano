@@ -7,7 +7,39 @@
 //! `unreachable!()`, since the `cpu_time_enabled` bool prevents it from
 //! ever being called at runtime.
 
-pub use crate::types::CpuNs;
+// ── CpuNs ──────────────────────────────────────────────────────
+
+/// CPU-time nanoseconds (per-thread, from clock_gettime).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(transparent)]
+pub struct CpuNs(u64);
+
+impl CpuNs {
+    pub(crate) const ZERO: Self = CpuNs(0);
+    fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn saturating_sub(self, other: CpuNs) -> CpuNs {
+        CpuNs(self.0.saturating_sub(other.0))
+    }
+}
+
+#[cfg(feature = "_test_internals")]
+impl CpuNs {
+    pub fn new(v: u64) -> Self {
+        Self(v)
+    }
+}
+
+impl core::ops::AddAssign for CpuNs {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
 
 #[cfg(unix)]
 #[repr(C)]
@@ -45,7 +77,7 @@ use std::sync::atomic::{compiler_fence, Ordering};
 ///
 /// Returns the bias as f64 bits (f64::to_bits).
 #[cfg(unix)]
-pub fn calibrate_bias() -> u64 {
+pub fn calibrate_bias() -> CpuNs {
     // 100K iterations: enough to amortize syscall jitter while keeping
     // calibration under 1ms. Higher than time.rs's 10K because CPU-time
     // reads are noisier (syscall vs TSC instruction).
@@ -57,7 +89,7 @@ pub fn calibrate_bias() -> u64 {
     }
     let end = cpu_now_ns().raw();
     let bias = (end - start) as f64 / SAMPLES as f64;
-    bias.to_bits()
+    CpuNs::from_raw(bias.round() as u64)
 }
 
 /// Return the current thread's CPU time in nanoseconds.
@@ -93,6 +125,6 @@ pub(crate) fn cpu_now_ns() -> CpuNs {
 
 /// No CPU-time calibration on non-Unix platforms. Returns 0 (no bias).
 #[cfg(not(unix))]
-pub fn calibrate_bias() -> u64 {
-    0
+pub fn calibrate_bias() -> CpuNs {
+    CpuNs::ZERO
 }

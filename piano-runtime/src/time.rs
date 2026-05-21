@@ -18,8 +18,70 @@ use std::sync::atomic::{compiler_fence, Ordering};
 use std::sync::Once;
 use std::time::Instant;
 
-use crate::types::CpuNs;
-pub use crate::types::{Ticks, WallNs};
+use crate::cpu_clock::CpuNs;
+
+// ── Ticks ───────────────────────────────────────────────────────
+
+/// Raw hardware counter value (TSC on x86_64, CNTVCT on aarch64,
+/// epoch-relative nanoseconds on fallback platforms).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(transparent)]
+pub struct Ticks(u64);
+
+impl Ticks {
+    pub(crate) const ZERO: Self = Ticks(0);
+    pub(crate) fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn wrapping_sub(self, other: Ticks) -> Ticks {
+        Ticks(self.0.wrapping_sub(other.0))
+    }
+}
+
+// ── WallNs ──────────────────────────────────────────────────────
+
+/// Calibrated wall-clock nanoseconds, epoch-relative.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(transparent)]
+pub struct WallNs(u64);
+
+impl WallNs {
+    pub(crate) const ZERO: Self = WallNs(0);
+    fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn saturating_sub(self, other: WallNs) -> WallNs {
+        WallNs(self.0.saturating_sub(other.0))
+    }
+}
+
+#[cfg(feature = "_test_internals")]
+impl WallNs {
+    pub fn new(v: u64) -> Self {
+        Self(v)
+    }
+}
+
+impl core::ops::Add for WallNs {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        WallNs(self.0 + rhs.0)
+    }
+}
+
+impl core::ops::AddAssign for WallNs {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
 
 /// Immutable calibration snapshot. Copy-able, no atomics on access.
 ///
@@ -33,7 +95,7 @@ pub struct CalibrationData {
     multiplier: u64,
     bias_ticks: u64,
     epoch_tsc: u64,
-    cpu_bias_ns: u64,
+    cpu_bias: CpuNs,
 }
 
 impl CalibrationData {
@@ -48,7 +110,7 @@ impl CalibrationData {
             multiplier: 0,
             bias_ticks: 0,
             epoch_tsc: 0,
-            cpu_bias_ns: 0,
+            cpu_bias: CpuNs::ZERO,
         };
 
         // SAFETY: ONCE.call_once guarantees single initialization. After init,
@@ -58,15 +120,14 @@ impl CalibrationData {
             ONCE.call_once(|| {
                 let (quotient, multiplier, epoch_tsc) = calibrate();
                 let bias_ticks = calibrate_bias();
-                let cpu_bias_f64_bits = crate::cpu_clock::calibrate_bias();
-                let cpu_bias_ns = f64::from_bits(cpu_bias_f64_bits).round() as u64;
+                let cpu_bias = crate::cpu_clock::calibrate_bias();
 
                 CACHED = CalibrationData {
                     quotient,
                     multiplier,
                     bias_ticks,
                     epoch_tsc,
-                    cpu_bias_ns,
+                    cpu_bias,
                 };
             });
             CACHED
@@ -81,7 +142,7 @@ impl CalibrationData {
             multiplier,
             bias_ticks,
             epoch_tsc,
-            cpu_bias_ns: 0,
+            cpu_bias: CpuNs::ZERO,
         }
     }
 
@@ -116,7 +177,7 @@ impl CalibrationData {
     /// Return the calibrated CPU-time measurement bias in nanoseconds.
     #[inline(always)]
     pub fn cpu_bias_ns(&self) -> CpuNs {
-        CpuNs::from_raw(self.cpu_bias_ns)
+        self.cpu_bias
     }
 }
 
