@@ -6,7 +6,7 @@
 
 use crate::alloc::{AllocDelta, AllocSnapshot};
 
-// ── Timing ──────────────────────────────────────────────────────
+// ── Ticks ───────────────────────────────────────────────────────
 
 /// Raw hardware counter value (TSC on x86_64, CNTVCT on aarch64,
 /// epoch-relative nanoseconds on fallback platforms).
@@ -28,7 +28,7 @@ impl Ticks {
     }
 }
 
-// ── Wall clock ──────────────────────────────────────────────────
+// ── WallNs ──────────────────────────────────────────────────────
 
 /// Calibrated wall-clock nanoseconds, epoch-relative.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -62,7 +62,7 @@ impl core::ops::AddAssign for WallNs {
     }
 }
 
-// ── CPU time ────────────────────────────────────────────────────
+// ── CpuNs ──────────────────────────────────────────────────────
 
 /// CPU-time nanoseconds (per-thread, from clock_gettime).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -96,7 +96,7 @@ impl core::ops::AddAssign for CpuNs {
     }
 }
 
-// ── Function identity ───────────────────────────────────────────
+// ── NameId ──────────────────────────────────────────────────────
 
 /// Function name ID (assigned by rewriter, consumed by runtime).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,7 +119,7 @@ impl NameId {
     }
 }
 
-// ── Async poll lifecycle ────────────────────────────────────────
+// ── PollActive / PollDeltas ─────────────────────────────────────
 
 /// Pre-poll measurement snapshots. Consumed by `end_poll` to compute deltas.
 pub(crate) struct PollActive {
