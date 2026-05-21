@@ -1,8 +1,12 @@
 //! Sync function instrumentation -- RAII sentinel.
 //!
 //! Guard is created when entering a profiled function and dropped when
-//! exiting. On drop, it computes self-time via the TLS children-time
-//! accumulator and aggregates into the per-thread FnAgg vec.
+//! exiting. On drop it computes self_ns = inclusive_ns - children_ns
+//! and aggregates into the per-thread FnAgg vec.
+//!
+//! Children within the Guard's scope report their inclusive time via
+//! the per-thread accumulator. Rust's reverse drop order (drop.rs:93)
+//! guarantees nested children report before the parent reads.
 //!
 //! Invariants:
 //! - Guard is !Send. Alloc deltas are computed on the same thread as
@@ -10,7 +14,6 @@
 //! - Profiler bookkeeping allocs are excluded from user counts.
 //!   Enforcement: ProfilerBookkeeping proof token wraps creation and drop.
 //! - Guard never panics. All arithmetic uses saturating_sub.
-//! - TLS children_ns is saved/restored on create/drop (RAII stack discipline).
 
 use core::sync::atomic::{compiler_fence, Ordering};
 

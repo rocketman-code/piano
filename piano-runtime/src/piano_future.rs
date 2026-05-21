@@ -2,16 +2,18 @@
 //!
 //! PianoFuture wraps an inner Future and accumulates per-poll wall, CPU,
 //! alloc, and children deltas. On completion or cancellation (drop), it
-//! computes self-time and aggregates into the per-thread FnAgg vec.
+//! computes self_ns = inclusive_ns - children_ns and aggregates.
 //!
 //! Wall time uses per-poll accumulation (same as CPU and alloc), so
 //! suspension time between polls is excluded from self_ns.
 //!
-//! Same exit path as Guard: children TLS save/restore + aggregate.
+//! Children within each poll report their inclusive time. On completion
+//! or cancellation, the future reports its own inclusive time to its
+//! parent scope. Every child reports -- completed, cancelled, or
+//! interrupted.
 //!
 //! Invariants:
 //! - Wall time is accumulated per-poll, not measured as a span.
-//! - Each poll saves/restores TLS children_ns (nested guards contribute).
 //! - All four measurements (wall, cpu, alloc, children) are captured
 //!   together in end_poll and destructured exhaustively.
 //! - Bookkeeping allocs excluded via ProfilerBookkeeping proof token.
@@ -54,7 +56,6 @@ pub struct PianoFuture<F> {
     name_id: NameId,
     /// None = never polled. Some = accumulated wall time across polls.
     wall_acc: Option<WallNs>,
-    saved_children_ns: WallNs,
     alloc_acc: AllocDelta,
     cpu_acc: CpuNs,
     children_ns_acc: WallNs,
@@ -75,7 +76,6 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
                 session: None,
                 name_id: NameId::from_raw(0),
                 wall_acc: None,
-                saved_children_ns: WallNs::ZERO,
                 alloc_acc: AllocDelta::ZERO,
                 cpu_acc: CpuNs::ZERO,
                 children_ns_acc: WallNs::ZERO,
@@ -84,16 +84,11 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
         }
     };
 
-    // Save parent's children_ns accumulator at construction time.
-    // This future's inclusive time will be reported to the parent on completion.
-    let saved_children_ns = children::save_and_zero();
-
     PianoFuture {
         inner: body,
         session: Some(session),
         name_id,
         wall_acc: None,
-        saved_children_ns,
         alloc_acc: AllocDelta::ZERO,
         cpu_acc: CpuNs::ZERO,
         children_ns_acc: WallNs::ZERO,
@@ -169,8 +164,8 @@ impl<F: Future> Future for PianoFuture<F> {
             }
         };
 
-        // Save TLS children_ns for this poll. Nested sync Guards and
-        // PianoFutures will add their inclusive times to TLS during this poll.
+        // Begin a children scope for this poll. Children within the poll
+        // report their inclusive time; we read the sum in end_poll.
         let poll_children_saved = children::save_and_zero();
 
         // If inner panics, emit() in Drop can still produce output.
@@ -191,7 +186,8 @@ impl<F: Future> Future for PianoFuture<F> {
             children,
         } = end_poll(active, session);
 
-        // end_poll reads children TLS; restore must happen AFTER.
+        // End the per-poll children scope. Reports zero inclusive time
+        // for this poll (the future reports its total on completion).
         children::restore_and_report(poll_children_saved, WallNs::ZERO);
 
         if let Some(ref mut acc) = this.wall_acc {
@@ -230,7 +226,7 @@ impl<F> PianoFuture<F> {
             &session.agg_registry,
         );
 
-        children::restore_and_report(self.saved_children_ns, inclusive_ns);
+        children::report_inclusive(inclusive_ns);
     }
 }
 
