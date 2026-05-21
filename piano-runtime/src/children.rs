@@ -51,5 +51,5 @@ pub fn save_and_zero() -> WallNs {
 /// Silent no-op if TLS is destroyed.
 #[inline(always)]
 pub fn restore_and_report(saved: WallNs, own_inclusive_ns: WallNs) {
-    let _ = CHILDREN_NS.try_with(|c| c.set(WallNs::from_raw(saved.raw() + own_inclusive_ns.raw())));
+    let _ = CHILDREN_NS.try_with(|c| c.set(saved + own_inclusive_ns));
 }

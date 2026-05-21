@@ -24,13 +24,28 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::{Context, Poll};
 
 use crate::aggregator;
-use crate::alloc::{snapshot_alloc_counters, AllocDelta, ProfilerBookkeeping};
+use crate::alloc::{snapshot_alloc_counters, AllocDelta, AllocSnapshot, ProfilerBookkeeping};
 use crate::children;
 use crate::cpu_clock::CpuNs;
 use crate::session::ProfileSession;
-use crate::time::{read, WallNs};
-use crate::types::{PollActive, PollDeltas};
+use crate::time::{read, Ticks, WallNs};
 use crate::NameId;
+
+/// Pre-poll measurement snapshots. Consumed by `end_poll` to compute deltas.
+struct PollActive {
+    wall_start: Ticks,
+    cpu_start: CpuNs,
+    alloc_start: AllocSnapshot,
+}
+
+/// Per-poll measurement deltas. Must be destructured exhaustively.
+/// Adding a field forces every consumer to handle it at compile time.
+struct PollDeltas {
+    wall: WallNs,
+    cpu: CpuNs,
+    alloc: AllocDelta,
+    children: WallNs,
+}
 
 /// Future wrapper for async function instrumentation.
 pub struct PianoFuture<F> {
