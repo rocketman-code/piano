@@ -5,8 +5,7 @@
 //! are drained and written as summary NDJSON (one line per function per
 //! thread, instead of one line per call).
 //!
-//! Linear scan with name_id equality. Benchmarked at 5.5 ns/call for
-//! 3 functions, 18 ns/call for 100 functions (Zipf distribution).
+//! Linear scan with name_id equality.
 //!
 //! Invariants:
 //! - Per-thread (no cross-thread sharing during recording).

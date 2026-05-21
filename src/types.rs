@@ -1,14 +1,13 @@
 //! Domain types for the CLI reader pipeline.
 //!
-//! Each type is derived from the carve spec. ParsedWall and CorrectedWall
-//! are distinct types -- the bias correction boundary is type-enforced.
+//! ParsedWall and CorrectedWall are distinct types -- the bias
+//! correction boundary is type-enforced.
 
 use std::ops::AddAssign;
 
-// ── MeasurementValue entity: ParsedWall ─────────────────────────
+// ── Parsed wall clock ───────────────────────────────────────────
 
-/// Parsed wall-clock nanoseconds (from NDJSON deserialization, before bias correction).
-/// Spec: MeasurementValue::ParsedWall.
+/// Wall-clock nanoseconds from NDJSON deserialization, before bias correction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(transparent)]
 pub(crate) struct ParsedWall(pub(crate) u64);
@@ -29,10 +28,9 @@ impl AddAssign for ParsedWall {
     }
 }
 
-// ── MeasurementValue entity: CorrectedWall ──────────────────────
+// ── Corrected wall clock ────────────────────────────────────────
 
-/// Corrected wall-clock nanoseconds (after bias subtraction).
-/// Spec: MeasurementValue::CorrectedWall. Consumed by display_wall.
+/// Wall-clock nanoseconds after bias subtraction.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CorrectedWall(u64);
 
@@ -42,10 +40,9 @@ impl CorrectedWall {
     }
 }
 
-// ── MeasurementValue entity: ParsedCpu ──────────────────────────
+// ── Parsed CPU time ─────────────────────────────────────────────
 
-/// Parsed CPU-time nanoseconds (from NDJSON deserialization, before bias correction).
-/// Spec: MeasurementValue::ParsedCpu.
+/// CPU-time nanoseconds from NDJSON deserialization, before bias correction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(transparent)]
 pub(crate) struct ParsedCpu(pub(crate) u64);
@@ -66,10 +63,9 @@ impl AddAssign for ParsedCpu {
     }
 }
 
-// ── MeasurementValue entity: CorrectedCpu ───────────────────────
+// ── Corrected CPU time ──────────────────────────────────────────
 
-/// Corrected CPU-time nanoseconds (after bias subtraction).
-/// Spec: MeasurementValue::CorrectedCpu. Consumed by display_cpu.
+/// CPU-time nanoseconds after bias subtraction.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CorrectedCpu(u64);
 
@@ -79,10 +75,9 @@ impl CorrectedCpu {
     }
 }
 
-// ── MeasurementValue entity: ParsedAlloc ────────────────────────
+// ── Allocation deltas ───────────────────────────────────────────
 
-/// Allocation delta counters (alloc minus free). No bias correction step.
-/// Spec: MeasurementValue::ParsedAlloc (Delta).
+/// Allocation delta counters (alloc minus free).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ParsedAlloc {
     pub(crate) alloc_count: u64,
@@ -100,16 +95,15 @@ impl AddAssign for ParsedAlloc {
     }
 }
 
-// ── FunctionIdentity entity: StableIdentity ─────────────────────
+// ── Function identity ───────────────────────────────────────────
 
 /// Stable function identity for cross-run matching.
-/// Spec: FunctionIdentity::Stable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StableIdentity(pub String);
 
-// ── Spec operations: bias correction ────────────────────────────
+// ── Bias correction ─────────────────────────────────────────────
 
-/// Spec: apply_wall_bias_correction. ParsedWall -> CorrectedWall.
+/// Subtract per-call measurement bias from parsed wall time.
 pub(crate) fn apply_wall_bias(
     parsed: ParsedWall,
     bias_per_call: ParsedWall,
@@ -122,7 +116,7 @@ pub(crate) fn apply_wall_bias(
     )
 }
 
-/// Spec: apply_cpu_bias_correction. ParsedCpu -> CorrectedCpu.
+/// Subtract per-call measurement bias from parsed CPU time.
 pub(crate) fn apply_cpu_bias(
     parsed: ParsedCpu,
     bias_per_call: ParsedCpu,

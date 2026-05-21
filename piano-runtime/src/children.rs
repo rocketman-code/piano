@@ -4,13 +4,13 @@
 //! all children that have completed within the current Guard's scope.
 //! Guard saves the previous value on creation (resetting to 0) and
 //! restores it on drop (adding its own inclusive time to the parent's
-//! accumulator). Same RAII save/restore pattern as parent.rs.
+//! accumulator).
 //!
 //! This enables self-time computation at measurement time:
 //!   self_ns = inclusive_ns - children_inclusive_ns
 //!
 //! Without this, self-time requires post-hoc span tree reconstruction
-//! from per-call records (570 MB of I/O for 3M calls).
+//! from per-call records.
 //!
 //! Invariants:
 //! - Managed exclusively by Guard and PianoFuture.

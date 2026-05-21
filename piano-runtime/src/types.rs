@@ -1,16 +1,15 @@
 //! Domain types for the measurement pipeline.
 //!
-//! Each type is derived from the carve spec. Fields are private --
-//! only the operation that establishes the property can construct
-//! the value. Consumers read through public accessors.
+//! Fields are private -- only the operation that establishes the
+//! property can construct the value. Consumers read through public
+//! accessors.
 
 use crate::alloc::{AllocDelta, AllocSnapshot};
 
-// ── MeasurementValue entity: Ticks ──────────────────────────────
+// ── Timing ──────────────────────────────────────────────────────
 
 /// Raw hardware counter value (TSC on x86_64, CNTVCT on aarch64,
 /// epoch-relative nanoseconds on fallback platforms).
-/// Spec: MeasurementValue::Ticks.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(transparent)]
 pub struct Ticks(u64);
@@ -29,10 +28,9 @@ impl Ticks {
     }
 }
 
-// ── MeasurementValue entity: WallNs ─────────────────────────────
+// ── Wall clock ──────────────────────────────────────────────────
 
 /// Calibrated wall-clock nanoseconds, epoch-relative.
-/// Spec: MeasurementValue::WallNs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(transparent)]
 pub struct WallNs(u64);
@@ -64,10 +62,9 @@ impl core::ops::AddAssign for WallNs {
     }
 }
 
-// ── MeasurementValue entity: CpuNs ─────────────────────────────
+// ── CPU time ────────────────────────────────────────────────────
 
 /// CPU-time nanoseconds (per-thread, from clock_gettime).
-/// Spec: MeasurementValue::CpuNs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(transparent)]
 pub struct CpuNs(u64);
@@ -99,10 +96,9 @@ impl core::ops::AddAssign for CpuNs {
     }
 }
 
-// ── FunctionId entity: NameId ───────────────────────────────────
+// ── Function identity ───────────────────────────────────────────
 
 /// Function name ID (assigned by rewriter, consumed by runtime).
-/// Spec: FunctionId::Assigned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct NameId(u32);
@@ -123,10 +119,9 @@ impl NameId {
     }
 }
 
-// ── AsyncExecution entity: PollActive ───────────────────────────
+// ── Async poll lifecycle ────────────────────────────────────────
 
 /// Pre-poll measurement snapshots. Consumed by `end_poll` to compute deltas.
-/// Spec: AsyncExecution Polling state (capture_poll_start output).
 pub(crate) struct PollActive {
     pub(crate) wall_start: Ticks,
     pub(crate) cpu_start: CpuNs,
@@ -134,7 +129,6 @@ pub(crate) struct PollActive {
 }
 
 /// Per-poll measurement deltas. Must be destructured exhaustively.
-/// Spec: AsyncExecution PollComplete -> Accumulated transition.
 /// Adding a field forces every consumer to handle it at compile time.
 pub(crate) struct PollDeltas {
     pub(crate) wall: WallNs,

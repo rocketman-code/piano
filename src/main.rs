@@ -416,15 +416,6 @@ fn assign_name_ids(
 /// Build an instrumented binary and return (binary_path, runs_dir, instrumented_fn_count).
 ///
 /// Returns `Ok(None)` when `--list-skipped` is used (early exit after printing).
-/// Build an instrumented binary.
-///
-/// Pipeline:
-///   1. Resolve project path, cargo metadata, binary target, source dir
-///   2. Resolve target functions (selectors, --skip, --list-skipped early exit)
-///   3. Qualify names, disambiguate, assign numeric IDs, discover macro functions
-///   4. Pre-build piano-runtime, clean stale files, create runs dir
-///   5. Compute workspace-relative paths, assemble WrapperConfig, write config
-///   6. Build with RUSTC_WORKSPACE_WRAPPER, warn about concurrency
 fn build_project(
     opts: BuildOpts,
     project_root: &Option<PathBuf>,
@@ -640,11 +631,6 @@ fn build_project(
     let (global_name_ids, global_display_names, _next_id) =
         assign_name_ids(&all_qualified, &display_names);
 
-    // TODO(rewriter-rebuild): macro function name discovery will be
-    // reimplemented as part of the new guard-only rewriter.
-
-    // Build set of all instrumentable function names across the entire workspace.
-    // Uses all_functions (not just measured targets) so that non-measured functions
     // Build a set of measured function names (from targets) for quick lookup.
     let measured_names: HashSet<String> = targets
         .iter()
