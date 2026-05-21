@@ -5,7 +5,11 @@
 //! structure is visible in one place.
 
 #[allow(unused_imports)]
+pub use crate::alloc::{AllocDelta, AllocSnapshot};
+#[allow(unused_imports)]
 pub use crate::cpu_clock::CpuNs;
+#[allow(unused_imports)]
+pub(crate) use crate::inflight::InterruptedEntry;
 #[allow(unused_imports)]
 pub use crate::time::{Ticks, WallNs};
 
