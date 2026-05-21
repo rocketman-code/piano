@@ -1,12 +1,96 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
+use crate::types::{apply_cpu_bias, apply_wall_bias};
 
 use super::{
-    FnAgg, FnEntry, NdjsonAggregate, NdjsonMeasurement, NdjsonNameTable, ParsedAlloc, ParsedCpu,
-    ParsedWall, Run, RunCompleteness, RunFormat, StableIdentity, apply_cpu_bias, apply_wall_bias,
+    FnAgg, FnEntry, NdjsonAggregate, NdjsonMeasurement, NdjsonNameTable, Run, RunCompleteness,
+    RunFormat,
 };
+
+// ── Parsed wall clock ───────────────────────────────────────────
+
+/// Wall-clock nanoseconds from NDJSON deserialization, before bias correction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ParsedWall(u64);
+
+impl ParsedWall {
+    pub(crate) fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn saturating_sub(self, rhs: Self) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_test(v: u64) -> Self {
+        Self(v)
+    }
+}
+
+impl AddAssign for ParsedWall {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+// ── Parsed CPU time ─────────────────────────────────────────────
+
+/// CPU-time nanoseconds from NDJSON deserialization, before bias correction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ParsedCpu(u64);
+
+impl ParsedCpu {
+    pub(crate) fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn saturating_sub(self, rhs: Self) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_test(v: u64) -> Self {
+        Self(v)
+    }
+}
+
+impl AddAssign for ParsedCpu {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+// ── Allocation deltas ───────────────────────────────────────────
+
+/// Allocation delta counters (alloc minus free).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ParsedAlloc {
+    pub(crate) alloc_count: u64,
+    pub(crate) alloc_bytes: u64,
+    pub(crate) free_count: u64,
+    pub(crate) free_bytes: u64,
+}
+
+impl AddAssign for ParsedAlloc {
+    fn add_assign(&mut self, rhs: Self) {
+        self.alloc_count += rhs.alloc_count;
+        self.alloc_bytes += rhs.alloc_bytes;
+        self.free_count += rhs.free_count;
+        self.free_bytes += rhs.free_bytes;
+    }
+}
+
+// ── Function identity ───────────────────────────────────────────
+
+/// Stable function identity for cross-run matching.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StableIdentity(pub(crate) String);
 
 /// Read a profiling run from a JSON or NDJSON file on disk.
 pub fn load_run(path: &Path) -> Result<Run, Error> {

@@ -11,9 +11,7 @@ pub(crate) mod test_util;
 pub(super) const HEADER: Style = Style::new().bold();
 pub(super) const DIM: Style = Style::new().effects(Effects::DIMMED);
 
-pub(super) use crate::types::{
-    ParsedAlloc, ParsedCpu, ParsedWall, StableIdentity, apply_cpu_bias, apply_wall_bias,
-};
+pub(super) use load::{ParsedAlloc, ParsedCpu, ParsedWall, StableIdentity};
 
 /// Describes the file format a Run was loaded from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
