@@ -150,7 +150,6 @@ impl Drop for Guard {
             &session.agg_registry,
         );
 
-        // Report inclusive time to parent scope.
         children::restore_and_report(self.saved_children_ns, inclusive_ns);
     }
 }

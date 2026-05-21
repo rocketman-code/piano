@@ -37,9 +37,7 @@ pub struct PianoFuture<F> {
     inner: F,
     session: Option<&'static ProfileSession>,
     name_id: NameId,
-    /// None = Constructed (never polled). Some = accumulated wall time.
-    /// Spec: create_async produces Constructed (None).
-    /// First poll transitions to Accumulated (Some).
+    /// None = never polled. Some = accumulated wall time across polls.
     wall_acc: Option<WallNs>,
     saved_children_ns: WallNs,
     alloc_acc: AllocDelta,
@@ -89,7 +87,6 @@ pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
 }
 
 /// Capture pre-poll measurement snapshots (wall, cpu, alloc).
-/// Called after Constructed -> Polling transition.
 #[inline(always)]
 fn begin_poll(session: &ProfileSession) -> PollActive {
     let alloc_start = {
@@ -111,7 +108,6 @@ fn begin_poll(session: &ProfileSession) -> PollActive {
 }
 
 /// Capture post-poll snapshots and compute all per-poll deltas.
-/// Spec: capture_poll_end + accumulate_poll (Polling -> PollComplete -> Accumulated).
 #[inline(always)]
 fn end_poll(active: PollActive, session: &ProfileSession) -> PollDeltas {
     compiler_fence(Ordering::SeqCst);
@@ -162,7 +158,6 @@ impl<F: Future> Future for PianoFuture<F> {
         // PianoFutures will add their inclusive times to TLS during this poll.
         let poll_children_saved = children::save_and_zero();
 
-        // Transition Constructed -> Polling before the inner poll.
         // If inner panics, emit() in Drop can still produce output.
         if this.wall_acc.is_none() {
             this.wall_acc = Some(WallNs::ZERO);
@@ -170,7 +165,6 @@ impl<F: Future> Future for PianoFuture<F> {
 
         let active = begin_poll(session);
 
-        // Poll inner future
         // SAFETY: inner is pinned through self. We never move it.
         let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
         let result = inner.poll(cx);
@@ -185,7 +179,6 @@ impl<F: Future> Future for PianoFuture<F> {
         // end_poll reads children TLS; restore must happen AFTER.
         children::restore_and_report(poll_children_saved, WallNs::ZERO);
 
-        // Accumulate all four measurements together.
         if let Some(ref mut acc) = this.wall_acc {
             *acc += wall;
         }
@@ -222,7 +215,6 @@ impl<F> PianoFuture<F> {
             &session.agg_registry,
         );
 
-        // Report our inclusive time to the parent scope.
         children::restore_and_report(self.saved_children_ns, inclusive_ns);
     }
 }
