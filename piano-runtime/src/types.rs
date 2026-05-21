@@ -1,9 +1,13 @@
 //! Domain types for the measurement pipeline.
 //!
 //! Each type is defined in the module that contains its producing
-//! operation. This module re-exports them for crate-wide access.
-//! Structure visible everywhere, construction restricted to the
-//! producing module.
+//! operation. This module re-exports them so the full domain
+//! structure is visible in one place.
+
+#[allow(unused_imports)]
+pub use crate::cpu_clock::CpuNs;
+#[allow(unused_imports)]
+pub use crate::time::{Ticks, WallNs};
 
 // ── NameId ──────────────────────────────────────────────────────
 
