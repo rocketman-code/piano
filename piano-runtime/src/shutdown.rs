@@ -2,6 +2,10 @@
 
 //! Lifecycle management -- atexit and signal handlers for abnormal exit.
 //!
+//! `process::exit` does not run destructors (process.rs:2429-2432) but
+//! does run atexit handlers (process.rs:2445-2446). Signals bypass both.
+//! Piano handles each path separately.
+//!
 //! Two shutdown paths, two contracts, NO shared code:
 //!
 //! Normal path (RootCtx::drop, atexit handler): acquires mutexes, drains

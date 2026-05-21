@@ -1,5 +1,16 @@
 #![allow(unsafe_code)]
 
+//! In-flight function tracking for process::exit recovery.
+//!
+//! `process::exit` does not run Drop (process.rs:2429-2432), so Guards
+//! on the stack are abandoned. This module stores (name_id, start_ticks)
+//! in lock-free atomics for each active function. The atexit handler
+//! reads these to emit interrupted entries with approximate timing.
+//!
+//! Depth tracking handles recursion: only the outermost call stores
+//! start_ticks, inner calls increment depth. On drain, depth > 0
+//! means the function was active when the process exited.
+
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::time::Ticks;
