@@ -2,6 +2,11 @@
 
 //! Lifecycle management -- atexit and signal handlers for abnormal exit.
 //!
+//! `process::exit` does not run destructors (std::process::exit docs:
+//! "the process is terminated immediately") but does run atexit handlers
+//! (libc::atexit contract). Signals bypass both.
+//! Piano handles each path separately.
+//!
 //! Two shutdown paths, two contracts, NO shared code:
 //!
 //! Normal path (RootCtx::drop, atexit handler): acquires mutexes, drains
