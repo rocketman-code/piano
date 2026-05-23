@@ -1,8 +1,8 @@
 //! Domain types for the measurement pipeline.
 //!
-//! Each type is defined in the module that contains its producing
-//! operation. This module re-exports them so the full domain
-//! structure is visible in one place.
+//! Source of truth: piano.carve (spec) -> carve -> carve-build ->
+//! generated Rust. Types are checked in, not build-time generated.
+//! Regenerate when the spec changes; CI checks freshness.
 
 #[allow(unused_imports)]
 pub use crate::alloc::{AllocDelta, AllocSnapshot};

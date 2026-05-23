@@ -1,9 +1,8 @@
 //! Domain types for the CLI reader pipeline.
 //!
-//! Parsed types (ParsedWall, ParsedCpu, ParsedAlloc, StableIdentity)
-//! are defined in report::load where deserialization produces them.
-//! Corrected types live here alongside the bias correction functions
-//! that produce them.
+//! Source of truth: piano.carve (spec) -> carve -> carve-build ->
+//! generated Rust. Types are checked in, not build-time generated.
+//! Regenerate when the spec changes; CI checks freshness.
 
 use crate::report::load::{ParsedCpu, ParsedWall};
 

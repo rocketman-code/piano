@@ -8,6 +8,14 @@
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` (documentation must compile cleanly, enforced in CI)
 - Idiomatic Rust: prefer stdlib patterns (iterators, if-let chains, Result propagation with `?`) over manual indexing or `process::exit` (except at the CLI boundary in `main.rs`)
 
+## Type Generation
+
+Domain types are generated from `piano.carve` via carve + carve-build.
+Generated files live in `src/generated/` (checked in, not build-time).
+Regenerate when the spec changes; CI checks freshness by re-generating
+and diffing. Hand-written types that duplicate spec-derived types are
+divergence risk -- the spec is the single source of truth.
+
 ## Module Organization
 
 A module should have one clear responsibility. When a developer opens a file, they should be able to state its purpose in one sentence without using "and."
@@ -25,16 +33,27 @@ When splitting `foo.rs` into `foo/mod.rs` + child modules:
 
 ## Testing
 
+Three layers, each derived from the spec:
+
+1. Types (compiler-enforced): requires/ensures in piano.carve derive types
+   via carve. The compiler rejects wrong dataflow. No tests needed.
+2. Invariants (test-enforced): asserts clauses in piano.carve declare
+   properties every output must satisfy. Tests check these predicates.
+3. Relational postconditions (user-written): input-output relationships
+   the spec can't express propositionally. User writes the test body;
+   the spec mandates it exists.
+
 Integration tests in `tests/`. Unit tests in source files (`#[cfg(test)]` modules) for parsing, formatting, and internal logic.
 
 ### When to Test
 
-- ALWAYS test: data transformations (NDJSON/JSON parsing, report formatting), AST rewriting correctness, cross-thread timing attribution, build pipeline (staging, dependency injection)
+- ALWAYS test: relational postconditions (output = f(input)), spec-declared invariants (asserts), data transformations (NDJSON/JSON parsing, report formatting), AST rewriting correctness
 - Test at boundaries: where runtime output gets parsed by the CLI, where user source gets rewritten
 - Cross-validate against known-good outputs (sample_crossval pattern)
 
 ### When NOT to Test
 
+- Dataflow (types guarantee it -- if carve derives the types, the compiler enforces the flow)
 - Subjective design choices (report column widths, wording)
 - Loud failures (code that crashes immediately and obviously)
 - Trivial delegation (passing args to a well-tested dependency)
