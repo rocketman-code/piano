@@ -30,6 +30,13 @@ pub struct EntryPointParams<'a> {
 //
 // Each classification step produces a typed result.
 // Transformation functions accept only the correct type.
+//
+// Priority ordering: async keyword checked first, then impl Future
+// return type, then sync. A Rust function can have both async keyword
+// AND -> impl Future return (valid syntax), so these are not mutually
+// exclusive. Async takes priority because the body has await points
+// and must be wrapped as a coroutine regardless of return type.
+// (Rust Reference, Items > Functions > Async functions.)
 
 struct Instrumentable {
     func: ast::Fn,
@@ -492,10 +499,15 @@ fn returns_impl_future(func: &ast::Fn) -> bool {
 /// Detect #[global_allocator] via structural AST analysis and inject wrapping
 /// into the StringInjector.
 ///
+/// Priority: direct #[global_allocator] checked first (determines
+/// unconditional vs cfg-gated), then #[cfg_attr]. A Rust item can have
+/// both #[cfg(a)] and #[cfg_attr(b, global_allocator)] — these are not
+/// mutually exclusive. (Rust Reference, Conditional Compilation.)
+///
 /// Case 1 (absent): insert PianoAllocator<System> at end of file.
 /// Case 2 (unconditional): replace the static item with wrapped version.
 /// Case 3 (cfg-gated): replace with wrapped + negated cfg fallback.
-/// Case 4 (cfg_attr-applied): same wrapping strategy as cfg-gated.
+/// Case 4 (cfg_attr-applied): same wrapping, using cfg_attr predicate.
 fn inject_allocator(
     file: &SourceFile,
     source: &str,
