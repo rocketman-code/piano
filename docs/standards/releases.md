@@ -36,7 +36,7 @@ Batch related changes, release when there's a meaningful set of user-facing chan
 3. `cargo clippy --workspace --all-targets -- -D warnings` clean
 4. `cargo doc --workspace --no-deps` builds without warnings
 5. Review README.md -- are all factual claims still true? (overhead numbers, bias numbers, limitations, Rust version, compatibility) Does this release add something that would change whether a new person tries piano?
-6. Update `CHANGELOG.md` (entries must be user-facing, no internal jargon)
+6. Update `CHANGELOG.md` (entries must be user-facing, no internal jargon), and update the comparison links at the bottom: point `[Unreleased]` at `vX.Y.Z...HEAD` and add the new version's compare link
 7. Bump version in both `Cargo.toml` and `piano-runtime/Cargo.toml`
 8. Run `cargo generate-lockfile --ignore-rust-version` (without this flag, cargo constrains all workspace deps to the lowest member MSRV, downgrading shared dependencies like clap)
 9. Commit: `chore(cargo): bump version to 0.x.y` -- this commit may only touch `Cargo.toml`, `piano-runtime/Cargo.toml`, and `Cargo.lock` (CI enforces this on `release/*` PRs)
