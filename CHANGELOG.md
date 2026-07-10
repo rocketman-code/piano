@@ -7,6 +7,14 @@ and this project adheres to pre-1.0 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Instrumenting a global allocator that carries both a `#[cfg(...)]` gate and a `#[cfg_attr(..., global_allocator)]` attribute no longer drops the `#[cfg(...)]` gate from the rewritten static, and the appended fallback allocator now negates the conjunction of both predicates instead of the `cfg_attr` predicate alone.
+
+### Changed
+
+- Domain types are derived from the committed spec files (`piano.carve`, `piano-runtime.carve`) and generated into committed zones with generated invariant tests; the measurement, classification, and reader-boundary types are now the spec-derived types.
+
 ## [0.15.1] - 2026-05-11
 
 Fixes async allocation attribution, a crash under timed profiling, and a platform-specific timing bug.
