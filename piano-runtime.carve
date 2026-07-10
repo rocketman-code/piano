@@ -1,0 +1,590 @@
+# piano-runtime.carve: the injected piano runtime specified in carve's
+# language. This file declares module piano-runtime (named by its
+# filename; no module lines): the measurement value types and their
+# arithmetic, the sync and async execution lifecycles, flat-profile
+# aggregation with process-exit interruption, and the emitting side of the
+# runtime->CLI NDJSON serialization boundary. Its sibling piano.carve
+# declares the CLI; together they are one model, and cross-module names are
+# plain. Contract rationale cites the primary sources (the Rust Reference,
+# std documentation, and the implementing modules); this spec is the
+# single source of truth for the domain types both crates regenerate from.
+
+# Measurement section (runtime
+# module; one module named by the file stem, no module line). All
+# declarations here are Private (pub(crate) in the Rust backend): the
+# runtime's crate-root public surface is NameId, PianoAllocator, enter,
+# enter_async, PianoFuture (piano-runtime/src/lib.rs:64-69); the
+# measurement value types and their arithmetic are internal machinery
+# the guard and future implementations use, not part of the injected
+# API. Per-operation rationale, witness
+# bindings, and the D-8 (non-negativity) resolution.
+
+# ── Runtime: measurement value types ──────────────────────────────
+# The five measurement carriers. Each is a scalar-backed counter in a
+# distinct unit; keeping the units in distinct types makes a
+# cross-unit subtraction (ticks minus nanoseconds, wall minus cpu)
+# unrepresentable.
+# Ticks/WallNs/CpuNs are u64 newtypes (repr(transparent) in code);
+# AllocSnapshot/AllocDelta are four-field products (the domain model
+# and the code both carry four counters, not one scalar).
+
+# Raw hardware counter reading, architecture-selected: RDTSC on
+# x86_64, CNTVCT_EL0 on aarch64, monotonic-clock nanoseconds on the
+# fallback. Carries no wall-time meaning on its own.
+# the counter is chosen per architecture
+# ticks are not nanoseconds until calibrated
+# piano-runtime/src/time.rs:29 (Ticks), :189 read()
+type Ticks : u64
+
+# Calibrated wall-clock nanoseconds, epoch-relative: raw ticks
+# projected through the per-process calibration ratio.
+# ticks are not nanoseconds until calibrated
+# piano-runtime/src/time.rs:50
+type WallNs : u64
+
+# Per-thread CPU-time nanoseconds from
+# clock_gettime(CLOCK_THREAD_CPUTIME_ID): counts only on-cpu
+# execution (sleeps, I/O waits, scheduling delays read as zero), a
+# distinct clock from wall time rather than a rescaling of it.
+# per-thread cpu time counts only on-cpu execution
+# piano-runtime/src/cpu_clock.rs:15
+type CpuNs : u64
+
+# A reading of the per-thread allocation counters at one instant. The
+# counters are monotonically increasing and never reset, so a region's
+# cost is recovered as a later snapshot minus an earlier one.
+# allocation counting interposes on the global allocator
+# allocation counting is snapshot minus snapshot
+# piano-runtime/src/alloc.rs:37-42
+type AllocSnapshot
+  field alloc_count : u64
+  field alloc_bytes : u64
+  field free_count : u64
+  field free_bytes : u64
+
+# The difference between two snapshots: a region's allocation cost.
+# Each field is a saturating snapshot-minus-snapshot, so no field
+# underflows below zero.
+# allocation counting is snapshot minus snapshot
+# alloc counts reflect the compiled binary not the source
+# piano-runtime/src/alloc.rs:80-85
+type AllocDelta
+  field alloc_count : u64
+  field alloc_bytes : u64
+  field free_count : u64
+  field free_bytes : u64
+
+# ── Hardware counter read ─────────────────────────────────────────
+# The measurement substrate is read from the target architecture, not
+# selected at runtime; all three arms return the same opaque Ticks so
+# downstream code is architecture-blind.
+# the counter is chosen per architecture
+# piano-runtime/src/time.rs:189 read()
+operation read_tsc() -> Ticks
+  requires true
+  ensures is_ticks(return)
+
+# Per-thread CPU clock read through inline clock_gettime FFI.
+# per-thread cpu time counts only on-cpu execution
+# piano-runtime/src/cpu_clock.rs:101 cpu_now_ns()
+operation read_cpu_clock() -> CpuNs
+  requires true
+  ensures is_cpu_ns(return)
+
+# ── Calibration: ticks -> nanoseconds ─────────────────────────────
+# Projects a raw tick reading onto wall nanoseconds through the
+# per-process calibration ratio. The unit change is the contract: the
+# result is nanoseconds and is no longer ticks. Non-negativity holds
+# because the epoch subtraction is monotone within one counter (the
+# result rides through now_ns's wrapping epoch subtraction, valid
+# because the epoch is captured at start).
+# ticks are not nanoseconds until calibrated
+# a duration is non-negative within one thread's monotonic counter
+# piano-runtime/src/time.rs:161 now_ns() / :151 ticks_to_ns()
+operation calibrate_to_ns(v: &Ticks) -> WallNs
+  requires is_ticks(v)
+  ensures is_wall_ns(return)
+  tests is_nonnegative_wall_ns(return)
+
+# ── Duration primitives ───────────────────────────────────────────
+# A duration is a same-unit end-minus-start. Ticks subtract with
+# WRAPPING arithmetic: across a 64-bit counter wraparound the wrapped
+# delta is the correct elapsed span (true span < 2^64), so ticks_delta
+# is deliberately NOT clamped and carries no non-negativity witness
+# (a clamp witness over a wrapped span would be vacuous). WallNs and CpuNs subtract with
+# SATURATING arithmetic, clamping at zero, so their non-negativity is
+# a real, witnessable property established here.
+# a duration is non-negative within one thread's monotonic counter
+# piano-runtime/src/time.rs:40 Ticks::wrapping_sub
+operation ticks_delta(end: &Ticks, start: &Ticks) -> Ticks
+  requires is_ticks(end)
+  ensures is_ticks(return)
+
+# piano-runtime/src/time.rs:61 WallNs::saturating_sub
+operation wall_duration(end: &WallNs, start: &WallNs) -> WallNs
+  requires is_wall_ns(end)
+  ensures is_wall_ns(return)
+  tests is_nonnegative_wall_ns(return)
+
+# piano-runtime/src/cpu_clock.rs:26 CpuNs::saturating_sub
+operation cpu_duration(end: &CpuNs, start: &CpuNs) -> CpuNs
+  requires is_cpu_ns(end)
+  ensures is_cpu_ns(return)
+  tests is_nonnegative_cpu_ns(return)
+
+# ── Accumulation ──────────────────────────────────────────────────
+# Running sums; addition, not subtraction, so no non-negativity
+# obligation. Observed params (same-family return) keep the operation
+# below the resource-minimality warning.
+# piano-runtime/src/time.rs:73 WallNs::Add
+operation wall_accumulate(acc: &WallNs, delta: &WallNs) -> WallNs
+  requires is_wall_ns(acc)
+  ensures is_wall_ns(return)
+
+# piano-runtime/src/cpu_clock.rs:38 CpuNs::AddAssign
+operation cpu_accumulate(acc: &CpuNs, delta: &CpuNs) -> CpuNs
+  requires is_cpu_ns(acc)
+  ensures is_cpu_ns(return)
+
+# ── Self time = inclusive - children ──────────────────────────────
+# Every child reports its inclusive time upward to the enclosing
+# parent scope; nested drop order guarantees a child reports before
+# its parent reads. Every child reports (completed, cancelled, or
+# interrupted), so the sum stays complete.
+# self time is inclusive time minus children time
+# piano-runtime/src/children.rs report_inclusive / restore_and_report
+operation report_child_inclusive(child_inclusive: &WallNs)
+  requires is_wall_ns(child_inclusive)
+  ensures true
+
+# Self time is inclusive minus the children sum, clamped non-negative
+# (saturating_sub supplies the non-negativity) and bounded by the
+# inclusive value (a part of a whole). is_le_inclusive is relational:
+# it reads both the inclusive input and the return.
+# self time is inclusive time minus children time
+# a duration is non-negative within one thread's monotonic counter
+# piano-runtime: guard.rs / piano_future.rs inclusive_ns.saturating_sub(children_ns)
+operation compute_self_time(inclusive: &WallNs, children_sum: &WallNs) -> WallNs
+  requires and(is_wall_ns(inclusive), is_wall_ns(children_sum))
+  ensures is_wall_ns(return)
+  tests is_nonnegative_wall_ns(return)
+  tests is_le_inclusive(inclusive, return)
+
+# ── Allocation counting ───────────────────────────────────────────
+# The counters are maintained by PianoAllocator interposing on the
+# global allocator (public, but modeled as allocator-lifecycle
+# machinery, not a value operation here). snapshot_counter reads them,
+# compute_delta differences two readings (per-field saturating_sub, so
+# no field underflows), accumulate_delta sums deltas. Counts reflect
+# the compiled binary, not the source: the optimizer may elide
+# allocations before they reach the allocator.
+# allocation counting interposes on the global allocator
+# allocation counting is snapshot minus snapshot
+# alloc counts reflect the compiled binary not the source
+# piano-runtime/src/alloc.rs:111 snapshot_alloc_counters()
+operation snapshot_counter() -> AllocSnapshot
+  requires true
+  ensures is_snapshot(return)
+
+# piano-runtime/src/alloc.rs:52 delta_since()
+operation compute_delta(end: &AllocSnapshot, start: &AllocSnapshot) -> AllocDelta
+  requires is_snapshot(end)
+  ensures is_delta(return)
+  tests is_nonnegative_delta(return)
+
+# piano-runtime/src/alloc.rs:96 AllocDelta::AddAssign
+operation accumulate_delta(acc: &AllocDelta, delta: &AllocDelta) -> AllocDelta
+  requires is_delta(acc)
+  ensures is_delta(return)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── Runtime: the per-run function identity ────────────────────────
+# The per-run function id. Minted by the rewriter at instrumentation time
+# and injected into generated source as a literal; the runtime receives it
+# across a trust boundary and cannot establish assignment itself, so the
+# domain supplies it (the name_id is a per-run index, not the identity).
+public type NameId : u32
+given is_assigned(v)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── Runtime: sync execution lifecycle ─────────────────────────────
+# Target file/module: piano-runtime.carve (no module line; the file stem
+# names the one module).
+#
+# The RAII timing sentinel. `enter` materializes it bound to the profiled
+# function's body scope; the compiler runs its Drop at every exit path
+# (early return, `?`, panic), so the measured inclusive span is exactly
+# the value's lifetime, which is exactly the function's dynamic extent.
+#
+# Domain (std::ops::Drop; Rust Reference, Destructors; implementing
+# source guard.rs / children.rs / lib.rs):
+#   destructors run at scope exit — Drop is implicit at scope exit
+#     with no exit call, which is why enter has no exported exit twin:
+#     guard.rs:55 (enter), guard.rs:118 (Drop).
+#   destructors run during unwinding — a panicking function still
+#     records; the unwind runs Drop, and Guard never panics (all
+#     saturating_sub): guard.rs:16, 140-144.
+#   locals drop in reverse declaration order +
+#   reverse drop order computes nested self time — a callee's Guard
+#     lives in a scope strictly inside the caller's, so it drops first and
+#     reports its inclusive time before the caller's Drop reads the
+#     children sum; sync nesting is exclusive, so the save-and-restore in
+#     create/Drop is correct: guard.rs:89, 142, 156; children.rs
+#     save_and_zero / restore_and_report.
+#   struct fields drop in declaration order — the !Send marker field
+#     is zero-sized and inert; observable drop is the explicit Drop::drop.
+
+# One base type, two refinements. is_entered / is_exited are refinement
+# predicates over the single SyncExecution core (the Guard's captured
+# state), NOT two declared types: entering and exiting are two lifecycle
+# points of the same value, before and after Drop. Kind is product (it has
+# fields). Fields are the boundary-given core captured at enter
+# (guard.rs:87-108). name_id is the per-run function-identity type NameId
+# (declared above in this file, referenced here by plain model-wide name).
+# Ticks / CpuNs / AllocSnapshot / WallNs are the measurement types
+# (same module).
+opaque type SyncExecution
+  field name_id : NameId
+  field start_ticks : Ticks
+  field cpu_start : CpuNs
+  field alloc_start : AllocSnapshot
+  field saved_children_ns : WallNs
+
+# enter_sync (real symbol `enter`, lib.rs:68) is the one exported sync
+# entry the injected guards call, so it is public. It observes the
+# assigned id (NameId is Copy; read, not invalidated) and mints the
+# entered sentinel: snapshots alloc/cpu, saves-and-zeroes the parent
+# children accumulator (children::save_and_zero), stamps start_ticks.
+# is_assigned is supplied by the runtime-side given; enter_sync requires it.
+public operation enter_sync(id: &NameId) -> SyncExecution
+  requires true
+  ensures is_entered(return)
+
+# exit_sync is Drop::drop (guard.rs:118): compiler-invoked at scope exit,
+# not an exported symbol, hence private (there is no `exit` in lib.rs).
+# It consumes the guard (bare param — Drop consumes the value): reads
+# end_ticks, computes inclusive, reads the children sum, computes self via
+# compute_self_time, aggregates, then restores-and-reports this
+# guard's own inclusive time up to the parent (children::restore_and_report).
+# saved_children_ns is consumed: it is the parent's accumulator borrowed at
+# enter and handed back at exit, so it lives only in the entered state and
+# is absent from the exited one. not(is_entered(return)) is left to the
+# entailment below rather than restated (would be a redundancy warning).
+operation exit_sync(exec: SyncExecution) -> SyncExecution
+  requires is_entered(exec)
+  ensures is_exited(return)
+  consumes saved_children_ns
+
+# Lifecycle mutual exclusion: a guard is entered xor exited. The second
+# line supplies not(is_entered) on the exited state, so exit_sync's ensures
+# need not restate it.
+given is_entered(v) => not(is_exited(v))
+given is_exited(v) => not(is_entered(v))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── piano-runtime: async execution lifecycle ──────────────────────
+# Target file: piano-runtime.carve (module piano-runtime).
+# Implementing source: piano-runtime/src/piano_future.rs.
+#
+# Domain: core::future::Future (doc.rust-lang.org/std/future/trait.Future.html;
+# core::task::Poll, doc.rust-lang.org/std/task/enum.Poll.html). Piano overlays
+# per-poll measurement on the poll lifecycle: each poll brackets one begin/end
+# pair, deltas accumulate into scalar accumulators, and one terminal emit
+# reports the aggregate. See measurement accumulates per poll not across
+# polls for the overlay-onto-lifecycle mapping.
+#
+# NameId is the per-run function-identity type (declared once model-wide
+# earlier in this file; piano-runtime/src/types.rs:23, pub use
+# types::NameId). name_id is the field; NameId is its type.
+#
+# WallNs, CpuNs, AllocDelta come from the measurement section; Option is a backend
+# prelude container. All referenced by plain name (model-wide).
+
+# AsyncExecution overlays the poll state machine of one instrumented future
+# (piano_future.rs:53, pub struct PianoFuture). Every field exists from
+# creation (create_async initializes them), so all are base fields, not
+# introductions. wall_acc None means never polled (piano_future.rs:57), the
+# witness that carries is_ever_polled; the accumulators are per-poll sums
+# (piano_future.rs:57-61), never a first-poll-to-completion span. emitted is
+# the exactly-once emit guard (piano_future.rs:62, 214): it stays a bool
+# field, not a lifecycle state: the once-only discipline is the caller's
+# take-the-value-out vehicle, outside the spec's move algebra.
+opaque type AsyncExecution
+  field name_id : NameId
+  field wall_acc : Option<WallNs>
+  field cpu_acc : CpuNs
+  field alloc_acc : AllocDelta
+  field children_ns_acc : WallNs
+  field emitted : bool
+
+# futures are inert until polled: a fresh execution has run nothing and
+# consumes no time. is_idle is exactly this inert, never-polled condition
+# (wall_acc None). Models the active-session path of enter_async
+# (piano_future.rs:69, pub fn enter_async; the sole public entry the rewriter
+# injects). Future::poll docs, verbatim: "Futures alone are inert; they must
+# be actively polled" (piano.carve:304-305).
+public operation create_async(id: &NameId) -> AsyncExecution
+  requires true
+  ensures is_idle(return)
+
+# poll is the sole advance of an async computation: poll is the single
+# entry point that moves the computation; each call is one synchronous,
+# indivisible step. begin_poll opens the pre-poll snapshot bracket
+# (piano_future.rs:176). It requires is_idle, so it accepts both the fresh
+# execution (first poll) and the suspended-between-polls state (re-poll), the
+# poll loop. is_idle => not(is_mid_poll) forbids re-entering a poll already in
+# progress. a future may migrate threads between polls: each poll's
+# snapshots are captured on whatever thread runs it, so a thread change
+# between polls never corrupts a measurement.
+operation begin_poll(exec: AsyncExecution) -> MidPoll
+  requires is_idle(exec)
+  ensures is_mid_poll(return)
+  introduces poll_start_ticks : Ticks
+  introduces poll_cpu_start : CpuNs
+  introduces poll_alloc_start : AllocSnapshot
+  introduces poll_children_saved : WallNs
+
+# measurement accumulates per poll not across polls: end_poll closes the
+# bracket (piano_future.rs:182-198), adding this poll's wall/cpu/alloc/children
+# deltas into the accumulators -- summing per-poll deltas, never one span that
+# would fold in the inert suspension gap. Returns to idle (re-pollable) and
+# establishes is_ever_polled: at least one poll has completed. is_ever_polled
+# is the second dimension distinguishing this suspended state from the fresh
+# never-polled one; both are is_idle.
+operation end_poll(exec: MidPoll) -> AsyncExecution
+  requires is_mid_poll(exec)
+  ensures and(is_idle(return), is_ever_polled(return))
+  consumes poll_start_ticks
+  consumes poll_cpu_start
+  consumes poll_alloc_start
+  consumes poll_children_saved
+
+# a finished future is not polled again: completion is a distinct terminal
+# overlay state, reachable only from idle-and-ever-polled (a poll returned
+# Ready, piano_future.rs:200). is_poll_completed => not(is_idle) makes this
+# state fail begin_poll's is_idle precondition, so re-polling a finished future
+# is structurally unrepresentable -- the typestate encoding of "Once a future
+# has finished, clients should not poll it again" (Future::poll docs, verbatim,
+# piano.carve:302-303). No code call maps to mark_completed: completion is the
+# inline is_ready() branch; the operation models the lifecycle transition the
+# report distinguishes from cancellation only at the state level.
+operation mark_completed(exec: AsyncExecution) -> PollCompleted
+  requires and(is_idle(exec), is_ever_polled(exec))
+  ensures is_poll_completed(return)
+
+# The single terminal emit (piano_future.rs:209-230, fn emit): one identical
+# aggregate written regardless of terminal kind. Observed, because emit reads
+# the accumulators and reports without moving the future -- Drop re-enters it
+# (piano_future.rs:233-238). Requires is_ever_polled, exactly the runtime guard
+# wall_acc.is_some() (piano_future.rs:210): a never-polled future (is_idle only)
+# cannot satisfy it and emits nothing, so the no-emit case is structural, not a
+# field check. Reachable from all three terminal states via is_ever_polled:
+# poll_completed (a finished future is not polled again, the Ready path),
+# the idle-and-ever-polled state (cancellation) and mid_poll (interruption),
+# both drop-driven (a future may be dropped at any point: PianoFuture's Drop
+# emits a best-effort aggregate). One emit operation serves every terminal
+# condition: the terminal distinction lives in the states, and three
+# observe-only operations with one indistinguishable output would be
+# phantom structure. Exactly-once is discharged structurally, a two-run
+# property carrying no witness.
+operation emit(exec: &AsyncExecution)
+  requires is_ever_polled(exec)
+  ensures true
+
+# Poll-state mutual exclusions (piano.carve:347-350): a future is in exactly
+# one of idle / mid_poll / poll_completed.
+given is_mid_poll(v) => not(is_idle(v))
+given is_idle(v) => not(is_mid_poll(v))
+given is_poll_completed(v) => not(is_idle(v))
+given is_poll_completed(v) => not(is_mid_poll(v))
+
+# ever_polled monotonicity: entering a poll (mid_poll) or finishing
+# (poll_completed) both entail at least one poll has begun, so both are
+# ever_polled. measurement accumulates per poll not across polls:
+# ever_polled once wall_acc is Some (piano_future.rs:57, 172). These let the
+# single emit's is_ever_polled precondition be satisfied from every terminal
+# state.
+given is_mid_poll(v) => is_ever_polled(v)
+given is_poll_completed(v) => is_ever_polled(v)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Target file: piano-runtime.carve (module piano-runtime, filename-named,
+# no module lines). Flat-profile aggregation and process-exit outcome
+# classification. Cross-unit references are plain names (model-wide):
+#   NameId  -- the per-run function-identity type (declared above in this file).
+#   is_assigned(id) -- the runtime-side given on that identity.
+#   Ticks, WallNs, CpuNs, AllocDelta -- the measurement newtypes.
+#   is_ticks / is_wall_ns / is_cpu_ns / is_delta -- their predicates.
+
+# ── Runtime: aggregation ──────────────────────────────────────────
+# flat profile aggregation groups by function identity and sums fields
+# atomically. A flat profile groups measurement records under a
+# function's identity and sums each numeric measure across that
+# function's calls; all measures for one call advance together in one
+# indivisible step, never field by field across separate passes (row
+# consistency: a row read mid-update would describe a different call
+# subset per field). Lineage: gprof (Graham, Kessler & McKusick, "gprof:
+# a Call Graph Execution Profiler", SIGPLAN '82). Implementation:
+# piano-runtime/src/aggregator.rs -- a per-thread Vec<FnAgg>, linear scan
+# on function identity, all four measures added in one block
+# (aggregator.rs:73-78); miss pushes a new FnAgg row.
+#
+# The five domain measurements are observed (&): aggregate reads each and
+# folds it into the thread's accumulator (the caller's Copy values
+# survive), returns nothing, and transitions none of them to a new state,
+# so observed is the minimal resource mode (consuming would be
+# over-restrictive). name_id carries the is_assigned given; the four numeric
+# measures carry the measurement predicates. Private: the aggregation subsystem
+# is internal plumbing behind the re-exported enter/enter_async lifecycle;
+# aggregate's only callers are guard.rs and piano_future.rs inside the
+# crate (no external caller, not re-exported at the crate root).
+operation aggregate(id: &NameId, self_wall: &WallNs, inclusive_wall: &WallNs, cpu: &CpuNs, alloc: &AllocDelta)
+  requires and(is_wall_ns(self_wall), and(is_wall_ns(inclusive_wall), and(is_cpu_ns(cpu), is_delta(alloc))))
+  ensures true
+
+# ── Process lifecycle: exit classification ────────────────────────
+# process exit abandons stack destructors. std::process::exit runs no
+# destructors on any thread's stack, so every measurement Guard live on
+# the stack is abandoned and the record its Drop would have emitted is
+# lost. The std docs state verbatim
+# (doc.rust-lang.org/std/process/fn.exit.html): the function "will
+# immediately terminate the current process", and "no destructors on the
+# current stack or any other thread's stack will be run". Registered
+# atexit handlers still run, which is the escape hatch: piano mirrors each
+# active function's (name_id, start_ticks) into lock-free atomic slots on
+# entry (piano-runtime/src/inflight.rs) and, at exit, drains the
+# still-live slots into interrupted entries with approximate timing.
+#
+# completed and interrupted outcomes are mutually exclusive. Every
+# execution resolves to exactly one outcome, and the two partition all
+# executions. This is NOT one runtime value with two variants: completed
+# and interrupted are disjoint EMIT PATHS that materialize different
+# types. A completed call emits from its Guard's Drop, clears its
+# in-flight slot (depth to 0, start to 0, inflight.rs:74-77), and is
+# reported through per-function aggregation (the aggregate operation
+# above, drained to FnAgg rows). Only calls still live on the abandoned
+# stack keep depth > 0 and a nonzero start, so the exit drain emits an
+# InterruptedEntry for exactly those and no others (inflight.rs:95-107).
+# The exclusion is a structural runtime guarantee (the depth/start
+# clearing), not a predicate entailment: the completed path mints no
+# outcome value (its data becomes an aggregated FnAgg row), so there is no
+# shared sort for an is_completed/is_interrupted entailment to range over.
+# The interrupted path is the only one that materializes an outcome type.
+
+# The materialized interrupted outcome, the sole outcome value the runtime
+# mints (inflight.rs InterruptedEntry). name_id is
+# the per-run function-identity type NameId; start_ticks is the raw hardware
+# counter the in-flight slot stored (Ticks, uncalibrated, not WallNs);
+# depth is the recursion depth counted so a still-active recursive
+# function is emitted once, not once per frame. The serialize/parse
+# outcome operations ride this type across the NDJSON boundary. Private:
+# inflight is a pub(crate) module and InterruptedEntry a pub(crate) type.
+type InterruptedEntry
+  field name_id : NameId
+  field start_ticks : Ticks
+  field depth : u32
+
+# interrupt_execution derives the interrupted entry from the in-flight
+# start tick and the exit-time tick (write_interrupted_aggregates
+# computes elapsed = end_ns - start_ns from these, output.rs:95-99). Both
+# operands are raw Ticks -- the type inflight actually stores and drains
+# (start_ticks.raw() / Ticks::from_raw); the predicate over Ticks is
+# is_ticks. Observed: reads the ticks to
+# compute approximate timing, invalidates nothing. Private (inflight).
+operation interrupt_execution(id: &NameId, start: &Ticks, depth: u32) -> InterruptedEntry
+  requires is_ticks(start)
+  ensures is_interrupted(return)
+# Reporting an interrupted entry IS serialize_interrupted composed with
+# write_line; a spec operation for the composition would be phantom
+# structure (the same law that collapsed the three terminal emits).
+
+# ═══════════════════════════════════════════════════════════════════
+# ── piano-runtime -> CLI serialization boundary (emitting side) ───
+# Module-local types, textual seam, line-level parse.
+# The boundary is textual NDJSON: no Rust value crosses it at runtime, the
+# file IS the interface: a run is a line-delimited stream of
+# self-contained JSON records.  Each module declares its own types; no
+# cross-module type reference exists, so no crate edge piano ->
+# piano-runtime is forced (the two crates share zero types across this seam
+# and agree only on a byte format).  Correctness across the seam is carried
+# the way the codebase already carries it -- hand-built round-trip format
+# fixtures -- NOT the type system (see the seam-witness open question in
+# above). The reading half lives in piano.carve.
+
+# write's I/O sink and failure type.  Not carve IR: the backend binds
+# Destination -> &std::path::Path, IoError -> std::io::Error.  Mirrors the
+# io::Result the serializer already returns (output.rs l.12: "Write errors
+# are propagated as io::Result").
+# The emitted name tables (display and qualified), hand-authored on the
+# emitting side; the reader's parsed table is a distinct CLI-module value.
+external NameTable
+
+external Destination
+external IoError
+
+# SerializedLine: one NDJSON record as bytes leaving the runtime.  RT-local,
+# base String.  Named SerializedLine (not NdjsonLine) because model-wide name
+# uniqueness forbids the CLI's raw-line type sharing the name — and the two
+# ARE different values (emitted bytes vs. bytes read back from a file), which
+# is itself the evidence that the seam is textual, not a typed handoff.
+# Source: piano-runtime/src/output.rs.
+type SerializedLine : String
+
+# ── Pure serialization (never fails; hand-written formatting, no JSON dep,
+#    "Never panics" — output.rs l.11-12).  Each op ensures the produced line
+#    is self-contained valid JSON terminated by a newline (the serializer's
+#    stated invariant, output.rs l.6-9). ─────────────────────────────────
+
+# The header line: name table + run metadata + calibrated bias constants.
+# bias_ns / cpu_bias_ns are the per-call correction constants the reader will
+# subtract: measured time includes the cost of measuring it, and the
+# correction constants travel with the run they correct.
+# Source: output.rs write_header l.20-33, write_name_table_fields l.195-225.
+operation serialize_header(names: &NameTable, bias: &WallNs, cpu_bias: &CpuNs, run_id: &String, timestamp_ms: u128) -> SerializedLine
+  requires true
+  ensures is_header_line(return)
+  tests is_self_contained(return)
+
+# One aggregated per-function line (default mode; self-time pre-computed by
+# the runtime).  Fields mirror write_aggregates exactly.
+# Source: output.rs write_aggregates l.60-88, serialize_aggregate_to_stack
+# l.140-182 (signal-safe stack encoding, no alloc).
+operation serialize_aggregate(id: &NameId, self_wall: &WallNs, inclusive_wall: &WallNs, cpu_self: &CpuNs, alloc: &AllocDelta, calls: u64, thread: u64) -> SerializedLine
+  requires and(is_wall_ns(self_wall), and(is_wall_ns(inclusive_wall), and(is_cpu_ns(cpu_self), is_delta(alloc))))
+  ensures is_aggregate_line(return)
+  tests is_self_contained(return)
+
+# One interrupted-function line: a Guard abandoned by process::exit, recovered
+# from inflight tracking.  Source: output.rs write_interrupted_aggregates
+# l.90-116 (crate-private today -> Private here).
+operation serialize_interrupted(id: &NameId, elapsed: &WallNs, depth: u32) -> SerializedLine
+  requires is_wall_ns(elapsed)
+  ensures is_interrupted_line(return)
+  tests is_self_contained(return)
+
+# The trailer line: structurally identical to the header (dual name table for
+# crash resilience), only the "type" field differs.  The witness pins that
+# duality — the load-bearing recovery invariant: header and trailer
+# are identical in structure with only the type field differing.
+# Source: output.rs write_trailer l.36-43, serialize_trailer l.46-55.
+operation serialize_trailer(names: &NameTable, bias: &WallNs, cpu_bias: &CpuNs) -> SerializedLine
+  requires true
+  ensures is_trailer_line(return)
+  tests is_self_contained(return)
+  tests is_dual_of_header(return)
+
+# ── The one fallible step: committing bytes to the sink.  I/O is where the
+#    runtime can fail; formatting is not. ────────────────────────────────
+operation write_line(line: SerializedLine, dest: &Destination)
+  requires is_serialized(line)
+  ensures true
+  fails IoError
+
+given is_header_line(v) => is_serialized(v)
+given is_aggregate_line(v) => is_serialized(v)
+given is_interrupted_line(v) => is_serialized(v)
+given is_trailer_line(v) => is_serialized(v)

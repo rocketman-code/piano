@@ -22,3 +22,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 [[bench]]
 name = "piano_future_overhead"
 harness = false
+
+[package.metadata.carve]
+Destination = "std::path::Path"
+IoError = "std::io::Error"
+NameTable = "crate::output::NameTable"

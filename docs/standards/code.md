@@ -10,11 +10,18 @@
 
 ## Type Generation
 
-Domain types are generated from `piano.carve` via carve + carve-build.
-Generated files live in `src/generated/` (checked in, not build-time).
-Regenerate when the spec changes; CI checks freshness by re-generating
-and diffing. Hand-written types that duplicate spec-derived types are
-divergence risk -- the spec is the single source of truth.
+Domain types are generated from the root spec set (`piano.carve` +
+`piano-runtime.carve`, one module per file) via the carve binary.
+Generated zones are committed, never build-time: `src/generated.rs`,
+`src/invariants.rs`, and the workspace `derivation.snapshot` are
+regenerated wholesale by `carve generate`; the `src/generated/<type>/ops.rs`
+files are user-owned operation implementations written once. Freshness:
+run `carve generate` at the workspace root and require a clean
+`git diff` on the regenerated files (the CI job lands when carve is
+publicly released; until then the check is run locally with the carve
+binary built from its repo). Hand-written types that duplicate
+spec-derived types are divergence risk -- the spec is the single source
+of truth.
 
 ## Module Organization
 

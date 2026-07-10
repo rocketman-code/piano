@@ -1,0 +1,670 @@
+# piano.carve: the piano CLI specified in carve's language. This file
+# declares module piano (named by its filename; no module lines): the
+# source rewriter's function and allocator classification, build
+# invocation, cross-run diff identity and tags, and the NDJSON reading
+# side of the runtime->CLI serialization boundary. Its sibling
+# piano-runtime.carve declares the injected runtime; together they are one
+# model, and cross-module names are plain. Contract rationale cites the
+# primary sources (the Rust Reference, std documentation, and the
+# implementing modules); this spec is the single source of truth for the
+# domain types both crates regenerate from.
+
+# ── CLI rewriter: function classification (module piano) ──────────
+# Primary sources: src/resolve.rs (classify, extract_cst_abi) and
+# src/rewrite/mod.rs (detect_instrumentable, apply_filter, classify,
+# inject_*). Every declaration in this section is
+# private: the rewriter's classification pipeline is module-internal (the
+# impl structs Instrumentable/Selected/Classified* and every fn are
+# private; the crate exposes only instrument_source/InstrumentResult), so
+# nothing here carries the public prefix.
+
+# syn/ra_ap_syntax handles. carve carries only the name; the Rust backend
+# binds Fn -> ra_ap_syntax::ast::Fn, StmtList -> ra_ap_syntax::ast::StmtList
+# via [package.metadata.carve].
+# The rewriter's string-injection buffer: consumed and returned, because
+# the injection transforms it (its edit list grows) and a transformed
+# resource is a move in the spec's algebra.
+external Injector
+
+# The parsed source file the allocator detection walks.
+external SourceFile
+
+external Fn
+external StmtList
+
+# The instrumentable-function core threaded through the classification
+# pipeline (impl: rewrite/mod.rs Instrumentable { func, stmt_list }). func
+# is the signature+body handle, stmt_list the body's statement block (the
+# injection site), fn_name the resolved qualified name. fn_name is
+# intrinsic to the function (a function always has a name), so it lives in
+# the core; the measurement index name_id, which first exists only at
+# selection, is introduced there instead (see apply_filter). Boundary
+# value: detect_instrumentable lifts a raw syn Fn into this domain type.
+type SourceFunction
+  field func : Fn
+  field stmt_list : StmtList
+  field fn_name : String
+
+# The classification typestates each compose the shared core as a field
+# and differ only by the ensured invariant (rustls per-state-struct
+# pattern; reference.md Typestates uses this exact SourceFunction/Selected/
+# ClassifiedAsync domain). In the impl these are the newtypes Selected /
+# ClassifiedAsync / ClassifiedImplFuture / ClassifiedSync, each wrapping
+# the prior state and adding no data beyond the introduced name_id.
+# Private: module-internal to the rewriter.
+type Selected
+  field source : SourceFunction
+type ClassifiedAsync
+  field source : SourceFunction
+  field name_id : u32
+type ClassifiedImplFuture
+  field source : SourceFunction
+  field name_id : u32
+type ClassifiedSync
+  field source : SourceFunction
+  field name_id : u32
+
+# No entailments in this section. async and impl Future are NOT mutually
+# exclusive: `async fn foo() -> impl Future<Output = T>` is legal -- the
+# async keyword desugars the body into one coroutine while the explicit
+# impl Future annotates a (doubly wrapped) return type.
+# async and impl future are not mutually exclusive. The overlap is
+# resolved by PRIORITY (async tested first), encoded in the ensures
+# clauses below (classify_impl_future ensures not(is_async)), never by a
+# mutual-exclusion given. Mutual exclusion is reserved for genuinely
+# disjoint syntactic facts (cfg-gated vs unconditional in the allocator section below).
+# (Rust Reference, Items > Functions > Async functions.)
+
+# ── Instrumentability detection ───────────────────────────────────
+# A function is instrumentable iff it carries a block body of executable
+# statements AND is neither const nor of a non-Rust ABI. The body is where
+# the injected runtime call goes, so a bodyless function (an abstract
+# trait method, an extern-block foreign fn) has nothing to instrument.
+# instrumentability requires an executable rust body.
+# const is excluded because "the body of a const function may only use
+# constant expressions" (Rust Reference, Constant evaluation > Const
+# functions); the injected profiling call is an ordinary runtime call, not
+# a constant expression, so injecting it would make a const fn body
+# ill-formed. The barrier is the constant-expression body restriction, NOT
+# runtime callability (a const fn IS runtime-callable from a non-const
+# context). A non-Rust ABI is excluded because its body uses a foreign
+# calling convention: extern "Rust" stays instrumentable, while extern "C"
+# and bare extern (which defaults to C) do not; the discriminant is the
+# resolved ABI string. unsafe fn is deliberately NOT excluded (the guard
+# is pure safe code). const and non-rust-abi functions are
+# uninstrumentable. Source: src/resolve.rs classify / extract_cst_abi;
+# rewrite/mod.rs detect_instrumentable. Nullary boundary producer: the
+# file-walk input is beneath the spec's abstraction, so it grounds the
+# pipeline by lifting a detected function into the domain core with no
+# modeled parameter (consistent with detect_allocator).
+operation detect_instrumentable(func: Fn) -> SourceFunction
+  requires true
+  ensures is_instrumentable(return)
+  tests is_instrumentable_sound(return)
+
+# ── Selection ─────────────────────────────────────────────────────
+# An instrumentable function is selected when it is in the measured set;
+# an instrumentable-but-unselected function is pass-through (it receives
+# ctx but no guard), so is_instrumentable and is_selected are distinct.
+# apply_filter introduces name_id: the measurement index that first exists
+# at selection (reference.md's own introduces example). Source:
+# rewrite/mod.rs apply_filter (looks name_id up in `measured`). f is moved
+# into Selected (consumed); the transition plus the field introduction
+# justify the move.
+operation apply_filter(f: SourceFunction, name_id: u32) -> Selected
+  requires is_instrumentable(f)
+  ensures and(is_instrumentable(return), is_selected(return))
+  introduces name_id : u32
+
+# ── Kind classification (priority-ordered) ────────────────────────
+# The kind alone selects the injection strategy, and there are three kinds
+# because there are three temporal shapes a body can have.
+# function kind selects the instrumentation strategy. classify tests
+# async FIRST, then impl Future, then sync (rewrite/mod.rs classify).
+
+# Async: the async keyword desugars the body into a coroutine REGARDLESS
+# of return annotation and regardless of await presence -- an async fn
+# with zero awaits is still a coroutine (its state machine has a single
+# state). an async fn is a coroutine regardless of its return
+# annotation. So async is tested first: any function with the async
+# keyword takes the body-wrapping (coroutine) path, which is correct for a
+# coroutine body whose block evaluates to the Output, not to a future.
+# (Rust Reference, Items > Functions > Async functions.) Source:
+# rewrite/mod.rs classify (async_token checked first). f consumed (the
+# transition to a distinct classified state justifies the move).
+operation classify_async(f: Selected) -> ClassifiedAsync
+  requires and(is_instrumentable(f), is_selected(f))
+  ensures and(is_instrumentable(return), and(is_selected(return), is_async(return)))
+  tests is_coroutine_by_desugaring(return)
+
+# impl Future (delegation): the residual branch sees only non-async
+# functions that return a concrete future already built by their body, so
+# ensures not(is_async) records the priority residual (an async fn never
+# reaches here). async and impl future are not mutually exclusive,
+# function kind selects the instrumentation strategy. The detector
+# inspects only the top-level return type: impl Iterator<Item = impl
+# Future> is NOT classified impl Future. Source: rewrite/mod.rs
+# returns_impl_future. f consumed.
+operation classify_impl_future(f: Selected) -> ClassifiedImplFuture
+  requires and(is_instrumentable(f), is_selected(f))
+  ensures and(is_instrumentable(return), and(is_selected(return), and(is_impl_future(return), not(is_async(return)))))
+  tests is_delegable_future(return)
+
+# Sync (RAII scope guard): a sync function runs to completion within one
+# lexical call, so its span is bracketed by scope entry and exit via a
+# Drop guard. The residual of the priority: neither async nor impl Future.
+# function kind selects the instrumentation strategy. Source:
+# rewrite/mod.rs classify (else branch). f consumed.
+operation classify_sync(f: Selected) -> ClassifiedSync
+  requires and(is_instrumentable(f), is_selected(f))
+  ensures and(is_instrumentable(return), and(is_selected(return), and(not(is_async(return)), not(is_impl_future(return)))))
+  tests is_scope_bounded(return)
+
+# ── Injection ─────────────────────────────────────────────────────
+# Each kind has one injection routine; all observe the classified function
+# (they read the syntax to compute the injection offset, they do not
+# consume the domain value) and produce nothing.
+# function kind selects the instrumentation strategy. Source:
+# rewrite/mod.rs inject_sync_guard / inject_async_wrap /
+# inject_impl_future_wrap (each takes &Classified*).
+
+# Sync: insert a local Drop guard at the top of the body
+# (piano_runtime::enter(name_id)); measurement is tied to the guard's
+# lifetime, which coincides with the call.
+operation inject_guard(inj: Injector, f: &ClassifiedSync) -> Injector
+  requires and(is_instrumentable(f), and(is_selected(f), and(not(is_async(f)), not(is_impl_future(f)))))
+  ensures true
+
+# Async: move the body into a fresh coroutine the runtime owns and await
+# it (enter_async(name_id, async move { <body> }).await), reconstructing
+# the same state machine the compiler would have built.
+operation wrap_async(inj: Injector, f: &ClassifiedAsync) -> Injector
+  requires and(is_instrumentable(f), and(is_selected(f), is_async(f)))
+  ensures true
+
+# impl Future: wrap the returned future by delegation
+# (enter_async(name_id, <body>)); no async block is introduced because the
+# body already yields a future.
+operation wrap_impl_future(inj: Injector, f: &ClassifiedImplFuture) -> Injector
+  requires and(is_instrumentable(f), and(is_selected(f), is_impl_future(f)))
+  ensures true
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Rewriter: allocator classification
+# ═══════════════════════════════════════════════════════════════════
+# Domain: Rust conditional compilation and #[global_allocator]
+# (Rust Reference, Conditional Compilation; Rust Reference, Runtime).
+# Implementing source: src/rewrite/mod.rs (find_global_allocator
+# 658-713, inject_allocator 500-609, AllocatorClassification 619-629).
+#
+# These are internal rewriter helpers, not CLI public API (the public
+# entry is instrument_source); every type and operation is Private.
+
+# ── The detected allocator site (the shared core) ─────────────────
+# The sole static bearing #[global_allocator] (directly or via
+# cfg_attr), located structurally in the entry file. AllocatorSite is
+# the leaf core threaded through the classification pipeline: the
+# bucket states below compose it, so every state carries its whole
+# field set. The old `: SyntaxNode` base is dropped (v0.1.0 reads kind
+# from structure) -- the site retains no syn handle, only the extracted
+# text the injector needs, so this section declares no external.
+#
+# form_gate and cfg_attr are the two orthogonal syntactic attributes the
+# detector reads off the static. They compose freely: an item may bear
+# both #[cfg(a)] and #[cfg_attr(b, global_allocator)], and both a direct
+# #[global_allocator] and a #[cfg_attr(pred, global_allocator)]
+# (cfg_attr applies attributes not the form;
+# direct and cfg_attr global_allocator coexist only under a false predicate).
+#
+# CRITICAL (D-1): form_gate is the FIELD holding the actual #[cfg(...)]
+# form gate; is_cfg_gated below is the PREDICATE naming the direct+cfg
+# priority BUCKET. They are different things. A CfgAttrApplied site
+# (is_cfg_gated = false as a bucket) may still carry form_gate = Some: the
+# form gate and the classification bucket are orthogonal. Because
+# form_gate lives on the core every state composes, no state -- including
+# CfgAttrApplied -- can drop it. This is the structural fix for the
+# find_global_allocator/inject_allocator defect that discarded the gate.
+type AllocatorSite
+  field start : usize
+  field end : usize
+  field name : String
+  field type_expr : String
+  field init_expr : String
+  field form_gate : Option<String>
+  field cfg_attr : Option<String>
+
+# ── Classification bucket states ──────────────────────────────────
+# Each composes the AllocatorSite core (rustls per-state-struct
+# pattern), so each carries form_gate whatever its bucket. A bucket is a
+# typestate because it gates a wrap operation's signature.
+type Unconditional
+  field site : AllocatorSite
+type CfgGated
+  field site : AllocatorSite
+type CfgAttrApplied
+  field site : AllocatorSite
+
+# ── The wrapped outcome ───────────────────────────────────────────
+# One terminal state for all three wrapping strategies: the static has
+# been rewritten to a PianoAllocator<T>, exactly one active
+# global_allocator per predicate configuration
+# (global_allocator designates one static allocator). All three
+# wraps converge on it (same field set: the composed core).
+type WrappedAllocator
+  field site : AllocatorSite
+
+# ── Domain entailments ────────────────────────────────────────────
+# The direct case partitions on a binary syntactic property: a form
+# either bears a #[cfg(...)] gate or it does not, so the cfg-gated and
+# unconditional BUCKETS are mutually exclusive
+# (cfg gates a whole form; Rust Reference, Conditional Compilation,
+# rule cfg.attr.effect). These two givens encode that partition.
+#
+# There is deliberately NO entailment excluding is_cfg_attr_applied
+# from the others: cfg_attr composes with cfg and with a direct
+# attribute, so its exclusivity is a PRIORITY-bucket fact, not a
+# syntactic one, and lives in the classify ensures below, never in a
+# given (cfg_attr applies attributes not the form, closing sentence:
+# a classification predicate names a priority bucket, not a syntactic
+# exclusion).
+given is_cfg_gated(v) => not(is_unconditional(v))
+given is_unconditional(v) => not(is_cfg_gated(v))
+
+# ── Detection ─────────────────────────────────────────────────────
+# Locate the sole #[global_allocator] static and read its attributes
+# into the core. Nullary boundary detector (old-spec convention; the
+# real input is the parsed entry file).
+operation detect_allocator(file: &SourceFile) -> AllocatorSite
+  requires true
+  ensures is_detected(return)
+
+# ── Priority classification (direct dominates cfg_attr) ───────────
+# Precedence: check for a direct #[global_allocator] FIRST; when
+# present the form_gate field decides unconditional vs cfg-gated, and
+# cfg_attr is never consulted. Only with no direct attribute does the
+# site fall through to the cfg_attr bucket. This precedence tracks the
+# attribute the compiler would actually select: when both a direct and
+# a cfg_attr global_allocator are present the item compiles only under a
+# false predicate, so the direct attribute is always the active one
+# (direct and cfg_attr global_allocator coexist only under a false predicate).
+#
+# The not(...) clauses are BUCKET exclusions (which priority bucket this
+# site landed in), never claims about the underlying attributes
+# (cfg_attr applies attributes not the form).
+operation classify_cfg_gated(a: AllocatorSite) -> CfgGated
+  requires is_detected(a)
+  ensures and(is_detected(return), and(is_cfg_gated(return), not(is_cfg_attr_applied(return))))
+
+operation classify_unconditional(a: AllocatorSite) -> Unconditional
+  requires is_detected(a)
+  ensures and(is_detected(return), and(is_unconditional(return), not(is_cfg_attr_applied(return))))
+
+operation classify_cfg_attr_applied(a: AllocatorSite) -> CfgAttrApplied
+  requires is_detected(a)
+  ensures and(is_detected(return), and(is_cfg_attr_applied(return), and(not(is_unconditional(return)), not(is_cfg_gated(return)))))
+
+# ── Wrapping (one active allocator per configuration) ─────────────
+# Each strategy replaces the static with a PianoAllocator<T> wrapper and
+# preserves the one-per-crate-graph singleton
+# (global_allocator designates one static allocator). is_single_global_allocator
+# is that singleton, witnessed on every strategy.
+#
+# D-1: wrap_cfg_gated and wrap_cfg_attr carry is_cfg_gate_preserved, a
+# relational witness over (input, return) asserting the wrapped static
+# still bears the input's form_gate. wrap_cfg_attr needs it precisely
+# because the old code dropped the coexisting gate; the field composes
+# forward structurally, the witness is the test-time backstop.
+# wrap_unconditional needs no such witness: its form_gate is None.
+operation wrap_unconditional(a: Unconditional) -> WrappedAllocator
+  requires and(is_detected(a), is_unconditional(a))
+  ensures and(is_detected(return), is_wrapped(return))
+  tests is_single_global_allocator(return)
+
+operation wrap_cfg_gated(a: CfgGated) -> WrappedAllocator
+  requires and(is_detected(a), is_cfg_gated(a))
+  ensures and(is_detected(return), is_wrapped(return))
+  tests is_cfg_gate_preserved(a, return)
+  tests is_single_global_allocator(return)
+
+operation wrap_cfg_attr(a: CfgAttrApplied) -> WrappedAllocator
+  requires and(is_detected(a), is_cfg_attr_applied(a))
+  ensures and(is_detected(return), is_wrapped(return))
+  tests is_cfg_gate_preserved(a, return)
+  tests is_single_global_allocator(return)
+
+# No detected site: piano appends a default wrapped allocator so the
+# instrumented crate still routes allocation through the counter
+# (global_allocator designates one static allocator: when no static
+# exists, piano appends PianoAllocator<std::alloc::System>, preserving
+# the one-per-crate-graph invariant).
+operation append_default_allocator() -> WrappedAllocator
+  requires true
+  ensures is_wrapped(return)
+  tests is_single_global_allocator(return)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Diff identity and tags.
+# Kind is read from structure (fields->product, variants->sum, :Base->
+# newtype, none->unit); the old grammar's :Struct/:Enum bases are dropped.
+
+# ── External error type (CLI-wide) ────────────────────────────────
+# The CLI's terminal error surface. Not carve IR: piano's Error enum is
+# hand-written (src/error.rs), so it is external and the backend binds
+# CliError -> piano::error::Error in Cargo.toml [package.metadata.carve].
+# One enum carries the multiplicity (InvalidTagName, RunNotFound, ...);
+# reference: "fails names a single error type, which may itself be an
+# enum; multiplicity lives in the type, not the clause". Declared once
+# model-wide for the CLI module; the build and reader sections reference it
+# plainly rather than redeclaring.
+external CliError
+
+# The reader's parsed name tables (display names and qualified identities),
+# a hand-authored newtype over the parsed map. The emitting side's table is
+# a different value in the runtime module (textual seam).
+external ParsedNameTable
+
+# ── Diff: cross-run function matching ─────────────────────────────
+# a stable identity keys cross-run diffing: functions match across
+# runs by the fully qualified name, which is invariant to a run's display
+# disambiguation, never the display name (the display name escalates
+# minimal -> medium -> full only to break within-run collisions, so it can
+# shift with no source change). FunctionIdentity is the qualified name.
+type FunctionIdentity : String
+
+# StableIdentity is the qualified name stored as the match key
+# (src/report/load.rs lines 89-93). It composes the identity core, the
+# per-state-struct pattern the reference names.
+type StableIdentity
+  field identity : FunctionIdentity
+
+# store_stable_identity attaches the qualified name to each function as the
+# stable match key (load.rs build_fn_entries lines 541-546).
+operation store_stable_identity(name: &FunctionIdentity) -> StableIdentity
+  requires true
+  ensures is_stable(return)
+# ── Tag management ────────────────────────────────────────────────
+# a tag names a saved run through a validate save resolve load
+# lifecycle: an ordered chain validate -> save -> resolve -> load, each
+# stage requiring the guarantee the previous stage established. is_valid
+# (syntactic filename safety) and is_resolved (points at a live run on
+# disk) are DISTINCT guarantees: a syntactically valid tag may still be
+# stale (src/report/tag.rs). This is a classic typestate: valid -> resolved.
+type TagName : String
+
+# A run's identity on disk. Resolution yields a RunId, never a TagName:
+# the two are different sorts (a tag names, a run id locates).
+type RunId : String
+
+# The tag bindings directory and the runs directory: the stores the tag
+# lifecycle acts on. Consumer-owned paths.
+external TagStore
+
+external RunStore
+
+# validate_tag rejects empty, ".", "..", slashes, backslashes, and null
+# bytes -- the tag IS the binding's filename, so an unvalidated name is a
+# path-traversal hazard (validate_tag_name lines 11-34). Terminal error:
+# an invalid name cannot establish is_valid.
+operation validate_tag(name: &TagName) -> TagName
+  requires true
+  ensures is_valid(return)
+  fails CliError
+
+# save_tag writes the tag -> run_id binding; requires a validated name
+# (save_tag lines 37-43). Terminal error: the file write is a real IO
+# failure. Private: save_tag is not re-exported at the piano crate root
+# (lib.rs exposes modules only), so the CLI's public surface is its
+# command line, not this Rust symbol.
+operation save_tag(name: &TagName, run: &RunId, store: &TagStore)
+  requires is_valid(name)
+  ensures true
+  fails CliError
+
+# resolve_tag reads the binding back to a run id; requires validity,
+# establishes resolvability (resolve_tag lines 46-62). Terminal error: a
+# missing tag file cannot establish is_resolved (Error::RunNotFound).
+# Private: not re-exported at the crate root.
+operation resolve_tag(name: &TagName, store: &TagStore) -> RunId
+  requires is_valid(name)
+  ensures is_resolved(return)
+  fails CliError
+
+# load_tagged_run fetches the resolved run; requires resolvability
+# (load_tagged_run lines 65-73). Terminal error: a stale tag resolves yet
+# fails at load with RunNotFound -- the guarantee that distinguishes
+# is_resolved from a live run (pinned by
+# load_tagged_run_returns_run_not_found_for_stale_tag lines 132-153).
+# Private: not re-exported at the crate root.
+operation load_tagged_run(run: &RunId, runs: &RunStore)
+  requires is_resolved(run)
+  ensures true
+  fails CliError
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── Build: compiler invocation and outcome classification ─────────
+# Domain: build success is a zero exit status distinct from spawn
+# failure. A build's outcome is read from the TERMINATED process's
+# exit status: success and failure partition every process that ran,
+# and the failure to spawn the compiler at all is a categorically
+# different event with no exit status to classify. Target module:
+# piano (the CLI). Implementing source: src/build.rs.
+
+# ExitStatus exists only for a process that started and terminated; it
+# cannot represent a process that was never launched
+# (std::process::ExitStatus). carve carries only the name; the backend
+# binds ExitStatus -> std::process::ExitStatus.
+external ExitStatus
+
+# The spawn failure. Command::output returns an io::Result whose Err
+# arm is the process that never ran, so the launch is a prior, fallible
+# step with no exit status to classify
+# (std::process::Command::output). The backend binds
+# SpawnError -> std::io::Error.
+external SpawnError
+
+# BuildResult is the terminated process's result: one product carrying
+# the exit status and the captured compiler diagnostics. Success and
+# failure are not two data shapes but one datum classified by
+# status.success() (std::process::ExitStatus::success: "success is
+# defined as a zero exit status"), so the partition rides the predicate
+# algebra below, not structural variants. The old `: Enum` kind
+# annotation is dropped: fields with no variants read as a product.
+public type BuildResult
+  field status : ExitStatus
+  field diagnostics : String
+
+# Once terminated, the status is either success or not, with nothing in
+# between: success and failure are mutually exclusive by definition
+# (build success is a zero exit status distinct from spawn failure;
+# ExitStatus::success docs), not by policy.
+given is_success(v) => not(is_failure(v))
+given is_failure(v) => not(is_success(v))
+
+# invoke_compiler runs the compiler and yields a terminated result
+# (or(is_success, is_failure)). The prior spawn fails with SpawnError
+# before any exit status exists to classify: Command::output()?
+# propagates the spawn error as a distinct outcome ahead of the
+# `if !output.status.success()` branch (src/build.rs build_instrumented
+# ~795, cargo_metadata ~49, build_runtime_rlib ~624).
+public operation invoke_compiler() -> BuildResult
+  requires true
+  ensures or(is_success(return), is_failure(return))
+  fails SpawnError
+
+# classify_success narrows the terminated result to the success state:
+# a zero status proceeds to locate the emitted artifact (src/build.rs
+# ~815). A refinement within BuildResult's own family (the predicate
+# changes, the core does not), so the input is consumed: the state
+# change justifies the move.
+operation classify_success(result: BuildResult) -> BuildResult
+  requires or(is_success(result), is_failure(result))
+  ensures is_success(return)
+
+# classify_failure narrows to the failure state: the
+# `if !output.status.success()` branch that parses cargo's JSON
+# diagnostics (src/build.rs ~797, ~628).
+operation classify_failure(result: BuildResult) -> BuildResult
+  requires or(is_success(result), is_failure(result))
+  ensures is_failure(return)
+
+# report_build_failure observes a failure state to render diagnostics
+# (extract_user_errors / detect_send_bound_guidance / eprintln;
+# src/build.rs ~797-812). Observed (&): the result survives the report.
+# The requires is_failure gate is discharged structurally by the
+# typestate, so an illegal call on a success result is unrepresentable.
+operation report_build_failure(result: &BuildResult)
+  requires is_failure(result)
+  ensures true
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ── runtime -> CLI serialization boundary (reading side) ──────────
+# The reading half of the textual NDJSON seam (the emitting
+# side lives in piano-runtime.carve). Bytes recovered from the run file
+# are re-parsed here; the reader's types are CLI-local and distinct from
+# the runtime's, which is itself the evidence the seam is textual, not a
+# typed handoff: a run is a line-delimited stream of self-contained JSON
+# records. The reader's terminal parse error is the
+# CLI-wide CliError (declared once, above), which the backend binds
+# to piano's real error enum (crate::error::Error, carrying InvalidRunData
+# with path + reason).
+
+# NdjsonLine: one raw text line read back from the run file.  CLI-local, base
+# String.  Distinct value and type from the runtime's SerializedLine (see the
+# note there): this is bytes recovered from disk, possibly truncated.
+# Source: src/report/load.rs parse_ndjson l.400 (`contents.lines()`).
+type NdjsonLine : String
+
+# ── Proof-carrying scalars: a parsed value carries its proof.
+#    NDJSON scalars deserialize into distinct newtypes that expose only raw()
+#    and saturating arithmetic; a raw u64 never flows past the parse site.
+#    These are #[serde(transparent)] over u64.  They are DISTINCT from the
+#    runtime's WallNs/CpuNs even though both wrap u64: the reader's value must
+#    be its own refinement, which is why the runtime measurement newtypes are NOT
+#    shared across the seam even under shape (a). ─────────────────────────
+# src/report/load.rs l.16-33
+type ParsedWall : u64
+# src/report/load.rs l.44-61
+type ParsedCpu : u64
+# name_id read from a record / the name table
+type ParsedId : u32
+
+# Allocation delta counters.  No bias correction: allocation counts are exact
+# and deterministic (they are not inflated by measuring, unlike time), so
+# ParsedAlloc is consumed at display directly, never "corrected".
+# Source: src/report/load.rs ParsedAlloc l.72-87.
+type ParsedAlloc
+  field alloc_count : u64
+  field alloc_bytes : u64
+  field free_count : u64
+  field free_bytes : u64
+
+# Corrected scalars: the reader's arithmetic output.  No constructor except
+# bias application (types.rs: CorrectedWall/CorrectedCpu are opaque newtypes
+# with only as_ms()): the parsed value carries its proof, and measured
+# time includes the cost of measuring it.
+# src/types.rs l.13-19
+type CorrectedWall : u64
+# src/types.rs l.25-31
+type CorrectedCpu : u64
+
+# ── NDJSON record types (a whole line, deserialized by serde in one shot).
+#    The proof-carrying scalars ride as FIELDS: deserialization is what mints
+#    them, so parsing is contracted at the RECORD, not the field.
+#    Source: src/report/mod.rs l.93-151. ──────────────────────────────────
+
+# Header / trailer line: shared structure, "type" discriminates.
+type NdjsonNameTable
+  field kind : String
+  field names : ParsedNameTable
+  field qualified : ParsedNameTable
+
+# Raw-span line (--raw-spans mode): one per completed invocation.
+type NdjsonMeasurement
+  field span_id : u64
+  field parent_span_id : u64
+  field name_id : u32
+  field start_ns : ParsedWall
+  field end_ns : ParsedWall
+  field thread_id : u64
+  field cpu_start_ns : ParsedCpu
+  field cpu_end_ns : ParsedCpu
+  field alloc_count : u64
+  field alloc_bytes : u64
+  field free_count : u64
+  field free_bytes : u64
+
+# Aggregated line (default mode): self-time pre-computed by the runtime.
+type NdjsonAggregate
+  field thread : u64
+  field name_id : u32
+  field calls : u64
+  field self_ns : ParsedWall
+  field inclusive_ns : ParsedWall
+  field cpu_self_ns : ParsedCpu
+  field alloc_count : u64
+  field alloc_bytes : u64
+  field free_count : u64
+  field free_bytes : u64
+  field interrupted : bool
+
+# BodyRecord: the classification of ONE body line.  Unrecognized is not a
+# failure — it is the SKIP, and the skip is a domain fact (the recovery
+# obligation: the runtime writes while the profiled process may be killed at
+# any instant, so a crashed run degrades to a valid prefix and a reader loses
+# at most the final partial line).  Tightening the skip into a terminal error
+# would DEFEAT crash recovery: an unrecognized body line is dropped, not
+# fatal.  Source: src/report/load.rs l.454-478.
+type BodyRecord
+  variant Trailer
+    field table : NdjsonNameTable
+  variant Aggregate
+    field agg : NdjsonAggregate
+  variant Measurement
+    field span : NdjsonMeasurement
+  variant Unrecognized
+
+# ── Parse: the header is the ONE terminal error; body lines classify (skip
+#    on non-match). ────────────────────────────────────────────────────────
+
+# The header line alone is load-bearing: a missing or non-"header" first line
+# is the single terminal parse error in the stream: the one
+# terminal parse error is a malformed or absent header, surfaced as
+# Error::InvalidRunData").  Source: src/report/load.rs l.402-416.
+operation parse_header(line: NdjsonLine) -> ParsedHeader
+  requires true
+  ensures is_header(return)
+  fails CliError
+  tests is_structurally_valid(return)
+
+# Every body line classifies; a line matching no record is Unrecognized and
+# dropped.  Total (no fails): the disjunctive ensures credits each branch, and
+# the witness pins totality (every line lands in exactly one variant, non-match
+# -> Unrecognized).  Source: src/report/load.rs l.454-478.
+operation classify_body_line(line: &NdjsonLine) -> BodyRecord
+  requires true
+  ensures or(is_trailer(return), or(is_aggregate(return), or(is_measurement(return), is_unrecognized(return))))
+  tests is_classification_total(return)
+
+# ── Field projection: pull the proof-carrying scalars out of a classified
+#    aggregate line so bias correction can consume them.  Mirrors the
+#    accumulation in build_fn_entries / load_ndjson (load.rs l.136-159,
+#    524-540).  (Representative set; the measurement-line projections are
+#    analogous.) ───────────────────────────────────────────────────────────
+operation take_self_wall(rec: &NdjsonAggregate) -> ParsedWall
+  requires true
+  ensures is_parsed_wall(return)
+
+operation take_self_cpu(rec: &NdjsonAggregate) -> ParsedCpu
+  requires true
+  ensures is_parsed_cpu(return)
+
+operation take_alloc(rec: &NdjsonAggregate) -> ParsedAlloc
+  requires true
+  ensures is_parsed_alloc(return)
+# Allocation counts are exact, so a parsed alloc is never corrected: display
+# consuming is_parsed_alloc is the terminal use, not a missing correction step.
+given is_parsed_alloc(v) => not(is_corrected_wall(v))

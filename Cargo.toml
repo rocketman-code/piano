@@ -1,6 +1,10 @@
 [workspace]
 members = ["piano-runtime"]
 
+[workspace.metadata.carve.crates]
+piano = "piano"
+piano-runtime = "piano-runtime"
+
 [package]
 name = "piano"
 version = "0.15.1"
@@ -46,3 +50,15 @@ tempfile = "3"
 
 [build-dependencies]
 toml_edit = "0.22"
+
+[package.metadata.carve]
+CliError = "crate::error::Error"
+ExitStatus = "std::process::ExitStatus"
+Fn = "ra_ap_syntax::ast::Fn"
+SpawnError = "std::io::Error"
+StmtList = "ra_ap_syntax::ast::StmtList"
+ParsedNameTable = "crate::report::load::ParsedNameTable"
+Injector = "crate::source_map::StringInjector"
+RunStore = "std::path::Path"
+SourceFile = "ra_ap_syntax::SourceFile"
+TagStore = "std::path::Path"
