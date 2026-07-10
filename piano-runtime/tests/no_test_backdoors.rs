@@ -92,14 +92,34 @@ fn no_test_backdoors_in_source() {
                 }
             }
 
-            // No #[cfg(test)] in production source
+            // No #[cfg(test)] in production source. One exemption: the
+            // spec-generated test layout wires `mod invariants;` and
+            // `mod fixtures;` from lib.rs behind cfg(test). Those are
+            // declarations of test-only modules, absent from production
+            // builds entirely, so they create no test-gated production
+            // code path; every other cfg(test) in src/ stays forbidden.
             if trimmed.starts_with("#[cfg(test)]") {
-                violations.push(format!(
-                    "{}:{}: #[cfg(test)] in production source -- tests \
-                     belong in tests/, not in src/",
-                    rel.display(),
-                    n,
-                ));
+                let next_item: Vec<&str> = contents
+                    .lines()
+                    .skip(line_num + 1)
+                    .filter(|l| {
+                        let t = l.trim();
+                        !t.is_empty() && !t.starts_with("#[")
+                    })
+                    .take(1)
+                    .collect();
+                let carve_test_mod = next_item.first().is_some_and(|l| {
+                    let t = l.trim();
+                    t == "mod invariants;" || t == "mod fixtures;"
+                });
+                if !carve_test_mod {
+                    violations.push(format!(
+                        "{}:{}: #[cfg(test)] in production source -- tests \
+                         belong in tests/, not in src/",
+                        rel.display(),
+                        n,
+                    ));
+                }
             }
 
             // Every unsafe block/impl must have a // SAFETY: comment

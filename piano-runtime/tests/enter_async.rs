@@ -210,11 +210,13 @@ fn multi_poll_alloc_accumulation() {
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 1);
         assert_eq!(
-            agg[0].alloc.alloc_count, 2,
+            agg[0].alloc.alloc_count(),
+            2,
             "allocs from both polls must accumulate"
         );
         assert_eq!(
-            agg[0].alloc.alloc_bytes, 300,
+            agg[0].alloc.alloc_bytes(),
+            300,
             "bytes from both polls must accumulate"
         );
     })

@@ -7,37 +7,42 @@
 //! `unreachable!()`, since the `cpu_time_enabled` bool prevents it from
 //! ever being called at runtime.
 
+pub use crate::generated::piano_runtime::cpu_ns::CpuNs;
+
 // ── CpuNs ──────────────────────────────────────────────────────
 
 /// CPU-time nanoseconds (per-thread, from clock_gettime).
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(transparent)]
-pub struct CpuNs(u64);
+impl Copy for CpuNs {}
 
 impl CpuNs {
-    pub(crate) const ZERO: Self = CpuNs(0);
-    fn from_raw(v: u64) -> Self {
-        Self(v)
+    #[cfg(not(feature = "_test_internals"))]
+    pub(crate) fn from_raw(v: u64) -> Self {
+        Self::new(v)
     }
+
+    #[cfg(feature = "_test_internals")]
+    pub fn from_raw(v: u64) -> Self {
+        Self::new(v)
+    }
+
+    #[cfg(not(feature = "_test_internals"))]
+    pub(crate) fn raw(self) -> u64 {
+        self.value()
+    }
+
+    #[cfg(feature = "_test_internals")]
     pub fn raw(self) -> u64 {
-        self.0
+        self.value()
     }
 
     pub(crate) fn saturating_sub(self, other: CpuNs) -> CpuNs {
-        CpuNs(self.0.saturating_sub(other.0))
-    }
-}
-
-#[cfg(feature = "_test_internals")]
-impl CpuNs {
-    pub fn new(v: u64) -> Self {
-        Self(v)
+        CpuNs::from_raw(self.raw().saturating_sub(other.raw()))
     }
 }
 
 impl core::ops::AddAssign for CpuNs {
     fn add_assign(&mut self, rhs: Self) {
-        self.0 += rhs.0;
+        *self = CpuNs::from_raw(self.raw().saturating_add(rhs.raw()));
     }
 }
 
@@ -126,5 +131,5 @@ pub(crate) fn cpu_now_ns() -> CpuNs {
 /// No CPU-time calibration on non-Unix platforms. Returns 0 (no bias).
 #[cfg(not(unix))]
 pub fn calibrate_bias() -> CpuNs {
-    CpuNs::ZERO
+    CpuNs::from_raw(0)
 }

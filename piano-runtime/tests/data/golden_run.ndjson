@@ -1,0 +1,5 @@
+{"type":"header","run_id":"golden-run","timestamp_ms":1700000000000,"bias_ns":11,"cpu_bias_ns":7,"names":{"0":"work","1":"helper"},"qualified":{"0":"crate::work","1":"crate::helper"}}
+{"thread":0,"name_id":0,"calls":2,"self_ns":30,"inclusive_ns":50,"cpu_self_ns":12,"alloc_count":3,"alloc_bytes":96,"free_count":1,"free_bytes":32}
+{"thread":1,"name_id":1,"calls":1,"self_ns":20,"inclusive_ns":25,"cpu_self_ns":9,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}
+{"name_id":1,"calls":2,"self_ns":80,"inclusive_ns":80,"cpu_self_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0,"interrupted":true}
+{"type":"trailer","bias_ns":11,"cpu_bias_ns":7,"names":{"0":"work","1":"helper"},"qualified":{"0":"crate::work","1":"crate::helper"}}

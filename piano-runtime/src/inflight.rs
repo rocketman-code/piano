@@ -78,11 +78,7 @@ pub(crate) fn exit(name_id: NameId) {
     }
 }
 
-pub(crate) struct InterruptedEntry {
-    pub(crate) name_id: NameId,
-    pub(crate) start_ticks: Ticks,
-    pub(crate) depth: u32,
-}
+pub(crate) use crate::generated::piano_runtime::interrupted_entry::InterruptedEntry;
 
 pub(crate) fn drain() -> Vec<InterruptedEntry> {
     let ptr = SLOTS.load(Ordering::Acquire);
@@ -97,11 +93,13 @@ pub(crate) fn drain() -> Vec<InterruptedEntry> {
         if depth > 0 {
             let start = slots.start[i].load(Ordering::Relaxed);
             if start > 0 {
-                entries.push(InterruptedEntry {
-                    name_id: NameId::from_raw(i as u32),
-                    start_ticks: Ticks::from_raw(start),
-                    depth,
-                });
+                entries.push(
+                    crate::generated::piano_runtime::interrupted_entry::ops::interrupt_execution(
+                        &NameId::from_raw(i as u32),
+                        &Ticks::from_raw(start),
+                        depth,
+                    ),
+                );
             }
         }
     }

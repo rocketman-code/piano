@@ -19,67 +19,82 @@ use std::sync::Once;
 use std::time::Instant;
 
 use crate::cpu_clock::CpuNs;
+pub use crate::generated::piano_runtime::ticks::Ticks;
+pub use crate::generated::piano_runtime::wall_ns::WallNs;
 
 // ── Ticks ───────────────────────────────────────────────────────
 
 /// Raw hardware counter value (TSC on x86_64, CNTVCT on aarch64,
 /// epoch-relative nanoseconds on fallback platforms).
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(transparent)]
-pub struct Ticks(u64);
+impl Copy for Ticks {}
 
 impl Ticks {
-    pub(crate) const ZERO: Self = Ticks(0);
+    #[cfg(not(feature = "_test_internals"))]
     pub(crate) fn from_raw(v: u64) -> Self {
-        Self(v)
+        Self::new(v)
     }
+
+    #[cfg(feature = "_test_internals")]
+    pub fn from_raw(v: u64) -> Self {
+        Self::new(v)
+    }
+
+    #[cfg(not(feature = "_test_internals"))]
+    pub(crate) fn raw(self) -> u64 {
+        self.value()
+    }
+
+    #[cfg(feature = "_test_internals")]
     pub fn raw(self) -> u64 {
-        self.0
+        self.value()
     }
 
     pub(crate) fn wrapping_sub(self, other: Ticks) -> Ticks {
-        Ticks(self.0.wrapping_sub(other.0))
+        Ticks::from_raw(self.raw().wrapping_sub(other.raw()))
     }
 }
 
 // ── WallNs ──────────────────────────────────────────────────────
 
 /// Calibrated wall-clock nanoseconds, epoch-relative.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(transparent)]
-pub struct WallNs(u64);
+impl Copy for WallNs {}
 
 impl WallNs {
-    pub(crate) const ZERO: Self = WallNs(0);
-    fn from_raw(v: u64) -> Self {
-        Self(v)
+    #[cfg(not(feature = "_test_internals"))]
+    pub(crate) fn from_raw(v: u64) -> Self {
+        Self::new(v)
     }
+
+    #[cfg(feature = "_test_internals")]
+    pub fn from_raw(v: u64) -> Self {
+        Self::new(v)
+    }
+
+    #[cfg(not(feature = "_test_internals"))]
+    pub(crate) fn raw(self) -> u64 {
+        self.value()
+    }
+
+    #[cfg(feature = "_test_internals")]
     pub fn raw(self) -> u64 {
-        self.0
+        self.value()
     }
 
     pub(crate) fn saturating_sub(self, other: WallNs) -> WallNs {
-        WallNs(self.0.saturating_sub(other.0))
-    }
-}
-
-#[cfg(feature = "_test_internals")]
-impl WallNs {
-    pub fn new(v: u64) -> Self {
-        Self(v)
+        WallNs::from_raw(self.raw().saturating_sub(other.raw()))
     }
 }
 
 impl core::ops::Add for WallNs {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
-        WallNs(self.0 + rhs.0)
+        WallNs::from_raw(self.raw().saturating_add(rhs.raw()))
     }
 }
 
 impl core::ops::AddAssign for WallNs {
     fn add_assign(&mut self, rhs: Self) {
-        self.0 += rhs.0;
+        *self = *self + rhs;
     }
 }
 
@@ -104,14 +119,10 @@ impl CalibrationData {
     /// Uses a Once + static inside the function so repeated calls
     /// return the cached Copy value after the first.
     pub fn calibrate() -> Self {
+        use std::mem::MaybeUninit;
+
         static ONCE: Once = Once::new();
-        static mut CACHED: CalibrationData = CalibrationData {
-            quotient: 0,
-            multiplier: 0,
-            bias_ticks: 0,
-            epoch_tsc: 0,
-            cpu_bias: CpuNs::ZERO,
-        };
+        static mut CACHED: MaybeUninit<CalibrationData> = MaybeUninit::uninit();
 
         // SAFETY: ONCE.call_once guarantees single initialization. After init,
         // CACHED is only read (never written). The static mut is required
@@ -122,15 +133,15 @@ impl CalibrationData {
                 let bias_ticks = calibrate_bias();
                 let cpu_bias = crate::cpu_clock::calibrate_bias();
 
-                CACHED = CalibrationData {
+                CACHED = MaybeUninit::new(CalibrationData {
                     quotient,
                     multiplier,
                     bias_ticks,
                     epoch_tsc,
                     cpu_bias,
-                };
+                });
             });
-            CACHED
+            CACHED.assume_init()
         }
     }
 
@@ -142,7 +153,7 @@ impl CalibrationData {
             multiplier,
             bias_ticks,
             epoch_tsc,
-            cpu_bias: CpuNs::ZERO,
+            cpu_bias: CpuNs::from_raw(0),
         }
     }
 

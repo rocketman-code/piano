@@ -16,6 +16,28 @@ use std::io::{self, Write};
 use crate::cpu_clock::CpuNs;
 use crate::time::WallNs;
 
+#[allow(dead_code)]
+pub struct NameTable(Vec<(u32, String, String)>);
+
+impl NameTable {
+    #[allow(dead_code)]
+    pub(crate) fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    #[cfg(feature = "_test_internals")]
+    pub fn from_owned(entries: Vec<(u32, String, String)>) -> Self {
+        Self(entries)
+    }
+
+    fn borrowed(&self) -> Vec<(u32, &str, &str)> {
+        self.0
+            .iter()
+            .map(|(id, display, qualified)| (*id, display.as_str(), qualified.as_str()))
+            .collect()
+    }
+}
+
 /// Write the name table as a header line, including run metadata.
 pub fn write_header(
     w: &mut impl Write,
@@ -63,28 +85,36 @@ pub fn write_aggregates(
 ) -> io::Result<()> {
     for (thread_idx, thread_agg) in per_thread.iter().enumerate() {
         for a in thread_agg {
-            writeln!(
-                w,
-                concat!(
-                    "{{\"thread\":{},\"name_id\":{},\"calls\":{},\"self_ns\":{},\"inclusive_ns\":{},",
-                    "\"cpu_self_ns\":{},",
-                    "\"alloc_count\":{},\"alloc_bytes\":{},",
-                    "\"free_count\":{},\"free_bytes\":{}}}"
-                ),
-                thread_idx,
-                a.name_id.raw(),
-                a.calls,
-                a.self_ns.raw(),
-                a.inclusive_ns.raw(),
-                a.cpu_self_ns.raw(),
-                a.alloc.alloc_count,
-                a.alloc.alloc_bytes,
-                a.alloc.free_count,
-                a.alloc.free_bytes,
-            )?;
+            write_aggregate(w, a, thread_idx as u64)?;
         }
     }
     Ok(())
+}
+
+pub(crate) fn write_aggregate(
+    w: &mut impl Write,
+    aggregate: &crate::aggregator::FnAgg,
+    thread: u64,
+) -> io::Result<()> {
+    writeln!(
+        w,
+        concat!(
+            "{{\"thread\":{},\"name_id\":{},\"calls\":{},\"self_ns\":{},\"inclusive_ns\":{},",
+            "\"cpu_self_ns\":{},",
+            "\"alloc_count\":{},\"alloc_bytes\":{},",
+            "\"free_count\":{},\"free_bytes\":{}}}"
+        ),
+        thread,
+        aggregate.name_id.raw(),
+        aggregate.calls,
+        aggregate.self_ns.raw(),
+        aggregate.inclusive_ns.raw(),
+        aggregate.cpu_self_ns.raw(),
+        aggregate.alloc.alloc_count(),
+        aggregate.alloc.alloc_bytes(),
+        aggregate.alloc.free_count(),
+        aggregate.alloc.free_bytes(),
+    )
 }
 
 pub(crate) fn write_interrupted_aggregates(
@@ -94,25 +124,34 @@ pub(crate) fn write_interrupted_aggregates(
 ) -> io::Result<()> {
     let end_ticks = crate::time::read();
     for e in entries {
-        let start_ns = calibration.now_ns(e.start_ticks);
+        let start_ns = calibration.now_ns(*e.start_ticks());
         let end_ns = calibration.now_ns(end_ticks);
         let elapsed = end_ns.saturating_sub(start_ns);
-        writeln!(
-            w,
-            concat!(
-                "{{\"name_id\":{},\"calls\":{},\"self_ns\":{},\"inclusive_ns\":{},",
-                "\"cpu_self_ns\":0,",
-                "\"alloc_count\":0,\"alloc_bytes\":0,",
-                "\"free_count\":0,\"free_bytes\":0,",
-                "\"interrupted\":true}}"
-            ),
-            e.name_id.raw(),
-            e.depth,
-            elapsed.raw(),
-            elapsed.raw(),
-        )?;
+        write_interrupted(w, *e.name_id(), elapsed, e.depth())?;
     }
     Ok(())
+}
+
+pub(crate) fn write_interrupted(
+    w: &mut impl Write,
+    id: crate::NameId,
+    elapsed: WallNs,
+    depth: u32,
+) -> io::Result<()> {
+    writeln!(
+        w,
+        concat!(
+            "{{\"name_id\":{},\"calls\":{},\"self_ns\":{},\"inclusive_ns\":{},",
+            "\"cpu_self_ns\":0,",
+            "\"alloc_count\":0,\"alloc_bytes\":0,",
+            "\"free_count\":0,\"free_bytes\":0,",
+            "\"interrupted\":true}}"
+        ),
+        id.raw(),
+        depth,
+        elapsed.raw(),
+        elapsed.raw(),
+    )
 }
 
 /// Format a u64 as decimal digits into a byte buffer. Returns bytes written.
@@ -169,13 +208,13 @@ pub fn serialize_aggregate_to_stack(
     put!(b",\"cpu_self_ns\":");
     put_u64!(a.cpu_self_ns.raw());
     put!(b",\"alloc_count\":");
-    put_u64!(a.alloc.alloc_count);
+    put_u64!(a.alloc.alloc_count());
     put!(b",\"alloc_bytes\":");
-    put_u64!(a.alloc.alloc_bytes);
+    put_u64!(a.alloc.alloc_bytes());
     put!(b",\"free_count\":");
-    put_u64!(a.alloc.free_count);
+    put_u64!(a.alloc.free_count());
     put!(b",\"free_bytes\":");
-    put_u64!(a.alloc.free_bytes);
+    put_u64!(a.alloc.free_bytes());
     put!(b"}\n");
 
     pos
@@ -237,4 +276,77 @@ fn write_json_escaped(w: &mut impl Write, s: &str) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn serialize_header_line(
+    names: &NameTable,
+    bias_ns: WallNs,
+    cpu_bias_ns: CpuNs,
+    run_id: &str,
+    timestamp_ms: u128,
+) -> String {
+    let borrowed = names.borrowed();
+    let mut buf = Vec::new();
+    let _ = write_header(
+        &mut buf,
+        &borrowed,
+        bias_ns,
+        cpu_bias_ns,
+        run_id,
+        timestamp_ms,
+    );
+    buffer_to_string(buf)
+}
+
+pub(crate) fn serialize_aggregate_line(
+    id: crate::NameId,
+    self_wall: WallNs,
+    inclusive_wall: WallNs,
+    cpu_self: CpuNs,
+    alloc: crate::AllocDelta,
+    calls: u64,
+    thread: u64,
+) -> String {
+    let aggregate = crate::aggregator::FnAgg {
+        name_id: id,
+        calls,
+        self_ns: self_wall,
+        inclusive_ns: inclusive_wall,
+        cpu_self_ns: cpu_self,
+        alloc,
+    };
+    let mut buf = Vec::new();
+    let _ = write_aggregate(&mut buf, &aggregate, thread);
+    buffer_to_string(buf)
+}
+
+pub(crate) fn serialize_interrupted_line(id: crate::NameId, elapsed: WallNs, depth: u32) -> String {
+    let mut buf = Vec::new();
+    let _ = write_interrupted(&mut buf, id, elapsed, depth);
+    buffer_to_string(buf)
+}
+
+pub(crate) fn serialize_trailer_line(
+    names: &NameTable,
+    bias_ns: WallNs,
+    cpu_bias_ns: CpuNs,
+) -> String {
+    let borrowed = names.borrowed();
+    let mut buf = Vec::new();
+    let _ = write_trailer(&mut buf, &borrowed, bias_ns, cpu_bias_ns);
+    buffer_to_string(buf)
+}
+
+fn buffer_to_string(buf: Vec<u8>) -> String {
+    match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
+}
+
+#[cfg(feature = "_test_internals")]
+impl crate::SerializedLine {
+    pub fn from_value(inner: String) -> Self {
+        Self::new(inner)
+    }
 }

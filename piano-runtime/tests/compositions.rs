@@ -85,11 +85,11 @@ fn guard_inside_piano_future_alloc_deltas_compose() {
         let sync_m = agg.iter().find(|a| a.name_id.raw() == 1).unwrap();
         let async_m = agg.iter().find(|a| a.name_id.raw() == 0).unwrap();
 
-        assert_eq!(sync_m.alloc.alloc_count, 1);
-        assert_eq!(sync_m.alloc.alloc_bytes, 200);
+        assert_eq!(sync_m.alloc.alloc_count(), 1);
+        assert_eq!(sync_m.alloc.alloc_bytes(), 200);
         // Async's alloc includes its own (100) + sync child (200)
-        assert_eq!(async_m.alloc.alloc_count, 2);
-        assert_eq!(async_m.alloc.alloc_bytes, 300);
+        assert_eq!(async_m.alloc.alloc_count(), 2);
+        assert_eq!(async_m.alloc.alloc_bytes(), 300);
     })
     .join()
     .unwrap();
@@ -118,13 +118,14 @@ fn nested_piano_future_emit_allocs_are_reentrant() {
         let outer = agg.iter().find(|a| a.name_id.raw() == 0).unwrap();
         let inner = agg.iter().find(|a| a.name_id.raw() == 1).unwrap();
 
-        assert_eq!(inner.alloc.alloc_count, 0);
-        assert_eq!(inner.alloc.alloc_bytes, 0);
+        assert_eq!(inner.alloc.alloc_count(), 0);
+        assert_eq!(inner.alloc.alloc_bytes(), 0);
         assert_eq!(
-            outer.alloc.alloc_count, 1,
+            outer.alloc.alloc_count(),
+            1,
             "outer async future should only include the explicit user allocation"
         );
-        assert_eq!(outer.alloc.alloc_bytes, 100);
+        assert_eq!(outer.alloc.alloc_bytes(), 100);
     })
     .join()
     .unwrap();
@@ -205,11 +206,13 @@ fn piano_future_thread_migration() {
 
         let m = &agg[0];
         assert_eq!(
-            m.alloc.alloc_count, 2,
+            m.alloc.alloc_count(),
+            2,
             "allocs from both polls (thread A + B) must accumulate"
         );
         assert_eq!(
-            m.alloc.alloc_bytes, 300,
+            m.alloc.alloc_bytes(),
+            300,
             "bytes from both polls (100 + 200) must accumulate"
         );
     });

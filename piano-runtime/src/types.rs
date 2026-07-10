@@ -1,8 +1,9 @@
 //! Domain types for the measurement pipeline.
 //!
-//! Source of truth: piano.carve (spec) -> carve -> carve-build ->
-//! generated Rust. Types are checked in, not build-time generated.
-//! Regenerate when the spec changes; CI checks freshness.
+//! Source of truth: piano-runtime.carve. The measurement newtypes and
+//! NameId are the spec-derived types from the generated zone, extended
+//! with the crate's established surface (Copy, raw accessors, arithmetic)
+//! in their producing modules and re-exported here.
 
 #[allow(unused_imports)]
 pub use crate::alloc::{AllocDelta, AllocSnapshot};
@@ -18,22 +19,17 @@ pub use crate::time::{Ticks, WallNs};
 /// Function name ID (assigned by rewriter, consumed by runtime).
 /// Boundary type: produced at the crate's public API entry points
 /// (enter, enter_async) from u32 values assigned by the rewriter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct NameId(u32);
+/// The spec-derived newtype is the type; these extensions preserve the
+/// crate's established surface on it.
+pub use crate::generated::piano_runtime::name_id::NameId;
+
+impl Copy for NameId {}
 
 impl NameId {
     pub(crate) fn from_raw(v: u32) -> Self {
-        Self(v)
+        Self::new(v)
     }
     pub fn raw(self) -> u32 {
-        self.0
-    }
-}
-
-#[cfg(feature = "_test_internals")]
-impl NameId {
-    pub fn new(v: u32) -> Self {
-        Self(v)
+        self.value()
     }
 }

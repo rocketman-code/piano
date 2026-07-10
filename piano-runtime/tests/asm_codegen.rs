@@ -32,9 +32,12 @@ const TSC_PATTERN: &str = "__UNSUPPORTED_ARCH__";
 /// The compiler fence annotation emitted by LLVM.
 const FENCE_PATTERN: &str = "#MEMBARRIER";
 
-/// Substring that identifies a call to Guard::create in the ASM.
-/// enter() is #[inline(always)], Guard::create is NOT inlined.
-const GUARD_CREATE_CALL: &str = "Guard::create";
+/// Substring that identifies the out-of-line entry bookkeeping call in
+/// the ASM. enter() is #[inline(always)]; the enter_sync operation is
+/// #[inline(never)], the one shared out-of-line copy (formerly
+/// Guard::create; the split survived the adoption of the spec-derived
+/// entry operation).
+const GUARD_CREATE_CALL: &str = "enter_sync";
 
 /// Substring that identifies a call to cpu_now_ns in the ASM.
 const CPU_NOW_CALL: &str = "cpu_now_ns";
@@ -274,19 +277,19 @@ fn tm6_stamp_fence_then_tsc() {
         "tm6_positive: must contain a TSC read (from stamp)"
     );
 
-    // Guard::create must be called BEFORE the fence (bookkeeping done first).
+    // enter_sync must be called BEFORE the fence (bookkeeping done first).
     let create_indices = find_indices(&lines, GUARD_CREATE_CALL);
     assert!(
         !create_indices.is_empty(),
-        "tm6_positive: Guard::create call not found"
+        "tm6_positive: enter_sync call not found"
     );
     let last_create = *create_indices.last().unwrap();
 
-    // The stamp fence comes after Guard::create returns.
+    // The stamp fence comes after enter_sync returns.
     let stamp_fence = fences
         .iter()
         .find(|&&f| f > last_create)
-        .expect("tm6_positive: no fence after Guard::create");
+        .expect("tm6_positive: no fence after enter_sync");
     let stamp_tsc = tscs
         .iter()
         .find(|&&t| t > *stamp_fence)
@@ -395,14 +398,14 @@ fn tm6_drop_tsc_then_fence() {
 
 // ---- TM7: enter/stamp split (code size) ------------------------------------
 //
-// Claim: Ctx::enter() inlines to a call Guard::create() + inline rdtsc.
-//        Guard::create is NOT inlined (one shared copy via function call).
+// Claim: Ctx::enter() inlines to a call to enter_sync() + inline rdtsc.
+//        enter_sync is NOT inlined (one shared copy via function call).
 //
 // What we verify:
-// (a) Positive: tm7_positive has a `call` to Guard::create AND an
+// (a) Positive: tm7_positive has a `call` to enter_sync AND an
 //     inline TSC read (rdtsc/cntvct).
 // (b) Negative: tm7_negative has an inline TSC read but NO call to
-//     Guard::create.
+//     enter_sync.
 
 #[test]
 fn tm7_enter_stamp_split() {
@@ -410,7 +413,7 @@ fn tm7_enter_stamp_split() {
         return;
     }
 
-    // Positive: must have both a call to Guard::create AND inline TSC.
+    // Positive: must have both a call to enter_sync AND inline TSC.
     let Some(asm) = extract_asm("tm7_positive") else {
         return;
     };
@@ -423,14 +426,14 @@ fn tm7_enter_stamp_split() {
 
     assert!(
         has_create_call,
-        "tm7_positive: Guard::create must appear as a call instruction\nASM:\n{asm}"
+        "tm7_positive: enter_sync must appear as a call instruction\nASM:\n{asm}"
     );
     assert!(
         has_inline_tsc,
         "tm7_positive: TSC read must be inlined (from stamp())\nASM:\n{asm}"
     );
 
-    // Negative: inline TSC but NO call to Guard::create.
+    // Negative: inline TSC but NO call to enter_sync.
     let Some(asm) = extract_asm("tm7_negative") else {
         return;
     };
@@ -443,7 +446,7 @@ fn tm7_enter_stamp_split() {
 
     assert!(
         !has_create_call,
-        "tm7_negative: must NOT have a call to Guard::create (everything is inline)\nASM:\n{asm}"
+        "tm7_negative: must NOT have a call to enter_sync (everything is inline)\nASM:\n{asm}"
     );
     assert!(
         has_inline_tsc,

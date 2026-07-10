@@ -31,79 +31,122 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
 use std::marker::PhantomData;
 
+pub use crate::generated::piano_runtime::alloc_delta::AllocDelta;
+pub use crate::generated::piano_runtime::alloc_snapshot::AllocSnapshot;
+
 /// Snapshot of per-thread allocation counters. Copy ensures no TLS destructor
 /// (global allocator TLS with destructors is forbidden on older Rust versions).
-#[derive(Clone, Copy)]
-pub struct AllocSnapshot {
-    alloc_count: u64,
-    alloc_bytes: u64,
-    free_count: u64,
-    free_bytes: u64,
-}
+impl Copy for AllocSnapshot {}
 
 impl AllocSnapshot {
-    pub const ZERO: Self = Self {
-        alloc_count: 0,
-        alloc_bytes: 0,
-        free_count: 0,
-        free_bytes: 0,
-    };
+    #[cfg(not(feature = "_test_internals"))]
+    pub(crate) fn from_counts(
+        alloc_count: u64,
+        alloc_bytes: u64,
+        free_count: u64,
+        free_bytes: u64,
+    ) -> Self {
+        crate::generated::piano_runtime::alloc_snapshot::ops::from_counts(
+            alloc_count,
+            alloc_bytes,
+            free_count,
+            free_bytes,
+        )
+    }
+
+    #[cfg(feature = "_test_internals")]
+    pub fn from_counts(
+        alloc_count: u64,
+        alloc_bytes: u64,
+        free_count: u64,
+        free_bytes: u64,
+    ) -> Self {
+        crate::generated::piano_runtime::alloc_snapshot::ops::from_counts(
+            alloc_count,
+            alloc_bytes,
+            free_count,
+            free_bytes,
+        )
+    }
+
+    #[cfg(not(feature = "_test_internals"))]
+    pub(crate) fn zero() -> Self {
+        Self::from_counts(0, 0, 0, 0)
+    }
+
+    #[cfg(feature = "_test_internals")]
+    pub fn zero() -> Self {
+        Self::from_counts(0, 0, 0, 0)
+    }
 
     pub fn delta_since(&self, start: &AllocSnapshot) -> AllocDelta {
-        AllocDelta {
-            alloc_count: self.alloc_count.saturating_sub(start.alloc_count),
-            alloc_bytes: self.alloc_bytes.saturating_sub(start.alloc_bytes),
-            free_count: self.free_count.saturating_sub(start.free_count),
-            free_bytes: self.free_bytes.saturating_sub(start.free_bytes),
-        }
-    }
-}
-
-#[cfg(feature = "_test_internals")]
-impl AllocSnapshot {
-    pub fn alloc_count(&self) -> u64 {
-        self.alloc_count
-    }
-    pub fn alloc_bytes(&self) -> u64 {
-        self.alloc_bytes
-    }
-    pub fn free_count(&self) -> u64 {
-        self.free_count
-    }
-    pub fn free_bytes(&self) -> u64 {
-        self.free_bytes
+        AllocDelta::from_counts(
+            self.alloc_count().saturating_sub(start.alloc_count()),
+            self.alloc_bytes().saturating_sub(start.alloc_bytes()),
+            self.free_count().saturating_sub(start.free_count()),
+            self.free_bytes().saturating_sub(start.free_bytes()),
+        )
     }
 }
 
 /// Delta of allocation counters between two points in time.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AllocDelta {
-    pub alloc_count: u64,
-    pub alloc_bytes: u64,
-    pub free_count: u64,
-    pub free_bytes: u64,
-}
+impl Copy for AllocDelta {}
 
 impl AllocDelta {
-    pub const ZERO: Self = Self {
-        alloc_count: 0,
-        alloc_bytes: 0,
-        free_count: 0,
-        free_bytes: 0,
-    };
+    #[cfg(not(feature = "_test_internals"))]
+    pub(crate) fn from_counts(
+        alloc_count: u64,
+        alloc_bytes: u64,
+        free_count: u64,
+        free_bytes: u64,
+    ) -> Self {
+        crate::generated::piano_runtime::alloc_delta::ops::from_counts(
+            alloc_count,
+            alloc_bytes,
+            free_count,
+            free_bytes,
+        )
+    }
+
+    #[cfg(feature = "_test_internals")]
+    pub fn from_counts(
+        alloc_count: u64,
+        alloc_bytes: u64,
+        free_count: u64,
+        free_bytes: u64,
+    ) -> Self {
+        crate::generated::piano_runtime::alloc_delta::ops::from_counts(
+            alloc_count,
+            alloc_bytes,
+            free_count,
+            free_bytes,
+        )
+    }
+
+    #[cfg(not(feature = "_test_internals"))]
+    pub(crate) fn zero() -> Self {
+        Self::from_counts(0, 0, 0, 0)
+    }
+
+    #[cfg(feature = "_test_internals")]
+    pub fn zero() -> Self {
+        Self::from_counts(0, 0, 0, 0)
+    }
 }
 
 impl core::ops::AddAssign for AllocDelta {
     fn add_assign(&mut self, rhs: Self) {
-        self.alloc_count += rhs.alloc_count;
-        self.alloc_bytes += rhs.alloc_bytes;
-        self.free_count += rhs.free_count;
-        self.free_bytes += rhs.free_bytes;
+        *self = AllocDelta::from_counts(
+            self.alloc_count() + rhs.alloc_count(),
+            self.alloc_bytes() + rhs.alloc_bytes(),
+            self.free_count() + rhs.free_count(),
+            self.free_bytes() + rhs.free_bytes(),
+        );
     }
 }
 
 thread_local! {
-    static ALLOC_COUNTERS: Cell<AllocSnapshot> = const { Cell::new(AllocSnapshot::ZERO) };
+    static ALLOC_COUNTERS: Cell<AllocSnapshot> = Cell::new(AllocSnapshot::zero());
     static REENTRANCY: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -111,7 +154,7 @@ thread_local! {
 pub fn snapshot_alloc_counters() -> AllocSnapshot {
     ALLOC_COUNTERS
         .try_with(|c| c.get())
-        .unwrap_or(AllocSnapshot::ZERO)
+        .unwrap_or_else(|_| AllocSnapshot::zero())
 }
 
 /// Record an allocation on the current thread.
@@ -121,10 +164,13 @@ pub fn record_alloc(size: u64) {
     let _ = REENTRANCY.try_with(|r| {
         if r.get() == 0 {
             let _ = ALLOC_COUNTERS.try_with(|c| {
-                let mut s = c.get();
-                s.alloc_count += 1;
-                s.alloc_bytes += size;
-                c.set(s);
+                let s = c.get();
+                c.set(AllocSnapshot::from_counts(
+                    s.alloc_count() + 1,
+                    s.alloc_bytes() + size,
+                    s.free_count(),
+                    s.free_bytes(),
+                ));
             });
         }
     });
@@ -136,10 +182,13 @@ fn record_dealloc(size: u64) {
     let _ = REENTRANCY.try_with(|r| {
         if r.get() == 0 {
             let _ = ALLOC_COUNTERS.try_with(|c| {
-                let mut s = c.get();
-                s.free_count += 1;
-                s.free_bytes += size;
-                c.set(s);
+                let s = c.get();
+                c.set(AllocSnapshot::from_counts(
+                    s.alloc_count(),
+                    s.alloc_bytes(),
+                    s.free_count() + 1,
+                    s.free_bytes() + size,
+                ));
             });
         }
     });

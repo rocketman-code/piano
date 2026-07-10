@@ -54,8 +54,8 @@ fn guard_captures_alloc_deltas() {
             record_alloc(200);
         }
         let agg = drain_thread_agg();
-        assert_eq!(agg[0].alloc.alloc_count, 2);
-        assert_eq!(agg[0].alloc.alloc_bytes, 300);
+        assert_eq!(agg[0].alloc.alloc_count(), 2);
+        assert_eq!(agg[0].alloc.alloc_bytes(), 300);
     })
     .join()
     .unwrap();
@@ -69,8 +69,8 @@ fn guard_excludes_own_bookkeeping_allocs() {
             let _g = enter(0);
         }
         let agg = drain_thread_agg();
-        assert_eq!(agg[0].alloc.alloc_count, 0);
-        assert_eq!(agg[0].alloc.alloc_bytes, 0);
+        assert_eq!(agg[0].alloc.alloc_count(), 0);
+        assert_eq!(agg[0].alloc.alloc_bytes(), 0);
     })
     .join()
     .unwrap();
@@ -157,8 +157,8 @@ fn alloc_deltas_scoped_to_guard_lifetime() {
         }
         record_alloc(888); // after guard
         let agg = drain_thread_agg();
-        assert_eq!(agg[0].alloc.alloc_count, 2, "only allocs during guard");
-        assert_eq!(agg[0].alloc.alloc_bytes, 125);
+        assert_eq!(agg[0].alloc.alloc_count(), 2, "only allocs during guard");
+        assert_eq!(agg[0].alloc.alloc_bytes(), 125);
     })
     .join()
     .unwrap();
@@ -175,8 +175,8 @@ fn guard_captures_free_deltas() {
             drop(v);
         }
         let agg = drain_thread_agg();
-        assert!(agg[0].alloc.free_count >= 1);
-        assert!(agg[0].alloc.free_bytes >= 100);
+        assert!(agg[0].alloc.free_count() >= 1);
+        assert!(agg[0].alloc.free_bytes() >= 100);
     })
     .join()
     .unwrap();
@@ -259,8 +259,8 @@ fn alloc_accumulates_across_calls() {
         let agg = drain_thread_agg();
         assert_eq!(agg.len(), 1, "same name_id should merge");
         assert_eq!(agg[0].calls, 2);
-        assert_eq!(agg[0].alloc.alloc_count, 2);
-        assert_eq!(agg[0].alloc.alloc_bytes, 300);
+        assert_eq!(agg[0].alloc.alloc_count(), 2);
+        assert_eq!(agg[0].alloc.alloc_bytes(), 300);
     })
     .join()
     .unwrap();

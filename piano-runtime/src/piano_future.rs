@@ -1,65 +1,37 @@
 //! Async function instrumentation -- PianoFuture wrapper.
 //!
-//! PianoFuture wraps an inner Future and accumulates per-poll wall, CPU,
-//! alloc, and children deltas. On completion or cancellation (drop), it
-//! computes self_ns = inclusive_ns - children_ns and aggregates.
-//!
-//! Wall time uses per-poll accumulation (same as CPU and alloc), so
-//! suspension time between polls is excluded from self_ns.
-//!
-//! Children within each poll report their inclusive time. On completion
-//! or cancellation, the future reports its own inclusive time to its
-//! parent scope. Every child reports -- completed, cancelled, or
-//! interrupted.
+//! PianoFuture is the vehicle for the spec-derived AsyncExecution state:
+//! it wraps an inner Future and drives the poll lifecycle operations.
+//! Each poll runs begin_poll (pre-poll snapshots into the mid-poll state),
+//! polls the inner future, then end_poll (deltas accumulated, back to
+//! idle with is_ever_polled established). On Ready the aggregate is
+//! emitted and the completion transition consumes the execution; on drop
+//! the vehicle emits best-effort for cancelled or panicking futures.
 //!
 //! Invariants:
-//! - Wall time is accumulated per-poll, not measured as a span.
-//! - All four measurements (wall, cpu, alloc, children) are captured
-//!   together in end_poll and destructured exhaustively.
-//! - Bookkeeping allocs excluded via ProfilerBookkeeping proof token.
-//! - Cancelled/panicking futures emit best-effort aggregate via Drop.
-//! - Never double-emits (emitted flag).
+//! - Wall time is accumulated per-poll, not measured as a span, so
+//!   suspension time between polls is excluded from self_ns.
+//! - Children within each poll report their inclusive time; the future
+//!   reports its own inclusive total upward exactly once, at emit.
+//! - Bookkeeping allocs excluded via ProfilerBookkeeping (in the ops).
+//! - Never double-emits: the execution value is taken out of the vehicle
+//!   to emit, so a second emit has nothing to act on.
+//! - While a poll is in flight the vehicle holds a primed fallback, so a
+//!   panic unwinding through the inner poll still emits on drop.
 
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::{Context, Poll};
 
-use crate::aggregator;
-use crate::alloc::{snapshot_alloc_counters, AllocDelta, AllocSnapshot, ProfilerBookkeeping};
-use crate::children;
-use crate::cpu_clock::CpuNs;
+use crate::generated::piano_runtime::async_execution::{ops, AsyncExecution};
 use crate::session::ProfileSession;
-use crate::time::{read, Ticks, WallNs};
 use crate::NameId;
-
-/// Pre-poll measurement snapshots. Consumed by `end_poll` to compute deltas.
-struct PollActive {
-    wall_start: Ticks,
-    cpu_start: CpuNs,
-    alloc_start: AllocSnapshot,
-}
-
-/// Per-poll measurement deltas. Must be destructured exhaustively.
-/// Adding a field forces every consumer to handle it at compile time.
-struct PollDeltas {
-    wall: WallNs,
-    cpu: CpuNs,
-    alloc: AllocDelta,
-    children: WallNs,
-}
 
 /// Future wrapper for async function instrumentation.
 pub struct PianoFuture<F> {
     inner: F,
-    session: Option<&'static ProfileSession>,
-    name_id: NameId,
-    /// None = never polled. Some = accumulated wall time across polls.
-    wall_acc: Option<WallNs>,
-    alloc_acc: AllocDelta,
-    cpu_acc: CpuNs,
-    children_ns_acc: WallNs,
-    emitted: bool,
+    /// None = profiling inactive, or the execution was consumed at emit.
+    exec: Option<AsyncExecution>,
 }
 
 /// Wrap an async function body for profiling.
@@ -67,82 +39,8 @@ pub struct PianoFuture<F> {
 /// If profiling is not active, returns a transparent wrapper whose
 /// poll delegates directly to the inner future with no overhead.
 pub fn enter_async<F: Future>(name_id: u32, body: F) -> PianoFuture<F> {
-    let name_id = NameId::from_raw(name_id);
-    let session = match ProfileSession::get() {
-        Some(s) => s,
-        None => {
-            return PianoFuture {
-                inner: body,
-                session: None,
-                name_id: NameId::from_raw(0),
-                wall_acc: None,
-                alloc_acc: AllocDelta::ZERO,
-                cpu_acc: CpuNs::ZERO,
-                children_ns_acc: WallNs::ZERO,
-                emitted: true, // prevent emit on drop
-            };
-        }
-    };
-
-    PianoFuture {
-        inner: body,
-        session: Some(session),
-        name_id,
-        wall_acc: None,
-        alloc_acc: AllocDelta::ZERO,
-        cpu_acc: CpuNs::ZERO,
-        children_ns_acc: WallNs::ZERO,
-        emitted: false,
-    }
-}
-
-/// Capture pre-poll measurement snapshots (wall, cpu, alloc).
-#[inline(always)]
-fn begin_poll(session: &ProfileSession) -> PollActive {
-    let alloc_start = {
-        let _bookkeeping = ProfilerBookkeeping::enter();
-        snapshot_alloc_counters()
-    };
-    let wall_start = read();
-    let cpu_start = if session.cpu_time_enabled {
-        crate::cpu_clock::cpu_now_ns()
-    } else {
-        CpuNs::ZERO
-    };
-    compiler_fence(Ordering::SeqCst);
-    PollActive {
-        wall_start,
-        cpu_start,
-        alloc_start,
-    }
-}
-
-/// Capture post-poll snapshots and compute all per-poll deltas.
-#[inline(always)]
-fn end_poll(active: PollActive, session: &ProfileSession) -> PollDeltas {
-    compiler_fence(Ordering::SeqCst);
-    let cpu_end = if session.cpu_time_enabled {
-        crate::cpu_clock::cpu_now_ns()
-    } else {
-        CpuNs::ZERO
-    };
-    let wall_end = read();
-    let alloc = {
-        let _bookkeeping = ProfilerBookkeeping::enter();
-        let alloc_end = snapshot_alloc_counters();
-        alloc_end.delta_since(&active.alloc_start)
-    };
-    let children = children::current_children_ns();
-
-    let wall_start_ns = session.calibration.now_ns(active.wall_start);
-    let wall_end_ns = session.calibration.now_ns(wall_end);
-
-    PollDeltas {
-        wall: wall_end_ns.saturating_sub(wall_start_ns),
-        cpu: cpu_end.saturating_sub(active.cpu_start),
-        alloc,
-        children,
-    }
+    let exec = ProfileSession::get().map(|_| ops::create_async(&NameId::from_raw(name_id)));
+    PianoFuture { inner: body, exec }
 }
 
 impl<F: Future> Future for PianoFuture<F> {
@@ -151,11 +49,11 @@ impl<F: Future> Future for PianoFuture<F> {
     #[inline(always)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         // SAFETY: We project Pin to `inner` only. All other fields are
-        // Unpin primitives. We never move `inner` out of self.
+        // Unpin values. We never move `inner` out of self.
         let this = unsafe { self.get_unchecked_mut() };
 
-        let session = match this.session {
-            Some(s) => s,
+        let exec = match this.exec.take() {
+            Some(exec) => exec,
             None => {
                 // Inactive: transparent passthrough.
                 // SAFETY: inner is pinned through self. We never move it.
@@ -164,76 +62,36 @@ impl<F: Future> Future for PianoFuture<F> {
             }
         };
 
-        // Begin a children scope for this poll. Children within the poll
-        // report their inclusive time; we read the sum in end_poll.
-        let poll_children_saved = children::save_and_zero();
-
-        // If inner panics, emit() in Drop can still produce output.
-        if this.wall_acc.is_none() {
-            this.wall_acc = Some(WallNs::ZERO);
-        }
-
-        let active = begin_poll(session);
+        let mid = crate::begin_poll(exec);
+        // A panic unwinding through the inner poll drops `mid` on the
+        // stack; the primed fallback keeps the drop-path emit alive.
+        this.exec = Some(ops::primed_for_drop(&mid));
 
         // SAFETY: inner is pinned through self. We never move it.
         let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
         let result = inner.poll(cx);
 
-        let PollDeltas {
-            wall,
-            cpu,
-            alloc,
-            children,
-        } = end_poll(active, session);
-
-        // End the per-poll children scope. Reports zero inclusive time
-        // for this poll (the future reports its total on completion).
-        children::restore_and_report(poll_children_saved, WallNs::ZERO);
-
-        if let Some(ref mut acc) = this.wall_acc {
-            *acc += wall;
-        }
-        this.cpu_acc += cpu;
-        this.alloc_acc += alloc;
-        this.children_ns_acc += children;
+        let exec = ops::end_poll(mid);
 
         if result.is_ready() {
-            this.emit(session);
+            crate::emit(&exec);
+            let _completed = crate::mark_completed(exec);
+            this.exec = None;
+        } else {
+            this.exec = Some(exec);
         }
 
         result
     }
 }
 
-impl<F> PianoFuture<F> {
-    fn emit(&mut self, session: &'static ProfileSession) {
-        let inclusive_ns = match self.wall_acc {
-            Some(w) if !self.emitted => w,
-            _ => return,
-        };
-        self.emitted = true;
-
-        let bookkeeping = ProfilerBookkeeping::enter();
-        let self_ns = inclusive_ns.saturating_sub(self.children_ns_acc);
-
-        aggregator::aggregate(
-            &bookkeeping,
-            self.name_id,
-            self_ns,
-            inclusive_ns,
-            self.cpu_acc,
-            self.alloc_acc,
-            &session.agg_registry,
-        );
-
-        children::report_inclusive(inclusive_ns);
-    }
-}
-
 impl<F> Drop for PianoFuture<F> {
     fn drop(&mut self) {
-        if let Some(session) = self.session {
-            self.emit(session);
+        if let Some(exec) = self.exec.take() {
+            // Cancelled (idle, ever-polled) or panicked mid-poll (the
+            // primed fallback): best-effort emit. Never-polled executions
+            // emit nothing (wall_acc None inside the operation).
+            crate::emit(&exec);
         }
     }
 }

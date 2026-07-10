@@ -19,14 +19,16 @@ use crate::time::WallNs;
 use std::cell::Cell;
 
 thread_local! {
-    static CHILDREN_NS: Cell<WallNs> = const { Cell::new(WallNs::ZERO) };
+    static CHILDREN_NS: Cell<WallNs> = Cell::new(WallNs::from_raw(0));
 }
 
 /// Read the current children-time accumulator for this thread.
 /// Returns WallNs::ZERO if TLS is destroyed.
 #[inline(always)]
 pub fn current_children_ns() -> WallNs {
-    CHILDREN_NS.try_with(|c| c.get()).unwrap_or(WallNs::ZERO)
+    CHILDREN_NS
+        .try_with(|c| c.get())
+        .unwrap_or_else(|_| WallNs::from_raw(0))
 }
 
 /// Begin a new children scope. Returns the parent's accumulated
@@ -37,10 +39,10 @@ pub fn save_and_zero() -> WallNs {
     CHILDREN_NS
         .try_with(|c| {
             let prev = c.get();
-            c.set(WallNs::ZERO);
+            c.set(WallNs::from_raw(0));
             prev
         })
-        .unwrap_or(WallNs::ZERO)
+        .unwrap_or_else(|_| WallNs::from_raw(0))
 }
 
 /// End a children scope: report own inclusive time to the parent
