@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::sync::LazyLock;
 
 use ignore::WalkBuilder;
@@ -7,6 +7,12 @@ use serde::Deserialize;
 use toml_edit::DocumentMut;
 
 use crate::error::{Error, io_context};
+
+#[derive(Debug)]
+pub(crate) struct GeneratedCompilerOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) diagnostics: String,
+}
 
 /// Which cargo target to build.
 pub enum CargoTarget<'a> {
@@ -46,8 +52,7 @@ pub fn cargo_metadata(project_dir: &Path) -> Result<CargoMetadata, Error> {
         .arg("--no-deps")
         .current_dir(project_dir)
         .env_remove("RUSTUP_TOOLCHAIN")
-        .output()
-        .map_err(|e| Error::BuildFailed(format!("failed to run cargo metadata: {e}")))?;
+        .output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -59,6 +64,34 @@ pub fn cargo_metadata(project_dir: &Path) -> Result<CargoMetadata, Error> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout)
         .map_err(|e| Error::BuildFailed(format!("failed to parse cargo metadata: {e}")))
+}
+
+pub(crate) fn invoke_compiler_for_generated_ops() -> std::io::Result<GeneratedCompilerOutput> {
+    let mut command = Command::new("cargo");
+    command
+        .arg("build")
+        .arg("--message-format=json")
+        .env_remove("RUSTUP_TOOLCHAIN");
+    run_compiler_for_generated_ops(&mut command)
+}
+
+pub(crate) fn run_compiler_for_generated_ops(
+    command: &mut Command,
+) -> std::io::Result<GeneratedCompilerOutput> {
+    let output = command.output()?;
+    Ok(GeneratedCompilerOutput {
+        status: output.status,
+        diagnostics: compiler_diagnostics(&output.stdout, &output.stderr),
+    })
+}
+
+fn compiler_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let rendered = extract_rendered_errors(&stdout);
+    if !rendered.is_empty() {
+        return rendered.join("");
+    }
+    String::from_utf8_lossy(stderr).into_owned()
 }
 
 /// Find a target of the given kind in the metadata for the given package.
@@ -621,9 +654,7 @@ fn build_runtime_rlib(
         cmd.arg("--features").arg(features.join(","));
     }
 
-    let output = cmd
-        .output()
-        .map_err(|e| Error::BuildFailed(format!("failed to build piano-runtime: {e}")))?;
+    let output = cmd.output()?;
 
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);

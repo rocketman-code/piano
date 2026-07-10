@@ -8,7 +8,7 @@ use super::load::load_run_by_id;
 ///
 /// Rejects empty strings, path separators, `.`/`..` components, and null bytes
 /// to prevent path traversal and confusing filesystem behavior.
-fn validate_tag_name(tag: &str) -> Result<(), Error> {
+pub(crate) fn validate_tag_name(tag: &str) -> Result<(), Error> {
     if tag.is_empty() {
         return Err(Error::InvalidTagName(
             "provide a tag name (e.g., `baseline`, `v1`)".into(),

@@ -38,111 +38,6 @@ pub struct EntryPointParams<'a> {
 // and must be wrapped as a coroutine regardless of return type.
 // (Rust Reference, Items > Functions > Async functions.)
 
-struct Instrumentable {
-    func: ast::Fn,
-    stmt_list: ast::StmtList,
-}
-
-struct Selected {
-    inner: Instrumentable,
-    name_id: u32,
-    fn_name: String,
-}
-
-struct ClassifiedAsync(Selected);
-struct ClassifiedImplFuture(Selected);
-struct ClassifiedSync(Selected);
-
-fn detect_instrumentable(func: ast::Fn) -> Option<Instrumentable> {
-    let classification = crate::resolve::classify_cst_fn(&func);
-    if classification != crate::resolve::Classification::Instrumentable {
-        return None;
-    }
-    let body = func.body()?;
-    let stmt_list = body.stmt_list()?;
-    Some(Instrumentable { func, stmt_list })
-}
-
-fn apply_filter(
-    inst: Instrumentable,
-    fn_name: String,
-    measured: &HashMap<String, u32>,
-) -> Option<Selected> {
-    let &name_id = measured.get(&fn_name)?;
-    Some(Selected {
-        inner: inst,
-        name_id,
-        fn_name,
-    })
-}
-
-enum FunctionKind {
-    Async(ClassifiedAsync),
-    ImplFuture(ClassifiedImplFuture),
-    Sync(ClassifiedSync),
-}
-
-fn classify(sel: Selected) -> FunctionKind {
-    if sel.inner.func.async_token().is_some() {
-        FunctionKind::Async(ClassifiedAsync(sel))
-    } else if returns_impl_future(&sel.inner.func) {
-        FunctionKind::ImplFuture(ClassifiedImplFuture(sel))
-    } else {
-        FunctionKind::Sync(ClassifiedSync(sel))
-    }
-}
-
-fn find_close_brace(stmt_list: &ast::StmtList, fn_name: &str) -> Result<usize, String> {
-    let close_brace = stmt_list
-        .syntax()
-        .children_with_tokens()
-        .filter(|t| t.kind() == T!['}'])
-        .last()
-        .ok_or_else(|| format!("no closing brace for fn {fn_name}"))?;
-    Ok(close_brace.text_range().start().into())
-}
-
-fn inject_sync_guard(injector: &mut StringInjector, func: &ClassifiedSync, offset: usize) {
-    injector.insert(
-        offset,
-        format!(
-            " let __piano_guard = piano_runtime::enter({});",
-            func.0.name_id
-        ),
-    );
-}
-
-fn inject_async_wrap(
-    injector: &mut StringInjector,
-    func: &ClassifiedAsync,
-    offset: usize,
-) -> Result<(), String> {
-    let close_offset = find_close_brace(&func.0.inner.stmt_list, &func.0.fn_name)?;
-    injector.insert(
-        offset,
-        format!(
-            " piano_runtime::enter_async({}, async move {{",
-            func.0.name_id
-        ),
-    );
-    injector.insert(close_offset, "}).await");
-    Ok(())
-}
-
-fn inject_impl_future_wrap(
-    injector: &mut StringInjector,
-    func: &ClassifiedImplFuture,
-    offset: usize,
-) -> Result<(), String> {
-    let close_offset = find_close_brace(&func.0.inner.stmt_list, &func.0.fn_name)?;
-    injector.insert(
-        offset,
-        format!(" piano_runtime::enter_async({},", func.0.name_id),
-    );
-    injector.insert(close_offset, ")");
-    Ok(())
-}
-
 /// Instrument a source file in a single pass.
 ///
 /// When `entry_point` is None: only inject guards into measured functions.
@@ -437,33 +332,46 @@ fn try_inject_guard(
     measured: &HashMap<String, u32>,
     injector: &mut StringInjector,
 ) -> Result<(), String> {
-    let inst = match detect_instrumentable(func) {
-        Some(i) => i,
-        None => return Ok(()),
-    };
-    let sel = match apply_filter(inst, full_name, measured) {
-        Some(s) => s,
-        None => return Ok(()),
+    let source_function =
+        match crate::generated::piano::source_function::ops::from_fn(func, full_name) {
+            Some(source_function) => source_function,
+            None => return Ok(()),
+        };
+
+    let Some(&name_id) = measured.get(source_function.fn_name()) else {
+        return Ok(());
     };
 
-    let inject_offset = brace_offset_after_inner_attrs(&sel.inner.stmt_list)?;
-
-    match classify(sel) {
-        FunctionKind::Async(async_fn) => {
-            inject_async_wrap(injector, &async_fn, inject_offset)?;
-        }
-        FunctionKind::ImplFuture(impl_fn) => {
-            inject_impl_future_wrap(injector, &impl_fn, inject_offset)?;
-        }
-        FunctionKind::Sync(sync_fn) => {
-            inject_sync_guard(injector, &sync_fn, inject_offset);
-        }
-    }
+    let selected = crate::apply_filter(source_function, name_id);
+    inject_selected(selected, injector);
     Ok(())
 }
 
+fn inject_selected(selected: crate::Selected, injector: &mut StringInjector) {
+    if selected.source().func().async_token().is_some() {
+        let async_fn = crate::classify_async(selected);
+        *injector = crate::wrap_async(std::mem::take(injector), &async_fn);
+    } else if returns_impl_future(selected.source().func()) {
+        let impl_fn = crate::classify_impl_future(selected);
+        *injector = crate::wrap_impl_future(std::mem::take(injector), &impl_fn);
+    } else {
+        let sync_fn = crate::classify_sync(selected);
+        *injector = crate::inject_guard(std::mem::take(injector), &sync_fn);
+    }
+}
+
+fn select_macro_function(
+    func: ast::Fn,
+    fn_name: String,
+    measured: &HashMap<String, u32>,
+) -> Option<crate::Selected> {
+    let source_function = crate::generated::piano::source_function::ops::from_fn(func, fn_name)?;
+    let name_id = *measured.get(source_function.fn_name())?;
+    Some(crate::apply_filter(source_function, name_id))
+}
+
 /// Check if a function's return type contains `impl Future`.
-fn returns_impl_future(func: &ast::Fn) -> bool {
+pub(crate) fn returns_impl_future(func: &ast::Fn) -> bool {
     let Some(ret) = func.ret_type() else {
         return false;
     };
@@ -513,122 +421,75 @@ fn inject_allocator(
     source: &str,
     injector: &mut StringInjector,
 ) -> Result<(), String> {
-    let classification = find_global_allocator(file, source);
-
-    match classification {
+    match find_global_allocator_site(file, source) {
         None => {
-            // Case 1: no allocator
-            injector.insert(
-                source.len(),
-                concat!(
-                    "\n#[global_allocator]\n",
-                    "static __PIANO_ALLOC: piano_runtime::PianoAllocator<std::alloc::System>\n",
-                    "    = piano_runtime::PianoAllocator::new(std::alloc::System);\n",
-                ),
-            );
-        }
-        Some(AllocatorClassification::Unconditional(info)) => {
-            // Case 2: direct #[global_allocator], no cfg
-            let replacement = format!(
-                "#[global_allocator]\n\
-                 static {name}: piano_runtime::PianoAllocator<{ty}> = piano_runtime::PianoAllocator::new({init});",
-                name = info.name,
-                ty = info.type_expr,
-                init = info.init_expr,
-            );
-            injector.replace(info.start, info.end, replacement);
-        }
-        Some(AllocatorClassification::CfgGated { info, cfg_text }) => {
-            // Case 3: #[cfg(pred)] #[global_allocator]
-            let neg_cfg = negate_cfg(&cfg_text);
-            let original_text = &source[info.start..info.end];
-            let original_newlines = original_text.chars().filter(|&c| c == '\n').count();
-
-            let wrapped = format!(
-                "{cfg_text}\n#[global_allocator]\nstatic {name}: piano_runtime::PianoAllocator<{ty}> = piano_runtime::PianoAllocator::new({init});",
-                name = info.name,
-                ty = info.type_expr,
-                init = info.init_expr,
-            );
-            let wrapped_newlines = wrapped.chars().filter(|&c| c == '\n').count();
-            let padded = if wrapped_newlines < original_newlines {
-                format!(
-                    "{wrapped}{}",
-                    "\n".repeat(original_newlines - wrapped_newlines)
-                )
-            } else {
-                wrapped
-            };
-
-            injector.replace(info.start, info.end, padded);
+            let wrapped = crate::append_default_allocator();
             injector.insert(
                 source.len(),
                 format!(
-                    "\n{neg_cfg}\n#[global_allocator]\nstatic {name}: piano_runtime::PianoAllocator<std::alloc::System> = piano_runtime::PianoAllocator::new(std::alloc::System);\n",
-                    name = info.name,
+                    "\n{}\n",
+                    crate::generated::piano::wrapped_allocator::ops::render_wrapped_static(
+                        &wrapped
+                    )
                 ),
             );
         }
-        Some(AllocatorClassification::CfgAttrApplied {
-            info,
-            cfg_attr_text,
-        }) => {
-            // Case 4: #[cfg_attr(pred, global_allocator)]
-            let neg_cfg = negate_cfg(&cfg_attr_text);
-            let original_text = &source[info.start..info.end];
-            let original_newlines = original_text.chars().filter(|&c| c == '\n').count();
-
-            let wrapped = format!(
-                "{cfg_attr_text}\nstatic {name}: piano_runtime::PianoAllocator<{ty}> = piano_runtime::PianoAllocator::new({init});",
-                name = info.name,
-                ty = info.type_expr,
-                init = info.init_expr,
+        Some(site) => {
+            let start = *site.start();
+            let end = *site.end();
+            let wrapped = classify_allocator_site(site);
+            let replacement =
+                crate::generated::piano::wrapped_allocator::ops::render_wrapped_static(&wrapped);
+            injector.replace(
+                start,
+                end,
+                pad_replacement_to_original_lines(source, start, end, replacement),
             );
-            let wrapped_newlines = wrapped.chars().filter(|&c| c == '\n').count();
-            let padded = if wrapped_newlines < original_newlines {
-                format!(
-                    "{wrapped}{}",
-                    "\n".repeat(original_newlines - wrapped_newlines)
-                )
-            } else {
-                wrapped
-            };
-
-            injector.replace(info.start, info.end, padded);
-            injector.insert(
-                source.len(),
-                format!(
-                    "\n{neg_cfg}\n#[global_allocator]\nstatic {name}: piano_runtime::PianoAllocator<std::alloc::System> = piano_runtime::PianoAllocator::new(std::alloc::System);\n",
-                    name = info.name,
-                ),
-            );
+            if let Some(fallback) =
+                crate::generated::piano::wrapped_allocator::ops::render_fallback_static(&wrapped)
+            {
+                injector.insert(source.len(), fallback);
+            }
         }
     }
 
     Ok(())
 }
 
-struct AllocatorInfo {
+fn classify_allocator_site(site: crate::AllocatorSite) -> crate::WrappedAllocator {
+    if site.cfg_attr().is_some() {
+        crate::wrap_cfg_attr(crate::classify_cfg_attr_applied(site))
+    } else if site.form_gate().is_some() {
+        crate::wrap_cfg_gated(crate::classify_cfg_gated(site))
+    } else {
+        crate::wrap_unconditional(crate::classify_unconditional(site))
+    }
+}
+
+fn pad_replacement_to_original_lines(
+    source: &str,
     start: usize,
     end: usize,
-    name: String,
-    type_expr: String,
-    init_expr: String,
+    replacement: String,
+) -> String {
+    let original_newlines = source[start..end].chars().filter(|&c| c == '\n').count();
+    let replacement_newlines = replacement.chars().filter(|&c| c == '\n').count();
+    if replacement_newlines < original_newlines {
+        format!(
+            "{replacement}{}",
+            "\n".repeat(original_newlines - replacement_newlines)
+        )
+    } else {
+        replacement
+    }
 }
 
-enum AllocatorClassification {
-    Unconditional(AllocatorInfo),
-    CfgGated {
-        info: AllocatorInfo,
-        cfg_text: String,
-    },
-    CfgAttrApplied {
-        info: AllocatorInfo,
-        cfg_attr_text: String,
-    },
-}
-
-fn extract_static_info(static_item: &ast::Static, source: &str) -> Option<AllocatorInfo> {
+fn extract_static_site(
+    static_item: &ast::Static,
+    source: &str,
+    form_gate: Option<String>,
+    cfg_attr: Option<String>,
+) -> Option<crate::AllocatorSite> {
     let start: usize = static_item.syntax().text_range().start().into();
     let end: usize = static_item.syntax().text_range().end().into();
     let item_text = &source[start..end];
@@ -645,24 +506,23 @@ fn extract_static_info(static_item: &ast::Static, source: &str) -> Option<Alloca
     let after_eq = &after_colon[eq + 1..];
     let init_expr = after_eq.trim_end_matches(';').trim().to_string();
 
-    Some(AllocatorInfo {
-        start,
-        end,
-        name,
-        type_expr,
-        init_expr,
-    })
+    Some(crate::generated::piano::allocator_site::ops::from_parts(
+        start, end, name, type_expr, init_expr, form_gate, cfg_attr,
+    ))
 }
 
 /// Find a static item with #[global_allocator] using structural AST analysis.
-fn find_global_allocator(file: &SourceFile, source: &str) -> Option<AllocatorClassification> {
+pub(crate) fn find_global_allocator_site(
+    file: &SourceFile,
+    source: &str,
+) -> Option<crate::AllocatorSite> {
     for node in file.syntax().descendants() {
         let Some(static_item) = ast::Static::cast(node) else {
             continue;
         };
 
         let mut has_direct_global_alloc = false;
-        let mut cfg_gate: Option<String> = None;
+        let mut form_gate: Option<String> = None;
         let mut cfg_attr_global_alloc: Option<String> = None;
 
         for attr in static_item.attrs() {
@@ -678,7 +538,7 @@ fn find_global_allocator(file: &SourceFile, source: &str) -> Option<AllocatorCla
                     has_direct_global_alloc = true;
                 }
                 "cfg" => {
-                    cfg_gate = Some(attr.syntax().text().to_string());
+                    form_gate = Some(attr.syntax().text().to_string());
                 }
                 "cfg_attr" => {
                     let text = attr.syntax().text().to_string();
@@ -691,63 +551,14 @@ fn find_global_allocator(file: &SourceFile, source: &str) -> Option<AllocatorCla
         }
 
         if has_direct_global_alloc {
-            let info = extract_static_info(&static_item, source)?;
-            if let Some(cfg) = cfg_gate {
-                return Some(AllocatorClassification::CfgGated {
-                    info,
-                    cfg_text: cfg,
-                });
-            }
-            return Some(AllocatorClassification::Unconditional(info));
+            return extract_static_site(&static_item, source, form_gate, None);
         }
 
-        if let Some(text) = cfg_attr_global_alloc {
-            let info = extract_static_info(&static_item, source)?;
-            return Some(AllocatorClassification::CfgAttrApplied {
-                info,
-                cfg_attr_text: text,
-            });
+        if cfg_attr_global_alloc.is_some() {
+            return extract_static_site(&static_item, source, form_gate, cfg_attr_global_alloc);
         }
     }
     None
-}
-
-/// Negate a #[cfg(...)] attribute to #[cfg(not(...))].
-fn negate_cfg(cfg: &str) -> String {
-    if let Some(inner) = cfg
-        .strip_prefix("#[cfg(")
-        .and_then(|s| s.strip_suffix(")]"))
-    {
-        format!("#[cfg(not({inner}))]")
-    } else if let Some(rest) = cfg.strip_prefix("#[cfg_attr(") {
-        // Extract predicate from #[cfg_attr(PRED, ...)] using depth-aware parsing
-        let mut depth = 0u32;
-        let mut split_pos = None;
-        for (i, c) in rest.char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' => {
-                    if depth == 0 {
-                        break;
-                    }
-                    depth -= 1;
-                }
-                ',' if depth == 0 => {
-                    split_pos = Some(i);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        if let Some(pos) = split_pos {
-            let predicate = rest[..pos].trim();
-            format!("#[cfg(not({predicate}))]")
-        } else {
-            "#[cfg(not(any()))]".to_string()
-        }
-    } else {
-        "#[cfg(not(any()))]".to_string()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -844,7 +655,7 @@ fn inject_guards_into_expansion(
     impl_prefix: Option<&str>,
 ) -> String {
     let parse = SourceFile::parse(expanded, ra_ap_syntax::Edition::Edition2021);
-    let mut insertions: Vec<(usize, String)> = Vec::new();
+    let mut injector = StringInjector::new();
 
     for node in parse.tree().syntax().descendants() {
         let Some(func) = ast::Fn::cast(node) else {
@@ -857,72 +668,14 @@ fn inject_guards_into_expansion(
             None => bare_name,
         };
 
-        let inst = match detect_instrumentable(func) {
-            Some(i) => i,
-            None => continue,
-        };
-        let sel = match apply_filter(inst, fn_name, measured) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let Some(open_brace) = sel
-            .inner
-            .stmt_list
-            .syntax()
-            .children_with_tokens()
-            .find(|t| t.kind() == T!['{'])
-        else {
+        let Some(selected) = select_macro_function(func, fn_name, measured) else {
             continue;
         };
-        let offset: usize = open_brace.text_range().end().into();
 
-        match classify(sel) {
-            FunctionKind::Async(async_fn) => {
-                let Ok(close_offset) =
-                    find_close_brace(&async_fn.0.inner.stmt_list, &async_fn.0.fn_name)
-                else {
-                    continue;
-                };
-                insertions.push((
-                    offset,
-                    format!(
-                        " piano_runtime::enter_async({}, async move {{",
-                        async_fn.0.name_id
-                    ),
-                ));
-                insertions.push((close_offset, "}).await".to_string()));
-            }
-            FunctionKind::ImplFuture(impl_fn) => {
-                let Ok(close_offset) =
-                    find_close_brace(&impl_fn.0.inner.stmt_list, &impl_fn.0.fn_name)
-                else {
-                    continue;
-                };
-                insertions.push((
-                    offset,
-                    format!(" piano_runtime::enter_async({},", impl_fn.0.name_id),
-                ));
-                insertions.push((close_offset, ")".to_string()));
-            }
-            FunctionKind::Sync(sync_fn) => {
-                insertions.push((
-                    offset,
-                    format!(
-                        " let __piano_guard = piano_runtime::enter({});",
-                        sync_fn.0.name_id
-                    ),
-                ));
-            }
-        }
+        inject_selected(selected, &mut injector);
     }
 
-    insertions.sort_by(|a, b| b.0.cmp(&a.0));
-    let mut result = expanded.to_string();
-    for (offset, text) in &insertions {
-        result.insert_str(*offset, text);
-    }
-    result
+    injector.apply(expanded)
 }
 
 #[cfg(test)]
@@ -1248,6 +1001,26 @@ mod tests {
         assert!(
             result.source.contains("ProfileSession::init"),
             "lifecycle in main"
+        );
+    }
+
+    #[test]
+    fn cfg_attr_allocator_preserves_form_cfg_gate() {
+        let source = "#[cfg(feature = \"x\")]\n#[cfg_attr(feature = \"y\", global_allocator)]\nstatic ALLOC: MyAlloc = MyAlloc;\n\nfn main() {}\n";
+        let measured: HashMap<String, u32> = HashMap::new();
+        let ep = EntryPointParams {
+            name_table: &[],
+            runs_dir: "/tmp/runs",
+            cpu_time: false,
+        };
+        let result = instrument_source(source, &measured, Some(&ep)).unwrap();
+
+        assert!(
+            result.source.contains(
+                "#[cfg(feature = \"x\")]\n#[cfg_attr(feature = \"y\", global_allocator)]\nstatic ALLOC: piano_runtime::PianoAllocator<MyAlloc>"
+            ),
+            "cfg_attr allocator wrap must keep the original cfg form gate. Got:\n{}",
+            result.source
         );
     }
 

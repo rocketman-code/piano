@@ -1,8 +1,10 @@
 //! Domain types for the CLI reader pipeline.
 //!
-//! Source of truth: piano.carve (spec) -> carve -> carve-build ->
-//! generated Rust. Types are checked in, not build-time generated.
-//! Regenerate when the spec changes; CI checks freshness.
+//! Source of truth: piano.carve. The spec-derived CorrectedWall and
+//! CorrectedCpu live in the generated zone; the reader's internal pair
+//! here remains the display path's carrier until the reader pipeline
+//! consumes the generated types end to end, and the generated bias
+//! operations front the same saturating arithmetic.
 
 use crate::report::load::{ParsedCpu, ParsedWall};
 
@@ -13,6 +15,10 @@ use crate::report::load::{ParsedCpu, ParsedWall};
 pub(crate) struct CorrectedWall(u64);
 
 impl CorrectedWall {
+    pub(crate) fn raw(self) -> u64 {
+        self.0
+    }
+
     pub(crate) fn as_ms(self) -> f64 {
         self.0 as f64 / 1_000_000.0
     }
@@ -25,6 +31,10 @@ impl CorrectedWall {
 pub(crate) struct CorrectedCpu(u64);
 
 impl CorrectedCpu {
+    pub(crate) fn raw(self) -> u64 {
+        self.0
+    }
+
     pub(crate) fn as_ms(self) -> f64 {
         self.0 as f64 / 1_000_000.0
     }

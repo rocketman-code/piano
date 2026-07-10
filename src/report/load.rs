@@ -10,6 +10,10 @@ use super::{
     RunFormat,
 };
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedNameTable(Vec<String>);
+
 // ── Parsed wall clock ───────────────────────────────────────────
 
 /// Wall-clock nanoseconds from NDJSON deserialization, before bias correction.
@@ -18,6 +22,10 @@ use super::{
 pub(crate) struct ParsedWall(u64);
 
 impl ParsedWall {
+    pub(crate) fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
+
     pub(crate) fn raw(self) -> u64 {
         self.0
     }
@@ -46,6 +54,10 @@ impl AddAssign for ParsedWall {
 pub(crate) struct ParsedCpu(u64);
 
 impl ParsedCpu {
+    pub(crate) fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
+
     pub(crate) fn raw(self) -> u64 {
         self.0
     }
@@ -374,6 +386,101 @@ fn build_name_table(raw: &HashMap<String, String>) -> Vec<String> {
         names[id as usize] = name;
     }
     names
+}
+
+pub(crate) fn parse_generated_header(line: &str) -> Result<crate::ParsedHeader, Error> {
+    let header: NdjsonNameTable =
+        serde_json::from_str(line).map_err(|e| Error::InvalidRunData {
+            path: PathBuf::from("<generated ndjson line>"),
+            reason: format!("invalid NDJSON header: {e}"),
+        })?;
+    if header.kind != "header" {
+        return Err(Error::InvalidRunData {
+            path: PathBuf::from("<generated ndjson line>"),
+            reason: format!("expected header line, got type={:?}", header.kind),
+        });
+    }
+    Ok(crate::ParsedHeader::new(line.to_string()))
+}
+
+pub(crate) fn classify_generated_body_line(line: &str) -> crate::BodyRecord {
+    let line = line.trim();
+    if line.is_empty() {
+        return crate::BodyRecord::Unrecognized;
+    }
+
+    if let Ok(table) = serde_json::from_str::<NdjsonNameTable>(line)
+        && table.kind == "trailer"
+    {
+        return crate::BodyRecord::Trailer {
+            table: generated_name_table(table),
+        };
+    }
+
+    if let Ok(agg) = serde_json::from_str::<NdjsonAggregate>(line)
+        && agg.calls > 0
+    {
+        return crate::BodyRecord::Aggregate {
+            agg: generated_aggregate(agg),
+        };
+    }
+
+    if let Ok(span) = serde_json::from_str::<NdjsonMeasurement>(line) {
+        return crate::BodyRecord::Measurement {
+            span: generated_measurement(span),
+        };
+    }
+
+    crate::BodyRecord::Unrecognized
+}
+
+pub(crate) fn is_generated_header_structurally_valid(header: &crate::ParsedHeader) -> bool {
+    parse_generated_header(header.value()).is_ok()
+}
+
+fn generated_name_table(
+    table: NdjsonNameTable,
+) -> crate::generated::piano::ndjson_name_table::NdjsonNameTable {
+    crate::generated::piano::ndjson_name_table::NdjsonNameTable::new(
+        table.kind,
+        ParsedNameTable(build_name_table(&table.names)),
+        ParsedNameTable(build_name_table(&table.qualified)),
+    )
+}
+
+fn generated_aggregate(agg: NdjsonAggregate) -> crate::NdjsonAggregate {
+    crate::NdjsonAggregate::new(
+        agg.thread,
+        agg.name_id,
+        agg.calls,
+        crate::ParsedWall::new(agg.self_ns.raw()),
+        crate::ParsedWall::new(agg.inclusive_ns.raw()),
+        crate::ParsedCpu::new(agg.cpu_self_ns.raw()),
+        agg.alloc_count,
+        agg.alloc_bytes,
+        agg.free_count,
+        agg.free_bytes,
+        agg.interrupted,
+    )
+}
+
+fn generated_measurement(
+    span: NdjsonMeasurement,
+) -> crate::generated::piano::ndjson_measurement::NdjsonMeasurement {
+    crate::generated::piano::ndjson_measurement::NdjsonMeasurement::new(
+        span.span_id,
+        span.parent_span_id,
+        span.name_id,
+        crate::ParsedWall::new(span.start_ns.raw()),
+        crate::ParsedWall::new(span.end_ns.raw()),
+        span.thread_id,
+        crate::ParsedCpu::new(span.cpu_start_ns.raw()),
+        crate::ParsedCpu::new(span.cpu_end_ns.raw()),
+        span.alloc_count,
+        span.alloc_bytes,
+        span.free_count,
+        span.free_bytes,
+    )
 }
 
 /// Parsed NDJSON file contents. Single parse site so adding a field to the
