@@ -9,6 +9,8 @@ pub mod cpu_clock;
 mod cpu_clock;
 
 pub(crate) mod children;
+pub(crate) mod inflight;
+pub(crate) mod types;
 
 #[cfg(feature = "_test_internals")]
 #[doc(hidden)]
@@ -59,19 +61,7 @@ pub mod piano_future;
 #[cfg(not(feature = "_test_internals"))]
 mod piano_future;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct NameId(pub(crate) u32);
-
-#[cfg(feature = "_test_internals")]
-impl NameId {
-    pub fn new(v: u32) -> Self {
-        Self(v)
-    }
-    pub fn raw(self) -> u32 {
-        self.0
-    }
-}
+pub use types::NameId;
 
 // Public API for rewriter-generated code
 pub use alloc::PianoAllocator;

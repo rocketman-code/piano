@@ -20,25 +20,43 @@ use std::time::Instant;
 
 use crate::cpu_clock::CpuNs;
 
+// ── Ticks ───────────────────────────────────────────────────────
+
 /// Raw hardware counter value (TSC on x86_64, CNTVCT on aarch64,
 /// epoch-relative nanoseconds on fallback platforms).
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(transparent)]
-pub struct Ticks(pub(crate) u64);
+pub struct Ticks(u64);
 
 impl Ticks {
+    pub(crate) const ZERO: Self = Ticks(0);
+    pub(crate) fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
     pub(crate) fn wrapping_sub(self, other: Ticks) -> Ticks {
         Ticks(self.0.wrapping_sub(other.0))
     }
 }
 
+// ── WallNs ──────────────────────────────────────────────────────
+
 /// Calibrated wall-clock nanoseconds, epoch-relative.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(transparent)]
-pub struct WallNs(pub(crate) u64);
+pub struct WallNs(u64);
 
 impl WallNs {
     pub(crate) const ZERO: Self = WallNs(0);
+    fn from_raw(v: u64) -> Self {
+        Self(v)
+    }
+    pub fn raw(self) -> u64 {
+        self.0
+    }
 
     pub(crate) fn saturating_sub(self, other: WallNs) -> WallNs {
         WallNs(self.0.saturating_sub(other.0))
@@ -50,8 +68,12 @@ impl WallNs {
     pub fn new(v: u64) -> Self {
         Self(v)
     }
-    pub fn raw(self) -> u64 {
-        self.0
+}
+
+impl core::ops::Add for WallNs {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        WallNs(self.0 + rhs.0)
     }
 }
 
@@ -73,7 +95,7 @@ pub struct CalibrationData {
     multiplier: u64,
     bias_ticks: u64,
     epoch_tsc: u64,
-    cpu_bias_ns: u64,
+    cpu_bias: CpuNs,
 }
 
 impl CalibrationData {
@@ -88,7 +110,7 @@ impl CalibrationData {
             multiplier: 0,
             bias_ticks: 0,
             epoch_tsc: 0,
-            cpu_bias_ns: 0,
+            cpu_bias: CpuNs::ZERO,
         };
 
         // SAFETY: ONCE.call_once guarantees single initialization. After init,
@@ -98,15 +120,14 @@ impl CalibrationData {
             ONCE.call_once(|| {
                 let (quotient, multiplier, epoch_tsc) = calibrate();
                 let bias_ticks = calibrate_bias();
-                let cpu_bias_f64_bits = crate::cpu_clock::calibrate_bias();
-                let cpu_bias_ns = f64::from_bits(cpu_bias_f64_bits).round() as u64;
+                let cpu_bias = crate::cpu_clock::calibrate_bias();
 
                 CACHED = CalibrationData {
                     quotient,
                     multiplier,
                     bias_ticks,
                     epoch_tsc,
-                    cpu_bias_ns,
+                    cpu_bias,
                 };
             });
             CACHED
@@ -121,7 +142,7 @@ impl CalibrationData {
             multiplier,
             bias_ticks,
             epoch_tsc,
-            cpu_bias_ns: 0,
+            cpu_bias: CpuNs::ZERO,
         }
     }
 
@@ -138,19 +159,25 @@ impl CalibrationData {
     /// Convert a raw tick value to epoch-relative nanoseconds.
     #[inline(always)]
     pub fn now_ns(&self, raw_ticks: Ticks) -> WallNs {
-        WallNs(self.ticks_to_ns(raw_ticks.wrapping_sub(Ticks(self.epoch_tsc)).0))
+        WallNs::from_raw(
+            self.ticks_to_ns(
+                raw_ticks
+                    .wrapping_sub(Ticks::from_raw(self.epoch_tsc))
+                    .raw(),
+            ),
+        )
     }
 
     /// Return the calibrated measurement bias in nanoseconds.
     #[inline(always)]
     pub fn bias_ns(&self) -> WallNs {
-        WallNs(self.ticks_to_ns(self.bias_ticks))
+        WallNs::from_raw(self.ticks_to_ns(self.bias_ticks))
     }
 
     /// Return the calibrated CPU-time measurement bias in nanoseconds.
     #[inline(always)]
     pub fn cpu_bias_ns(&self) -> CpuNs {
-        CpuNs(self.cpu_bias_ns)
+        self.cpu_bias
     }
 }
 
@@ -164,7 +191,7 @@ pub fn read() -> Ticks {
     // SAFETY: _rdtsc is a stable intrinsic that reads the timestamp counter.
     // No memory safety implications: returns a u64 counter value.
     unsafe {
-        Ticks(core::arch::x86_64::_rdtsc())
+        Ticks::from_raw(core::arch::x86_64::_rdtsc())
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -173,7 +200,7 @@ pub fn read() -> Ticks {
         // SAFETY: mrs cntvct_el0 reads the generic timer counter register.
         // Architecturally guaranteed available at EL0 on all aarch64.
         unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) val) };
-        Ticks(val)
+        Ticks::from_raw(val)
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -189,7 +216,7 @@ pub fn read() -> Ticks {
             FALLBACK_ONCE.call_once(|| {
                 FALLBACK_EPOCH = Some(Instant::now());
             });
-            Ticks(
+            Ticks::from_raw(
                 Instant::now()
                     .saturating_duration_since(FALLBACK_EPOCH.unwrap_or_else(Instant::now))
                     .as_nanos() as u64,
@@ -233,12 +260,12 @@ fn calibrate() -> (u64, u64, u64) {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let wall_start = Instant::now();
-        let tsc_start = read().0;
+        let tsc_start = read().raw();
 
         let target = std::time::Duration::from_millis(CALIBRATION_SPIN_MS);
         while wall_start.elapsed() < target {}
 
-        let tsc_end = read().0;
+        let tsc_end = read().raw();
         let wall_ns = wall_start.elapsed().as_nanos() as u64;
         let tsc_ticks = tsc_end.wrapping_sub(tsc_start);
 
@@ -272,9 +299,9 @@ fn calibrate_bias() -> u64 {
 
         let mut deltas = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
-            let start = read().0;
+            let start = read().raw();
             compiler_fence(Ordering::SeqCst);
-            let end = read().0;
+            let end = read().raw();
             deltas.push(end.wrapping_sub(start));
         }
         deltas.sort_unstable();

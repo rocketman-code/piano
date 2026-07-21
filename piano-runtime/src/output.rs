@@ -19,37 +19,23 @@ use crate::time::WallNs;
 /// Write the name table as a header line, including run metadata.
 pub fn write_header(
     w: &mut impl Write,
-    names: &[(u32, &str)],
+    names: &[(u32, &str, &str)],
     bias_ns: WallNs,
     cpu_bias_ns: CpuNs,
     run_id: &str,
     timestamp_ms: u128,
 ) -> io::Result<()> {
-    let bias_ns = bias_ns.0;
-    let cpu_bias_ns = cpu_bias_ns.0;
     write!(
         w,
         "{{\"type\":\"header\",\"run_id\":\"{run_id}\",\"timestamp_ms\":{timestamp_ms},"
     )?;
-    write!(
-        w,
-        "\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{"
-    )?;
-    for (i, (id, name)) in names.iter().enumerate() {
-        if i > 0 {
-            write!(w, ",")?;
-        }
-        write!(w, "\"{id}\":\"",)?;
-        write_json_escaped(w, name)?;
-        write!(w, "\"")?;
-    }
-    writeln!(w, "}}}}")
+    write_name_table_fields(w, names, bias_ns, cpu_bias_ns)
 }
 
 /// Write the name table as a trailer line.
 pub fn write_trailer(
     w: &mut impl Write,
-    names: &[(u32, &str)],
+    names: &[(u32, &str, &str)],
     bias_ns: WallNs,
     cpu_bias_ns: CpuNs,
 ) -> io::Result<()> {
@@ -57,7 +43,11 @@ pub fn write_trailer(
 }
 
 /// Serialize the trailer to a byte vector for signal-safe writing.
-pub fn serialize_trailer(names: &[(u32, &str)], bias_ns: WallNs, cpu_bias_ns: CpuNs) -> Vec<u8> {
+pub fn serialize_trailer(
+    names: &[(u32, &str, &str)],
+    bias_ns: WallNs,
+    cpu_bias_ns: CpuNs,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(b'\n');
     let _ = write_trailer(&mut buf, names, bias_ns, cpu_bias_ns);
@@ -82,17 +72,45 @@ pub fn write_aggregates(
                     "\"free_count\":{},\"free_bytes\":{}}}"
                 ),
                 thread_idx,
-                a.name_id.0,
+                a.name_id.raw(),
                 a.calls,
-                a.self_ns.0,
-                a.inclusive_ns.0,
-                a.cpu_self_ns.0,
+                a.self_ns.raw(),
+                a.inclusive_ns.raw(),
+                a.cpu_self_ns.raw(),
                 a.alloc.alloc_count,
                 a.alloc.alloc_bytes,
                 a.alloc.free_count,
                 a.alloc.free_bytes,
             )?;
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_interrupted_aggregates(
+    w: &mut impl Write,
+    entries: &[crate::inflight::InterruptedEntry],
+    calibration: &crate::time::CalibrationData,
+) -> io::Result<()> {
+    let end_ticks = crate::time::read();
+    for e in entries {
+        let start_ns = calibration.now_ns(e.start_ticks);
+        let end_ns = calibration.now_ns(end_ticks);
+        let elapsed = end_ns.saturating_sub(start_ns);
+        writeln!(
+            w,
+            concat!(
+                "{{\"name_id\":{},\"calls\":{},\"self_ns\":{},\"inclusive_ns\":{},",
+                "\"cpu_self_ns\":0,",
+                "\"alloc_count\":0,\"alloc_bytes\":0,",
+                "\"free_count\":0,\"free_bytes\":0,",
+                "\"interrupted\":true}}"
+            ),
+            e.name_id.raw(),
+            e.depth,
+            elapsed.raw(),
+            elapsed.raw(),
+        )?;
     }
     Ok(())
 }
@@ -141,15 +159,15 @@ pub fn serialize_aggregate_to_stack(
     put!(b"{\"thread\":");
     put_u64!(thread_idx);
     put!(b",\"name_id\":");
-    put_u64!(a.name_id.0 as u64);
+    put_u64!(a.name_id.raw() as u64);
     put!(b",\"calls\":");
     put_u64!(a.calls);
     put!(b",\"self_ns\":");
-    put_u64!(a.self_ns.0);
+    put_u64!(a.self_ns.raw());
     put!(b",\"inclusive_ns\":");
-    put_u64!(a.inclusive_ns.0);
+    put_u64!(a.inclusive_ns.raw());
     put!(b",\"cpu_self_ns\":");
-    put_u64!(a.cpu_self_ns.0);
+    put_u64!(a.cpu_self_ns.raw());
     put!(b",\"alloc_count\":");
     put_u64!(a.alloc.alloc_count);
     put!(b",\"alloc_bytes\":");
@@ -166,22 +184,41 @@ pub fn serialize_aggregate_to_stack(
 fn write_name_table(
     w: &mut impl Write,
     kind: &str,
-    names: &[(u32, &str)],
+    names: &[(u32, &str, &str)],
     bias_ns: WallNs,
     cpu_bias_ns: CpuNs,
 ) -> io::Result<()> {
-    let bias_ns = bias_ns.0;
-    let cpu_bias_ns = cpu_bias_ns.0;
+    write!(w, "{{\"type\":\"{kind}\",")?;
+    write_name_table_fields(w, names, bias_ns, cpu_bias_ns)
+}
+
+fn write_name_table_fields(
+    w: &mut impl Write,
+    names: &[(u32, &str, &str)],
+    bias_ns: WallNs,
+    cpu_bias_ns: CpuNs,
+) -> io::Result<()> {
+    let bias_ns = bias_ns.raw();
+    let cpu_bias_ns = cpu_bias_ns.raw();
     write!(
         w,
-        "{{\"type\":\"{kind}\",\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{"
+        "\"bias_ns\":{bias_ns},\"cpu_bias_ns\":{cpu_bias_ns},\"names\":{{"
     )?;
-    for (i, (id, name)) in names.iter().enumerate() {
+    for (i, (id, display, _)) in names.iter().enumerate() {
         if i > 0 {
             write!(w, ",")?;
         }
         write!(w, "\"{id}\":\"",)?;
-        write_json_escaped(w, name)?;
+        write_json_escaped(w, display)?;
+        write!(w, "\"")?;
+    }
+    write!(w, "}},\"qualified\":{{")?;
+    for (i, (id, _, qualified)) in names.iter().enumerate() {
+        if i > 0 {
+            write!(w, ",")?;
+        }
+        write!(w, "\"{id}\":\"",)?;
+        write_json_escaped(w, qualified)?;
         write!(w, "\"")?;
     }
     writeln!(w, "}}}}")

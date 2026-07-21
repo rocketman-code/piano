@@ -626,9 +626,29 @@ fn build_runtime_rlib(
         .map_err(|e| Error::BuildFailed(format!("failed to build piano-runtime: {e}")))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut errors = String::new();
+        for line in stdout.lines() {
+            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
+                if msg.get("reason").and_then(|r| r.as_str()) == Some("compiler-message") {
+                    if let Some(rendered) = msg
+                        .get("message")
+                        .and_then(|m| m.get("rendered"))
+                        .and_then(|r| r.as_str())
+                    {
+                        errors.push_str(rendered);
+                    }
+                }
+            }
+        }
+        if errors.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::BuildFailed(format!(
+                "piano-runtime build failed:\n{stderr}"
+            )));
+        }
         return Err(Error::BuildFailed(format!(
-            "piano-runtime build failed: {stderr}"
+            "piano-runtime build failed:\n{errors}"
         )));
     }
 

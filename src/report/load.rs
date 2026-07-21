@@ -1,14 +1,96 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
+use crate::types::{apply_cpu_bias, apply_wall_bias};
 
 use super::{
     FnAgg, FnEntry, NdjsonAggregate, NdjsonMeasurement, NdjsonNameTable, Run, RunCompleteness,
     RunFormat,
 };
 
-const NS_PER_MS: f64 = 1_000_000.0;
+// ── Parsed wall clock ───────────────────────────────────────────
+
+/// Wall-clock nanoseconds from NDJSON deserialization, before bias correction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ParsedWall(u64);
+
+impl ParsedWall {
+    pub(crate) fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn saturating_sub(self, rhs: Self) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_test(v: u64) -> Self {
+        Self(v)
+    }
+}
+
+impl AddAssign for ParsedWall {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+// ── Parsed CPU time ─────────────────────────────────────────────
+
+/// CPU-time nanoseconds from NDJSON deserialization, before bias correction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ParsedCpu(u64);
+
+impl ParsedCpu {
+    pub(crate) fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn saturating_sub(self, rhs: Self) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_test(v: u64) -> Self {
+        Self(v)
+    }
+}
+
+impl AddAssign for ParsedCpu {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+// ── Allocation deltas ───────────────────────────────────────────
+
+/// Allocation delta counters (alloc minus free).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ParsedAlloc {
+    pub(crate) alloc_count: u64,
+    pub(crate) alloc_bytes: u64,
+    pub(crate) free_count: u64,
+    pub(crate) free_bytes: u64,
+}
+
+impl AddAssign for ParsedAlloc {
+    fn add_assign(&mut self, rhs: Self) {
+        self.alloc_count += rhs.alloc_count;
+        self.alloc_bytes += rhs.alloc_bytes;
+        self.free_count += rhs.free_count;
+        self.free_bytes += rhs.free_bytes;
+    }
+}
+
+// ── Function identity ───────────────────────────────────────────
+
+/// Stable function identity for cross-run matching.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StableIdentity(pub(crate) String);
 
 /// Read a profiling run from a JSON or NDJSON file on disk.
 pub fn load_run(path: &Path) -> Result<Run, Error> {
@@ -48,8 +130,8 @@ pub fn load_run(path: &Path) -> Result<Run, Error> {
 /// Aggregation groups self-attributed values by name_id.
 pub fn load_ndjson(path: &Path, uncorrected: bool) -> Result<(Run, RunCompleteness), Error> {
     let parsed = parse_ndjson(path)?;
-    let bias_ns = if uncorrected { 0 } else { parsed.bias_ns };
-    let cpu_bias_ns = if uncorrected { 0 } else { parsed.cpu_bias_ns };
+    let bias_ns = ParsedWall(if uncorrected { 0 } else { parsed.bias_ns });
+    let cpu_bias_ns = ParsedCpu(if uncorrected { 0 } else { parsed.cpu_bias_ns });
 
     let (fn_agg, has_cpu) = if !parsed.aggregates.is_empty() {
         // Aggregated format: self-time pre-computed by runtime
@@ -60,24 +142,36 @@ pub fn load_ndjson(path: &Path, uncorrected: bool) -> Result<(Run, RunCompletene
             entry.calls += a.calls;
             entry.self_ns += a.self_ns;
             entry.inclusive_ns += a.inclusive_ns;
-            entry.alloc_count += a.alloc_count;
-            entry.alloc_bytes += a.alloc_bytes;
-            entry.free_count += a.free_count;
-            entry.free_bytes += a.free_bytes;
             entry.cpu_self_ns += a.cpu_self_ns;
-            if a.cpu_self_ns > 0 {
+            entry.alloc += ParsedAlloc {
+                alloc_count: a.alloc_count,
+                alloc_bytes: a.alloc_bytes,
+                free_count: a.free_count,
+                free_bytes: a.free_bytes,
+            };
+            if a.cpu_self_ns.raw() > 0 {
                 has_cpu = true;
+            }
+            if a.interrupted {
+                entry.interrupted = true;
             }
         }
         (agg, has_cpu)
     } else {
         // Raw spans format: compute self-time from span tree
         let self_values = compute_self_attribution(&parsed.measurements);
-        let has_cpu = parsed.measurements.iter().any(|m| m.cpu_end_ns > 0);
+        let has_cpu = parsed.measurements.iter().any(|m| m.cpu_end_ns.raw() > 0);
         (aggregate_self_values(&self_values), has_cpu)
     };
 
-    let functions = build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
+    let functions = build_fn_entries(
+        &parsed.fn_names,
+        &parsed.fn_qualified,
+        &fn_agg,
+        has_cpu,
+        bias_ns,
+        cpu_bias_ns,
+    );
 
     let run = Run {
         run_id: parsed.run_id,
@@ -93,8 +187,8 @@ pub fn load_ndjson(path: &Path, uncorrected: bool) -> Result<(Run, RunCompletene
 /// thread data (all thread_ids are zero or identical).
 pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<Vec<Run>>, Error> {
     let parsed = parse_ndjson(path)?;
-    let bias_ns = if uncorrected { 0 } else { parsed.bias_ns };
-    let cpu_bias_ns = if uncorrected { 0 } else { parsed.cpu_bias_ns };
+    let bias_ns = ParsedWall(if uncorrected { 0 } else { parsed.bias_ns });
+    let cpu_bias_ns = ParsedCpu(if uncorrected { 0 } else { parsed.cpu_bias_ns });
 
     // Aggregated format: group by thread field
     if !parsed.aggregates.is_empty() {
@@ -105,7 +199,7 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
             return Ok(None);
         }
 
-        let has_cpu = parsed.aggregates.iter().any(|a| a.cpu_self_ns > 0);
+        let has_cpu = parsed.aggregates.iter().any(|a| a.cpu_self_ns.raw() > 0);
         let mut runs: Vec<(u64, Run)> = Vec::new();
         for &tid in &thread_ids {
             let mut fn_agg: HashMap<u32, FnAgg> = HashMap::new();
@@ -114,14 +208,25 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
                 entry.calls += a.calls;
                 entry.self_ns += a.self_ns;
                 entry.inclusive_ns += a.inclusive_ns;
-                entry.alloc_count += a.alloc_count;
-                entry.alloc_bytes += a.alloc_bytes;
-                entry.free_count += a.free_count;
-                entry.free_bytes += a.free_bytes;
                 entry.cpu_self_ns += a.cpu_self_ns;
+                entry.alloc += ParsedAlloc {
+                    alloc_count: a.alloc_count,
+                    alloc_bytes: a.alloc_bytes,
+                    free_count: a.free_count,
+                    free_bytes: a.free_bytes,
+                };
+                if a.interrupted {
+                    entry.interrupted = true;
+                }
             }
-            let functions =
-                build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
+            let functions = build_fn_entries(
+                &parsed.fn_names,
+                &parsed.fn_qualified,
+                &fn_agg,
+                has_cpu,
+                bias_ns,
+                cpu_bias_ns,
+            );
             runs.push((
                 tid,
                 Run {
@@ -145,7 +250,7 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
     }
 
     let self_values = compute_self_attribution(&parsed.measurements);
-    let has_cpu = parsed.measurements.iter().any(|m| m.cpu_end_ns > 0);
+    let has_cpu = parsed.measurements.iter().any(|m| m.cpu_end_ns.raw() > 0);
 
     // Group self-attributed values by thread_id.
     let mut by_thread: HashMap<u64, Vec<&SpanSelfValues>> = HashMap::new();
@@ -157,8 +262,14 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
         .into_iter()
         .map(|(tid, spans)| {
             let fn_agg = aggregate_self_values(spans);
-            let functions =
-                build_fn_entries(&parsed.fn_names, &fn_agg, has_cpu, bias_ns, cpu_bias_ns);
+            let functions = build_fn_entries(
+                &parsed.fn_names,
+                &parsed.fn_qualified,
+                &fn_agg,
+                has_cpu,
+                bias_ns,
+                cpu_bias_ns,
+            );
             (
                 tid,
                 Run {
@@ -179,12 +290,17 @@ pub fn load_ndjson_per_thread(path: &Path, uncorrected: bool) -> Result<Option<V
 struct SpanSelfValues {
     name_id: u32,
     thread_id: u64,
-    self_wall_ns: u64,
-    self_cpu_ns: u64,
-    self_alloc_count: u64,
-    self_alloc_bytes: u64,
-    self_free_count: u64,
-    self_free_bytes: u64,
+    self_wall_ns: ParsedWall,
+    self_cpu_ns: ParsedCpu,
+    self_alloc: ParsedAlloc,
+}
+
+/// Accumulated children's inclusive values for a parent span.
+#[derive(Default, Clone, Copy)]
+struct ChildrenSums {
+    wall: ParsedWall,
+    cpu: ParsedCpu,
+    alloc: ParsedAlloc,
 }
 
 /// Compute self-attribution for every span in the measurement list.
@@ -200,17 +316,18 @@ fn compute_self_attribution(measurements: &[NdjsonMeasurement]) -> Vec<SpanSelfV
         .collect();
 
     // For each span, accumulate the sum of its direct children's inclusive values.
-    // Key: parent_span_id, Value: (sum_wall, sum_cpu, sum_alloc_count, sum_alloc_bytes, sum_free_count, sum_free_bytes).
-    let mut children_sums: HashMap<u64, (u64, u64, u64, u64, u64, u64)> = HashMap::new();
+    let mut children_sums: HashMap<u64, ChildrenSums> = HashMap::new();
     for m in measurements {
         if m.parent_span_id != 0 && span_index.contains_key(&m.parent_span_id) {
             let entry = children_sums.entry(m.parent_span_id).or_default();
-            entry.0 += m.end_ns.saturating_sub(m.start_ns);
-            entry.1 += m.cpu_end_ns.saturating_sub(m.cpu_start_ns);
-            entry.2 += m.alloc_count;
-            entry.3 += m.alloc_bytes;
-            entry.4 += m.free_count;
-            entry.5 += m.free_bytes;
+            entry.wall += m.end_ns.saturating_sub(m.start_ns);
+            entry.cpu += m.cpu_end_ns.saturating_sub(m.cpu_start_ns);
+            entry.alloc += ParsedAlloc {
+                alloc_count: m.alloc_count,
+                alloc_bytes: m.alloc_bytes,
+                free_count: m.free_count,
+                free_bytes: m.free_bytes,
+            };
         }
     }
 
@@ -219,18 +336,19 @@ fn compute_self_attribution(measurements: &[NdjsonMeasurement]) -> Vec<SpanSelfV
         .map(|m| {
             let wall = m.end_ns.saturating_sub(m.start_ns);
             let cpu = m.cpu_end_ns.saturating_sub(m.cpu_start_ns);
-            let (child_wall, child_cpu, child_ac, child_ab, child_fc, child_fb) =
-                children_sums.get(&m.span_id).copied().unwrap_or_default();
+            let cs = children_sums.get(&m.span_id).copied().unwrap_or_default();
 
             SpanSelfValues {
                 name_id: m.name_id,
                 thread_id: m.thread_id,
-                self_wall_ns: wall.saturating_sub(child_wall),
-                self_cpu_ns: cpu.saturating_sub(child_cpu),
-                self_alloc_count: m.alloc_count.saturating_sub(child_ac),
-                self_alloc_bytes: m.alloc_bytes.saturating_sub(child_ab),
-                self_free_count: m.free_count.saturating_sub(child_fc),
-                self_free_bytes: m.free_bytes.saturating_sub(child_fb),
+                self_wall_ns: wall.saturating_sub(cs.wall),
+                self_cpu_ns: cpu.saturating_sub(cs.cpu),
+                self_alloc: ParsedAlloc {
+                    alloc_count: m.alloc_count.saturating_sub(cs.alloc.alloc_count),
+                    alloc_bytes: m.alloc_bytes.saturating_sub(cs.alloc.alloc_bytes),
+                    free_count: m.free_count.saturating_sub(cs.alloc.free_count),
+                    free_bytes: m.free_bytes.saturating_sub(cs.alloc.free_bytes),
+                },
             }
         })
         .collect()
@@ -264,6 +382,7 @@ struct ParsedNdjson {
     run_id: Option<String>,
     timestamp_ms: u128,
     fn_names: Vec<String>,
+    fn_qualified: Vec<String>,
     measurements: Vec<NdjsonMeasurement>,
     aggregates: Vec<NdjsonAggregate>,
     completeness: RunCompleteness,
@@ -319,12 +438,17 @@ fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
         .get("cpu_bias_ns")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let header_qualified: HashMap<String, String> = header_value
+        .get("qualified")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
 
     // Parse body lines: aggregates, raw measurements, and trailer.
     let body = &all_lines[1..];
     let mut measurements: Vec<NdjsonMeasurement> = Vec::new();
     let mut aggregates: Vec<NdjsonAggregate> = Vec::new();
     let mut trailer_names: Option<HashMap<String, String>> = None;
+    let mut trailer_qualified: Option<HashMap<String, String>> = None;
     let mut completeness = RunCompleteness::Recovered;
 
     for line in body {
@@ -335,6 +459,7 @@ fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
         if let Ok(name_table) = serde_json::from_str::<NdjsonNameTable>(line) {
             if name_table.kind == "trailer" {
                 trailer_names = Some(name_table.names);
+                trailer_qualified = Some(name_table.qualified);
                 completeness = RunCompleteness::Complete;
                 continue;
             }
@@ -353,12 +478,19 @@ fn parse_ndjson(path: &Path) -> Result<ParsedNdjson, Error> {
     }
 
     let raw_names = trailer_names.unwrap_or(header.names);
+    let raw_qualified = trailer_qualified.unwrap_or(header_qualified);
     let fn_names = build_name_table(&raw_names);
+    let fn_qualified = if raw_qualified.is_empty() {
+        Vec::new()
+    } else {
+        build_name_table(&raw_qualified)
+    };
 
     Ok(ParsedNdjson {
         run_id,
         timestamp_ms,
         fn_names,
+        fn_qualified,
         measurements,
         aggregates,
         completeness,
@@ -377,10 +509,7 @@ fn aggregate_self_values<'a>(
         agg.calls += 1;
         agg.self_ns += sv.self_wall_ns;
         agg.cpu_self_ns += sv.self_cpu_ns;
-        agg.alloc_count += sv.self_alloc_count;
-        agg.alloc_bytes += sv.self_alloc_bytes;
-        agg.free_count += sv.self_free_count;
-        agg.free_bytes += sv.self_free_bytes;
+        agg.alloc += sv.self_alloc;
     }
     fn_agg
 }
@@ -394,10 +523,11 @@ fn aggregate_self_values<'a>(
 /// Correction is aggregate, not per-call, to avoid clipping individual samples.
 fn build_fn_entries(
     fn_names: &[String],
+    fn_qualified: &[String],
     fn_agg: &HashMap<u32, FnAgg>,
     has_cpu: bool,
-    bias_ns: u64,
-    cpu_bias_ns: u64,
+    bias_ns: ParsedWall,
+    cpu_bias_ns: ParsedCpu,
 ) -> Vec<FnEntry> {
     fn_names
         .iter()
@@ -405,27 +535,32 @@ fn build_fn_entries(
         .map(|(idx, name)| {
             let name_id = idx as u32;
             let agg = fn_agg.get(&name_id).copied().unwrap_or_default();
-            let corrected_self_ns = agg.self_ns.saturating_sub(bias_ns * agg.calls);
-            let corrected_inclusive_ns = agg.inclusive_ns.saturating_sub(bias_ns * agg.calls);
-            let corrected_cpu_self_ns = agg.cpu_self_ns.saturating_sub(cpu_bias_ns * agg.calls);
+            let corrected_self = apply_wall_bias(agg.self_ns, bias_ns, agg.calls);
+            let corrected_inclusive = apply_wall_bias(agg.inclusive_ns, bias_ns, agg.calls);
+            let corrected_cpu = apply_cpu_bias(agg.cpu_self_ns, cpu_bias_ns, agg.calls);
             FnEntry {
                 name: name.clone(),
+                identity: fn_qualified
+                    .get(idx)
+                    .filter(|q| !q.is_empty())
+                    .map(|q| StableIdentity(q.clone())),
                 calls: agg.calls,
-                total_ms: if agg.inclusive_ns > 0 {
-                    Some(corrected_inclusive_ns as f64 / NS_PER_MS)
+                total_ms: if agg.inclusive_ns.raw() > 0 {
+                    Some(corrected_inclusive.as_ms())
                 } else {
                     None
                 },
-                self_ms: corrected_self_ns as f64 / NS_PER_MS,
+                self_ms: corrected_self.as_ms(),
                 cpu_self_ms: if has_cpu {
-                    Some(corrected_cpu_self_ns as f64 / NS_PER_MS)
+                    Some(corrected_cpu.as_ms())
                 } else {
                     None
                 },
-                alloc_count: agg.alloc_count,
-                alloc_bytes: agg.alloc_bytes,
-                free_count: agg.free_count,
-                free_bytes: agg.free_bytes,
+                alloc_count: agg.alloc.alloc_count,
+                alloc_bytes: agg.alloc.alloc_bytes,
+                free_count: agg.alloc.free_count,
+                free_bytes: agg.alloc.free_bytes,
+                interrupted: agg.interrupted,
             }
         })
         .collect()
@@ -504,6 +639,7 @@ fn merge_runs(runs: &[&Run]) -> Run {
         for f in &run.functions {
             let entry = merged.entry(f.name.clone()).or_insert(FnEntry {
                 name: f.name.clone(),
+                identity: f.identity.clone(),
                 calls: 0,
                 total_ms: None,
                 self_ms: 0.0,
@@ -512,7 +648,11 @@ fn merge_runs(runs: &[&Run]) -> Run {
                 alloc_bytes: 0,
                 free_count: 0,
                 free_bytes: 0,
+                interrupted: false,
             });
+            if f.interrupted {
+                entry.interrupted = true;
+            }
             entry.calls += f.calls;
             if let Some(t) = f.total_ms {
                 *entry.total_ms.get_or_insert(0.0) += t;
@@ -1327,7 +1467,7 @@ mod tests {
         // child1: leaf span, self = inclusive
         let child1_wall_ns: f64 = 3000.0; // 5000 - 2000
         assert!(
-            (child1.self_ms - child1_wall_ns / NS_PER_MS).abs() < 0.0001,
+            (child1.self_ms - child1_wall_ns / 1_000_000.0).abs() < 0.0001,
             "child1 self_ms should be ~0.003, got {}",
             child1.self_ms
         );
@@ -1336,7 +1476,7 @@ mod tests {
         // child2: leaf span, self = inclusive
         let child2_wall_ns: f64 = 4000.0; // 10000 - 6000
         assert!(
-            (child2.self_ms - child2_wall_ns / NS_PER_MS).abs() < 0.0001,
+            (child2.self_ms - child2_wall_ns / 1_000_000.0).abs() < 0.0001,
             "child2 self_ms should be ~0.004, got {}",
             child2.self_ms
         );

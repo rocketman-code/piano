@@ -1,8 +1,12 @@
 //! Sync function instrumentation -- RAII sentinel.
 //!
 //! Guard is created when entering a profiled function and dropped when
-//! exiting. On drop, it computes self-time via the TLS children-time
-//! accumulator and aggregates into the per-thread FnAgg vec.
+//! exiting. On drop it computes self_ns = inclusive_ns - children_ns
+//! and aggregates into the per-thread FnAgg vec.
+//!
+//! Children within the Guard's scope report their inclusive time via
+//! the per-thread accumulator. Rust's reverse drop order (drop.rs:93)
+//! guarantees nested children report before the parent reads.
 //!
 //! Invariants:
 //! - Guard is !Send. Alloc deltas are computed on the same thread as
@@ -10,7 +14,6 @@
 //! - Profiler bookkeeping allocs are excluded from user counts.
 //!   Enforcement: ProfilerBookkeeping proof token wraps creation and drop.
 //! - Guard never panics. All arithmetic uses saturating_sub.
-//! - TLS children_ns is saved/restored on create/drop (RAII stack discipline).
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -54,8 +57,9 @@ pub fn enter(name_id: u32) -> Guard {
         Some(s) => s,
         None => return Guard::inactive(),
     };
-    let mut guard = Guard::create(session, NameId(name_id));
+    let mut guard = Guard::create(session, NameId::from_raw(name_id));
     guard.stamp();
+    crate::inflight::enter(NameId::from_raw(name_id), guard.start_ticks);
     guard
 }
 
@@ -65,10 +69,10 @@ impl Guard {
         Self {
             session: None,
             saved_children_ns: WallNs::ZERO,
-            name_id: NameId(0),
+            name_id: NameId::from_raw(0),
             cpu_time_enabled: false,
             cpu_start: CpuNs::ZERO,
-            start_ticks: Ticks(0),
+            start_ticks: Ticks::ZERO,
             alloc_start: AllocSnapshot::ZERO,
             _not_send: PhantomData,
         }
@@ -97,7 +101,7 @@ impl Guard {
             name_id,
             cpu_time_enabled: session.cpu_time_enabled,
             cpu_start,
-            start_ticks: Ticks(0),
+            start_ticks: Ticks::ZERO,
             alloc_start: snap,
             _not_send: PhantomData,
         }
@@ -121,6 +125,7 @@ impl Drop for Guard {
             Some(s) => s,
             None => return,
         };
+        crate::inflight::exit(self.name_id);
         let bookkeeping = ProfilerBookkeeping::enter();
         let cpu_end = if self.cpu_time_enabled {
             cpu_now_ns()
@@ -148,7 +153,6 @@ impl Drop for Guard {
             &session.agg_registry,
         );
 
-        // Report inclusive time to parent scope.
         children::restore_and_report(self.saved_children_ns, inclusive_ns);
     }
 }

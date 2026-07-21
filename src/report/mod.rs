@@ -11,6 +11,8 @@ pub(crate) mod test_util;
 pub(super) const HEADER: Style = Style::new().bold();
 pub(super) const DIM: Style = Style::new().effects(Effects::DIMMED);
 
+pub(super) use load::{ParsedAlloc, ParsedCpu, ParsedWall, StableIdentity};
+
 /// Describes the file format a Run was loaded from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RunFormat {
@@ -50,6 +52,9 @@ pub struct Run {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct FnEntry {
     pub name: String,
+    /// Stable identity for cross-run matching (populated from NDJSON qualified names).
+    #[serde(skip)]
+    pub identity: Option<StableIdentity>,
     pub calls: u64,
     #[serde(default)]
     pub total_ms: Option<f64>,
@@ -64,19 +69,19 @@ pub struct FnEntry {
     pub free_count: u64,
     #[serde(default)]
     pub free_bytes: u64,
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 /// Accumulated per-function counters (used during NDJSON aggregation).
 #[derive(Default, Clone, Copy)]
 pub(super) struct FnAgg {
     pub(super) calls: u64,
-    pub(super) self_ns: u64,
-    pub(super) inclusive_ns: u64,
-    pub(super) alloc_count: u64,
-    pub(super) alloc_bytes: u64,
-    pub(super) free_count: u64,
-    pub(super) free_bytes: u64,
-    pub(super) cpu_self_ns: u64,
+    pub(super) self_ns: ParsedWall,
+    pub(super) inclusive_ns: ParsedWall,
+    pub(super) cpu_self_ns: ParsedCpu,
+    pub(super) alloc: ParsedAlloc,
+    pub(super) interrupted: bool,
 }
 
 /// NDJSON header/trailer line.
@@ -92,6 +97,9 @@ pub(super) struct NdjsonNameTable {
     /// Name table: string keys (name_id) mapped to function names.
     #[serde(default)]
     pub(super) names: std::collections::HashMap<String, String>,
+    /// Qualified name table: string keys (name_id) mapped to fully qualified paths.
+    #[serde(default)]
+    pub(super) qualified: std::collections::HashMap<String, String>,
 }
 
 /// NDJSON measurement line -- one per completed function invocation.
@@ -101,14 +109,14 @@ pub(super) struct NdjsonMeasurement {
     pub(super) span_id: u64,
     pub(super) parent_span_id: u64,
     pub(super) name_id: u32,
-    pub(super) start_ns: u64,
-    pub(super) end_ns: u64,
+    pub(super) start_ns: ParsedWall,
+    pub(super) end_ns: ParsedWall,
     #[serde(default)]
     pub(super) thread_id: u64,
     #[serde(default)]
-    pub(super) cpu_start_ns: u64,
+    pub(super) cpu_start_ns: ParsedCpu,
     #[serde(default)]
-    pub(super) cpu_end_ns: u64,
+    pub(super) cpu_end_ns: ParsedCpu,
     pub(super) alloc_count: u64,
     pub(super) alloc_bytes: u64,
     #[serde(default)]
@@ -125,11 +133,11 @@ pub(super) struct NdjsonAggregate {
     pub(super) thread: u64,
     pub(super) name_id: u32,
     pub(super) calls: u64,
-    pub(super) self_ns: u64,
+    pub(super) self_ns: ParsedWall,
     #[serde(default)]
-    pub(super) inclusive_ns: u64,
+    pub(super) inclusive_ns: ParsedWall,
     #[serde(default)]
-    pub(super) cpu_self_ns: u64,
+    pub(super) cpu_self_ns: ParsedCpu,
     #[serde(default)]
     pub(super) alloc_count: u64,
     #[serde(default)]
@@ -138,6 +146,8 @@ pub(super) struct NdjsonAggregate {
     pub(super) free_count: u64,
     #[serde(default)]
     pub(super) free_bytes: u64,
+    #[serde(default)]
+    pub(super) interrupted: bool,
 }
 
 /// Format a SystemTime as a relative duration string ("N sec/min/hours/days ago").

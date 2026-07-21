@@ -205,3 +205,81 @@ fn process_exit_streaming_no_tls_panic() {
         "streaming profiling data should contain 'work' function, got: {stats:?}"
     );
 }
+
+fn create_nested_exit_project(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+name = "nested-exit-test"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "nested-exit-test"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("src").join("main.rs"),
+        r#"fn main() {
+    outer();
+}
+
+fn outer() {
+    let mut sum = 0u64;
+    for i in 0..10000 { sum += i; }
+    let _ = sum;
+    std::process::exit(0);
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn process_exit_recovers_inflight_timing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("nested-exit");
+    create_nested_exit_project(&project_dir);
+    common::prepopulate_deps(&project_dir, common::mini_seed());
+
+    let piano_bin = env!("CARGO_BIN_EXE_piano");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_path = manifest_dir.join("piano-runtime");
+    let runs_dir = tmp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let build_output = std::process::Command::new(piano_bin)
+        .args(["build", "--fn", "outer", "--project"])
+        .arg(&project_dir)
+        .arg("--runtime-path")
+        .arg(&runtime_path)
+        .output()
+        .expect("piano build failed");
+    assert!(
+        build_output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    let binary_path = String::from_utf8_lossy(&build_output.stdout)
+        .trim()
+        .to_string();
+
+    let run_output = std::process::Command::new(&binary_path)
+        .env("PIANO_RUNS_DIR", &runs_dir)
+        .output()
+        .expect("failed to run");
+
+    let _ = run_output;
+
+    let ndjson_path = common::largest_ndjson_file(&runs_dir);
+    let content = fs::read_to_string(&ndjson_path).unwrap();
+    assert!(
+        content.contains("\"interrupted\":true"),
+        "should have interrupted aggregate line:\n{content}"
+    );
+}

@@ -401,13 +401,13 @@ fn assign_name_ids(
         if qf.minimal == "main" {
             continue;
         }
-        name_ids.entry(qf.minimal.clone()).or_insert_with(|| {
+        name_ids.entry(qf.full.clone()).or_insert_with(|| {
             let id = next_id;
             next_id += 1;
             id
         });
         displays
-            .entry(qf.minimal.clone())
+            .entry(qf.full.clone())
             .or_insert_with(|| display.clone());
     }
     (name_ids, displays, next_id)
@@ -416,15 +416,6 @@ fn assign_name_ids(
 /// Build an instrumented binary and return (binary_path, runs_dir, instrumented_fn_count).
 ///
 /// Returns `Ok(None)` when `--list-skipped` is used (early exit after printing).
-/// Build an instrumented binary.
-///
-/// Pipeline:
-///   1. Resolve project path, cargo metadata, binary target, source dir
-///   2. Resolve target functions (selectors, --skip, --list-skipped early exit)
-///   3. Qualify names, disambiguate, assign numeric IDs, discover macro functions
-///   4. Pre-build piano-runtime, clean stale files, create runs dir
-///   5. Compute workspace-relative paths, assemble WrapperConfig, write config
-///   6. Build with RUSTC_WORKSPACE_WRAPPER, warn about concurrency
 fn build_project(
     opts: BuildOpts,
     project_root: &Option<PathBuf>,
@@ -640,11 +631,6 @@ fn build_project(
     let (global_name_ids, global_display_names, _next_id) =
         assign_name_ids(&all_qualified, &display_names);
 
-    // TODO(rewriter-rebuild): macro function name discovery will be
-    // reimplemented as part of the new guard-only rewriter.
-
-    // Build set of all instrumentable function names across the entire workspace.
-    // Uses all_functions (not just measured targets) so that non-measured functions
     // Build a set of measured function names (from targets) for quick lookup.
     let measured_names: HashSet<String> = targets
         .iter()
@@ -690,11 +676,12 @@ fn build_project(
             .functions
             .iter()
             .filter_map(|qf| {
-                let qualified = qualify(&prefix, &qf.minimal);
-                if measured_names.contains(&qualified) {
+                let qualified_full = qualify(&prefix, &qf.full);
+                let qualified_minimal = qualify(&prefix, &qf.minimal);
+                if measured_names.contains(&qualified_minimal) {
                     global_name_ids
-                        .get(&qualified)
-                        .map(|&id| (qf.minimal.clone(), id))
+                        .get(&qualified_full)
+                        .map(|&id| (qf.full.clone(), id))
                 } else {
                     None
                 }
@@ -728,18 +715,18 @@ fn build_project(
         })?
         .to_path_buf();
 
-    // Build the (id, display_name) name table sorted by id.
-    let mut name_table: Vec<(u32, String)> = global_name_ids
+    // Build the (id, display_name, qualified_name) name table sorted by id.
+    let mut name_table: Vec<(u32, String, String)> = global_name_ids
         .iter()
         .map(|(qualified, &id)| {
             let display = global_display_names
                 .get(qualified)
                 .cloned()
                 .unwrap_or_else(|| qualified.clone());
-            (id, display)
+            (id, display, qualified.clone())
         })
         .collect();
-    name_table.sort_by_key(|(id, _)| *id);
+    name_table.sort_by_key(|(id, _, _)| *id);
 
     // Collect files that the wrapper will modify (for error remapping)
     let mut modified_files: std::collections::HashSet<std::path::PathBuf> =
@@ -1678,6 +1665,27 @@ mod tests {
         assert!(
             name_ids.contains_key("db::query"),
             "module-qualified functions must be in the name table"
+        );
+    }
+
+    #[test]
+    fn assign_name_ids_uses_full_not_minimal() {
+        let entries = vec![
+            piano::naming::QualifiedFunction::new("S::m", "outer_a::S::m", "outer_a::{0}::S::m"),
+            piano::naming::QualifiedFunction::new("S::m", "outer_b::S::m", "outer_b::{0}::S::m"),
+        ];
+        let display = piano::naming::disambiguate(&entries);
+        let (ids, _displays, next_id) = assign_name_ids(&entries, &display);
+        assert_eq!(next_id, 2, "two distinct functions must get two IDs");
+        let id_a = ids
+            .get("outer_a::{0}::S::m")
+            .expect("should have entry for first fn");
+        let id_b = ids
+            .get("outer_b::{0}::S::m")
+            .expect("should have entry for second fn");
+        assert_ne!(
+            id_a, id_b,
+            "different full names must produce different IDs"
         );
     }
 }

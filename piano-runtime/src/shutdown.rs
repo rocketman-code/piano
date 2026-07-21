@@ -2,6 +2,11 @@
 
 //! Lifecycle management -- atexit and signal handlers for abnormal exit.
 //!
+//! `process::exit` does not run destructors (std::process::exit docs:
+//! "the process is terminated immediately") but does run atexit handlers
+//! (libc::atexit contract). Signals bypass both.
+//! Piano handles each path separately.
+//!
 //! Two shutdown paths, two contracts, NO shared code:
 //!
 //! Normal path (RootCtx::drop, atexit handler): acquires mutexes, drains
@@ -30,7 +35,7 @@ use std::sync::{Arc, Mutex, Once};
 
 struct ShutdownState {
     file_sink: Arc<FileSink>,
-    names: &'static [(u32, &'static str)],
+    names: &'static [(u32, &'static str, &'static str)],
     agg_registry: Arc<AggRegistry>,
 }
 
@@ -54,7 +59,7 @@ fn shutdown_state() -> &'static Mutex<Option<ShutdownState>> {
 /// Multiple calls overwrite the previous state (last RootCtx::new wins).
 pub(crate) fn register(
     file_sink: Arc<FileSink>,
-    names: &'static [(u32, &'static str)],
+    names: &'static [(u32, &'static str, &'static str)],
     agg_registry: Arc<AggRegistry>,
 ) {
     #[cfg(unix)]
@@ -95,11 +100,17 @@ extern "C" fn atexit_handler() {
     };
 
     let aggregates = aggregator::drain_all_agg(&agg_registry);
+    let inflight = crate::inflight::drain();
     let calibration = crate::time::CalibrationData::calibrate();
 
     let _bookkeeping = crate::alloc::ProfilerBookkeeping::enter();
     let mut file = file_sink.lock();
     if !aggregates.is_empty() && crate::output::write_aggregates(&mut *file, &aggregates).is_err() {
+        file_sink.record_io_error();
+    }
+    if !inflight.is_empty()
+        && crate::output::write_interrupted_aggregates(&mut *file, &inflight, &calibration).is_err()
+    {
         file_sink.record_io_error();
     }
     if crate::output::write_trailer(
@@ -236,7 +247,7 @@ mod signal {
     /// Register signal handlers. Pre-serializes the trailer, extracts the
     /// raw fd, and leaks the registry pointer for signal-safe access.
     pub(super) fn register(
-        names: &'static [(u32, &'static str)],
+        names: &'static [(u32, &'static str, &'static str)],
         file_sink: &Arc<FileSink>,
         agg_registry: &Arc<AggRegistry>,
     ) {

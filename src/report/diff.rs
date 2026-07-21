@@ -50,8 +50,15 @@ struct DiffSetup<'a> {
 }
 
 fn prepare_diff<'a>(a: &'a Run, b: &'a Run, show_all: bool, limit: Option<usize>) -> DiffSetup<'a> {
-    let a_map: HashMap<&str, &FnEntry> = a.functions.iter().map(|f| (f.name.as_str(), f)).collect();
-    let b_map: HashMap<&str, &FnEntry> = b.functions.iter().map(|f| (f.name.as_str(), f)).collect();
+    let key_for = |f: &'a FnEntry| -> &'a str {
+        f.identity
+            .as_ref()
+            .map(|id| id.0.as_str())
+            .unwrap_or(f.name.as_str())
+    };
+
+    let a_map: HashMap<&str, &FnEntry> = a.functions.iter().map(|f| (key_for(f), f)).collect();
+    let b_map: HashMap<&str, &FnEntry> = b.functions.iter().map(|f| (key_for(f), f)).collect();
 
     let mut names: Vec<&str> = a_map.keys().chain(b_map.keys()).copied().collect();
     names.sort_unstable();
@@ -107,9 +114,12 @@ pub fn diff_runs_json(a: &Run, b: &Run, show_all: bool, limit: Option<usize>) ->
 
     let json_entries: Vec<JsonDiffEntry> = names
         .iter()
-        .map(|name| {
-            let self_a = a_map.get(name).map_or(0.0, |e| e.self_ms);
-            let self_b = b_map.get(name).map_or(0.0, |e| e.self_ms);
+        .map(|key| {
+            let entry_a = a_map.get(key);
+            let entry_b = b_map.get(key);
+            let display_name = entry_b.or(entry_a).map(|e| e.name.as_str()).unwrap_or(key);
+            let self_a = entry_a.map_or(0.0, |e| e.self_ms);
+            let self_b = entry_b.map_or(0.0, |e| e.self_ms);
             let delta = self_b - self_a;
             let delta_pct = if self_a > 0.0 {
                 Some(delta / self_a * 100.0)
@@ -119,19 +129,19 @@ pub fn diff_runs_json(a: &Run, b: &Run, show_all: bool, limit: Option<usize>) ->
                 None
             };
             JsonDiffEntry {
-                name: name.to_string(),
+                name: display_name.to_string(),
                 self_ms_a: self_a,
                 self_ms_b: self_b,
                 delta_ms: delta,
                 delta_pct,
-                calls_a: a_map.get(name).map_or(0, |e| e.calls),
-                calls_b: b_map.get(name).map_or(0, |e| e.calls),
-                alloc_count_a: a_map.get(name).map_or(0, |e| e.alloc_count),
-                alloc_count_b: b_map.get(name).map_or(0, |e| e.alloc_count),
-                alloc_bytes_a: a_map.get(name).map_or(0, |e| e.alloc_bytes),
-                alloc_bytes_b: b_map.get(name).map_or(0, |e| e.alloc_bytes),
-                cpu_self_ms_a: a_map.get(name).and_then(|e| e.cpu_self_ms),
-                cpu_self_ms_b: b_map.get(name).and_then(|e| e.cpu_self_ms),
+                calls_a: entry_a.map_or(0, |e| e.calls),
+                calls_b: entry_b.map_or(0, |e| e.calls),
+                alloc_count_a: entry_a.map_or(0, |e| e.alloc_count),
+                alloc_count_b: entry_b.map_or(0, |e| e.alloc_count),
+                alloc_bytes_a: entry_a.map_or(0, |e| e.alloc_bytes),
+                alloc_bytes_b: entry_b.map_or(0, |e| e.alloc_bytes),
+                cpu_self_ms_a: entry_a.and_then(|e| e.cpu_self_ms),
+                cpu_self_ms_b: entry_b.and_then(|e| e.cpu_self_ms),
             }
         })
         .collect();
@@ -203,21 +213,25 @@ pub fn diff_runs(
         out.push_str(&format!("{DIM}{}{DIM:#}\n", "-".repeat(width)));
     }
 
-    for name in &names {
-        let before = a_map.get(name).map_or(0.0, |e| e.self_ms);
-        let after = b_map.get(name).map_or(0.0, |e| e.self_ms);
+    for key in &names {
+        let entry_b = b_map.get(key);
+        let entry_a = a_map.get(key);
+        // Use the display name from the entry (prefer B's name since it's the "after" run).
+        let display_name = entry_b.or(entry_a).map(|e| e.name.as_str()).unwrap_or(key);
+        let before = entry_a.map_or(0.0, |e| e.self_ms);
+        let after = entry_b.map_or(0.0, |e| e.self_ms);
         let delta = after - before;
 
         let delta_val = format!("{delta:+.2}ms");
         out.push_str(&format!(
-            "{name:<40} {before:>w_a$.2}ms {after:>w_b$.2}ms {delta_val:>DELTA_W$}",
+            "{display_name:<40} {before:>w_a$.2}ms {after:>w_b$.2}ms {delta_val:>DELTA_W$}",
             w_a = col_a - 2,
             w_b = col_b - 2,
         ));
 
         if has_cpu {
-            let cpu_before = a_map.get(name).and_then(|e| e.cpu_self_ms);
-            let cpu_after = b_map.get(name).and_then(|e| e.cpu_self_ms);
+            let cpu_before = entry_a.and_then(|e| e.cpu_self_ms);
+            let cpu_after = entry_b.and_then(|e| e.cpu_self_ms);
             let fmt_cpu = |v: Option<f64>, col_w: usize| match v {
                 Some(ms) => format!("{ms:>w$.2}ms", w = col_w - 2),
                 None => format!("{:>col_w$}", "-"),
@@ -230,8 +244,8 @@ pub fn diff_runs(
         }
 
         if has_allocs {
-            let allocs_after = b_map.get(name).map_or(0u64, |e| e.alloc_count);
-            let allocs_before = a_map.get(name).map_or(0u64, |e| e.alloc_count);
+            let allocs_after = entry_b.map_or(0u64, |e| e.alloc_count);
+            let allocs_before = entry_a.map_or(0u64, |e| e.alloc_count);
             let allocs_delta = allocs_after as i128 - allocs_before as i128;
             out.push_str(&format!(" {allocs_after:>10} {allocs_delta:>+10}"));
         }
@@ -266,7 +280,7 @@ pub fn diff_runs(
 mod tests {
     use super::super::load::load_ndjson;
     use super::super::tag::load_tagged_run;
-    use super::super::{FnEntry, Run, RunFormat};
+    use super::super::{FnEntry, Run, RunFormat, StableIdentity};
     use super::*;
     use std::fs;
     use tempfile::TempDir;
@@ -1248,6 +1262,205 @@ mod tests {
         assert_aligned(
             &diff_runs(&a, &b, "before", "after", false, None),
             "cpu+alloc",
+        );
+    }
+
+    #[test]
+    fn diff_matches_by_identity_not_display_name() {
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "walk".into(),
+                identity: Some(StableIdentity("mod::walk".into())),
+                calls: 3,
+                total_ms: Some(12.0),
+                self_ms: 10.0,
+                ..Default::default()
+            }],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "outer::walk".into(),
+                identity: Some(StableIdentity("mod::walk".into())),
+                calls: 3,
+                total_ms: Some(9.0),
+                self_ms: 8.0,
+                ..Default::default()
+            }],
+        };
+        let diff = diff_runs(&a, &b, "Before", "After", true, None);
+        assert!(
+            diff.contains("-2.00"),
+            "should show delta when identity matches despite name change: {diff}"
+        );
+    }
+
+    #[test]
+    fn diff_json_matches_by_identity_uses_display_name() {
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "walk".into(),
+                identity: Some(StableIdentity("mod::walk".into())),
+                calls: 3,
+                self_ms: 10.0,
+                ..Default::default()
+            }],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "outer::walk".into(),
+                identity: Some(StableIdentity("mod::walk".into())),
+                calls: 3,
+                self_ms: 8.0,
+                ..Default::default()
+            }],
+        };
+        let json = diff_runs_json(&a, &b, true, None);
+        let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "identity match should produce single entry"
+        );
+        // Display name should come from B (the "after" run).
+        assert_eq!(entries[0].name, "outer::walk");
+        assert!((entries[0].delta_ms - (-2.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn diff_falls_back_to_name_without_identity() {
+        // When identity is None, matching falls back to display name.
+        let a = Run {
+            run_id: None,
+            timestamp_ms: 1000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "walk".into(),
+                calls: 3,
+                self_ms: 10.0,
+                ..Default::default()
+            }],
+        };
+        let b = Run {
+            run_id: None,
+            timestamp_ms: 2000,
+            source_format: RunFormat::default(),
+            functions: vec![FnEntry {
+                name: "walk".into(),
+                calls: 3,
+                self_ms: 8.0,
+                ..Default::default()
+            }],
+        };
+        let diff = diff_runs(&a, &b, "Before", "After", true, None);
+        assert!(
+            diff.contains("-2.00"),
+            "should match by name when identity is None: {diff}"
+        );
+    }
+
+    #[test]
+    fn diff_stable_identity_across_disambiguation_change() {
+        let dir = TempDir::new().unwrap();
+
+        // Run A: function displayed as "walk" (no disambiguation needed)
+        let ndjson_a = concat!(
+            r#"{"type":"header","run_id":"a","timestamp_ms":1000,"bias_ns":0,"cpu_bias_ns":0,"names":{"0":"walk"},"qualified":{"0":"mod::walker::walk"}}"#,
+            "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":10000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"type":"trailer","bias_ns":0,"cpu_bias_ns":0,"names":{"0":"walk"},"qualified":{"0":"mod::walker::walk"}}"#,
+            "\n",
+        );
+        // Run B: same function now displayed as "walker::walk" (disambiguation kicked in
+        // because another "walk" was added to the instrumented set)
+        let ndjson_b = concat!(
+            r#"{"type":"header","run_id":"b","timestamp_ms":2000,"bias_ns":0,"cpu_bias_ns":0,"names":{"0":"walker::walk"},"qualified":{"0":"mod::walker::walk"}}"#,
+            "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":8000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"type":"trailer","bias_ns":0,"cpu_bias_ns":0,"names":{"0":"walker::walk"},"qualified":{"0":"mod::walker::walk"}}"#,
+            "\n",
+        );
+
+        fs::write(dir.path().join("1000.ndjson"), ndjson_a).unwrap();
+        fs::write(dir.path().join("2000.ndjson"), ndjson_b).unwrap();
+
+        let (run_a, _) = load_ndjson(&dir.path().join("1000.ndjson"), false).unwrap();
+        let (run_b, _) = load_ndjson(&dir.path().join("2000.ndjson"), false).unwrap();
+
+        // Display names differ (disambiguation changed)
+        assert_ne!(run_a.functions[0].name, run_b.functions[0].name);
+        // Stable identity is the same
+        assert_eq!(run_a.functions[0].identity, run_b.functions[0].identity);
+        assert!(
+            run_a.functions[0].identity.is_some(),
+            "identity should be parsed"
+        );
+
+        // Diff should match by identity and show the delta
+        let diff = diff_runs(&run_a, &run_b, "before", "after", true, None);
+        assert!(
+            diff.contains("-2.00"),
+            "should show -2ms delta despite display name change: {diff}"
+        );
+
+        // JSON diff should also match by identity
+        let json = diff_runs_json(&run_a, &run_b, true, None);
+        let entries: Vec<JsonDiffEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(entries.len(), 1, "should have exactly 1 matched entry");
+        assert!(
+            (entries[0].delta_ms - (-2.0)).abs() < 0.01,
+            "delta should be -2ms"
+        );
+    }
+
+    #[test]
+    fn diff_old_ndjson_without_qualified_falls_back_to_name() {
+        let dir = TempDir::new().unwrap();
+
+        // Old format: no "qualified" field
+        let ndjson_a = concat!(
+            r#"{"type":"header","run_id":"a","timestamp_ms":1000,"bias_ns":0,"cpu_bias_ns":0,"names":{"0":"work"}}"#,
+            "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":5000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"type":"trailer","bias_ns":0,"cpu_bias_ns":0,"names":{"0":"work"}}"#,
+            "\n",
+        );
+        let ndjson_b = concat!(
+            r#"{"type":"header","run_id":"b","timestamp_ms":2000,"bias_ns":0,"cpu_bias_ns":0,"names":{"0":"work"}}"#,
+            "\n",
+            r#"{"span_id":1,"parent_span_id":0,"name_id":0,"start_ns":0,"end_ns":8000000,"thread_id":1,"cpu_start_ns":0,"cpu_end_ns":0,"alloc_count":0,"alloc_bytes":0,"free_count":0,"free_bytes":0}"#,
+            "\n",
+            r#"{"type":"trailer","bias_ns":0,"cpu_bias_ns":0,"names":{"0":"work"}}"#,
+            "\n",
+        );
+
+        fs::write(dir.path().join("1000.ndjson"), ndjson_a).unwrap();
+        fs::write(dir.path().join("2000.ndjson"), ndjson_b).unwrap();
+
+        let (run_a, _) = load_ndjson(&dir.path().join("1000.ndjson"), false).unwrap();
+        let (run_b, _) = load_ndjson(&dir.path().join("2000.ndjson"), false).unwrap();
+
+        // No identity (old format)
+        assert!(run_a.functions[0].identity.is_none());
+        // Falls back to name matching and still shows delta
+        let diff = diff_runs(&run_a, &run_b, "before", "after", true, None);
+        assert!(
+            diff.contains("+3.00"),
+            "should match by name and show +3ms delta: {diff}"
         );
     }
 }

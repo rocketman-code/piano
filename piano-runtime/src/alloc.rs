@@ -3,6 +3,16 @@
 //! Allocation tracking -- per-thread counters, RAII reentrancy guard,
 //! and the PianoAllocator that intercepts heap allocations.
 //!
+//! Counts reflect the compiled binary's runtime behavior, not source-level
+//! intent. The GlobalAlloc trait docs state "you must not rely on
+//! allocations actually happening" -- LLVM can eliminate calls before
+//! they reach the allocator. Counts may be lower than source-level
+//! allocations suggest.
+//!
+//! `thread_local!` is safe inside GlobalAlloc: the trait methods receive
+//! `&self` (shared reference), and `thread_local!` provides per-thread
+//! isolation, so no synchronization issues arise.
+//!
 //! Invariants:
 //! - Reentrancy guard is always correctly paired (enter/exit).
 //!   Enforcement: RAII ReentrancyGuard type. No public enter/exit
@@ -10,7 +20,7 @@
 //!   Unpaired exit is structurally impossible.
 //! - ReentrancyGuard is !Send (TLS counter is per-thread; moving the
 //!   guard to another thread would decrement the wrong counter).
-//!   Enforcement: PhantomData<*const ()>.
+//!   Enforcement: `PhantomData<*const ()>`.
 //! - Alloc counters are monotonically increasing, never reset.
 //!   Enforcement: record_alloc only adds. No reset/clear functions.
 //! - Allocator-observable profiler bookkeeping requires a proof token.

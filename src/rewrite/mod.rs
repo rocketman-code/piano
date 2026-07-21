@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use ra_ap_syntax::ast::HasAttrs;
+use ra_ap_syntax::ast::{HasAttrs, HasModuleItem, HasName};
 use ra_ap_syntax::{AstNode, SourceFile, SyntaxKind, T, ast};
 
 use crate::source_map::StringInjector;
@@ -21,9 +21,126 @@ pub struct InstrumentResult {
 
 /// Parameters for entry-point-only injections (name table, allocator, lifecycle).
 pub struct EntryPointParams<'a> {
-    pub name_table: &'a [(u32, &'a str)],
+    pub name_table: &'a [(u32, &'a str, &'a str)],
     pub runs_dir: &'a str,
     pub cpu_time: bool,
+}
+
+// ── Function classification pipeline ─────────────────────────────
+//
+// Each classification step produces a typed result.
+// Transformation functions accept only the correct type.
+//
+// Priority ordering: async keyword checked first, then impl Future
+// return type, then sync. A Rust function can have both async keyword
+// AND -> impl Future return (valid syntax), so these are not mutually
+// exclusive. Async takes priority because the body has await points
+// and must be wrapped as a coroutine regardless of return type.
+// (Rust Reference, Items > Functions > Async functions.)
+
+struct Instrumentable {
+    func: ast::Fn,
+    stmt_list: ast::StmtList,
+}
+
+struct Selected {
+    inner: Instrumentable,
+    name_id: u32,
+    fn_name: String,
+}
+
+struct ClassifiedAsync(Selected);
+struct ClassifiedImplFuture(Selected);
+struct ClassifiedSync(Selected);
+
+fn detect_instrumentable(func: ast::Fn) -> Option<Instrumentable> {
+    let classification = crate::resolve::classify_cst_fn(&func);
+    if classification != crate::resolve::Classification::Instrumentable {
+        return None;
+    }
+    let body = func.body()?;
+    let stmt_list = body.stmt_list()?;
+    Some(Instrumentable { func, stmt_list })
+}
+
+fn apply_filter(
+    inst: Instrumentable,
+    fn_name: String,
+    measured: &HashMap<String, u32>,
+) -> Option<Selected> {
+    let &name_id = measured.get(&fn_name)?;
+    Some(Selected {
+        inner: inst,
+        name_id,
+        fn_name,
+    })
+}
+
+enum FunctionKind {
+    Async(ClassifiedAsync),
+    ImplFuture(ClassifiedImplFuture),
+    Sync(ClassifiedSync),
+}
+
+fn classify(sel: Selected) -> FunctionKind {
+    if sel.inner.func.async_token().is_some() {
+        FunctionKind::Async(ClassifiedAsync(sel))
+    } else if returns_impl_future(&sel.inner.func) {
+        FunctionKind::ImplFuture(ClassifiedImplFuture(sel))
+    } else {
+        FunctionKind::Sync(ClassifiedSync(sel))
+    }
+}
+
+fn find_close_brace(stmt_list: &ast::StmtList, fn_name: &str) -> Result<usize, String> {
+    let close_brace = stmt_list
+        .syntax()
+        .children_with_tokens()
+        .filter(|t| t.kind() == T!['}'])
+        .last()
+        .ok_or_else(|| format!("no closing brace for fn {fn_name}"))?;
+    Ok(close_brace.text_range().start().into())
+}
+
+fn inject_sync_guard(injector: &mut StringInjector, func: &ClassifiedSync, offset: usize) {
+    injector.insert(
+        offset,
+        format!(
+            " let __piano_guard = piano_runtime::enter({});",
+            func.0.name_id
+        ),
+    );
+}
+
+fn inject_async_wrap(
+    injector: &mut StringInjector,
+    func: &ClassifiedAsync,
+    offset: usize,
+) -> Result<(), String> {
+    let close_offset = find_close_brace(&func.0.inner.stmt_list, &func.0.fn_name)?;
+    injector.insert(
+        offset,
+        format!(
+            " piano_runtime::enter_async({}, async move {{",
+            func.0.name_id
+        ),
+    );
+    injector.insert(close_offset, "}).await");
+    Ok(())
+}
+
+fn inject_impl_future_wrap(
+    injector: &mut StringInjector,
+    func: &ClassifiedImplFuture,
+    offset: usize,
+) -> Result<(), String> {
+    let close_offset = find_close_brace(&func.0.inner.stmt_list, &func.0.fn_name)?;
+    injector.insert(
+        offset,
+        format!(" piano_runtime::enter_async({},", func.0.name_id),
+    );
+    injector.insert(close_offset, ")");
+    Ok(())
 }
 
 /// Instrument a source file in a single pass.
@@ -44,15 +161,15 @@ pub fn instrument_source(
     // --- Entry point: registrations appended after user code ---
     if let Some(ep) = entry_point {
         let mut entries = String::new();
-        for (id, name) in ep.name_table {
+        for (id, display, qualified) in ep.name_table {
             if !entries.is_empty() {
                 entries.push_str(", ");
             }
-            entries.push_str(&format!("({id}, \"{name}\")"));
+            entries.push_str(&format!("({id}, \"{display}\", \"{qualified}\")"));
         }
         injector.insert(
             source.len(),
-            format!("\nconst PIANO_NAMES: &[(u32, &str)] = &[{entries}];\n"),
+            format!("\nconst PIANO_NAMES: &[(u32, &str, &str)] = &[{entries}];\n"),
         );
     }
 
@@ -61,84 +178,9 @@ pub fn instrument_source(
         inject_allocator(&file, source, &mut injector)?;
     }
 
-    // --- Guards + shutdown: walk all descendants ---
-    for node in file.syntax().descendants() {
-        let Some(func) = ast::Fn::cast(node) else {
-            continue;
-        };
-        let Some(body) = func.body() else { continue };
-        let fn_name = crate::naming::qualified_name_for_fn(&func);
-
-        // Shutdown: inject lifecycle into fn main()
-        if fn_name == "main" {
-            if let Some(ep) = entry_point {
-                let stmt_list = body
-                    .stmt_list()
-                    .ok_or_else(|| "no stmt_list for fn main".to_string())?;
-                let inject_offset = brace_offset_after_inner_attrs(&stmt_list)?;
-                injector.insert(
-                    inject_offset,
-                    build_lifecycle_prefix(ep.runs_dir, ep.cpu_time),
-                );
-            }
-            continue; // main is excluded from the name table
-        }
-
-        // Guard: only for measured functions
-        let Some(&name_id) = measured.get(&fn_name) else {
-            continue;
-        };
-
-        // Skip const fn and non-Rust ABI
-        if func.const_token().is_some() {
-            continue;
-        }
-        if let Some(abi) = func.abi() {
-            if let Some(token) = abi.string_token() {
-                let abi_str = token.text();
-                if abi_str != "\"Rust\"" {
-                    continue;
-                }
-            }
-        }
-
-        let stmt_list = body
-            .stmt_list()
-            .ok_or_else(|| format!("no stmt_list for fn {fn_name}"))?;
-        let inject_offset = brace_offset_after_inner_attrs(&stmt_list)?;
-
-        let is_async_fn = func.async_token().is_some();
-        let is_impl_future = returns_impl_future(&func);
-
-        if is_async_fn || is_impl_future {
-            let close_brace = stmt_list
-                .syntax()
-                .children_with_tokens()
-                .filter(|t| t.kind() == T!['}'])
-                .last()
-                .ok_or_else(|| format!("no closing brace for fn {fn_name}"))?;
-            let close_offset: usize = close_brace.text_range().start().into();
-
-            if is_async_fn {
-                injector.insert(
-                    inject_offset,
-                    format!(" piano_runtime::enter_async({name_id}, async move {{"),
-                );
-                injector.insert(close_offset, "}).await");
-            } else {
-                injector.insert(
-                    inject_offset,
-                    format!(" piano_runtime::enter_async({name_id},"),
-                );
-                injector.insert(close_offset, ")");
-            }
-        } else {
-            injector.insert(
-                inject_offset,
-                format!(" let __piano_guard = piano_runtime::enter({name_id});"),
-            );
-        }
-    }
+    // --- Guards + shutdown: structured walk with scope tracking ---
+    let mut scope = crate::naming::ScopeState::new();
+    walk_for_guards(&file, &mut scope, measured, &mut injector, entry_point)?;
 
     // --- Macro expansion: replace fn-generating invocations ---
     expand_and_replace_macros(file.syntax(), measured, &mut injector);
@@ -168,35 +210,314 @@ fn brace_offset_after_inner_attrs(stmt_list: &ast::StmtList) -> Result<usize, St
     Ok(offset)
 }
 
+// ---------------------------------------------------------------------------
+// Structured walk with scope tracking (mirrors resolve.rs FnCollector)
+// ---------------------------------------------------------------------------
+
+/// Walk a source file structurally, tracking scope to produce full qualified
+/// names that match resolve.rs output.
+fn walk_for_guards(
+    file: &SourceFile,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+    entry_point: Option<&EntryPointParams<'_>>,
+) -> Result<(), String> {
+    for item in file.items() {
+        walk_item_for_guards(&item, scope, measured, injector, entry_point)?;
+    }
+    Ok(())
+}
+
+fn walk_item_for_guards(
+    item: &ast::Item,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+    entry_point: Option<&EntryPointParams<'_>>,
+) -> Result<(), String> {
+    match item {
+        ast::Item::Module(module) => {
+            let mod_name = module
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_else(|| "_".to_string());
+            scope.push_mod(&mod_name);
+            if let Some(item_list) = module.item_list() {
+                for child_item in item_list.items() {
+                    walk_item_for_guards(&child_item, scope, measured, injector, entry_point)?;
+                }
+            }
+            scope.pop();
+        }
+        ast::Item::Fn(func) => {
+            visit_top_level_fn_for_guards(func, scope, measured, injector, entry_point)?;
+        }
+        ast::Item::Impl(imp) => {
+            visit_impl_for_guards(imp, scope, measured, injector)?;
+        }
+        ast::Item::Trait(tr) => {
+            visit_trait_for_guards(tr, scope, measured, injector)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn visit_top_level_fn_for_guards(
+    func: &ast::Fn,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+    entry_point: Option<&EntryPointParams<'_>>,
+) -> Result<(), String> {
+    let bare_name = crate::naming::qualified_name_for_fn(func);
+
+    // Handle fn main() lifecycle injection
+    if bare_name == "main" {
+        if let Some(ep) = entry_point {
+            let body = func
+                .body()
+                .ok_or_else(|| "no body for fn main".to_string())?;
+            let stmt_list = body
+                .stmt_list()
+                .ok_or_else(|| "no stmt_list for fn main".to_string())?;
+            let inject_offset = brace_offset_after_inner_attrs(&stmt_list)?;
+            injector.insert(
+                inject_offset,
+                build_lifecycle_prefix(ep.runs_dir, ep.cpu_time),
+            );
+        }
+    } else {
+        // Instrument this function using full scoped name
+        let full_name = scope.render_full(&bare_name);
+        try_inject_guard(func.clone(), full_name, measured, injector)?;
+    }
+
+    // Push fn scope and walk body for nested items
+    let fn_name = func
+        .name()
+        .map(|n| n.text().to_string())
+        .unwrap_or_default();
+    scope.push_fn(&fn_name);
+    if let Some(body) = func.body() {
+        walk_fn_body_for_guards(body, scope, measured, injector)?;
+    }
+    scope.pop();
+    Ok(())
+}
+
+fn visit_impl_for_guards(
+    imp: &ast::Impl,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    if let Some(assoc_list) = imp.assoc_item_list() {
+        for assoc in assoc_list.assoc_items() {
+            if let ast::AssocItem::Fn(func) = assoc {
+                visit_impl_fn_for_guards(&func, scope, measured, injector)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn visit_impl_fn_for_guards(
+    func: &ast::Fn,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    let bare_qualified = crate::naming::qualified_name_for_fn(func);
+    let full_name = scope.render_full(&bare_qualified);
+    try_inject_guard(func.clone(), full_name, measured, injector)?;
+
+    // Push fn scope and walk body for nested items
+    let fn_name = func
+        .name()
+        .map(|n| n.text().to_string())
+        .unwrap_or_default();
+    scope.push_fn(&fn_name);
+    if let Some(body) = func.body() {
+        walk_fn_body_for_guards(body, scope, measured, injector)?;
+    }
+    scope.pop();
+    Ok(())
+}
+
+fn visit_trait_for_guards(
+    tr: &ast::Trait,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    if let Some(assoc_list) = tr.assoc_item_list() {
+        for assoc in assoc_list.assoc_items() {
+            if let ast::AssocItem::Fn(func) = assoc {
+                if func.body().is_some() {
+                    let bare_qualified = crate::naming::qualified_name_for_fn(&func);
+                    let full_name = scope.render_full(&bare_qualified);
+                    try_inject_guard(func.clone(), full_name, measured, injector)?;
+
+                    let fn_name = func
+                        .name()
+                        .map(|n| n.text().to_string())
+                        .unwrap_or_default();
+                    scope.push_fn(&fn_name);
+                    if let Some(body) = func.body() {
+                        walk_fn_body_for_guards(body, scope, measured, injector)?;
+                    }
+                    scope.pop();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk a function body to find nested items, tracking BLOCK_EXPR boundaries.
+fn walk_fn_body_for_guards(
+    body: ast::BlockExpr,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    let Some(stmt_list) = body.stmt_list() else {
+        return Ok(());
+    };
+    for node in stmt_list.syntax().children() {
+        walk_body_child_for_guards(node, scope, measured, injector)?;
+    }
+    Ok(())
+}
+
+fn walk_body_child_for_guards(
+    node: ra_ap_syntax::SyntaxNode,
+    scope: &mut crate::naming::ScopeState,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    let kind = node.kind();
+    if kind == SyntaxKind::FN {
+        if let Some(inner_fn) = ast::Fn::cast(node) {
+            let bare_qualified = crate::naming::qualified_name_for_fn(&inner_fn);
+            let full_name = scope.render_full(&bare_qualified);
+            try_inject_guard(inner_fn.clone(), full_name, measured, injector)?;
+
+            // Recurse into nested fn's body
+            scope.push_fn(&bare_qualified);
+            if let Some(inner_body) = inner_fn.body() {
+                walk_fn_body_for_guards(inner_body, scope, measured, injector)?;
+            }
+            scope.pop();
+        }
+    } else if kind == SyntaxKind::BLOCK_EXPR {
+        if let Some(inner_block) = ast::BlockExpr::cast(node) {
+            scope.push_block();
+            walk_fn_body_for_guards(inner_block, scope, measured, injector)?;
+            scope.pop();
+        }
+    } else if kind == SyntaxKind::IMPL {
+        if let Some(imp) = ast::Impl::cast(node) {
+            visit_impl_for_guards(&imp, scope, measured, injector)?;
+        }
+    } else {
+        for child in node.children() {
+            walk_body_child_for_guards(child, scope, measured, injector)?;
+        }
+    }
+    Ok(())
+}
+
+/// Try to inject a guard into a function. Uses the shared classification pipeline.
+fn try_inject_guard(
+    func: ast::Fn,
+    full_name: String,
+    measured: &HashMap<String, u32>,
+    injector: &mut StringInjector,
+) -> Result<(), String> {
+    let inst = match detect_instrumentable(func) {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+    let sel = match apply_filter(inst, full_name, measured) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    let inject_offset = brace_offset_after_inner_attrs(&sel.inner.stmt_list)?;
+
+    match classify(sel) {
+        FunctionKind::Async(async_fn) => {
+            inject_async_wrap(injector, &async_fn, inject_offset)?;
+        }
+        FunctionKind::ImplFuture(impl_fn) => {
+            inject_impl_future_wrap(injector, &impl_fn, inject_offset)?;
+        }
+        FunctionKind::Sync(sync_fn) => {
+            inject_sync_guard(injector, &sync_fn, inject_offset);
+        }
+    }
+    Ok(())
+}
+
 /// Check if a function's return type contains `impl Future`.
 fn returns_impl_future(func: &ast::Fn) -> bool {
     let Some(ret) = func.ret_type() else {
         return false;
     };
-    let ret_text = ret.syntax().text().to_string();
-    ret_text.contains("impl") && ret_text.contains("Future")
+    let Some(ty) = ret.ty() else { return false };
+    let ast::Type::ImplTraitType(impl_trait) = ty else {
+        return false;
+    };
+    let Some(bounds) = impl_trait.type_bound_list() else {
+        return false;
+    };
+
+    for bound in bounds.bounds() {
+        let Some(bound_ty) = bound.ty() else { continue };
+        let ast::Type::PathType(path_ty) = bound_ty else {
+            continue;
+        };
+        let Some(path) = path_ty.path() else { continue };
+        for segment in path.segments() {
+            if let Some(name_ref) = segment.name_ref() {
+                if name_ref.text() == "Future" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
 // Allocator injection (CST-based, single-pass)
 // ---------------------------------------------------------------------------
 
-/// Detect #[global_allocator] via CST and inject wrapping into the StringInjector.
+/// Detect #[global_allocator] via structural AST analysis and inject wrapping
+/// into the StringInjector.
 ///
-/// Case 1 (absent): insert PianoAllocator<System> at offset 0.
-/// Case 2 (present, no cfg): replace the static item with wrapped version.
-/// Case 3 (present, with cfg): replace with wrapped + negated cfg fallback.
+/// Priority: direct #[global_allocator] checked first (determines
+/// unconditional vs cfg-gated), then #[cfg_attr]. A Rust item can have
+/// both #[cfg(a)] and #[cfg_attr(b, global_allocator)] — these are not
+/// mutually exclusive. (Rust Reference, Conditional Compilation.)
+///
+/// Case 1 (absent): insert PianoAllocator<System> at end of file.
+/// Case 2 (unconditional): replace the static item with wrapped version.
+/// Case 3 (cfg-gated): replace with wrapped + negated cfg fallback.
+/// Case 4 (cfg_attr-applied): same wrapping, using cfg_attr predicate.
 fn inject_allocator(
     file: &SourceFile,
     source: &str,
     injector: &mut StringInjector,
 ) -> Result<(), String> {
-    // Find the static item with #[global_allocator]
-    let alloc_info = find_global_allocator(file, source);
+    let classification = find_global_allocator(file, source);
 
-    match alloc_info {
+    match classification {
         None => {
-            // Case 1: no allocator. Append PianoAllocator<System> after user code.
+            // Case 1: no allocator
             injector.insert(
                 source.len(),
                 concat!(
@@ -206,54 +527,81 @@ fn inject_allocator(
                 ),
             );
         }
-        Some(info) => {
-            if let Some(ref cfg) = info.cfg_attr {
-                // Case 3: cfg-gated allocator.
-                // Replace: wrap the user's allocator (same line count).
-                // Append: add negated-cfg System fallback after user code.
-                let neg_cfg = negate_cfg(cfg);
-                let original_text = &source[info.start..info.end];
-                let original_newlines = original_text.chars().filter(|&c| c == '\n').count();
+        Some(AllocatorClassification::Unconditional(info)) => {
+            // Case 2: direct #[global_allocator], no cfg
+            let replacement = format!(
+                "#[global_allocator]\n\
+                 static {name}: piano_runtime::PianoAllocator<{ty}> = piano_runtime::PianoAllocator::new({init});",
+                name = info.name,
+                ty = info.type_expr,
+                init = info.init_expr,
+            );
+            injector.replace(info.start, info.end, replacement);
+        }
+        Some(AllocatorClassification::CfgGated { info, cfg_text }) => {
+            // Case 3: #[cfg(pred)] #[global_allocator]
+            let neg_cfg = negate_cfg(&cfg_text);
+            let original_text = &source[info.start..info.end];
+            let original_newlines = original_text.chars().filter(|&c| c == '\n').count();
 
-                // Build the wrapped version: cfg + #[global_allocator] + static on one line
-                let wrapped = format!(
-                    "{cfg}\n#[global_allocator]\nstatic {name}: piano_runtime::PianoAllocator<{ty}> = piano_runtime::PianoAllocator::new({init});",
-                    name = info.name,
-                    ty = info.type_expr,
-                    init = info.init_expr,
-                );
-                // Count newlines in wrapped and pad to match original
-                let wrapped_newlines = wrapped.chars().filter(|&c| c == '\n').count();
-                let padded = if wrapped_newlines < original_newlines {
-                    format!(
-                        "{wrapped}{}",
-                        "\n".repeat(original_newlines - wrapped_newlines)
-                    )
-                } else {
-                    wrapped
-                };
-
-                injector.replace(info.start, info.end, padded);
-
-                // Append the fallback after all user code (zero-shift: no lines added in the middle)
-                injector.insert(
-                    source.len(),
-                    format!(
-                        "\n{neg_cfg}\n#[global_allocator]\nstatic {name}: piano_runtime::PianoAllocator<std::alloc::System> = piano_runtime::PianoAllocator::new(std::alloc::System);\n",
-                        name = info.name,
-                    ),
-                );
+            let wrapped = format!(
+                "{cfg_text}\n#[global_allocator]\nstatic {name}: piano_runtime::PianoAllocator<{ty}> = piano_runtime::PianoAllocator::new({init});",
+                name = info.name,
+                ty = info.type_expr,
+                init = info.init_expr,
+            );
+            let wrapped_newlines = wrapped.chars().filter(|&c| c == '\n').count();
+            let padded = if wrapped_newlines < original_newlines {
+                format!(
+                    "{wrapped}{}",
+                    "\n".repeat(original_newlines - wrapped_newlines)
+                )
             } else {
-                // Case 2: no cfg, simple wrap (same line count as original)
-                let replacement = format!(
-                    "#[global_allocator]\n\
-                     static {name}: piano_runtime::PianoAllocator<{ty}> = piano_runtime::PianoAllocator::new({init});",
+                wrapped
+            };
+
+            injector.replace(info.start, info.end, padded);
+            injector.insert(
+                source.len(),
+                format!(
+                    "\n{neg_cfg}\n#[global_allocator]\nstatic {name}: piano_runtime::PianoAllocator<std::alloc::System> = piano_runtime::PianoAllocator::new(std::alloc::System);\n",
                     name = info.name,
-                    ty = info.type_expr,
-                    init = info.init_expr,
-                );
-                injector.replace(info.start, info.end, replacement);
-            }
+                ),
+            );
+        }
+        Some(AllocatorClassification::CfgAttrApplied {
+            info,
+            cfg_attr_text,
+        }) => {
+            // Case 4: #[cfg_attr(pred, global_allocator)]
+            let neg_cfg = negate_cfg(&cfg_attr_text);
+            let original_text = &source[info.start..info.end];
+            let original_newlines = original_text.chars().filter(|&c| c == '\n').count();
+
+            let wrapped = format!(
+                "{cfg_attr_text}\nstatic {name}: piano_runtime::PianoAllocator<{ty}> = piano_runtime::PianoAllocator::new({init});",
+                name = info.name,
+                ty = info.type_expr,
+                init = info.init_expr,
+            );
+            let wrapped_newlines = wrapped.chars().filter(|&c| c == '\n').count();
+            let padded = if wrapped_newlines < original_newlines {
+                format!(
+                    "{wrapped}{}",
+                    "\n".repeat(original_newlines - wrapped_newlines)
+                )
+            } else {
+                wrapped
+            };
+
+            injector.replace(info.start, info.end, padded);
+            injector.insert(
+                source.len(),
+                format!(
+                    "\n{neg_cfg}\n#[global_allocator]\nstatic {name}: piano_runtime::PianoAllocator<std::alloc::System> = piano_runtime::PianoAllocator::new(std::alloc::System);\n",
+                    name = info.name,
+                ),
+            );
         }
     }
 
@@ -266,62 +614,100 @@ struct AllocatorInfo {
     name: String,
     type_expr: String,
     init_expr: String,
-    cfg_attr: Option<String>,
 }
 
-/// Find a static item with #[global_allocator] using CST, extract its components.
-fn find_global_allocator(file: &SourceFile, source: &str) -> Option<AllocatorInfo> {
+enum AllocatorClassification {
+    Unconditional(AllocatorInfo),
+    CfgGated {
+        info: AllocatorInfo,
+        cfg_text: String,
+    },
+    CfgAttrApplied {
+        info: AllocatorInfo,
+        cfg_attr_text: String,
+    },
+}
+
+fn extract_static_info(static_item: &ast::Static, source: &str) -> Option<AllocatorInfo> {
+    let start: usize = static_item.syntax().text_range().start().into();
+    let end: usize = static_item.syntax().text_range().end().into();
+    let item_text = &source[start..end];
+
+    let static_kw = item_text.find("static ")?;
+    let after_static = &item_text[static_kw + 7..];
+    let colon = after_static.find(':')?;
+    let name = after_static[..colon].trim().to_string();
+
+    let after_colon = &after_static[colon + 1..];
+    let eq = after_colon.find('=')?;
+    let type_expr = after_colon[..eq].trim().to_string();
+
+    let after_eq = &after_colon[eq + 1..];
+    let init_expr = after_eq.trim_end_matches(';').trim().to_string();
+
+    Some(AllocatorInfo {
+        start,
+        end,
+        name,
+        type_expr,
+        init_expr,
+    })
+}
+
+/// Find a static item with #[global_allocator] using structural AST analysis.
+fn find_global_allocator(file: &SourceFile, source: &str) -> Option<AllocatorClassification> {
     for node in file.syntax().descendants() {
         let Some(static_item) = ast::Static::cast(node) else {
             continue;
         };
 
-        // Check for #[global_allocator] attribute
-        let has_global_alloc = static_item.attrs().any(|attr| {
-            let text = attr.syntax().text().to_string();
-            text.contains("global_allocator") && !text.starts_with("#!")
-        });
-        if !has_global_alloc {
-            continue;
+        let mut has_direct_global_alloc = false;
+        let mut cfg_gate: Option<String> = None;
+        let mut cfg_attr_global_alloc: Option<String> = None;
+
+        for attr in static_item.attrs() {
+            if attr.kind().is_inner() {
+                continue;
+            }
+            let Some(name) = attr.simple_name() else {
+                continue;
+            };
+
+            match name.as_str() {
+                "global_allocator" => {
+                    has_direct_global_alloc = true;
+                }
+                "cfg" => {
+                    cfg_gate = Some(attr.syntax().text().to_string());
+                }
+                "cfg_attr" => {
+                    let text = attr.syntax().text().to_string();
+                    if text.contains("global_allocator") {
+                        cfg_attr_global_alloc = Some(text);
+                    }
+                }
+                _ => {}
+            }
         }
 
-        // Extract the full range (includes attributes)
-        let start: usize = static_item.syntax().text_range().start().into();
-        let end: usize = static_item.syntax().text_range().end().into();
-
-        // Extract name, type, initializer from the source text
-        let item_text = &source[start..end];
-
-        let static_kw = item_text.find("static ")?;
-        let after_static = &item_text[static_kw + 7..];
-        let colon = after_static.find(':')?;
-        let name = after_static[..colon].trim().to_string();
-
-        let after_colon = &after_static[colon + 1..];
-        let eq = after_colon.find('=')?;
-        let type_expr = after_colon[..eq].trim().to_string();
-
-        let after_eq = &after_colon[eq + 1..];
-        let init_expr = after_eq.trim_end_matches(';').trim().to_string();
-
-        // Check for #[cfg(...)] attribute
-        let cfg_attr = static_item.attrs().find_map(|attr| {
-            let text = attr.syntax().text().to_string();
-            if text.starts_with("#[cfg(") || text.starts_with("#[cfg_attr(") {
-                Some(text)
-            } else {
-                None
+        if has_direct_global_alloc {
+            let info = extract_static_info(&static_item, source)?;
+            if let Some(cfg) = cfg_gate {
+                return Some(AllocatorClassification::CfgGated {
+                    info,
+                    cfg_text: cfg,
+                });
             }
-        });
+            return Some(AllocatorClassification::Unconditional(info));
+        }
 
-        return Some(AllocatorInfo {
-            start,
-            end,
-            name,
-            type_expr,
-            init_expr,
-            cfg_attr,
-        });
+        if let Some(text) = cfg_attr_global_alloc {
+            let info = extract_static_info(&static_item, source)?;
+            return Some(AllocatorClassification::CfgAttrApplied {
+                info,
+                cfg_attr_text: text,
+            });
+        }
     }
     None
 }
@@ -441,55 +827,48 @@ fn expand_and_replace_macros(
     for exp in &expansions {
         let call = &calls[exp.call_idx];
 
-        // Inject guards into the expanded text for measured functions.
-        let instrumented = inject_guards_into_expansion(&exp.expanded_text, measured);
+        let impl_prefix = crate::naming::impl_prefix_at(root, call.byte_start);
+        let instrumented =
+            inject_guards_into_expansion(&exp.expanded_text, measured, impl_prefix.as_deref());
 
-        // Replace the MACRO_CALL byte range with the instrumented expansion.
         injector.replace(call.byte_start, call.byte_end, instrumented);
     }
 }
 
-/// Inject guards into expanded macro text. Parses the expansion, finds fn
-/// items, and inserts guards for functions that are in the measured map.
-/// Inject guards into expanded macro text. Uses the same guard logic as
-/// the main instrument_source loop: sync enter(), async enter_async(),
-/// impl-Future wrapping. Skips const fn and non-Rust ABI.
-fn inject_guards_into_expansion(expanded: &str, measured: &HashMap<String, u32>) -> String {
+/// Inject guards into expanded macro text. Uses the shared classification
+/// pipeline (detect_instrumentable -> apply_filter -> classify) to ensure
+/// consistent behavior with the main instrument_source loop.
+fn inject_guards_into_expansion(
+    expanded: &str,
+    measured: &HashMap<String, u32>,
+    impl_prefix: Option<&str>,
+) -> String {
     let parse = SourceFile::parse(expanded, ra_ap_syntax::Edition::Edition2021);
-
-    // Collect insertions: (byte_offset, text, is_close_brace_insert)
-    // We use a Vec of insertions applied in reverse order.
     let mut insertions: Vec<(usize, String)> = Vec::new();
 
     for node in parse.tree().syntax().descendants() {
         let Some(func) = ast::Fn::cast(node) else {
             continue;
         };
-        let Some(body) = func.body() else { continue };
-        let fn_name = crate::naming::qualified_name_for_fn(&func);
 
-        let Some(&name_id) = measured.get(&fn_name) else {
-            continue;
+        let bare_name = crate::naming::qualified_name_for_fn(&func);
+        let fn_name = match impl_prefix {
+            Some(prefix) => format!("{prefix}::{bare_name}"),
+            None => bare_name,
         };
 
-        // Skip const fn
-        if func.const_token().is_some() {
-            continue;
-        }
-
-        // Skip non-Rust ABI
-        if let Some(abi) = func.abi() {
-            if let Some(token) = abi.string_token() {
-                if token.text() != "\"Rust\"" {
-                    continue;
-                }
-            }
-        }
-
-        let Some(stmt_list) = body.stmt_list() else {
-            continue;
+        let inst = match detect_instrumentable(func) {
+            Some(i) => i,
+            None => continue,
         };
-        let Some(open_brace) = stmt_list
+        let sel = match apply_filter(inst, fn_name, measured) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let Some(open_brace) = sel
+            .inner
+            .stmt_list
             .syntax()
             .children_with_tokens()
             .find(|t| t.kind() == T!['{'])
@@ -498,39 +877,46 @@ fn inject_guards_into_expansion(expanded: &str, measured: &HashMap<String, u32>)
         };
         let offset: usize = open_brace.text_range().end().into();
 
-        let is_async_fn = func.async_token().is_some();
-        let is_impl_future = returns_impl_future(&func);
-
-        if is_async_fn || is_impl_future {
-            let Some(close_brace) = stmt_list
-                .syntax()
-                .children_with_tokens()
-                .filter(|t| t.kind() == T!['}'])
-                .last()
-            else {
-                continue;
-            };
-            let close_offset: usize = close_brace.text_range().start().into();
-
-            if is_async_fn {
+        match classify(sel) {
+            FunctionKind::Async(async_fn) => {
+                let Ok(close_offset) =
+                    find_close_brace(&async_fn.0.inner.stmt_list, &async_fn.0.fn_name)
+                else {
+                    continue;
+                };
                 insertions.push((
                     offset,
-                    format!(" piano_runtime::enter_async({name_id}, async move {{"),
+                    format!(
+                        " piano_runtime::enter_async({}, async move {{",
+                        async_fn.0.name_id
+                    ),
                 ));
                 insertions.push((close_offset, "}).await".to_string()));
-            } else {
-                insertions.push((offset, format!(" piano_runtime::enter_async({name_id},")));
+            }
+            FunctionKind::ImplFuture(impl_fn) => {
+                let Ok(close_offset) =
+                    find_close_brace(&impl_fn.0.inner.stmt_list, &impl_fn.0.fn_name)
+                else {
+                    continue;
+                };
+                insertions.push((
+                    offset,
+                    format!(" piano_runtime::enter_async({},", impl_fn.0.name_id),
+                ));
                 insertions.push((close_offset, ")".to_string()));
             }
-        } else {
-            insertions.push((
-                offset,
-                format!(" let __piano_guard = piano_runtime::enter({name_id});"),
-            ));
+            FunctionKind::Sync(sync_fn) => {
+                insertions.push((
+                    offset,
+                    format!(
+                        " let __piano_guard = piano_runtime::enter({});",
+                        sync_fn.0.name_id
+                    ),
+                ));
+            }
         }
     }
 
-    // Apply in reverse order to preserve offsets.
     insertions.sort_by(|a, b| b.0.cmp(&a.0));
     let mut result = expanded.to_string();
     for (offset, text) in &insertions {
@@ -619,6 +1005,18 @@ mod tests {
         let measured: HashMap<String, u32> = [("callback".into(), 0)].into_iter().collect();
         let result = instrument_source(source, &measured, None).unwrap();
         assert!(!result.source.contains("piano_runtime::enter"));
+    }
+
+    #[test]
+    fn skips_bare_extern_fn() {
+        let source = "extern fn callback(x: i32) -> i32 {\n    x + 1\n}\n";
+        let measured: HashMap<String, u32> = [("callback".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(
+            !result.source.contains("piano_runtime::enter"),
+            "bare extern fn has C ABI and must not be instrumented. Got:\n{}",
+            result.source,
+        );
     }
 
     #[test]
@@ -713,7 +1111,7 @@ mod tests {
     #[test]
     fn instruments_nested_function() {
         let source = "fn outer() {\n    fn inner() {\n        let x = 1;\n    }\n    inner();\n}\n";
-        let measured: HashMap<String, u32> = [("outer".into(), 0), ("inner".into(), 1)]
+        let measured: HashMap<String, u32> = [("outer".into(), 0), ("outer::inner".into(), 1)]
             .into_iter()
             .collect();
         let result = instrument_source(source, &measured, None).unwrap();
@@ -787,7 +1185,7 @@ mod tests {
         let source = "fn work() {\n    1;\n}\nfn main() {\n    work();\n}\n";
         let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
         let ep = EntryPointParams {
-            name_table: &[(0, "work")],
+            name_table: &[(0, "work", "work")],
             runs_dir: "/tmp/runs",
             cpu_time: false,
         };
@@ -801,7 +1199,7 @@ mod tests {
         // Name table
         assert!(result.source.contains("PIANO_NAMES"), "name table injected");
         assert!(
-            result.source.contains("(0, \"work\")"),
+            result.source.contains("(0, \"work\", \"work\")"),
             "name table has work"
         );
         // Allocator (case 1: absent)
@@ -829,7 +1227,7 @@ mod tests {
         let source = "#[global_allocator]\nstatic ALLOC: MyAlloc = MyAlloc;\n\nfn work() {\n    1;\n}\nfn main() {\n    work();\n}\n";
         let measured: HashMap<String, u32> = [("work".into(), 0)].into_iter().collect();
         let ep = EntryPointParams {
-            name_table: &[(0, "work")],
+            name_table: &[(0, "work", "work")],
             runs_dir: "/tmp/runs",
             cpu_time: false,
         };
@@ -902,12 +1300,12 @@ m!();
 
         let measured: HashMap<String, u32> = [
             ("free".into(), 0),
-            ("in_module".into(), 1),
+            ("inner::in_module".into(), 1),
             ("S::inherent_method".into(), 2),
             ("T::trait_default".into(), 3),
             ("<S as T>::trait_impl".into(), 4),
             ("<S as T>::trait_abstract".into(), 5),
-            ("nested".into(), 6),
+            ("outer::nested".into(), 6),
             ("outer".into(), 7),
             ("macro_fn".into(), 8),
         ]
@@ -989,6 +1387,27 @@ fn main() {}
     }
 
     #[test]
+    fn macro_fn_in_impl_block_gets_guard() {
+        let source = r#"
+struct S;
+macro_rules! make_method { () => { fn method(&self) { let _ = 1; } }; }
+impl S {
+    make_method!();
+}
+fn main() {}
+"#;
+        let measured: HashMap<String, u32> = [("S::method".into(), 0)].into_iter().collect();
+        let result =
+            instrument_source(source, &measured, None).expect("instrument_source should succeed");
+
+        assert!(
+            result.source.contains("piano_runtime::enter(0)"),
+            "macro-expanded fn inside impl should be instrumented with qualified name S::method. Got:\n{}",
+            result.source,
+        );
+    }
+
+    #[test]
     fn macro_mixed_measured_unmeasured() {
         let source = r#"
 macro_rules! pair { () => { fn tracked() { let _ = 1; } fn untracked() { let _ = 2; } }; }
@@ -1010,6 +1429,120 @@ fn main() {}
             1,
             "only the measured fn should get a guard, not both. Got:\n{}",
             result.source
+        );
+    }
+
+    #[test]
+    fn impl_future_standard_path() {
+        let source = "fn f() -> impl std::future::Future<Output = i32> { async { 42 } }";
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let func = parse
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(ast::Fn::cast)
+            .unwrap();
+        assert!(returns_impl_future(&func));
+    }
+
+    #[test]
+    fn impl_future_short_name() {
+        let source = "fn f() -> impl Future<Output = ()> { async {} }";
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let func = parse
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(ast::Fn::cast)
+            .unwrap();
+        assert!(returns_impl_future(&func));
+    }
+
+    #[test]
+    fn impl_future_with_clone_bound() {
+        let source = "fn f() -> impl Clone + Future<Output = i32> { async { 42 } }";
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let func = parse
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(ast::Fn::cast)
+            .unwrap();
+        assert!(returns_impl_future(&func));
+    }
+
+    #[test]
+    fn impl_iterator_of_futures_is_not_impl_future() {
+        let source = "fn f() -> impl Iterator<Item = impl Future<Output = i32>> { todo!() }";
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let func = parse
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(ast::Fn::cast)
+            .unwrap();
+        assert!(
+            !returns_impl_future(&func),
+            "nested impl Future in generic param is not top-level impl Future"
+        );
+    }
+
+    #[test]
+    fn box_dyn_future_is_not_impl_future() {
+        let source = "fn f() -> Box<dyn Future<Output = i32>> { todo!() }";
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let func = parse
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(ast::Fn::cast)
+            .unwrap();
+        assert!(!returns_impl_future(&func));
+    }
+
+    #[test]
+    fn no_return_type_is_not_impl_future() {
+        let source = "fn f() { }";
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let func = parse
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(ast::Fn::cast)
+            .unwrap();
+        assert!(!returns_impl_future(&func));
+    }
+
+    #[test]
+    fn plain_return_type_is_not_impl_future() {
+        let source = "fn f() -> i32 { 42 }";
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let func = parse
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(ast::Fn::cast)
+            .unwrap();
+        assert!(!returns_impl_future(&func));
+    }
+
+    #[test]
+    fn impl_iterator_of_futures_gets_sync_guard() {
+        let source = r#"fn make_futures() -> impl Iterator<Item = impl std::future::Future<Output = i32>> {
+    vec![async { 42 }].into_iter()
+}
+"#;
+        let measured: HashMap<String, u32> = [("make_futures".into(), 0)].into_iter().collect();
+        let result = instrument_source(source, &measured, None).unwrap();
+        assert!(
+            result.source.contains("piano_runtime::enter(0)"),
+            "impl Iterator<Item = impl Future> should get sync guard, not PianoFuture wrap. Got:\n{}",
+            result.source,
+        );
+        assert!(
+            !result.source.contains("enter_async"),
+            "must NOT use enter_async for impl Iterator. Got:\n{}",
+            result.source,
         );
     }
 }
